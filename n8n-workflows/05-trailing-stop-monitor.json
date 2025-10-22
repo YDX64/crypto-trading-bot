@@ -1,0 +1,582 @@
+{
+  "name": "Crypto Trading Bot - Trailing Stop Monitor",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "seconds",
+              "secondsInterval": 30
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule Trigger (Every 30s)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM positions WHERE status IN ('OPEN', 'BREAK_EVEN', 'TRAILING')",
+        "options": {}
+      },
+      "id": "get-active-positions",
+      "name": "Get Active Positions",
+      "type": "n8n-nodes-base.sqlite",
+      "typeVersion": 1,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "split-positions",
+      "name": "Split Into Batches",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 1,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.BINANCE_BASE_URL}}/fapi/v2/positionRisk?symbol={{$json.symbol}}&timestamp={{Date.now() - 1000}}",
+        "method": "GET",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-MBX-APIKEY",
+              "value": "={{$env.BINANCE_API_KEY}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "get-position-info",
+      "name": "Get Position Info",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [850, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Check if position is still open\nconst positionInfo = $input.item.json;\nconst positionAmt = Math.abs(parseFloat(positionInfo.positionAmt || 0));\nconst originalQty = parseFloat($input.item.json.quantity);\n\nconst isOpen = positionAmt > 0;\nconst remainingPct = originalQty > 0 ? (positionAmt / originalQty) * 100 : 0;\nconst firstTpHit = remainingPct <= 80; // 25% closed\n\nreturn {\n  json: {\n    ...$input.item.json,\n    currentPrice: parseFloat(positionInfo.markPrice),\n    positionAmt: positionAmt,\n    remainingPct: remainingPct,\n    isOpen: isOpen,\n    firstTpHit: firstTpHit\n  }\n};"
+      },
+      "id": "check-position-status",
+      "name": "Check Position Status",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1050, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.isOpen}}",
+              "value2": false
+            }
+          ]
+        }
+      },
+      "id": "is-closed",
+      "name": "Is Closed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1250, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE positions SET status = 'CLOSED', closed_at = datetime('now') WHERE id = {{$json.id}}",
+        "options": {}
+      },
+      "id": "mark-as-closed",
+      "name": "Mark as Closed",
+      "type": "n8n-nodes-base.sqlite",
+      "typeVersion": 1,
+      "position": [1450, 200]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.firstTpHit}}",
+              "value2": true
+            },
+            {
+              "value1": "={{$json.status}}",
+              "value2": "OPEN"
+            }
+          ]
+        },
+        "combineOperation": "all"
+      },
+      "id": "should-move-to-breakeven",
+      "name": "Should Move to Breakeven?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1450, 400]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.BINANCE_BASE_URL}}/fapi/v1/openOrders?symbol={{$json.symbol}}&timestamp={{Date.now() - 1000}}",
+        "method": "GET",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-MBX-APIKEY",
+              "value": "={{$env.BINANCE_API_KEY}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "get-open-orders",
+      "name": "Get Open Orders",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1650, 400]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Cancel all stop loss orders\nconst orders = $input.item.json;\nconst stopOrders = orders.filter(o => o.type === 'STOP_MARKET' || o.type === 'STOP');\n\nreturn stopOrders.map(order => ({\n  json: {\n    ...$input.item.json,\n    orderId: order.orderId\n  }\n}));"
+      },
+      "id": "filter-stop-orders",
+      "name": "Filter Stop Orders",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1850, 400]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.BINANCE_BASE_URL}}/fapi/v1/order",
+        "method": "DELETE",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "symbol",
+              "value": "={{$json.symbol}}"
+            },
+            {
+              "name": "orderId",
+              "value": "={{$json.orderId}}"
+            },
+            {
+              "name": "timestamp",
+              "value": "={{Date.now() - 1000}}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-MBX-APIKEY",
+              "value": "={{$env.BINANCE_API_KEY}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "cancel-stop-order",
+      "name": "Cancel Stop Order",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [2050, 400]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.BINANCE_BASE_URL}}/fapi/v1/order",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "symbol",
+              "value": "={{$json.symbol}}"
+            },
+            {
+              "name": "side",
+              "value": "={{$json.side === 'LONG' ? 'SELL' : 'BUY'}}"
+            },
+            {
+              "name": "type",
+              "value": "STOP_MARKET"
+            },
+            {
+              "name": "stopPrice",
+              "value": "={{$json.entry_price}}"
+            },
+            {
+              "name": "closePosition",
+              "value": "true"
+            },
+            {
+              "name": "timestamp",
+              "value": "={{Date.now() - 1000}}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-MBX-APIKEY",
+              "value": "={{$env.BINANCE_API_KEY}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "place-breakeven-sl",
+      "name": "Place Breakeven SL",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [2250, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE positions SET status = 'BREAK_EVEN', current_stoploss = entry_price, is_break_even = 1, is_trailing = 1, first_tp_hit_at = datetime('now') WHERE id = {{$json.id}}",
+        "options": {}
+      },
+      "id": "update-to-breakeven",
+      "name": "Update to Breakeven",
+      "type": "n8n-nodes-base.sqlite",
+      "typeVersion": 1,
+      "position": [2450, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{$json.status}}",
+              "operation": "equals",
+              "value2": "TRAILING"
+            }
+          ]
+        }
+      },
+      "id": "is-trailing",
+      "name": "Is Trailing?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1450, 600]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Calculate new trailing stop\nconst position = $input.item.json;\nconst currentPrice = position.currentPrice;\nconst trailingPct = parseFloat($env.TRAILING_STOP_PERCENTAGE || 1.5) / 100;\n\nlet newStopLoss;\nlet shouldUpdate = false;\n\nif (position.side === 'LONG') {\n  // LONG: Move SL up as price increases\n  newStopLoss = currentPrice * (1 - trailingPct);\n  shouldUpdate = newStopLoss > position.current_stoploss;\n} else {\n  // SHORT: Move SL down as price decreases\n  newStopLoss = currentPrice * (1 + trailingPct);\n  shouldUpdate = newStopLoss < position.current_stoploss;\n}\n\nreturn {\n  json: {\n    ...position,\n    newStopLoss: newStopLoss,\n    shouldUpdate: shouldUpdate\n  }\n};"
+      },
+      "id": "calculate-trailing-sl",
+      "name": "Calculate Trailing SL",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1650, 600]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.shouldUpdate}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "should-update-sl",
+      "name": "Should Update SL?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1850, 600]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.BINANCE_BASE_URL}}/fapi/v1/openOrders?symbol={{$json.symbol}}&timestamp={{Date.now() - 1000}}",
+        "method": "GET",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-MBX-APIKEY",
+              "value": "={{$env.BINANCE_API_KEY}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "get-open-orders-2",
+      "name": "Get Open Orders 2",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [2050, 600]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.BINANCE_BASE_URL}}/fapi/v1/order",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "symbol",
+              "value": "={{$json.symbol}}"
+            },
+            {
+              "name": "side",
+              "value": "={{$json.side === 'LONG' ? 'SELL' : 'BUY'}}"
+            },
+            {
+              "name": "type",
+              "value": "STOP_MARKET"
+            },
+            {
+              "name": "stopPrice",
+              "value": "={{$json.newStopLoss}}"
+            },
+            {
+              "name": "closePosition",
+              "value": "true"
+            },
+            {
+              "name": "timestamp",
+              "value": "={{Date.now() - 1000}}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-MBX-APIKEY",
+              "value": "={{$env.BINANCE_API_KEY}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "update-trailing-sl",
+      "name": "Update Trailing SL",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [2250, 600]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE positions SET current_stoploss = {{$json.newStopLoss}}, current_price = {{$json.currentPrice}}, last_checked_at = datetime('now') WHERE id = {{$json.id}}",
+        "options": {}
+      },
+      "id": "update-position-db",
+      "name": "Update Position DB",
+      "type": "n8n-nodes-base.sqlite",
+      "typeVersion": 1,
+      "position": [2450, 600]
+    }
+  ],
+  "connections": {
+    "Schedule Trigger (Every 30s)": {
+      "main": [
+        [
+          {
+            "node": "Get Active Positions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Active Positions": {
+      "main": [
+        [
+          {
+            "node": "Split Into Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Into Batches": {
+      "main": [
+        [
+          {
+            "node": "Get Position Info",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Position Info": {
+      "main": [
+        [
+          {
+            "node": "Check Position Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Position Status": {
+      "main": [
+        [
+          {
+            "node": "Is Closed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Closed?": {
+      "main": [
+        [
+          {
+            "node": "Mark as Closed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Should Move to Breakeven?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Is Trailing?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Move to Breakeven?": {
+      "main": [
+        [
+          {
+            "node": "Get Open Orders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Open Orders": {
+      "main": [
+        [
+          {
+            "node": "Filter Stop Orders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Stop Orders": {
+      "main": [
+        [
+          {
+            "node": "Cancel Stop Order",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cancel Stop Order": {
+      "main": [
+        [
+          {
+            "node": "Place Breakeven SL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Place Breakeven SL": {
+      "main": [
+        [
+          {
+            "node": "Update to Breakeven",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Trailing?": {
+      "main": [
+        [
+          {
+            "node": "Calculate Trailing SL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Trailing SL": {
+      "main": [
+        [
+          {
+            "node": "Should Update SL?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Update SL?": {
+      "main": [
+        [
+          {
+            "node": "Get Open Orders 2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Open Orders 2": {
+      "main": [
+        [
+          {
+            "node": "Update Trailing SL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Trailing SL": {
+      "main": [
+        [
+          {
+            "node": "Update Position DB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {},
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 1,
+  "updatedAt": "2024-01-01T00:00:00.000Z",
+  "versionId": "1"
+}

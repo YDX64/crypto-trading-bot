@@ -1,0 +1,392 @@
+{
+  "name": "Crypto Trading Bot - Position Manager",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "open-position",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "open-position-webhook"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Calculate Position Size\nconst signal = $input.item.json.body.signal;\nconst accountBalance = parseFloat($env.ACCOUNT_BALANCE || 10000);\nconst riskPercentage = parseFloat($env.RISK_PERCENTAGE || 10) / 100;\n\nconst riskAmount = accountBalance * riskPercentage;\nconst positionSize = riskAmount;\nconst quantity = positionSize / signal.entry;\n\nreturn {\n  json: {\n    signal: signal,\n    accountBalance: accountBalance,\n    riskAmount: riskAmount,\n    positionSize: positionSize,\n    quantity: quantity,\n    marginType: signal.margin_type || $env.MARGIN_TYPE || 'ISOLATED',\n    leverage: signal.leverage || parseInt($env.MAX_LEVERAGE || 20)\n  }\n};"
+      },
+      "id": "calculate-position",
+      "name": "Calculate Position Size",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.BINANCE_BASE_URL}}/fapi/v1/marginType",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "symbol",
+              "value": "={{$json.signal.symbol}}"
+            },
+            {
+              "name": "marginType",
+              "value": "={{$json.marginType}}"
+            },
+            {
+              "name": "timestamp",
+              "value": "={{Date.now() - 1000}}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-MBX-APIKEY",
+              "value": "={{$env.BINANCE_API_KEY}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "set-margin-type",
+      "name": "Set Margin Type",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.BINANCE_BASE_URL}}/fapi/v1/leverage",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "symbol",
+              "value": "={{$json.signal.symbol}}"
+            },
+            {
+              "name": "leverage",
+              "value": "={{$json.leverage}}"
+            },
+            {
+              "name": "timestamp",
+              "value": "={{Date.now() - 1000}}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-MBX-APIKEY",
+              "value": "={{$env.BINANCE_API_KEY}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "set-leverage",
+      "name": "Set Leverage",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [850, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.BINANCE_BASE_URL}}/fapi/v1/order",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "symbol",
+              "value": "={{$json.signal.symbol}}"
+            },
+            {
+              "name": "side",
+              "value": "={{$json.signal.direction === 'LONG' ? 'BUY' : 'SELL'}}"
+            },
+            {
+              "name": "type",
+              "value": "MARKET"
+            },
+            {
+              "name": "quantity",
+              "value": "={{$json.quantity.toFixed(3)}}"
+            },
+            {
+              "name": "timestamp",
+              "value": "={{Date.now() - 1000}}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-MBX-APIKEY",
+              "value": "={{$env.BINANCE_API_KEY}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "open-market-order",
+      "name": "Open Market Order",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1050, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.BINANCE_BASE_URL}}/fapi/v1/order",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "symbol",
+              "value": "={{$json.signal.symbol}}"
+            },
+            {
+              "name": "side",
+              "value": "={{$json.signal.direction === 'LONG' ? 'SELL' : 'BUY'}}"
+            },
+            {
+              "name": "type",
+              "value": "STOP_MARKET"
+            },
+            {
+              "name": "stopPrice",
+              "value": "={{$json.signal.stoploss}}"
+            },
+            {
+              "name": "closePosition",
+              "value": "true"
+            },
+            {
+              "name": "timestamp",
+              "value": "={{Date.now() - 1000}}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-MBX-APIKEY",
+              "value": "={{$env.BINANCE_API_KEY}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "place-stop-loss",
+      "name": "Place Stop Loss",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1250, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Calculate First TP (25%)\nconst firstTpPercentage = parseFloat($env.FIRST_TP_PERCENTAGE || 25) / 100;\nconst firstTpQty = $input.item.json.quantity * firstTpPercentage;\n\nreturn {\n  json: {\n    ...$input.item.json,\n    firstTpQty: firstTpQty.toFixed(3),\n    firstTpPrice: $input.item.json.signal.targets[0]\n  }\n};"
+      },
+      "id": "calculate-first-tp",
+      "name": "Calculate First TP",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1450, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.BINANCE_BASE_URL}}/fapi/v1/order",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "symbol",
+              "value": "={{$json.signal.symbol}}"
+            },
+            {
+              "name": "side",
+              "value": "={{$json.signal.direction === 'LONG' ? 'SELL' : 'BUY'}}"
+            },
+            {
+              "name": "type",
+              "value": "TAKE_PROFIT_MARKET"
+            },
+            {
+              "name": "stopPrice",
+              "value": "={{$json.firstTpPrice}}"
+            },
+            {
+              "name": "quantity",
+              "value": "={{$json.firstTpQty}}"
+            },
+            {
+              "name": "timestamp",
+              "value": "={{Date.now() - 1000}}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-MBX-APIKEY",
+              "value": "={{$env.BINANCE_API_KEY}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "place-first-tp",
+      "name": "Place First TP",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1650, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO positions (symbol, side, leverage, margin_type, entry_price, quantity, position_size, initial_stoploss, current_stoploss, first_tp_price, first_tp_quantity, targets, status, opened_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', datetime('now'))",
+        "options": {}
+      },
+      "id": "save-position-db",
+      "name": "Save Position to DB",
+      "type": "n8n-nodes-base.sqlite",
+      "typeVersion": 1,
+      "position": [1850, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{$json}}",
+        "options": {}
+      },
+      "id": "respond-success",
+      "name": "Respond Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2050, 300]
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Calculate Position Size",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Position Size": {
+      "main": [
+        [
+          {
+            "node": "Set Margin Type",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Margin Type": {
+      "main": [
+        [
+          {
+            "node": "Set Leverage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Leverage": {
+      "main": [
+        [
+          {
+            "node": "Open Market Order",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Open Market Order": {
+      "main": [
+        [
+          {
+            "node": "Place Stop Loss",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Place Stop Loss": {
+      "main": [
+        [
+          {
+            "node": "Calculate First TP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate First TP": {
+      "main": [
+        [
+          {
+            "node": "Place First TP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Place First TP": {
+      "main": [
+        [
+          {
+            "node": "Save Position to DB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Position to DB": {
+      "main": [
+        [
+          {
+            "node": "Respond Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {},
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 1,
+  "updatedAt": "2024-01-01T00:00:00.000Z",
+  "versionId": "1"
+}

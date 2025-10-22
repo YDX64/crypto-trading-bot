@@ -1,0 +1,169 @@
+{
+  "name": "Crypto Trading Bot - Telegram Signal Receiver",
+  "nodes": [
+    {
+      "parameters": {
+        "updates": [
+          "message",
+          "channel_post"
+        ],
+        "additionalFields": {}
+      },
+      "id": "telegram-trigger",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "telegram-bot-webhook",
+      "credentials": {
+        "telegramApi": {
+          "id": "1",
+          "name": "Telegram Bot API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "// Check if message is a profit notification\nconst profitKeywords = [\n  'PROFIT', 'TARGET HIT', 'TP HIT', 'TAKE PROFIT',\n  'CLOSED', 'COMPLETED', 'BREAKEVEN', 'BREAK EVEN',\n  'BREAK-EVEN', 'TRAILING', 'STOPPED OUT'\n];\n\nconst message = $input.item.json.message?.text || $input.item.json.channel_post?.text || '';\nconst messageUpper = message.toUpperCase();\n\n// Check if it's a profit message\nconst isProfitMessage = profitKeywords.some(keyword => messageUpper.includes(keyword));\n\n// Check if it contains a trading pair\nconst hasTradingPair = messageUpper.includes('/USDT');\n\nreturn {\n  json: {\n    message: message,\n    isProfitMessage: isProfitMessage,\n    hasTradingPair: hasTradingPair,\n    shouldProcess: !isProfitMessage && hasTradingPair,\n    timestamp: new Date().toISOString(),\n    chatId: $input.item.json.message?.chat?.id || $input.item.json.channel_post?.chat?.id\n  }\n};"
+      },
+      "id": "filter-messages",
+      "name": "Filter Messages",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.shouldProcess}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "should-process",
+      "name": "Should Process?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.API_BASE_URL}}/signal",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "message",
+              "value": "={{$json.message}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "send-to-queue",
+      "name": "Send to Signal Queue",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [850, 200]
+    },
+    {
+      "parameters": {
+        "chatId": "={{$json.chatId}}",
+        "text": "📥 Signal received and queued for processing",
+        "additionalFields": {}
+      },
+      "id": "send-confirmation",
+      "name": "Send Confirmation",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [1050, 200],
+      "credentials": {
+        "telegramApi": {
+          "id": "1",
+          "name": "Telegram Bot API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{$json.chatId}}",
+        "text": "ℹ️ Message filtered: {{$json.isProfitMessage ? 'Profit notification' : 'No trading pair found'}}",
+        "additionalFields": {}
+      },
+      "id": "send-skip-notification",
+      "name": "Send Skip Notification",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [850, 400],
+      "credentials": {
+        "telegramApi": {
+          "id": "1",
+          "name": "Telegram Bot API"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Filter Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Messages": {
+      "main": [
+        [
+          {
+            "node": "Should Process?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Process?": {
+      "main": [
+        [
+          {
+            "node": "Send to Signal Queue",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Skip Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send to Signal Queue": {
+      "main": [
+        [
+          {
+            "node": "Send Confirmation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {},
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 1,
+  "updatedAt": "2024-01-01T00:00:00.000Z",
+  "versionId": "1"
+}
