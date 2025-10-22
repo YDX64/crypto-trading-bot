@@ -1,0 +1,307 @@
+{
+  "name": "Crypto Trading Bot - AI Analyzer",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "analyze-signal",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "analyze-signal-webhook"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Prepare Technical Analysis Prompt\nconst signal = $input.item.json.body.signal;\n\nconst prompt = `Analyze this crypto trading signal for ${signal.coin}USDT with deep technical analysis reasoning.\n\nSignal Details:\n- Direction: ${signal.direction}\n- Entry Price: ${signal.entry}\n- Stop Loss: ${signal.stoploss}\n- Take Profit Targets: ${signal.targets.join(', ')}\n- Leverage: ${signal.leverage}x\n\nPlease analyze:\n1. Support and resistance levels around the entry point\n2. Risk/Reward ratio calculation\n3. Momentum indicators and trend strength\n4. Volume analysis and market structure\n5. Key technical patterns\n\nBased on your deep technical analysis, determine if this trade setup is BULLISH or BEARISH.\n\nRespond in this exact format:\nVERDICT: [BULLISH or BEARISH]\nREASONING: [Your comprehensive technical analysis in 3-4 sentences]`;\n\nreturn {\n  json: {\n    signal: signal,\n    prompt: prompt,\n    analysisType: 'technical'\n  }\n};"
+      },
+      "id": "prepare-technical-prompt",
+      "name": "Prepare Technical Prompt",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [450, 200]
+    },
+    {
+      "parameters": {
+        "model": "={{$env.DEEPSEEK_MODEL || 'deepseek-reasoner'}}",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are an expert crypto trading analyst with deep knowledge of technical analysis, risk management, and market sentiment. Provide thorough reasoning for your analysis."
+            },
+            {
+              "role": "user",
+              "content": "={{$json.prompt}}"
+            }
+          ]
+        },
+        "options": {
+          "maxTokens": 500,
+          "temperature": 0.7
+        }
+      },
+      "id": "technical-analysis",
+      "name": "Technical Analysis (DeepSeek)",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1,
+      "position": [650, 200],
+      "credentials": {
+        "openAiApi": {
+          "id": "2",
+          "name": "DeepSeek API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "amount": 1500,
+        "unit": "milliseconds"
+      },
+      "id": "wait-1",
+      "name": "Wait (Rate Limit)",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [850, 200]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Prepare Risk Analysis Prompt\nconst signal = $input.item.json.signal;\n\nconst prompt = `Evaluate this ${signal.coin}USDT ${signal.direction} trade from a comprehensive risk management perspective.\n\nTrade Parameters:\n- Entry: ${signal.entry}\n- Stop Loss: ${signal.stoploss}\n- Targets: ${signal.targets.join(', ')}\n- Leverage: ${signal.leverage}x\n\nAnalyze the following risk factors:\n1. Position sizing and leverage appropriateness\n2. Stop loss placement and invalidation levels\n3. Take profit targets realism\n4. Market volatility and liquidity conditions\n5. Overall risk/reward assessment\n\nDetermine if the risk profile makes this trade BULLISH or BEARISH.\n\nRespond in this exact format:\nVERDICT: [BULLISH or BEARISH]\nREASONING: [Your detailed risk assessment in 3-4 sentences]`;\n\nreturn {\n  json: {\n    signal: signal,\n    prompt: prompt,\n    analysisType: 'risk',\n    technicalAnalysis: $input.item.json.message.content\n  }\n};"
+      },
+      "id": "prepare-risk-prompt",
+      "name": "Prepare Risk Prompt",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1050, 200]
+    },
+    {
+      "parameters": {
+        "model": "={{$env.DEEPSEEK_MODEL || 'deepseek-reasoner'}}",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are an expert crypto trading analyst with deep knowledge of technical analysis, risk management, and market sentiment. Provide thorough reasoning for your analysis."
+            },
+            {
+              "role": "user",
+              "content": "={{$json.prompt}}"
+            }
+          ]
+        },
+        "options": {
+          "maxTokens": 500,
+          "temperature": 0.7
+        }
+      },
+      "id": "risk-analysis",
+      "name": "Risk Analysis (DeepSeek)",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1,
+      "position": [1250, 200],
+      "credentials": {
+        "openAiApi": {
+          "id": "2",
+          "name": "DeepSeek API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "amount": 1500,
+        "unit": "milliseconds"
+      },
+      "id": "wait-2",
+      "name": "Wait (Rate Limit) 2",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [1450, 200]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Prepare Sentiment Analysis Prompt\nconst signal = $input.item.json.signal;\n\nconst prompt = `Provide final validation for ${signal.coin}USDT ${signal.direction} trade based on market sentiment and broader context.\n\nConsider:\n1. Overall crypto market sentiment and Bitcoin correlation\n2. News, events, or catalysts affecting ${signal.coin}\n3. Funding rates and open interest trends\n4. Whale activity and smart money flows\n5. Social sentiment and fear/greed index\n\nBased on comprehensive market sentiment analysis, is this setup BULLISH or BEARISH?\n\nRespond in this exact format:\nVERDICT: [BULLISH or BEARISH]\nREASONING: [Your market sentiment analysis in 3-4 sentences]`;\n\nreturn {\n  json: {\n    signal: signal,\n    prompt: prompt,\n    analysisType: 'sentiment',\n    technicalAnalysis: $input.item.json.technicalAnalysis,\n    riskAnalysis: $input.item.json.message.content\n  }\n};"
+      },
+      "id": "prepare-sentiment-prompt",
+      "name": "Prepare Sentiment Prompt",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1650, 200]
+    },
+    {
+      "parameters": {
+        "model": "={{$env.DEEPSEEK_MODEL || 'deepseek-reasoner'}}",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are an expert crypto trading analyst with deep knowledge of technical analysis, risk management, and market sentiment. Provide thorough reasoning for your analysis."
+            },
+            {
+              "role": "user",
+              "content": "={{$json.prompt}}"
+            }
+          ]
+        },
+        "options": {
+          "maxTokens": 500,
+          "temperature": 0.7
+        }
+      },
+      "id": "sentiment-analysis",
+      "name": "Sentiment Analysis (DeepSeek)",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1,
+      "position": [1850, 200],
+      "credentials": {
+        "openAiApi": {
+          "id": "2",
+          "name": "DeepSeek API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "// Calculate Consensus\nconst technical = $input.item.json.technicalAnalysis;\nconst risk = $input.item.json.riskAnalysis;\nconst sentiment = $input.item.json.message.content;\n\nconst analyses = [technical, risk, sentiment];\n\n// Count verdicts\nlet bullishCount = 0;\nlet bearishCount = 0;\n\nanalyses.forEach(analysis => {\n  const upper = analysis.toUpperCase();\n  if (upper.includes('VERDICT: BULLISH')) {\n    bullishCount++;\n  } else if (upper.includes('VERDICT: BEARISH')) {\n    bearishCount++;\n  } else {\n    // Fallback: check for keywords\n    if (upper.includes('BULLISH')) bullishCount++;\n    if (upper.includes('BEARISH')) bearishCount++;\n  }\n});\n\nconst verdict = bullishCount > bearishCount ? 'BULLISH' : 'BEARISH';\nconst signal = $input.item.json.signal;\nconst trendAligned = \n  (verdict === 'BULLISH' && signal.direction === 'LONG') ||\n  (verdict === 'BEARISH' && signal.direction === 'SHORT');\n\n// Calculate confidence\nconst total = bullishCount + bearishCount;\nlet confidence = 'Low';\nif (total > 0) {\n  const majority = Math.max(bullishCount, bearishCount);\n  if (majority === total) {\n    confidence = 'High';\n  } else if (majority >= total * 0.66) {\n    confidence = 'Medium';\n  }\n}\n\nreturn {\n  json: {\n    signal: signal,\n    aiVerdict: verdict,\n    trendAligned: trendAligned,\n    bullishVotes: bullishCount,\n    bearishVotes: bearishCount,\n    consensus: `${bullishCount} BULLISH vs ${bearishCount} BEARISH`,\n    confidence: confidence,\n    analysis1: technical.substring(0, 200),\n    analysis2: risk.substring(0, 200),\n    analysis3: sentiment.substring(0, 200),\n    timestamp: new Date().toISOString()\n  }\n};"
+      },
+      "id": "calculate-consensus",
+      "name": "Calculate Consensus",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [2050, 200]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{$json}}",
+        "options": {}
+      },
+      "id": "respond-result",
+      "name": "Respond Result",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2250, 200]
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Prepare Technical Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Technical Prompt": {
+      "main": [
+        [
+          {
+            "node": "Technical Analysis (DeepSeek)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Technical Analysis (DeepSeek)": {
+      "main": [
+        [
+          {
+            "node": "Wait (Rate Limit)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait (Rate Limit)": {
+      "main": [
+        [
+          {
+            "node": "Prepare Risk Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Risk Prompt": {
+      "main": [
+        [
+          {
+            "node": "Risk Analysis (DeepSeek)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Risk Analysis (DeepSeek)": {
+      "main": [
+        [
+          {
+            "node": "Wait (Rate Limit) 2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait (Rate Limit) 2": {
+      "main": [
+        [
+          {
+            "node": "Prepare Sentiment Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Sentiment Prompt": {
+      "main": [
+        [
+          {
+            "node": "Sentiment Analysis (DeepSeek)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sentiment Analysis (DeepSeek)": {
+      "main": [
+        [
+          {
+            "node": "Calculate Consensus",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Consensus": {
+      "main": [
+        [
+          {
+            "node": "Respond Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {},
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 1,
+  "updatedAt": "2024-01-01T00:00:00.000Z",
+  "versionId": "1"
+}

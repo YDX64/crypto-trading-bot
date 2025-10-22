@@ -1,0 +1,142 @@
+{
+  "name": "Crypto Trading Bot - Signal Parser",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "parse-signal",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "parse-signal-webhook"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Telegram Signal Parser\nconst message = $input.item.json.body.message || '';\n\n// Clean message\nlet cleanMessage = message;\ncleanMessage = cleanMessage.replace(/[🟢🔴⚡️📊💰🎯❌️]/g, '');\ncleanMessage = cleanMessage.replace(/\\(https?:\\/\\/[^\\)]+\\)/g, '');\ncleanMessage = cleanMessage.replace(/\\(buy\\)|\\(sell\\)/gi, '');\ncleanMessage = cleanMessage.toUpperCase().trim();\n\nconst result = {\n  raw_message: message,\n  parsed: false,\n  coin: null,\n  direction: null,\n  leverage: null,\n  margin_type: null,\n  entry_min: null,\n  entry_max: null,\n  entry: null,\n  targets: [],\n  stoploss: null,\n  symbol: null,\n  error: null\n};\n\ntry {\n  // 1. Extract Coin and Direction\n  const coinMatch = cleanMessage.match(/([A-Z0-9]+)\\/USDT.*?(LONG|SHORT)/);\n  if (coinMatch) {\n    result.coin = coinMatch[1];\n    result.direction = coinMatch[2];\n    result.symbol = result.coin + 'USDT';\n  }\n\n  // 2. Extract Margin Type and Leverage\n  const marginMatch = cleanMessage.match(/MARGIN:\\s*(CROSS|ISOLATED),?\\s*(\\d+)X/);\n  if (marginMatch) {\n    result.margin_type = marginMatch[1];\n    result.leverage = parseInt(marginMatch[2]);\n  } else {\n    // Fallback to just leverage\n    const leverageMatch = cleanMessage.match(/MARGIN:.*?(\\d+)X/);\n    if (leverageMatch) {\n      result.leverage = parseInt(leverageMatch[1]);\n    }\n  }\n\n  // 3. Extract Entry Range\n  const entryMatch = cleanMessage.match(/ENTRY:.*?<([0-9.]+)-([0-9.]+)>/);\n  if (entryMatch) {\n    result.entry_min = parseFloat(entryMatch[1]);\n    result.entry_max = parseFloat(entryMatch[2]);\n    result.entry = (result.entry_min + result.entry_max) / 2;\n  }\n\n  // 4. Extract Targets\n  const targetMatches = cleanMessage.matchAll(/\\d+\\.\\s*\\[([0-9.]+)\\]/g);\n  for (const match of targetMatches) {\n    result.targets.push(parseFloat(match[1]));\n  }\n\n  // 5. Extract Stop Loss\n  const slMatch = cleanMessage.match(/STOPLOSS:.*?\\[([0-9.]+)\\]/);\n  if (slMatch) {\n    result.stoploss = parseFloat(slMatch[1]);\n  }\n\n  // Validation\n  const isValid = \n    result.coin && \n    result.direction && \n    result.leverage && \n    result.entry && \n    result.stoploss && \n    result.targets.length > 0;\n\n  if (isValid) {\n    // Additional validation\n    if (result.direction === 'LONG') {\n      if (result.stoploss >= result.entry) {\n        result.error = 'LONG: Stop loss must be below entry';\n      } else if (result.targets.some(t => t <= result.entry)) {\n        result.error = 'LONG: All targets must be above entry';\n      } else {\n        result.parsed = true;\n      }\n    } else if (result.direction === 'SHORT') {\n      if (result.stoploss <= result.entry) {\n        result.error = 'SHORT: Stop loss must be above entry';\n      } else if (result.targets.some(t => t >= result.entry)) {\n        result.error = 'SHORT: All targets must be below entry';\n      } else {\n        result.parsed = true;\n      }\n    }\n\n    // Leverage validation\n    if (result.leverage <= 0 || result.leverage > 125) {\n      result.error = 'Invalid leverage: ' + result.leverage;\n      result.parsed = false;\n    }\n  } else {\n    result.error = 'Missing required fields';\n  }\n\n} catch (error) {\n  result.error = error.message;\n}\n\nreturn { json: result };"
+      },
+      "id": "parse-signal",
+      "name": "Parse Signal",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.parsed}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "is-valid",
+      "name": "Is Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO signals (raw_message, coin, direction, leverage, entry_min, entry_max, entry, targets, stoploss, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PARSED', datetime('now'))",
+        "options": {}
+      },
+      "id": "save-to-db",
+      "name": "Save to Database",
+      "type": "n8n-nodes-base.sqlite",
+      "typeVersion": 1,
+      "position": [850, 200]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{$json}}",
+        "options": {}
+      },
+      "id": "respond-success",
+      "name": "Respond Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1050, 200]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{$json}}",
+        "responseCode": 400,
+        "options": {}
+      },
+      "id": "respond-error",
+      "name": "Respond Error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [850, 400]
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Parse Signal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Signal": {
+      "main": [
+        [
+          {
+            "node": "Is Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Valid?": {
+      "main": [
+        [
+          {
+            "node": "Save to Database",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save to Database": {
+      "main": [
+        [
+          {
+            "node": "Respond Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {},
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 1,
+  "updatedAt": "2024-01-01T00:00:00.000Z",
+  "versionId": "1"
+}

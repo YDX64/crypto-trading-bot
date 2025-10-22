@@ -1,0 +1,526 @@
+{
+  "name": "Crypto Trading Bot - Main Orchestrator",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "process-signal",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook - Process Signal",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 400],
+      "webhookId": "process-signal-webhook"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT COUNT(*) as count FROM positions WHERE status IN ('OPEN', 'BREAK_EVEN', 'TRAILING')",
+        "options": {}
+      },
+      "id": "check-max-positions",
+      "name": "Check Max Positions",
+      "type": "n8n-nodes-base.sqlite",
+      "typeVersion": 1,
+      "position": [450, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{$json.count}}",
+              "operation": "smaller",
+              "value2": "={{parseInt($env.MAX_POSITIONS || 5)}}"
+            }
+          ]
+        }
+      },
+      "id": "has-capacity",
+      "name": "Has Capacity?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [650, 400]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.N8N_BASE_URL}}/webhook/parse-signal",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "message",
+              "value": "={{$json.message}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "parse-signal",
+      "name": "1. Parse Signal",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [850, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.parsed}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "is-parsed",
+      "name": "Is Parsed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1050, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.N8N_BASE_URL}}/webhook/analyze-signal",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "signal",
+              "value": "={{JSON.stringify($json)}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "analyze-signal",
+      "name": "2. AI Analysis",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1250, 200]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.trendAligned}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "is-trend-aligned",
+      "name": "Is Trend Aligned?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1450, 200]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.N8N_BASE_URL}}/webhook/open-position",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "signal",
+              "value": "={{JSON.stringify($json)}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "open-position",
+      "name": "3. Open Position",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1650, 100]
+    },
+    {
+      "parameters": {
+        "chatId": "={{$env.TELEGRAM_CHAT_ID}}",
+        "text": "✅ Position Opened!\n\n🪙 Symbol: {{$json.signal.symbol}}\n📊 Direction: {{$json.signal.direction}}\n💰 Entry: {{$json.signal.entry}}\n🎯 First TP: {{$json.signal.targets[0]}}\n❌ Stop Loss: {{$json.signal.stoploss}}\n⚡ Leverage: {{$json.leverage}}x\n📈 Size: {{$json.quantity}} ({{$json.positionSize}} USDT)\n\n🤖 AI Verdict: {{$json.aiVerdict}}\n📊 Consensus: {{$json.consensus}}\n🎯 Confidence: {{$json.confidence}}",
+        "additionalFields": {}
+      },
+      "id": "notify-success",
+      "name": "Notify Success",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [1850, 100],
+      "credentials": {
+        "telegramApi": {
+          "id": "1",
+          "name": "Telegram Bot API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{{\n  success: true,\n  position: $json\n}}}",
+        "options": {}
+      },
+      "id": "respond-success",
+      "name": "Respond Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2050, 100]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$env.WAITING_MODE_ENABLED === 'true'}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "is-waiting-mode-enabled",
+      "name": "Is Waiting Mode Enabled?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1650, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO waiting_signals (signal_id, symbol, direction, original_entry_min, original_entry_max, ai_verdict, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'WAITING', datetime('now'))",
+        "options": {}
+      },
+      "id": "add-to-waiting-queue",
+      "name": "Add to Waiting Queue",
+      "type": "n8n-nodes-base.sqlite",
+      "typeVersion": 1,
+      "position": [1850, 300]
+    },
+    {
+      "parameters": {
+        "chatId": "={{$env.TELEGRAM_CHAT_ID}}",
+        "text": "🕐 Signal Added to Waiting Mode\n\n🪙 Symbol: {{$json.signal.symbol}}\n📊 Direction: {{$json.signal.direction}}\n🤖 AI Verdict: {{$json.aiVerdict}}\n\n⚠️ Trend not aligned, will monitor for entry conditions.",
+        "additionalFields": {}
+      },
+      "id": "notify-waiting",
+      "name": "Notify Waiting",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [2050, 300],
+      "credentials": {
+        "telegramApi": {
+          "id": "1",
+          "name": "Telegram Bot API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{{\n  success: false,\n  reason: 'waiting_mode',\n  message: 'Signal added to waiting queue'\n}}}",
+        "options": {}
+      },
+      "id": "respond-waiting",
+      "name": "Respond Waiting",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2250, 300]
+    },
+    {
+      "parameters": {
+        "chatId": "={{$env.TELEGRAM_CHAT_ID}}",
+        "text": "❌ Signal Rejected\n\n🪙 Symbol: {{$json.signal.symbol}}\n📊 Direction: {{$json.signal.direction}}\n🤖 AI Verdict: {{$json.aiVerdict}}\n\n⚠️ Trend not aligned and waiting mode is disabled.",
+        "additionalFields": {}
+      },
+      "id": "notify-rejected",
+      "name": "Notify Rejected",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [1850, 500],
+      "credentials": {
+        "telegramApi": {
+          "id": "1",
+          "name": "Telegram Bot API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{{\n  success: false,\n  reason: 'trend_not_aligned',\n  message: 'Signal rejected - trend not aligned'\n}}}",
+        "options": {}
+      },
+      "id": "respond-rejected",
+      "name": "Respond Rejected",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2050, 500]
+    },
+    {
+      "parameters": {
+        "chatId": "={{$env.TELEGRAM_CHAT_ID}}",
+        "text": "⚠️ Signal Parse Failed\n\nError: {{$json.error}}\n\nRaw message:\n{{$json.raw_message}}",
+        "additionalFields": {}
+      },
+      "id": "notify-parse-failed",
+      "name": "Notify Parse Failed",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [1250, 400],
+      "credentials": {
+        "telegramApi": {
+          "id": "1",
+          "name": "Telegram Bot API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{{\n  success: false,\n  reason: 'parse_failed',\n  error: $json.error\n}}}",
+        "options": {}
+      },
+      "id": "respond-parse-failed",
+      "name": "Respond Parse Failed",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1450, 400]
+    },
+    {
+      "parameters": {
+        "chatId": "={{$env.TELEGRAM_CHAT_ID}}",
+        "text": "⚠️ Max Positions Reached\n\nCurrent: {{$json.count}}/{{$env.MAX_POSITIONS}}\n\nSignal skipped.",
+        "additionalFields": {}
+      },
+      "id": "notify-max-positions",
+      "name": "Notify Max Positions",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [850, 500],
+      "credentials": {
+        "telegramApi": {
+          "id": "1",
+          "name": "Telegram Bot API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{{\n  success: false,\n  reason: 'max_positions',\n  message: 'Maximum positions reached'\n}}}",
+        "options": {}
+      },
+      "id": "respond-max-positions",
+      "name": "Respond Max Positions",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1050, 500]
+    }
+  ],
+  "connections": {
+    "Webhook - Process Signal": {
+      "main": [
+        [
+          {
+            "node": "Check Max Positions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Max Positions": {
+      "main": [
+        [
+          {
+            "node": "Has Capacity?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Capacity?": {
+      "main": [
+        [
+          {
+            "node": "1. Parse Signal",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify Max Positions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "1. Parse Signal": {
+      "main": [
+        [
+          {
+            "node": "Is Parsed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Parsed?": {
+      "main": [
+        [
+          {
+            "node": "2. AI Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify Parse Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "2. AI Analysis": {
+      "main": [
+        [
+          {
+            "node": "Is Trend Aligned?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Trend Aligned?": {
+      "main": [
+        [
+          {
+            "node": "3. Open Position",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Is Waiting Mode Enabled?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "3. Open Position": {
+      "main": [
+        [
+          {
+            "node": "Notify Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Success": {
+      "main": [
+        [
+          {
+            "node": "Respond Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Waiting Mode Enabled?": {
+      "main": [
+        [
+          {
+            "node": "Add to Waiting Queue",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Add to Waiting Queue": {
+      "main": [
+        [
+          {
+            "node": "Notify Waiting",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Waiting": {
+      "main": [
+        [
+          {
+            "node": "Respond Waiting",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Rejected": {
+      "main": [
+        [
+          {
+            "node": "Respond Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Parse Failed": {
+      "main": [
+        [
+          {
+            "node": "Respond Parse Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Max Positions": {
+      "main": [
+        [
+          {
+            "node": "Respond Max Positions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {},
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 1,
+  "updatedAt": "2024-01-01T00:00:00.000Z",
+  "versionId": "1"
+}
