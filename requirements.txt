@@ -6,7 +6,7 @@ pydantic-settings==2.1.0
 # Async & Web
 fastapi==0.109.0
 uvicorn[standard]==0.27.0
-python-multipart==0.0.6
+python-multipart==0.0.22
 aiohttp>=3.9.0
 httpx>=0.25.0
 
@@ -43,13 +43,13 @@ pandas==2.1.4
 numpy==1.26.2
 
 # Security
-cryptography==41.0.7
+cryptography==46.0.7
 
 # Development
-pytest==7.4.3
+pytest==9.0.3
 pytest-asyncio==0.23.2
 pytest-cov==4.1.0
-black==23.12.1
+black==26.3.1
 flake8==7.0.0
 mypy==1.7.1
 pre-commit==3.6.0
