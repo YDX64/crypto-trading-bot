@@ -130,11 +130,27 @@ class TradingOrchestrator:
             f"🔁 Borsada {len(exchange_positions)} açık pozisyon bulundu, kurtarılıyor..."
         )
 
+        from src.models.scalp_trade import ScalpTradeModel
+
         async with AsyncSessionLocal() as session:
             for raw in exchange_positions:
                 symbol = raw["symbol"]
                 amt = float(raw["positionAmt"])
                 side = PositionSide.LONG if amt > 0 else PositionSide.SHORT
+
+                # TEK POZİSYON = TEK YÖNETİCİ: scalper'ın açık kaydı varsa bu
+                # pozisyonu scalper ExitManager yönetir; orchestrator'ın da
+                # benimsemesi çifte SL/TP müdahalesine yol açar.
+                scalp_row = (await session.execute(
+                    select(ScalpTradeModel.id)
+                    .where(ScalpTradeModel.symbol == symbol)
+                    .where(ScalpTradeModel.status == "OPEN")
+                )).first()
+                if scalp_row:
+                    self.logger.info(
+                        f"  ⏭️ {symbol}: scalper yönetiyor (scalp_trades #{scalp_row[0]}), atlanıyor"
+                    )
+                    continue
 
                 # Önce veritabanında bu sembole ait açık kayıt var mı?
                 result = await session.execute(

@@ -144,6 +144,14 @@ class Settings(BaseSettings):
     scalper_daily_loss_limit_pct: float = 15.0 # 0 = kesici kapalı
     scalper_use_equilibrium_filter: bool = True  # LONG yalnız discount, SHORT yalnız premium
     scalper_min_rr: float = 1.2                # beklenen harman TP getirisi / SL riski alt sınırı; 0 = kapalı
+    # Scalper — 2. tur deney bayrakları (2026-08-07 karar matrisi için)
+    scalper_entry_mode: str = "taker"            # "maker" = limit giriş simülasyonu (backtest)
+    scalper_taker_fee_pct: float = 0.05          # nominal % / bacak
+    scalper_maker_fee_pct: float = 0.02
+    scalper_maker_fill_timeout_candles: int = 3  # limit bu kadar mumda dolmazsa sinyal iptal
+    scalper_c_allowed_regimes: str = "UP,DOWN,RANGE"  # deney: "RANGE" ile sınırla
+    scalper_d_use_eqhl: bool = True              # D süpürmesi EQH/EQL kümelerine bağlı
+    scalper_eqhl_tolerance_pct: float = 0.05     # pivot eşitlik eşiği (%)
 
     @property
     def is_production(self) -> bool:
