@@ -256,6 +256,17 @@ class TestStrategyC:
 # --------------------------------------------------------------------------
 
 class TestStrategyD:
+    # Bu sınıftaki fikstürler (_bear_structure_leg / _bull_structure_leg)
+    # izole tekil swing'lerle kurulur, EQH/EQL kümesi (>=2 yakın pivot)
+    # OLUŞTURMAZ — equal_level_clusters(tolerance_pct=0.05) boş döner (bkz.
+    # ön-koşul doğrulaması). Bu sınıf CHoCH/FVG/OB + MFI/CMF onay
+    # mantığını (settings.scalper_d_use_eqhl'dan BAĞIMSIZ, D'nin
+    # DEĞİŞMEYEN kısmı) sınadığı için eski genel liquidity_sweep yoluna
+    # sabitlenir; EQH/EQL entegrasyonu TestStrategyDEqhl'de ayrıca sınanır.
+    @pytest.fixture(autouse=True)
+    def _pin_legacy_sweep_path(self, monkeypatch):
+        monkeypatch.setattr(setups_module.settings, "scalper_d_use_eqhl", False)
+
     def _bear_structure_leg(self, start_idx: int) -> list[Candle]:
         """Düşen tepe/düşen dip (bear) yapısı: 5 bacak (100->80->95->70->90->65),
         ardından son swing-low'u teyit eden 3 ufak toparlanma mumu."""
@@ -344,6 +355,92 @@ class TestStrategyD:
         candles += _leg(len(candles), 74.0, 75.0, steps=1)
         ctx = _ctx(candles, regime=Regime.RANGE)
         assert StrategyD().evaluate(ctx) is None
+
+
+# --------------------------------------------------------------------------
+# StrategyC — settings.scalper_c_allowed_regimes rejim kısıtı
+#
+# setups.py `from src.core.config import settings` ile TEKİL nesneyi modül
+# seviyesinde import eder; monkeypatch.setattr bu nesnenin özniteliğini
+# değiştirdiği için evaluate() çağrılarına da yansır (bkz.
+# TestStrategyFilterIntegration'daki aynı örüntü).
+# --------------------------------------------------------------------------
+
+class TestStrategyCAllowedRegimes:
+    def test_restricted_to_range_blocks_up_regime_signal(self, monkeypatch):
+        monkeypatch.setattr(setups_module.settings, "scalper_c_allowed_regimes", "RANGE")
+        candles = TestStrategyC()._divergence_candles()
+        ctx = _ctx(candles, regime=Regime.UP)
+        assert StrategyC().evaluate(ctx) is None
+
+    def test_up_down_range_allows_up_regime_signal(self, monkeypatch):
+        monkeypatch.setattr(setups_module.settings, "scalper_c_allowed_regimes", "UP,DOWN,RANGE")
+        candles = TestStrategyC()._divergence_candles()
+        ctx = _ctx(candles, regime=Regime.UP)
+        sig = StrategyC().evaluate(ctx)
+        assert sig is not None
+        assert sig.strategy == "C"
+        assert sig.direction == Direction.LONG
+
+
+# --------------------------------------------------------------------------
+# StrategyD — settings.scalper_d_use_eqhl: EQH/EQL kümesine bağlı süpürme
+#
+# Fikstür _bear_structure_leg'in bir varyasyonu: aynı düşen-tepe/düşen-dip
+# iskeletine, son iki dip ARASINDA neredeyse eşit fiyatlı bir "çifte dip"
+# eklenir (65.0 ve 64.98 pivot hedefleri -> gerçek low'lar 64.90 ve 64.88,
+# equal_level_clusters(tolerance_pct=0.05) ile KÜMELENİR: price≈64.89,
+# count=2 — gerçek fonksiyon çıktısıyla doğrulanmıştır). Süpürme mumu bu
+# kümenin altına (low=60.0) sarkıp üstüne (close=95.0) kapanarak hem
+# sweep_of_level'ı hem CHoCH'u (market_structure) tetikler.
+# --------------------------------------------------------------------------
+
+class TestStrategyDEqhl:
+    def _double_bottom_candles(self, sweep_candle=None) -> list[Candle]:
+        candles: list[Candle] = []
+        idx = 0
+        pivots = [100.0, 80.0, 95.0, 65.0, 80.0, 64.98]
+        for a, b in zip(pivots[:-1], pivots[1:]):
+            candles += _leg(idx, a, b, steps=6)
+            idx += 6
+        confirm = _leg(idx, 64.98, 74.0, steps=3)
+        candles += confirm
+        idx += 3
+        if sweep_candle is None:
+            sweep_candle = _mk_ohlc(idx, 76.0, 96.0, 60.0, 95.0, volume=200.0)
+        candles.append(sweep_candle)
+        return candles
+
+    def test_eqhl_cluster_swept_gives_long_with_stop_below_sweep(self, monkeypatch):
+        monkeypatch.setattr(setups_module.settings, "scalper_d_use_eqhl", True)
+        candles = self._double_bottom_candles()
+        ctx = _ctx(candles, regime=Regime.RANGE)
+        sig = StrategyD().evaluate(ctx)
+        assert sig is not None
+        assert sig.strategy == "D"
+        assert sig.direction == Direction.LONG
+        # süpürülen EQL kümesi (~64.89) altında, süpürme mumunun fitilinden
+        # (low=60.0) türeyen stop: 60.0 * 0.999 = 59.94
+        assert sig.stop_price == pytest.approx(59.94)
+        assert sig.stop_price < 64.89  # kümenin ALTINDA
+
+    def test_eqhl_cluster_present_but_not_swept_returns_none(self, monkeypatch):
+        monkeypatch.setattr(setups_module.settings, "scalper_d_use_eqhl", True)
+        # aynı çifte-dip kümesi mevcut ama son mum kümenin (≈64.89) altına
+        # hiç sarkmıyor (low=73.5) -> süpürme yok
+        no_sweep_candle = _mk_ohlc(33, 74.0, 76.0, 73.5, 75.5, volume=50.0)
+        candles = self._double_bottom_candles(sweep_candle=no_sweep_candle)
+        ctx = _ctx(candles, regime=Regime.RANGE)
+        assert StrategyD().evaluate(ctx) is None
+
+    def test_eqhl_disabled_legacy_path_still_works_on_existing_d_fixture(self, monkeypatch):
+        monkeypatch.setattr(setups_module.settings, "scalper_d_use_eqhl", False)
+        candles = TestStrategyD()._long_setup_candles()
+        ctx = _ctx(candles, regime=Regime.RANGE)
+        sig = StrategyD().evaluate(ctx)
+        assert sig is not None
+        assert sig.strategy == "D"
+        assert sig.direction == Direction.LONG
 
 
 # --------------------------------------------------------------------------

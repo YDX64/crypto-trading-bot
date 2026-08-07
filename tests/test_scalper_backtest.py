@@ -56,7 +56,14 @@ def _mk_candle(i: int, open_: float, high: float, low: float, close: float,
 
 @dataclass
 class _Cfg:
-    """cfg sözleşmesinin test için minimal, ağdan/settings'ten bağımsız kopyası."""
+    """cfg sözleşmesinin test için minimal, ağdan/settings'ten bağımsız kopyası.
+
+    NOT: scalper_entry_mode/taker_fee_pct/maker_fee_pct/maker_fill_timeout_candles
+    burada da mevcut çünkü backtest.py artık komisyon oranlarını settings yerine
+    doğrudan cfg'den okuyor (bkz. görev: "Sabit 0.05/0.02 değerlerini koddan sök").
+    Varsayılanlar ESKİ sabitlerle (_COMMISSION_RATE=0.0005 -> %0.05 taker) birebir
+    aynı — bu yüzden mevcut testlerin sayısal beklentileri DEĞİŞMEDEN geçerli kalır.
+    """
     scalper_risk_percentage: float = 2.0
     scalper_leverage: int = 20
     scalper_tp1_roi: float = 20.0
@@ -68,16 +75,21 @@ class _Cfg:
     scalper_breakeven_buffer_pct: float = 0.05
     scalper_chandelier_atr_mult: float = 2.5
     scalper_chandelier_atr_period: int = 14
+    scalper_entry_mode: str = "taker"
+    scalper_taker_fee_pct: float = 0.05
+    scalper_maker_fee_pct: float = 0.02
+    scalper_maker_fill_timeout_candles: int = 3
 
 
 def _mk_signal(entry_price: float, stop_price: float,
                direction: Direction = Direction.LONG,
                strategy: str = "B", symbol: str = "TESTUSDT",
-               risk_multiplier: float = 1.0) -> ScalpSignal:
+               risk_multiplier: float = 1.0,
+               regime: Regime = Regime.UP) -> ScalpSignal:
     return ScalpSignal(
         strategy=strategy, symbol=symbol, direction=direction,
         entry_price=entry_price, stop_price=stop_price, reason="test",
-        regime=Regime.UP, atr_5m=1.0, risk_multiplier=risk_multiplier,
+        regime=regime, atr_5m=1.0, risk_multiplier=risk_multiplier,
     )
 
 
@@ -429,3 +441,132 @@ class TestFetchPaginated:
         )
         assert result == all_candles
         assert len(result) == 30
+
+
+# --------------------------------------------------------------------------
+# Maker giriş modu (cfg.scalper_entry_mode == "maker")
+# --------------------------------------------------------------------------
+
+class TestMakerEntryMode:
+    def test_maker_fill_at_limit_price_no_slippage_maker_commission(self):
+        # Sinyal mumunun kapanışı (100.0) LIMIT fiyatıdır. idx1 değmiyor
+        # (low=100.2 > 100.0), idx2 değiyor (low=99.8 <= 100.0) -> orada dolum.
+        cfg = _Cfg(scalper_entry_mode="maker", scalper_maker_fill_timeout_candles=3)
+        signal = _mk_signal(entry_price=100.0, stop_price=99.0)
+
+        candles_5m = [
+            _mk_candle(0, 100.0, 100.0, 100.0, 100.0),   # sinyal mumu -> limit=100.0
+            _mk_candle(1, 100.3, 100.5, 100.2, 100.3),   # değmiyor
+            _mk_candle(2, 100.1, 100.2, 99.8, 100.0),    # değiyor -> dolum
+            _mk_candle(3, 100.0, 100.5, 99.5, 100.0),
+        ]
+
+        pos = open_position(signal, candles_5m, signal_idx=0, cfg=cfg, balance=10_000.0)
+
+        assert pos is not None
+        assert pos.entry_idx == 2
+        assert pos.entry_price == pytest.approx(100.0)  # limit fiyatı, kayma YOK
+        assert pos.entry_commission_rate == pytest.approx(cfg.scalper_maker_fee_pct / 100.0)
+        assert pos.exit_commission_rate == pytest.approx(cfg.scalper_taker_fee_pct / 100.0)
+
+    def test_maker_timeout_no_fill_yields_no_trade_and_increments_missed_counter(self):
+        # timeout=2 mum içinde limit'e hiç değmiyor (idx1, idx2 low > limit);
+        # idx3'te değse de timeout dışında -> sinyal sessizce iptal, kaçan sayaç artar.
+        cfg = _Cfg(scalper_entry_mode="maker", scalper_maker_fill_timeout_candles=2)
+        signal = _mk_signal(entry_price=100.0, stop_price=99.0)
+
+        candles_5m = [
+            _mk_candle(0, 100.0, 100.0, 100.0, 100.0),   # sinyal mumu -> limit=100.0
+            _mk_candle(1, 100.5, 100.6, 100.3, 100.5),   # değmiyor
+            _mk_candle(2, 100.4, 100.5, 100.2, 100.3),   # değmiyor (timeout'un son mumu)
+            _mk_candle(3, 99.0, 99.5, 98.5, 99.0),       # değerdi ama timeout DIŞINDA
+        ]
+
+        missed_counter: dict = {}
+        pos = open_position(
+            signal, candles_5m, signal_idx=0, cfg=cfg, balance=10_000.0,
+            missed_counter=missed_counter,
+        )
+
+        assert pos is None
+        assert missed_counter.get("maker_missed") == 1
+
+    def test_exit_commission_stays_taker_even_in_maker_mode(self):
+        # Maker girişte dolum + hemen sonrasında SL -> giriş komisyonu MAKER,
+        # çıkış (SL) komisyonu TAKER oranıyla hesaplanmalı (elle karşılaştırma).
+        cfg = _Cfg(scalper_entry_mode="maker", scalper_maker_fill_timeout_candles=2)
+        signal = _mk_signal(entry_price=100.0, stop_price=99.0)
+
+        candles_5m = [
+            _mk_candle(0, 100.0, 100.0, 100.0, 100.0),   # sinyal -> limit=100.0
+            _mk_candle(1, 100.0, 100.2, 99.8, 100.0),    # değiyor -> dolum @100.0
+            _mk_candle(2, 99.5, 99.6, 98.5, 99.0),        # SL'ye değiyor (98.5 <= 99.0)
+        ]
+
+        pos = open_position(signal, candles_5m, signal_idx=0, cfg=cfg, balance=10_000.0)
+        assert pos is not None
+        trade = manage_position(pos, candles_5m, cfg)
+
+        # --- Elle hesap ---
+        qty_expected = (10_000.0 * cfg.scalper_risk_percentage / 100.0) / abs(100.0 - 99.0)
+        entry_price_expected = 100.0  # limit, kaymasız
+        exit_price_expected = 99.0    # yapısal stop
+
+        gross_leg_pnl = (exit_price_expected - entry_price_expected) * qty_expected
+        exit_commission = (cfg.scalper_taker_fee_pct / 100.0) * qty_expected * exit_price_expected
+        entry_commission = (cfg.scalper_maker_fee_pct / 100.0) * qty_expected * entry_price_expected
+        expected_total_pnl = gross_leg_pnl - exit_commission - entry_commission
+
+        assert trade.exit_reason == "SL"
+        assert trade.entry_price == pytest.approx(entry_price_expected)
+        assert trade.exit_price == pytest.approx(exit_price_expected)
+        assert trade.pnl == pytest.approx(expected_total_pnl, rel=1e-9)
+
+
+# --------------------------------------------------------------------------
+# Rejim etiketi
+# --------------------------------------------------------------------------
+
+class TestRegimeTagging:
+    def test_position_and_trade_record_signal_regime(self):
+        cfg = _Cfg()
+        signal = _mk_signal(entry_price=100.0, stop_price=99.0, regime=Regime.DOWN)
+
+        candles_5m = [
+            _mk_candle(0, 100.0, 100.0, 100.0, 100.0),
+            _mk_candle(1, 100.0, 100.5, 98.0, 99.0),   # giriş + hemen SL
+        ]
+
+        pos = open_position(signal, candles_5m, signal_idx=0, cfg=cfg, balance=10_000.0)
+        assert pos is not None
+        assert pos.regime == "DOWN"
+
+        trade = manage_position(pos, candles_5m, cfg)
+        assert trade.regime == "DOWN"
+
+    def test_simulate_symbol_tags_trades_with_context_regime(self):
+        # Sahte strateji sinyalin regime'ini ctx.regime'den alır (gerçek A/B/C
+        # stratejileriyle birebir aynı sözleşme); backtest kaydına geçmeli.
+        cfg = _Cfg()
+
+        class _RegimeAwareLongStrategy(StrategyProtocol):
+            name = "X"
+
+            def evaluate(self, ctx: StrategyContext) -> Optional[ScalpSignal]:
+                return _mk_signal(
+                    ctx.current_price, ctx.current_price * 0.99,
+                    symbol=ctx.symbol, regime=ctx.regime,
+                )
+
+        candles_5m = [
+            _mk_candle(0, 100.0, 100.1, 99.9, 100.0),
+            _mk_candle(1, 100.0, 100.5, 90.0, 95.0),   # giriş + anında SL
+        ]
+
+        trades = simulate_symbol(
+            "TESTUSDT", candles_5m, [], [], [_RegimeAwareLongStrategy()], cfg,
+        )
+
+        assert len(trades) == 1
+        # build_context([]) 4h verisi yokken detect_regime -> UNKNOWN döner (regime.py sözleşmesi)
+        assert trades[0].regime == "UNKNOWN"

@@ -20,6 +20,7 @@ from src.strategies.scalper.indicators import (
     cmf,
     donchian,
     ema,
+    equal_level_clusters,
     equilibrium,
     find_fvg,
     find_order_block,
@@ -29,6 +30,7 @@ from src.strategies.scalper.indicators import (
     market_structure,
     mfi_series,
     rsi_series,
+    sweep_of_level,
     swing_points,
 )
 from src.strategies.scalper.types import Candle, Direction
@@ -759,3 +761,123 @@ class TestEquilibrium:
     def test_none_when_insufficient_data(self):
         candles = _mk_candles([10, 11, 12], [5, 6, 7])
         assert equilibrium(candles) is None
+
+
+# --------------------------------------------------------------------------
+# equal_level_clusters
+# --------------------------------------------------------------------------
+
+class TestEqualLevelClusters:
+    def test_pivots_within_tolerance_form_single_cluster(self):
+        # swing-high'lar (left=1,right=1): idx1=15.00, idx3=15.03, idx5=14.97
+        # (birbirine %0.5 tolerans içinde) ve idx7=20.00 (dışarıda, tek
+        # başına kalıp <2 üyeli olduğu için kümeye giremez).
+        # Empirik doğrulama (fonksiyonun kendisine karşı): tek EQH kümesi,
+        # price=15.0 (ortalama), count=3, last_index=5 (en yeni pivot).
+        highs = [10, 15.00, 10, 15.03, 10, 14.97, 10, 20.00, 10]
+        lows = [5] * len(highs)
+        candles = _mk_candles(highs, lows)
+
+        result = equal_level_clusters(candles, left=1, right=1,
+                                       tolerance_pct=0.5, lookback=80)
+
+        assert result["eqh"] == [
+            {"price": pytest.approx(15.0), "count": 3, "last_index": 5}
+        ]
+        assert result["eql"] == []
+
+    def test_pivots_outside_tolerance_form_separate_clusters(self):
+        # İki ayrı ikili grup: (~15.00/15.02) ve (~25.00/25.03) — aralarında
+        # %0.5 toleransın çok üzerinde bir mesafe var, ayrı kümeler kalmalı.
+        highs = [10, 15.00, 10, 15.02, 10, 25.00, 10, 25.03, 10]
+        lows = [5] * len(highs)
+        candles = _mk_candles(highs, lows)
+
+        result = equal_level_clusters(candles, left=1, right=1,
+                                       tolerance_pct=0.5, lookback=80)
+
+        assert result["eqh"] == [
+            {"price": pytest.approx(15.01), "count": 2, "last_index": 3},
+            {"price": pytest.approx(25.015), "count": 2, "last_index": 7},
+        ]
+        # price'a göre artan sıralı olmalı
+        prices = [c["price"] for c in result["eqh"]]
+        assert prices == sorted(prices)
+
+    def test_fewer_than_two_pivots_no_cluster(self):
+        # Tek bir swing-high var (left=1,right=1) — küme oluşamaz (>=2 şart)
+        highs = [10, 15.00, 10]
+        lows = [5, 5, 5]
+        candles = _mk_candles(highs, lows)
+
+        result = equal_level_clusters(candles, left=1, right=1,
+                                       tolerance_pct=0.5, lookback=80)
+
+        assert result["eqh"] == []
+        assert result["eql"] == []
+
+    def test_eql_symmetric_clustering(self):
+        # Aynaısı: üç swing-low birbirine %0.5 içinde -> tek EQL kümesi
+        lows = [20, 15.00, 20, 15.02, 20, 15.04, 20]
+        highs = [30] * len(lows)
+        candles = _mk_candles(highs, lows)
+
+        result = equal_level_clusters(candles, left=1, right=1,
+                                       tolerance_pct=0.5, lookback=80)
+
+        assert result["eql"] == [
+            {"price": pytest.approx(15.02), "count": 3, "last_index": 5}
+        ]
+        assert result["eqh"] == []
+
+    def test_insufficient_data_returns_empty_clusters(self):
+        candles = _mk_candles([10, 11, 12], [5, 6, 7])
+        result = equal_level_clusters(candles, left=3, right=3)
+        assert result == {"eqh": [], "eql": []}
+
+
+# --------------------------------------------------------------------------
+# sweep_of_level
+# --------------------------------------------------------------------------
+
+class TestSweepOfLevel:
+    def test_low_sweep_run_and_reclaim_true(self):
+        # Pencerede bir mum low=95 ile 100'ün altına sarkıyor (run); son
+        # mumun kapanışı (100.5) 100'ün üstünde -> geri alım (failure) -> True
+        c1 = _mk_candle(0, 110, 95, 97)
+        c2 = _mk_candle(1, 103, 99, 101)
+        c3 = _mk_candle(2, 103, 101, 100.5)
+        assert sweep_of_level([c1, c2, c3], 100.0, "low", reclaim_within=3) is True
+
+    def test_low_sweep_run_but_close_stays_below_false(self):
+        # Aynı sarkma var ama pencerenin son kapanışı 100'ün altında kalıyor
+        # -> gerçek kırılım, süpürme değil -> False
+        c1 = _mk_candle(0, 110, 95, 97)
+        c2 = _mk_candle(1, 103, 99, 98)
+        c3 = _mk_candle(2, 100, 96, 97.0)
+        assert sweep_of_level([c1, c2, c3], 100.0, "low", reclaim_within=3) is False
+
+    def test_low_never_dipped_false(self):
+        # Hiçbir mumun low'u 100'ün altına sarkmıyor -> run yok -> False
+        c1 = _mk_candle(0, 110, 105, 107)
+        c2 = _mk_candle(1, 108, 104, 106)
+        c3 = _mk_candle(2, 109, 103, 105)
+        assert sweep_of_level([c1, c2, c3], 100.0, "low", reclaim_within=3) is False
+
+    def test_high_sweep_run_and_reclaim_true(self):
+        # Ayna vaka: bir mumun high'ı 100'ün üzerine sarkıyor (run); son
+        # mumun kapanışı (98.0) 100'ün altında -> geri alım -> True
+        h1 = _mk_candle(0, 105, 90, 95)
+        h2 = _mk_candle(1, 101, 96, 99)
+        h3 = _mk_candle(2, 99, 90, 98.0)
+        assert sweep_of_level([h1, h2, h3], 100.0, "high", reclaim_within=3) is True
+
+    def test_empty_candles_returns_false(self):
+        assert sweep_of_level([], 100.0, "low") is False
+
+    def test_non_positive_level_price_returns_false(self):
+        c1 = _mk_candle(0, 110, 95, 97)
+        c2 = _mk_candle(1, 103, 99, 101)
+        c3 = _mk_candle(2, 103, 101, 100.5)
+        assert sweep_of_level([c1, c2, c3], 0.0, "low", reclaim_within=3) is False
+        assert sweep_of_level([c1, c2, c3], -5.0, "low", reclaim_within=3) is False

@@ -610,3 +610,102 @@ def find_order_block(candles: list[Candle], direction: Direction,
             return {"low": ob.low, "high": ob.high, "index": i}
 
     return None
+
+
+# --------------------------------------------------------------------------
+# Equal Highs/Lows kümelenmesi ve likidite süpürmesi (run & failure)
+# --------------------------------------------------------------------------
+
+def equal_level_clusters(candles: list[Candle], left: int = 3, right: int = 3,
+                          tolerance_pct: float = 0.05, lookback: int = 80) -> dict:
+    """Equal Highs/Lows kümelenmesi: son `lookback` mumdaki swing-high
+    pivotlarından, birbirine `tolerance_pct` (%) içinde olan EN AZ 2 pivot
+    bir EQH kümesi oluşturur (fiyatların ortalaması küme seviyesi).
+    Swing-low'lar için aynı şekilde EQL.
+
+    Gruplama açgözlüdür: pivotlar fiyata göre sıralanır, bitişik pivotlar
+    kümenin O ANA KADARKİ ortalamasına `tolerance_pct` içindeyse kümeye
+    katılır; değilse mevcut küme (>= 2 üyeliyse) kapatılıp yeni küme
+    başlatılır. Bir pivot yalnız bir kümeye girer.
+
+    Dönüş: {"eqh": [{"price": float, "count": int, "last_index": int}, ...],
+            "eql": [...]} — price'a göre artan sıralı.
+    """
+    n = len(candles)
+    start = max(0, n - lookback)
+    window = candles[start:]
+
+    highs_rel, lows_rel = swing_points(window, left, right)
+    highs_idx = [start + i for i in highs_rel]
+    lows_idx = [start + i for i in lows_rel]
+
+    def _cluster(indices: list[int], price_of) -> list[dict]:
+        pivots = sorted(
+            ((price_of(candles[i]), i) for i in indices),
+            key=lambda pair: pair[0],
+        )
+
+        clusters: list[dict] = []
+        cur_prices: list[float] = []
+        cur_indices: list[int] = []
+
+        def _flush() -> None:
+            if len(cur_prices) >= 2:
+                clusters.append({
+                    "price": sum(cur_prices) / len(cur_prices),
+                    "count": len(cur_prices),
+                    "last_index": max(cur_indices),
+                })
+
+        for price, idx in pivots:
+            if cur_prices:
+                avg = sum(cur_prices) / len(cur_prices)
+                within = avg > 0.0 and abs(price - avg) / avg * 100.0 <= tolerance_pct
+                if within:
+                    cur_prices.append(price)
+                    cur_indices.append(idx)
+                    continue
+                _flush()
+                cur_prices = [price]
+                cur_indices = [idx]
+            else:
+                cur_prices = [price]
+                cur_indices = [idx]
+
+        _flush()
+        return clusters
+
+    eqh = _cluster(highs_idx, lambda c: c.high)
+    eql = _cluster(lows_idx, lambda c: c.low)
+    return {"eqh": eqh, "eql": eql}
+
+
+def sweep_of_level(candles: list[Candle], level_price: float, side: str,
+                    reclaim_within: int = 3) -> bool:
+    """İki aşamalı likidite süpürmesi ("run & failure").
+
+    side="low": son `reclaim_within` mumun içinde EN AZ BİR mumun low'u
+    `level_price`'ın ALTINA sarktı (run) VE o penceredeki SON mumun kapanışı
+    `level_price`'ın ÜSTÜNDE (failure/geri alım). side="high" aynası (high
+    üstüne sarkma + son kapanış altta kalma).
+
+    Sınır durumları: boş/eksik veri → False; level_price <= 0 → False.
+    """
+    n = len(candles)
+    if n == 0 or level_price <= 0.0:
+        return False
+
+    window_size = min(reclaim_within, n)
+    if window_size <= 0:
+        return False
+    window = candles[n - window_size:]
+    last_close = window[-1].close
+
+    if side == "low":
+        ran = any(c.low < level_price for c in window)
+        return ran and last_close > level_price
+    if side == "high":
+        ran = any(c.high > level_price for c in window)
+        return ran and last_close < level_price
+
+    return False

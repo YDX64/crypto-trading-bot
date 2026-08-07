@@ -68,8 +68,10 @@ _CTX_15M_WINDOW = 100
 _CTX_4H_WINDOW = 250
 
 # Maliyet modeli.
-_COMMISSION_RATE = 0.0005  # %0,05 nominal, giriş VE her çıkış bacağında
-_SLIPPAGE_RATE = 0.0002    # %0,02, yalnız girişte, aleyhte
+# NOT: komisyon oranları artık settings'ten okunur (scalper_taker_fee_pct /
+# scalper_maker_fee_pct, % biriminde — /100 ile orana çevrilir). Kayma yalnız
+# taker girişte uygulanır ve ayrı bir settings alanı YOK — sabit kalır.
+_SLIPPAGE_RATE = 0.0002    # %0,02, yalnız taker girişte, aleyhte
 
 _DEFAULT_VIRTUAL_BALANCE = 10_000.0
 _AUTO_UNIVERSE_TOP_N = 8
@@ -238,7 +240,7 @@ class OpenPosition:
     direction: Direction
     stop_price: float          # yapısal, DEĞİŞMEZ ilk stop (SL leg fiyatı)
     entry_idx: int              # candles_5m üzerindeki dolum mumu indeksi
-    entry_price: float          # kayma uygulanmış GERÇEK dolum fiyatı
+    entry_price: float          # kayma uygulanmış (taker) ya da limit (maker) GERÇEK dolum fiyatı
     entry_time: int             # dolum mumunun open_time'ı (ms)
     qty_total: float
     leverage: int
@@ -249,6 +251,9 @@ class OpenPosition:
     runner_qty: float
     breakeven_price: float
     current_stop: float
+    regime: str                 # giriş anındaki ctx.regime (sinyal üretim anı) — rapor kırılımı için
+    entry_commission_rate: float  # giriş bacağı oranı (taker ya da maker fee)
+    exit_commission_rate: float   # çıkış bacakları oranı — HER modda taker fee
     tp1_filled: bool = False
     tp2_filled: bool = False
     trailing_active: bool = False
@@ -285,11 +290,40 @@ class BacktestTrade:
     mfe_pct: float
     duration_minutes: float
     exit_idx: int
+    regime: str = "UNKNOWN"
     legs: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         d = {k: v for k, v in self.__dict__.items() if k != "exit_idx"}
         return d
+
+
+def _find_maker_fill(
+    signal: ScalpSignal, candles_5m: List[Candle], signal_idx: int, cfg: Any,
+) -> Optional[tuple]:
+    """Maker giriş modu: LIMIT fiyatı = sinyal mumunun kapanışı. Sonraki
+    `scalper_maker_fill_timeout_candles` mum içinde fiyat limite değerse
+    (LONG: mum.low <= limit; SHORT: mum.high >= limit) ilk değen mumda,
+    kaymasız, limit fiyatından dolum sayılır.
+
+    Döner: (entry_idx, entry_price) ya da timeout içinde hiç değmezse None."""
+    limit_price = candles_5m[signal_idx].close
+    timeout = max(0, int(cfg.scalper_maker_fill_timeout_candles))
+    n = len(candles_5m)
+
+    for offset in range(1, timeout + 1):
+        idx = signal_idx + offset
+        if idx >= n:
+            break
+        c = candles_5m[idx]
+        touched = (
+            c.low <= limit_price if signal.direction == Direction.LONG
+            else c.high >= limit_price
+        )
+        if touched:
+            return idx, limit_price
+
+    return None
 
 
 def open_position(
@@ -298,10 +332,18 @@ def open_position(
     signal_idx: int,
     cfg: Any,
     balance: float = _DEFAULT_VIRTUAL_BALANCE,
+    missed_counter: Optional[Dict[str, int]] = None,
 ) -> Optional[OpenPosition]:
     """Sinyalden pozisyon kurar: risk bazlı boyutlama + stop mesafesi kapısı
-    + SONRAKİ mumun open'ında kaymalı dolum. Kapı geçilmezse None döner
-    (işlem yok)."""
+    + dolum simülasyonu. Kapı geçilmezse None döner (işlem yok).
+
+    Dolum simülasyonu `cfg.scalper_entry_mode`'a göre değişir:
+    - "taker" (varsayılan): SONRAKİ mumun open'ında kaymalı (aleyhte) dolum,
+      komisyon cfg.scalper_taker_fee_pct.
+    - "maker": LIMIT emri simülasyonu (bkz. _find_maker_fill) — timeout
+      içinde dolmazsa sinyal SESSİZCE iptal edilir; `missed_counter`
+      verilmişse (mutasyonla) sayaç artırılır, işlem raporlanabilsin diye.
+    """
     entry_hint = signal.entry_price
     stop_price = signal.stop_price
     if entry_hint <= 0:
@@ -315,8 +357,28 @@ def open_position(
     if price_distance <= 0:
         return None
 
-    if signal_idx + 1 >= len(candles_5m):
-        return None  # sonraki mum yok — dolum yapılamaz
+    entry_mode = getattr(cfg, "scalper_entry_mode", "taker")
+
+    if entry_mode == "maker":
+        fill = _find_maker_fill(signal, candles_5m, signal_idx, cfg)
+        if fill is None:
+            if missed_counter is not None:
+                missed_counter["maker_missed"] = missed_counter.get("maker_missed", 0) + 1
+            return None
+        entry_idx, entry_price = fill
+        entry_commission_rate = cfg.scalper_maker_fee_pct / 100.0
+    else:
+        if signal_idx + 1 >= len(candles_5m):
+            return None  # sonraki mum yok — dolum yapılamaz
+        entry_idx = signal_idx + 1
+        entry_candle = candles_5m[entry_idx]
+        if signal.direction == Direction.LONG:
+            entry_price = entry_candle.open * (1.0 + _SLIPPAGE_RATE)
+        else:
+            entry_price = entry_candle.open * (1.0 - _SLIPPAGE_RATE)
+        entry_commission_rate = cfg.scalper_taker_fee_pct / 100.0
+
+    exit_commission_rate = cfg.scalper_taker_fee_pct / 100.0  # çıkışlar her modda taker
 
     risk_amount = balance * (cfg.scalper_risk_percentage / 100.0) * signal.risk_multiplier
     qty = risk_amount / price_distance
@@ -330,12 +392,7 @@ def open_position(
     if qty <= 0:
         return None
 
-    entry_idx = signal_idx + 1
     entry_candle = candles_5m[entry_idx]
-    if signal.direction == Direction.LONG:
-        entry_price = entry_candle.open * (1.0 + _SLIPPAGE_RATE)
-    else:
-        entry_price = entry_candle.open * (1.0 - _SLIPPAGE_RATE)
 
     tp1_price = price_at_roi(entry_price, cfg.scalper_tp1_roi, leverage, signal.direction)
     tp2_price = price_at_roi(entry_price, cfg.scalper_tp2_roi, leverage, signal.direction)
@@ -366,6 +423,9 @@ def open_position(
         runner_qty=runner_qty,
         breakeven_price=breakeven_price,
         current_stop=stop_price,
+        regime=signal.regime.value if hasattr(signal.regime, "value") else str(signal.regime),
+        entry_commission_rate=entry_commission_rate,
+        exit_commission_rate=exit_commission_rate,
     )
 
 
@@ -388,7 +448,7 @@ def _fill_leg(pos: OpenPosition, qty: float, price: float, label: str) -> None:
     if qty <= 0:
         return
     gross = _leg_pnl(pos, qty, price)
-    commission = _COMMISSION_RATE * qty * price
+    commission = pos.exit_commission_rate * qty * price
     pos.legs.append({"label": label, "quantity": qty, "price": price, "pnl": gross - commission})
     pos.remaining_qty -= qty
 
@@ -495,7 +555,7 @@ def _finalize_trade(pos: OpenPosition, exit_idx: int, candles_5m: List[Candle]) 
         pos.exit_time = candles_5m[exit_idx].close_time
 
     total_pnl = sum(leg["pnl"] for leg in pos.legs)
-    entry_commission = _COMMISSION_RATE * pos.qty_total * pos.entry_price
+    entry_commission = pos.entry_commission_rate * pos.qty_total * pos.entry_price
     total_pnl -= entry_commission
 
     margin = (pos.qty_total * pos.entry_price / pos.leverage) if pos.leverage else pos.qty_total * pos.entry_price
@@ -521,6 +581,7 @@ def _finalize_trade(pos: OpenPosition, exit_idx: int, candles_5m: List[Candle]) 
         mfe_pct=pos.mfe_pct,
         duration_minutes=duration_minutes,
         exit_idx=exit_idx,
+        regime=pos.regime,
         legs=pos.legs,
     )
 
@@ -558,6 +619,7 @@ def simulate_symbol(
     strategies: List[StrategyProtocol],
     cfg: Any,
     initial_balance: float = _DEFAULT_VIRTUAL_BALANCE,
+    missed_counter: Optional[Dict[str, int]] = None,
 ) -> List[BacktestTrade]:
     """Bir sembol için TEK eşzamanlı pozisyonla tam backtest simülasyonu.
     AĞ YOK — yalnız zaten çekilmiş mum listeleri üzerinde çalışır (saf,
@@ -593,7 +655,7 @@ def simulate_symbol(
             i += 1
             continue
 
-        pos = open_position(signal, candles_5m, i, cfg, initial_balance)
+        pos = open_position(signal, candles_5m, i, cfg, initial_balance, missed_counter=missed_counter)
         if pos is None:
             i += 1
             continue
@@ -670,11 +732,22 @@ def _group_by_strategy(trades: List[BacktestTrade]) -> Dict[str, List[BacktestTr
     return out
 
 
+def _group_by_strategy_regime(trades: List[BacktestTrade]) -> Dict[str, Dict[str, List[BacktestTrade]]]:
+    """(strateji, rejim) -> işlem listesi; strateji üstünde nested rejim
+    sözlüğü olarak — hem konsol hem JSON kırılım raporu için ortak."""
+    out: Dict[str, Dict[str, List[BacktestTrade]]] = {}
+    for t in trades:
+        out.setdefault(t.strategy, {}).setdefault(t.regime, []).append(t)
+    return out
+
+
 def _fmt_pf(pf: float) -> str:
     return "inf" if pf == float("inf") else f"{pf:.2f}"
 
 
-def print_report(all_trades: List[BacktestTrade]) -> None:
+def print_report(
+    all_trades: List[BacktestTrade], missed_counter: Optional[Dict[str, int]] = None,
+) -> None:
     by_strategy = _group_by_strategy(all_trades)
     overall = compute_stats(all_trades)
 
@@ -711,18 +784,70 @@ def print_report(all_trades: List[BacktestTrade]) -> None:
 
     print("-" * len(header))
     print(_row("TOPLAM", overall))
+    print("=" * len(header))
+
+    if missed_counter is not None:
+        missed_total = sum(missed_counter.values())
+        print(f"Kaçan sinyal (maker limit timeout içinde dolmadı): {missed_total}")
+
+    print()
+    _print_regime_breakdown(all_trades)
+
+
+def _print_regime_breakdown(all_trades: List[BacktestTrade]) -> None:
+    """İkinci, kompakt tablo: her (strateji, rejim) çifti için işlem sayısı,
+    kazanma%, toplam PnL, P.Faktör."""
+    grouped = _group_by_strategy_regime(all_trades)
+
+    cols = [
+        ("Strateji", 8), ("Rejim", 8), ("İşlem", 6), ("Kazanma%", 9),
+        ("Toplam PnL", 12), ("P.Faktör", 9),
+    ]
+    header = " | ".join(name.ljust(w) for name, w in cols)
+    print("=" * len(header))
+    print("REJİM KIRILIMI")
+    print("=" * len(header))
+    print(header)
+    print("-" * len(header))
+
+    if not grouped:
+        print("(işlem yok)")
+    else:
+        for strategy_name in sorted(grouped.keys()):
+            for regime_name in sorted(grouped[strategy_name].keys()):
+                s = compute_stats(grouped[strategy_name][regime_name])
+                values = [
+                    strategy_name, regime_name, str(s["trades"]),
+                    f"{s['winrate']:.1f}", f"{s['total_pnl']:.2f}", _fmt_pf(s["profit_factor"]),
+                ]
+                print(" | ".join(v.ljust(w) for v, (_, w) in zip(values, cols)))
+
     print("=" * len(header) + "\n")
 
 
 def write_json_report(
-    all_trades: List[BacktestTrade], days: int, symbols: List[str], strategy_names: str
+    all_trades: List[BacktestTrade],
+    days: int,
+    symbols: List[str],
+    strategy_names: str,
+    missed_counter: Optional[Dict[str, int]] = None,
 ) -> str:
     by_strategy = _group_by_strategy(all_trades)
+    by_strategy_regime = _group_by_strategy_regime(all_trades)
+    regime_breakdown = {
+        strategy_name: {
+            regime_name: compute_stats(ts) for regime_name, ts in regimes.items()
+        }
+        for strategy_name, regimes in by_strategy_regime.items()
+    }
+
     payload = {
         "generated_at": datetime.utcnow().isoformat() + "Z",
         "params": {"days": days, "symbols": symbols, "strategies": strategy_names},
         "overall": compute_stats(all_trades),
         "by_strategy": {name: compute_stats(ts) for name, ts in by_strategy.items()},
+        "regime_breakdown": regime_breakdown,
+        "missed_signals": dict(missed_counter) if missed_counter is not None else {},
         "trades": [t.to_dict() for t in all_trades],
     }
 
@@ -748,9 +873,13 @@ async def run_backtest(
     strategy_names: str,
     base_url: str = "https://fapi.binance.com",
     cfg: Any = settings,
+    missed_counter: Optional[Dict[str, int]] = None,
 ) -> List[BacktestTrade]:
     """Verilen semboller için tarihsel veriyi çeker ve tüm stratejileri
-    simüle eder; tüm işlemleri (tüm semboller birleşik) döndürür."""
+    simüle eder; tüm işlemleri (tüm semboller birleşik) döndürür.
+
+    `missed_counter` verilirse (mutasyonla) maker modda timeout içinde
+    dolmayan sinyallerin sayısı buraya birikir (tüm semboller toplamı)."""
     strategies = get_enabled(strategy_names)
     if not strategies:
         raise ValueError(f"Geçerli scalper stratejisi bulunamadı: '{strategy_names}'")
@@ -767,7 +896,10 @@ async def run_backtest(
             app_logger.info(
                 f"📊 {symbol}: 5m={len(candles_5m)} 15m={len(candles_15m)} 4h={len(candles_4h)} mum toplandı"
             )
-            trades = simulate_symbol(symbol, candles_5m, candles_15m, candles_4h, strategies, cfg)
+            trades = simulate_symbol(
+                symbol, candles_5m, candles_15m, candles_4h, strategies, cfg,
+                missed_counter=missed_counter,
+            )
             app_logger.info(f"✅ {symbol}: {len(trades)} işlem simüle edildi")
             all_trades.extend(trades)
     finally:
@@ -810,16 +942,19 @@ async def main_async(args: argparse.Namespace) -> None:
         f"🚀 Scalper backtest başlıyor: gün={args.days} sembol={symbols} strateji={args.strategies}"
     )
 
-    all_trades = await run_backtest(days=args.days, symbols=symbols, strategy_names=args.strategies)
+    missed_counter: Dict[str, int] = {}
+    all_trades = await run_backtest(
+        days=args.days, symbols=symbols, strategy_names=args.strategies, missed_counter=missed_counter,
+    )
 
-    print_report(all_trades)
+    print_report(all_trades, missed_counter=missed_counter)
     # NOT: src/core/logger.py loguru için sys.stdout.buffer'ı SARAN ayrı bir
     # TextIOWrapper kurar; süreç çıkışında bu iki wrapper'ın kapanma sırası
     # bazen print() çıktısının OS'e hiç flush edilmeden kaybolmasına yol
     # açabiliyor. logger.py'ye dokunmadan, kendi çıktımızı garantiye almak
     # için burada açıkça flush ediyoruz.
     sys.stdout.flush()
-    write_json_report(all_trades, args.days, symbols, args.strategies)
+    write_json_report(all_trades, args.days, symbols, args.strategies, missed_counter=missed_counter)
 
 
 def main() -> None:

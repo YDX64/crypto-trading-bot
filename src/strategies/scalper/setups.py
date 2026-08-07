@@ -22,6 +22,7 @@ from src.strategies.scalper.indicators import (
     bullish_divergence,
     cmf,
     donchian,
+    equal_level_clusters,
     equilibrium,
     find_fvg,
     find_order_block,
@@ -31,6 +32,7 @@ from src.strategies.scalper.indicators import (
     market_structure,
     mfi_series,
     rsi_series,
+    sweep_of_level,
     swing_points,
 )
 from src.strategies.scalper.types import (
@@ -286,6 +288,13 @@ class StrategyC(StrategyProtocol):
     Bollinger bant taşması + RSI diverjansı üst üste binince ters yönde
     girer. B'nin trend filtresinin değer katıp katmadığını ölçmek için var
     — counter-trend riski nedeniyle risk_multiplier sabit 0.5.
+
+    settings.scalper_c_allowed_regimes (virgüllü CSV, örn. "RANGE" veya
+    "UP,DOWN,RANGE") hangi rejimlerde çalışacağını daraltır — deneysel A/B
+    karşılaştırması için (örn. C'yi yalnız RANGE'de çalıştırıp B ile
+    çakışmasını önlemek). Varsayılan "UP,DOWN,RANGE" önceki davranışla
+    (yalnız UNKNOWN engelli) birebir aynıdır. UNKNOWN, listede ne yazarsa
+    yazsın HER ZAMAN engellidir.
     """
 
     name = "C"
@@ -301,7 +310,12 @@ class StrategyC(StrategyProtocol):
     _RISK_MULTIPLIER = 0.5
 
     def evaluate(self, ctx: StrategyContext) -> ScalpSignal | None:
-        if ctx.regime == Regime.UNKNOWN:
+        allowed_regimes = {
+            name.strip().upper()
+            for name in settings.scalper_c_allowed_regimes.split(",")
+            if name.strip()
+        }
+        if ctx.regime == Regime.UNKNOWN or ctx.regime.value not in allowed_regimes:
             return None
 
         candles_5m = ctx.candles_5m
@@ -385,6 +399,16 @@ class StrategyD(StrategyProtocol):
     bunlardan en az biri MFI/CMF para akışı teyidiyle birleşince giriş
     üretir. Rejime karşı işlem açmaz: DOWN'da LONG yok, UP'ta SHORT yok
     (güçlü akıntıya karşı yüzülmez); UNKNOWN'da hiç işlem yok.
+
+    settings.scalper_d_use_eqhl (varsayılan True) süpürme tespitini genel
+    liquidity_sweep() yerine equal_level_clusters() (EQH/EQL — birbirine
+    yakın en az iki pivotun oluşturduğu likidite kümesi) + sweep_of_level()
+    ("run & failure": kümenin ötesine sarkıp geri kapanış) ikilisine bağlar
+    — tek bir izole swing yerine gerçek bir likidite havuzunun süpürüldüğünü
+    arar. False iken eski genel yol aynen çalışır (A/B karşılaştırması
+    için). Her iki yolda da stop hesaplaması AYNIDIR (son 3 mumun en
+    düşük/yüksek fitili ±%0.1 tampon) — sweep_of_level'ın varsayılan
+    reclaim_within=3 penceresiyle birebir örtüşür.
     """
 
     name = "D"
@@ -415,17 +439,40 @@ class StrategyD(StrategyProtocol):
         if atr_5m <= 0.0:
             return None
 
-        sweep = liquidity_sweep(candles_5m, self._SWING_LEFT, self._SWING_RIGHT,
-                                 self._SWEEP_LOOKBACK)
-        if sweep == "low":
+        if settings.scalper_d_use_eqhl:
+            long_sweep = self._eqhl_sweep_found(candles_5m, "eql", "low")
+            short_sweep = self._eqhl_sweep_found(candles_5m, "eqh", "high")
+        else:
+            sweep = liquidity_sweep(candles_5m, self._SWING_LEFT, self._SWING_RIGHT,
+                                     self._SWEEP_LOOKBACK)
+            long_sweep = sweep == "low"
+            short_sweep = sweep == "high"
+
+        if long_sweep:
             if ctx.regime == Regime.DOWN:
                 return None
             return self._evaluate_long(ctx, candles_5m, atr_5m)
-        if sweep == "high":
+        if short_sweep:
             if ctx.regime == Regime.UP:
                 return None
             return self._evaluate_short(ctx, candles_5m, atr_5m)
         return None
+
+    def _eqhl_sweep_found(self, candles_5m: list, cluster_side: str, sweep_side: str) -> bool:
+        """EQH/EQL kümelerinden herhangi biri süpürüldü mü (scalper_d_use_eqhl=True yolu).
+
+        cluster_side: equal_level_clusters() çıktı sözlüğündeki anahtar
+        ("eql" -> LONG adayı, "eqh" -> SHORT adayı). sweep_side: aynı yönü
+        sweep_of_level()'a geçmek için ("low"/"high"). Kümedeki pivotlardan
+        HERHANGİ BİRİ süpürülmüşse True — hangi kümenin süpürüldüğü stop
+        hesabını etkilemez (bkz. sınıf docstring'i: stop her zaman son 3
+        mumun fitilinden türer).
+        """
+        clusters = equal_level_clusters(candles_5m, tolerance_pct=settings.scalper_eqhl_tolerance_pct)
+        return any(
+            sweep_of_level(candles_5m, level["price"], sweep_side)
+            for level in clusters[cluster_side]
+        )
 
     def _prior_cmf(self, candles_5m: list) -> float:
         """`_CMF_SHIFT` mum önceki CMF(period) penceresi — işaret dönüşü
