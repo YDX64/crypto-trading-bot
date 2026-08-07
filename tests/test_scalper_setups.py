@@ -731,3 +731,271 @@ class TestExecutorRiskRewardGate:
         assert client.calls == ["get_account_balance"]
         assert pm.calls == []
         assert tracker.calls == []
+
+
+# --------------------------------------------------------------------------
+# ScalpExecutor — maker (limit) giriş modu: iki fazlı giriş
+#
+# AĞ YOK: _FakeClientMaker, _FakeClient'ın (yukarıda tanımlı) taker akışı
+# için gerekli tüm sahte metodlarını miras alır; üstüne maker akışının
+# ihtiyaç duyduğu quantize_price / _request_with_retry (LIMIT giriş emri
+# için — ImprovedBinanceClient'ta market dışında public bir emir
+# sarmalayıcısı yok, executor bu iç metodu position_manager.py'nin
+# _emergency_close'ındaki ile AYNI desenle kullanır) / get_order /
+# cancel_order sahtelerini ekler.
+# --------------------------------------------------------------------------
+
+def _mk_maker_cfg(**overrides) -> _ExecCfg:
+    """_ExecCfg'yi DEĞİŞTİRMEDEN (dosyanın başına dokunmadan) maker modu
+    için gereken ek alanları çalışma zamanında ekler — @dataclass örnekleri
+    slotless olduğundan bu güvenlidir."""
+    cfg = _ExecCfg()
+    cfg.scalper_entry_mode = "maker"
+    cfg.scalper_maker_fill_timeout_candles = overrides.pop("scalper_maker_fill_timeout_candles", 3)
+    for key, value in overrides.items():
+        setattr(cfg, key, value)
+    return cfg
+
+
+class _FakeClientMaker(_FakeClient):
+    """Maker modu için ek uçları taklit eder. GERÇEK AĞ ÇAĞRISI YOK."""
+
+    def __init__(self, balance: float = 10_000.0, limit_order_id: int = 555):
+        super().__init__(balance=balance)
+        self.limit_order_id = limit_order_id
+        self.last_limit_params: dict | None = None
+        # order_id -> get_order()'ın döneceği YANIT SIRASI (pop(0) ile
+        # tüketilir); boşsa varsayılan {"status": "NEW"} döner.
+        self.get_order_responses: dict[int, list[dict]] = {}
+        self.cancel_calls: list[int] = []
+        self.cancel_response: dict = {"status": "CANCELED"}
+
+    async def quantize_price(self, symbol, price):
+        self.calls.append("quantize_price")
+        return price
+
+    async def _request_with_retry(self, method, endpoint, params=None, signed=False):
+        self.calls.append(f"_request_with_retry:{method}:{endpoint}")
+        if method == "POST" and endpoint == "/fapi/v1/order" and (params or {}).get("type") == "LIMIT":
+            self.last_limit_params = dict(params or {})
+            return {
+                "orderId": self.limit_order_id,
+                "status": "NEW",
+                "avgPrice": "0",
+                "executedQty": "0",
+            }
+        raise AssertionError(f"beklenmeyen _request_with_retry çağrısı: {method} {endpoint} {params}")
+
+    async def get_order(self, symbol, order_id):
+        self.calls.append("get_order")
+        queue = self.get_order_responses.get(order_id)
+        if queue:
+            return queue.pop(0)
+        return {"orderId": order_id, "status": "NEW"}
+
+    async def cancel_order(self, symbol, order_id):
+        self.calls.append("cancel_order")
+        self.cancel_calls.append(order_id)
+        return dict(self.cancel_response)
+
+
+class TestExecutorMakerEntry:
+    """maker modda try_open: FAZ 1 (LIMIT GTC kor, pending kaydı düşer)."""
+
+    async def test_try_open_places_gtc_limit_order_and_records_pending(self):
+        cfg = _mk_maker_cfg()
+        client = _FakeClientMaker(balance=10_000.0, limit_order_id=555)
+        pm = _FakePm(entry_price=100.0, filled_qty=1.0)
+        tracker = _FakeTracker()
+        executor = ScalpExecutor(client=client, pm=pm, tracker=tracker, cfg=cfg)
+
+        entry = 100.0
+        stop = entry * (1 - 0.005)  # RR kapısını geçer (bkz. TestExecutorRiskRewardGate)
+        signal = _mk_exec_signal(entry, stop)
+        ctx = _mk_exec_ctx()  # current_price=100.0
+
+        result = await executor.try_open(signal, ctx)
+
+        # Maker modda try_open HENÜZ pozisyon döndürmez — dolum check_pending'i bekler.
+        assert result is None
+        assert "TESTUSDT" in executor.pending_symbols()
+
+        # LIMIT emri doğru parametrelerle kondu.
+        assert client.last_limit_params is not None
+        assert client.last_limit_params["type"] == "LIMIT"
+        assert client.last_limit_params["timeInForce"] == "GTC"
+        assert client.last_limit_params["newOrderRespType"] == "RESULT"
+        assert client.last_limit_params["price"] == pytest.approx(ctx.current_price)
+        assert client.last_limit_params["side"] == "BUY"
+        assert "quantize_price" in client.calls
+
+        # Market emri hiç açılmadı (taker yolu tetiklenmedi).
+        assert "open_market_order" not in client.calls
+        assert pm.calls == []
+        assert tracker.calls == []
+
+        snap = executor.pending_snapshot()
+        assert len(snap) == 1
+        assert snap[0]["symbol"] == "TESTUSDT"
+        assert snap[0]["limit_price"] == pytest.approx(ctx.current_price)
+        assert snap[0]["scans_waited"] == 0
+
+    async def test_taker_mode_behavior_unchanged(self):
+        # cfg varsayılanı taker'dır (_ExecCfg'de scalper_entry_mode alanı
+        # YOK -> getattr fallback "taker") — bu, taker akışının maker
+        # eklentisinden ETKİLENMEDİĞİNİ, mevcut TestExecutorRiskRewardGate
+        # testinden bağımsız ikinci bir kanıtla doğrular.
+        cfg = _ExecCfg()
+        client = _FakeClient(balance=10_000.0)
+        pm = _FakePm(entry_price=100.0, filled_qty=1.0)
+        tracker = _FakeTracker()
+        executor = ScalpExecutor(client=client, pm=pm, tracker=tracker, cfg=cfg)
+
+        entry = 100.0
+        stop = entry * (1 - 0.005)
+        signal = _mk_exec_signal(entry, stop)
+        ctx = _mk_exec_ctx()
+
+        result = await executor.try_open(signal, ctx)
+
+        assert result is not None
+        assert isinstance(result, ScalpPosition)
+        assert "open_market_order" in client.calls
+        assert executor.pending_symbols() == set()
+
+
+class TestExecutorCheckPendingFilled:
+    """FAZ 2: check_pending — FILLED durumunda SL+TP kurulur, ScalpPosition döner."""
+
+    async def test_filled_pending_opens_protected_position(self):
+        cfg = _mk_maker_cfg()
+        client = _FakeClientMaker(balance=10_000.0, limit_order_id=555)
+        pm = _FakePm(entry_price=100.0, filled_qty=1.0)
+        tracker = _FakeTracker()
+        executor = ScalpExecutor(client=client, pm=pm, tracker=tracker, cfg=cfg)
+
+        entry = 100.0
+        stop = entry * (1 - 0.005)
+        signal = _mk_exec_signal(entry, stop)
+        ctx = _mk_exec_ctx()
+
+        opened = await executor.try_open(signal, ctx)
+        assert opened is None
+        assert "TESTUSDT" in executor.pending_symbols()
+
+        # Borsa artık FILLED bildiriyor — gerçek dolum fiyatı sinyal
+        # anındaki tahminden FARKLI (101.25) olabilir; TP'lerin bundan
+        # yeniden hesaplandığını dolaylı olarak pm.resolve_fill'in
+        # (_FakePm) çağrıldığı kanıtlar.
+        client.get_order_responses[555] = [{
+            "orderId": 555, "status": "FILLED",
+            "avgPrice": "101.25", "executedQty": "1.0",
+        }]
+
+        results = await executor.check_pending()
+
+        assert len(results) == 1
+        sp = results[0]
+        assert isinstance(sp, ScalpPosition)
+        assert sp.position.entry_price == pytest.approx(100.0)  # _FakePm sabit döner
+        assert "place_stop_loss_or_close" in pm.calls
+        assert "resolve_fill" in pm.calls
+        assert "place_take_profit" in client.calls
+        assert "record_open" in tracker.calls
+
+        # pending kaydı temizlendi — sembol atlama kümesinden düştü.
+        assert executor.pending_symbols() == set()
+        assert executor.pending_snapshot() == []
+
+    async def test_new_status_does_not_open_position_and_increments_scans_waited(self):
+        cfg = _mk_maker_cfg(scalper_maker_fill_timeout_candles=3)
+        client = _FakeClientMaker(balance=10_000.0, limit_order_id=555)
+        pm = _FakePm(entry_price=100.0, filled_qty=1.0)
+        tracker = _FakeTracker()
+        executor = ScalpExecutor(client=client, pm=pm, tracker=tracker, cfg=cfg)
+
+        signal = _mk_exec_signal(100.0, 99.5)
+        ctx = _mk_exec_ctx()
+        await executor.try_open(signal, ctx)
+
+        results = await executor.check_pending()
+
+        assert results == []
+        assert "TESTUSDT" in executor.pending_symbols()
+        assert executor.pending_snapshot()[0]["scans_waited"] == 1
+        assert "cancel_order" not in client.calls
+
+
+class TestExecutorCheckPendingTimeout:
+    """FAZ 2: check_pending — timeout'ta emir iptal edilir, pending düşer."""
+
+    async def test_timeout_cancels_order_and_drops_pending(self):
+        # timeout_candles=0 -> max_scans=0 -> İLK check_pending çağrısında
+        # scans_waited (1) > max_scans (0) olur, anında iptal tetiklenir.
+        cfg = _mk_maker_cfg(scalper_maker_fill_timeout_candles=0)
+        client = _FakeClientMaker(balance=10_000.0, limit_order_id=555)
+        pm = _FakePm(entry_price=100.0, filled_qty=1.0)
+        tracker = _FakeTracker()
+        executor = ScalpExecutor(client=client, pm=pm, tracker=tracker, cfg=cfg)
+
+        signal = _mk_exec_signal(100.0, 99.5)
+        ctx = _mk_exec_ctx()
+        await executor.try_open(signal, ctx)
+        assert "TESTUSDT" in executor.pending_symbols()
+
+        # get_order İKİ kez sorgulanır: (1) _check_one_pending'in ilk turu
+        # (status NEW -> scans_waited artar, timeout tetiklenir), (2)
+        # _cancel_pending'in iptalden ÖNCEKİ son doğrulaması (yine NEW ->
+        # gerçekten dolmamış, iptale devam). cancel_order ALREADY_GONE
+        # DEĞİL sıradan CANCELED döneceği için üçüncü bir get_order
+        # çağrısı yapılmaz (bkz. race testi ayrı senaryo).
+        client.get_order_responses[555] = [
+            {"orderId": 555, "status": "NEW"},
+            {"orderId": 555, "status": "NEW"},
+        ]
+
+        results = await executor.check_pending()
+
+        assert results == []
+        assert client.cancel_calls == [555]
+        assert executor.pending_symbols() == set()
+        assert pm.calls == []  # pozisyon hiç açılmadı — SL/TP kurulmadı
+        assert tracker.calls == []
+
+    async def test_cancel_fill_race_second_query_sees_filled_position_opened_protected(self):
+        # -2011 (iptal edilecek emir yok) simülasyonu: cancel_order
+        # ALREADY_GONE döner -> executor ikinci kez sorgular ve FILLED
+        # görür -> pozisyon SL+TP ile korumalı kurulur (asla korumasız
+        # bırakılmaz).
+        cfg = _mk_maker_cfg(scalper_maker_fill_timeout_candles=0)
+        client = _FakeClientMaker(balance=10_000.0, limit_order_id=555)
+        pm = _FakePm(entry_price=100.0, filled_qty=1.0)
+        tracker = _FakeTracker()
+        executor = ScalpExecutor(client=client, pm=pm, tracker=tracker, cfg=cfg)
+
+        signal = _mk_exec_signal(100.0, 99.5)
+        ctx = _mk_exec_ctx()
+        await executor.try_open(signal, ctx)
+
+        # get_order ÜÇ kez sorgulanır: (1) _check_one_pending'in ilk turu
+        # (NEW -> timeout tetiklenir), (2) _cancel_pending'in iptalden ÖNCEKİ
+        # son doğrulaması (yine NEW -> henüz dolmamış, cancel_order çağrılır),
+        # (3) cancel_order ALREADY_GONE (-2011 idempotent) döndüğü için
+        # yapılan tekrar sorgu — bu kez FILLED.
+        client.get_order_responses[555] = [
+            {"orderId": 555, "status": "NEW"},         # (1) ilk tur
+            {"orderId": 555, "status": "NEW"},         # (2) iptalden ÖNCE son doğrulama
+            {"orderId": 555, "status": "FILLED",       # (3) iptal sonrası tekrar sorgu
+             "avgPrice": "101.0", "executedQty": "1.0"},
+        ]
+        client.cancel_response = {"status": "ALREADY_GONE"}  # -2011 idempotent yanıtı
+
+        results = await executor.check_pending()
+
+        assert len(results) == 1
+        sp = results[0]
+        assert isinstance(sp, ScalpPosition)
+        assert client.cancel_calls == [555]
+        assert "place_stop_loss_or_close" in pm.calls  # pozisyon KORUMALI kuruldu
+        assert "place_take_profit" in client.calls
+        assert executor.pending_symbols() == set()

@@ -11,10 +11,14 @@ tasarım ilkeleri).
 Ana döngü (_loop, her scalper_scan_interval_seconds'ta bir):
   1. exits.step() — HER turda, taramadan BAĞIMSIZ, ÖNCE çalışır (açık
      pozisyonların TP1/trailing/kapanış takibi hiçbir zaman durmaz).
-  2. Günlük zarar kesici (kill switch) — limit aşılırsa yeni giriş
-     durur, exits.step() sürmeye devam eder.
-  3. Evren taraması.
-  4. kill_switch değilse: her sembol için tek strateji denemesi.
+  2. executor.check_pending() — exits.step()'ten HEMEN sonra: maker modunda
+     bekleyen LIMIT girişlerini bir tur ilerletir (dolan girişler
+     exits.track() ile izlemeye alınır).
+  3. Günlük zarar kesici (kill switch) — limit aşılırsa yeni giriş
+     durur, exits.step()/check_pending() sürmeye devam eder.
+  4. Evren taraması.
+  5. kill_switch değilse: her sembol için tek strateji denemesi (zaten
+     izlenen VEYA bekleyen maker girişi olan semboller atlanır).
 
 Hata izolasyonu: bir sembolün hatası turu öldürmez (sembol başına
 try/except), ama asyncio.CancelledError her zaman yükseltilir (görev
@@ -110,6 +114,14 @@ class ScalperEngine:
             except asyncio.CancelledError:
                 pass
 
+        # Maker modunda bekleyen tüm LIMIT girişlerini iptal et — temiz
+        # kapanış (client henüz kapatılmadan, aşağıdaki closer döngüsünden
+        # ÖNCE çalışmalı).
+        try:
+            await self.executor.cancel_all_pending()
+        except Exception as e:
+            self.logger.warning(f"⚠️ Bekleyen maker girişleri iptal edilirken hata: {e}")
+
         for closer in (self.fetcher.close, self.scanner.close, self.client.close):
             try:
                 await closer()
@@ -139,23 +151,34 @@ class ScalperEngine:
         # 1. Açık pozisyonların çıkış takibi — taramadan BAĞIMSIZ, her zaman önce.
         await self.exits.step()
 
-        # 2. Günlük zarar kesici.
+        # 2. Maker modunda bekleyen LIMIT girişlerini bir tur ilerlet — yeni
+        #    dolanlar hemen exits.track() ile izlemeye alınır.
+        for sp in await self.executor.check_pending():
+            self.exits.track(sp)
+            self._signals_today += 1
+            self.logger.info(
+                f"🎯 {sp.position.symbol}: maker girişi doldu -> pozisyon açıldı "
+                f"({sp.signal.direction.value} @ {sp.position.entry_price})",
+                extra={"trade": True},
+            )
+
+        # 3. Günlük zarar kesici.
         await self._update_kill_switch()
 
-        # 3. Evren taraması.
+        # 4. Evren taraması.
         self._universe = await self.scanner.get_universe()
         self._last_scan_at = _utcnow_iso()
 
         if self._kill_switch:
             return
 
-        # 4. Sembol başına tek strateji denemesi.
+        # 5. Sembol başına tek strateji denemesi.
         enabled_strategies = get_enabled(self.cfg.scalper_strategies)
         if not enabled_strategies:
             return
 
         for symbol in self._universe:
-            if symbol in self.exits.tracked_symbols():
+            if symbol in self.exits.tracked_symbols() or symbol in self.executor.pending_symbols():
                 continue
             if len(self.exits.tracked_symbols()) >= self.cfg.scalper_max_positions:
                 # Sembol başına değil, TUR başına kesici: kapasite dolduysa bu
@@ -333,4 +356,5 @@ class ScalperEngine:
             "signals_today": self._signals_today,
             "last_scan_at": self._last_scan_at,
             "tracked": tracked,
+            "pending_entries": self.executor.pending_snapshot(),
         }
