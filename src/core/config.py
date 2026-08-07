@@ -152,6 +152,10 @@ class Settings(BaseSettings):
     scalper_c_allowed_regimes: str = "UP,DOWN,RANGE"  # deney: "RANGE" ile sınırla
     scalper_d_use_eqhl: bool = True              # D süpürmesi EQH/EQL kümelerine bağlı
     scalper_eqhl_tolerance_pct: float = 0.05     # pivot eşitlik eşiği (%)
+    # İşlem başına MARJ tavanı (kasanın %'si). Risk tavanının (%2) ÜSTÜNE
+    # ikinci bir sınır: pozisyonun kilitlediği marj bunu aşamaz. Böylece aynı
+    # anda birden çok işleme yer kalır ve likidasyon mesafesi hep uzak olur.
+    scalper_max_margin_pct: float = 10.0
 
     @property
     def is_production(self) -> bool:

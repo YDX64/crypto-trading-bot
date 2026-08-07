@@ -195,7 +195,11 @@ class ScalpExecutor:
         risk_amount = balance * (self.cfg.scalper_risk_percentage / 100.0) * signal.risk_multiplier
         qty = risk_amount / price_distance
 
-        nominal_cap = balance * self.cfg.scalper_leverage * 0.5
+        # Marj tavanı: pozisyon marjı kasanın scalper_max_margin_pct'sini aşamaz
+        # (nominal = marj × kaldıraç). getattr: eski sahte-cfg testleri alan
+        # tanımlamaz — onlarda tarihsel %50 davranışı korunur.
+        margin_pct = getattr(self.cfg, "scalper_max_margin_pct", 50.0) / 100.0
+        nominal_cap = balance * self.cfg.scalper_leverage * margin_pct
         nominal = qty * entry_hint
         if nominal > nominal_cap and entry_hint > 0:
             qty = nominal_cap / entry_hint

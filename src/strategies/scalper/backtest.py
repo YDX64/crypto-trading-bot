@@ -384,7 +384,8 @@ def open_position(
     qty = risk_amount / price_distance
 
     leverage = cfg.scalper_leverage
-    nominal_cap = balance * leverage * 0.5
+    margin_pct = getattr(cfg, "scalper_max_margin_pct", 50.0) / 100.0
+    nominal_cap = balance * leverage * margin_pct
     nominal = qty * entry_hint
     if nominal > nominal_cap and entry_hint > 0:
         qty = nominal_cap / entry_hint
