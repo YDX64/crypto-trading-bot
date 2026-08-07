@@ -14,6 +14,7 @@ bağımlıdır. Strateji sınıflarının evaluate() metodları hiçbir IO/log
 
 from __future__ import annotations
 
+from src.core.config import settings
 from src.core.logger import app_logger
 from src.strategies.scalper.indicators import (
     bearish_divergence,
@@ -21,6 +22,7 @@ from src.strategies.scalper.indicators import (
     bullish_divergence,
     cmf,
     donchian,
+    equilibrium,
     find_fvg,
     find_order_block,
     last_swing_high,
@@ -38,6 +40,32 @@ from src.strategies.scalper.types import (
     StrategyContext,
     StrategyProtocol,
 )
+
+
+def passes_equilibrium(ctx: StrategyContext, direction: Direction, enabled: bool) -> bool:
+    """Ortak equilibrium (dealing range %50) kapısı.
+
+    Denge noktası 15m yapısından (ctx.candles_15m) hesaplanır: B'nin zaten
+    kullandığı "5m tetikler, 15m bağlam onaylar" örüntüsünün aynısı —
+    makro premium/discount yanlılığı üst zaman diliminden, giriş zamanlaması
+    5m'den gelir. Bu ayrım özellikle D için önemlidir: D'nin kendi girişi
+    genelde sert bir dönüş mumuyla tetiklenir ve bu mum kaçınılmaz olarak
+    kendi 5m aralığının dışına taşar — equilibrium'u 5m'den hesaplamak
+    stratejiyi kendi kuyruğunu kovalar hale getirirdi.
+
+    enabled=False -> her zaman True (kapı devre dışı). Denge noktası
+    hesaplanamıyorsa (eq=None, yani veri yetersizse) True — veri yokluğu
+    işlemi ENGELLEMEZ. LONG yalnız discount bölgesinde (fiyat < eq), SHORT
+    yalnız premium bölgesinde (fiyat > eq) geçer.
+    """
+    if not enabled:
+        return True
+    eq = equilibrium(ctx.candles_15m)
+    if eq is None:
+        return True
+    if direction == Direction.LONG:
+        return ctx.current_price < eq
+    return ctx.current_price > eq
 
 
 class StrategyA(StrategyProtocol):
@@ -113,6 +141,9 @@ class StrategyA(StrategyProtocol):
                 f"{vol_ratio:.1f}x hacim"
             )
             direction = Direction.SHORT
+
+        if not passes_equilibrium(ctx, direction, settings.scalper_use_equilibrium_filter):
+            return None
 
         return ScalpSignal(
             strategy=self.name,
@@ -232,6 +263,9 @@ class StrategyB(StrategyProtocol):
             )
             direction = Direction.SHORT
 
+        if not passes_equilibrium(ctx, direction, settings.scalper_use_equilibrium_filter):
+            return None
+
         return ScalpSignal(
             strategy=self.name,
             symbol=ctx.symbol,
@@ -296,6 +330,8 @@ class StrategyC(StrategyProtocol):
             stop_price = min(c.low for c in lookback_window) * (1.0 - self._STOP_BUFFER)
             if stop_price >= ctx.current_price:
                 return None
+            if not passes_equilibrium(ctx, Direction.LONG, settings.scalper_use_equilibrium_filter):
+                return None
 
             score = (self._RSI_LONG_MAX - rsi_last) + max(0.0, lower - last.close) / atr_5m
             return ScalpSignal(
@@ -317,6 +353,8 @@ class StrategyC(StrategyProtocol):
             lookback_window = candles_5m[-self._STOP_LOOKBACK:]
             stop_price = max(c.high for c in lookback_window) * (1.0 + self._STOP_BUFFER)
             if stop_price <= ctx.current_price:
+                return None
+            if not passes_equilibrium(ctx, Direction.SHORT, settings.scalper_use_equilibrium_filter):
                 return None
 
             score = (rsi_last - self._RSI_SHORT_MIN) + max(0.0, last.close - upper) / atr_5m
@@ -426,6 +464,8 @@ class StrategyD(StrategyProtocol):
         stop_price = sweep_low * self._STOP_MULT_LONG
         if stop_price >= price:
             return None
+        if not passes_equilibrium(ctx, Direction.LONG, settings.scalper_use_equilibrium_filter):
+            return None
 
         confirm_labels = []
         if choch:
@@ -480,6 +520,8 @@ class StrategyD(StrategyProtocol):
         sweep_high = max(c.high for c in candles_5m[-3:])
         stop_price = sweep_high * self._STOP_MULT_SHORT
         if stop_price <= price:
+            return None
+        if not passes_equilibrium(ctx, Direction.SHORT, settings.scalper_use_equilibrium_filter):
             return None
 
         confirm_labels = []

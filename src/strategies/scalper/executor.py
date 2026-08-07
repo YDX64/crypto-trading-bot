@@ -9,14 +9,15 @@ kurar. Hiçbir güvenlik deseni burada yeniden yazılmaz.
 Akış (try_open):
   1. Bakiye sorgusu (None/<=0 → vazgeç)
   2. Stop mesafesi risk kapısı ([min_stop_pct, max_stop_pct])
-  3. Risk bazlı boyutlama + nominal tavan kırpma
-  4. Yuvarlama + borsa filtresi doğrulaması
-  5. Margin type + leverage (emirden ÖNCE — hata zararsız)
-  6. Market emri (bu noktadan sonra pozisyon GERÇEK olabilir)
-  7. Gerçek dolum çözümü (pm.resolve_fill)
-  8. Stop-loss (pm.place_stop_loss_or_close — başarısızsa pozisyon zaten kapatıldı)
-  9. TP1/TP2 merdiveni (başarısızlık pozisyonu iptal ettirmez — SL var)
- 10. PositionModel + DB kaydı + tracker + ExitPlan
+  3. R:R kapısı (beklenen harman getiri / SL riski >= scalper_min_rr)
+  4. Risk bazlı boyutlama + nominal tavan kırpma
+  5. Yuvarlama + borsa filtresi doğrulaması
+  6. Margin type + leverage (emirden ÖNCE — hata zararsız)
+  7. Market emri (bu noktadan sonra pozisyon GERÇEK olabilir)
+  8. Gerçek dolum çözümü (pm.resolve_fill)
+  9. Stop-loss (pm.place_stop_loss_or_close — başarısızsa pozisyon zaten kapatıldı)
+ 10. TP1/TP2 merdiveni (başarısızlık pozisyonu iptal ettirmez — SL var)
+ 11. PositionModel + DB kaydı + tracker + ExitPlan
 """
 
 from __future__ import annotations
@@ -108,7 +109,35 @@ class ScalpExecutor:
             )
             return None
 
-        # --- 3. Risk bazlı boyutlama + nominal tavan ---
+        # --- 3. R:R kapısı ---
+        # Beklenen harman getiri (ROI%): tp1_roi*tp1_frac + tp2_roi*tp2_frac + tp1_roi*runner_frac
+        # (runner'ın en az TP1 kadar taşıdığı varsayımı — muhafazakâr)
+        # SL riski (ROI%): stop_distance_pct * kaldıraç
+        # rr = beklenen_getiri / sl_riski ; rr < cfg.scalper_min_rr -> None
+        # cfg.scalper_min_rr <= 0 ise kapı atlanır
+        min_rr = self.cfg.scalper_min_rr
+        if min_rr > 0:
+            tp1_frac = self.cfg.scalper_tp1_fraction
+            tp2_frac = self.cfg.scalper_tp2_fraction
+            runner_frac = max(0.0, 1.0 - tp1_frac - tp2_frac)
+            expected_roi = (
+                self.cfg.scalper_tp1_roi * tp1_frac
+                + self.cfg.scalper_tp2_roi * tp2_frac
+                + self.cfg.scalper_tp1_roi * runner_frac
+            )
+            sl_risk_roi = stop_distance_pct * self.cfg.scalper_leverage
+            if sl_risk_roi <= 0:
+                self.logger.error(f"❌ {symbol}: SL riski hesaplanamadı (sl_risk_roi<=0), sinyal atlandı")
+                return None
+            rr = expected_roi / sl_risk_roi
+            if rr < min_rr:
+                self.logger.info(
+                    f"⏭️ {symbol}: R:R yetersiz (rr={rr:.2f} < min={min_rr:.2f}, "
+                    f"beklenen_getiri=%{expected_roi:.2f}, sl_riski=%{sl_risk_roi:.2f}), sinyal atlandı"
+                )
+                return None
+
+        # --- 4. Risk bazlı boyutlama + nominal tavan ---
         price_distance = abs(entry_hint - stop_price)
         if price_distance <= 0:
             self.logger.error(f"❌ {symbol}: giriş/stop mesafesi sıfır, boyutlama yapılamıyor")
@@ -125,7 +154,7 @@ class ScalpExecutor:
                 f"✂️ {symbol}: nominal değer kırpıldı ({nominal:.2f} -> {nominal_cap:.2f} USDT tavanı)"
             )
 
-        # --- 4. Yuvarlama + borsa filtresi doğrulaması ---
+        # --- 5. Yuvarlama + borsa filtresi doğrulaması ---
         try:
             qty = await self.client.quantize_quantity(symbol, qty)
             await self.client.validate_order(symbol, qty, entry_hint)
@@ -136,7 +165,7 @@ class ScalpExecutor:
             self.logger.error(f"❌ {symbol}: boyutlama/doğrulama sırasında beklenmeyen hata ({e})")
             return None
 
-        # --- 5. Margin type + leverage (emirden ÖNCE — burada hata zararsız) ---
+        # --- 6. Margin type + leverage (emirden ÖNCE — burada hata zararsız) ---
         try:
             await self.client.set_margin_type(symbol, "ISOLATED")
             await self.client.set_leverage(symbol, self.cfg.scalper_leverage)
@@ -149,7 +178,7 @@ class ScalpExecutor:
             self.logger.error(f"❌ {symbol}: margin/leverage ayarında beklenmeyen hata ({e})")
             return None
 
-        # --- 6. Market emri: BU NOKTADAN SONRA pozisyon GERÇEK olabilir ---
+        # --- 7. Market emri: BU NOKTADAN SONRA pozisyon GERÇEK olabilir ---
         side = "BUY" if direction == Direction.LONG else "SELL"
         try:
             entry_order = await self.client.open_market_order(symbol=symbol, side=side, quantity=qty)
@@ -160,7 +189,7 @@ class ScalpExecutor:
             self.logger.error(f"❌ {symbol}: market order sırasında beklenmeyen hata ({e})")
             return None
 
-        # --- 7. Gerçek dolum çözümü ---
+        # --- 8. Gerçek dolum çözümü ---
         sl_side = "SELL" if direction == Direction.LONG else "BUY"
         try:
             entry_price, filled_qty = await self.pm.resolve_fill(symbol, entry_order)
@@ -178,7 +207,7 @@ class ScalpExecutor:
 
         self.logger.info(f"✅ Scalp dolum: {symbol} {filled_qty} @ {entry_price}")
 
-        # --- 8. Stop-loss: BAŞARISIZ OLURSA pm zaten pozisyonu acil kapattı ---
+        # --- 9. Stop-loss: BAŞARISIZ OLURSA pm zaten pozisyonu acil kapattı ---
         sl_order = await self.pm.place_stop_loss_or_close(
             symbol=symbol, sl_side=sl_side, stop_price=stop_price
         )
@@ -189,7 +218,7 @@ class ScalpExecutor:
             return None
         sl_algo_id = self._extract_id(sl_order)
 
-        # --- 9. TP merdiveni: başarısızlık pozisyonu tehlikeye atmaz (SL var) ---
+        # --- 10. TP merdiveni: başarısızlık pozisyonu tehlikeye atmaz (SL var) ---
         tp1_price = price_at_roi(entry_price, self.cfg.scalper_tp1_roi, self.cfg.scalper_leverage, direction)
         tp2_price = price_at_roi(entry_price, self.cfg.scalper_tp2_roi, self.cfg.scalper_leverage, direction)
         tp1_qty = filled_qty * self.cfg.scalper_tp1_fraction
@@ -199,7 +228,7 @@ class ScalpExecutor:
         tp1_algo_id = await self._place_tp_safely(symbol, sl_side, tp1_price, tp1_qty, "TP1")
         tp2_algo_id = await self._place_tp_safely(symbol, sl_side, tp2_price, tp2_qty, "TP2")
 
-        # --- 10. Kayıt: PositionModel + DB + tracker + ExitPlan ---
+        # --- 11. Kayıt: PositionModel + DB + tracker + ExitPlan ---
         leverage = self.cfg.scalper_leverage
         margin_usdt = (filled_qty * entry_price) / leverage if leverage else filled_qty * entry_price
 

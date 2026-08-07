@@ -142,6 +142,8 @@ class Settings(BaseSettings):
     scalper_chandelier_atr_mult: float = 2.5
     scalper_chandelier_atr_period: int = 14
     scalper_daily_loss_limit_pct: float = 15.0 # 0 = kesici kapalı
+    scalper_use_equilibrium_filter: bool = True  # LONG yalnız discount, SHORT yalnız premium
+    scalper_min_rr: float = 1.2                # beklenen harman TP getirisi / SL riski alt sınırı; 0 = kapalı
 
     @property
     def is_production(self) -> bool:

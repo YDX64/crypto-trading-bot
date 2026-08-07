@@ -17,10 +17,17 @@ from src.strategies.scalper.indicators import (
     bollinger,
     bullish_divergence,
     chandelier_stop,
+    cmf,
     donchian,
     ema,
+    equilibrium,
+    find_fvg,
+    find_order_block,
     last_swing_high,
     last_swing_low,
+    liquidity_sweep,
+    market_structure,
+    mfi_series,
     rsi_series,
     swing_points,
 )
@@ -420,3 +427,335 @@ class TestChandelierStop:
 
     def test_empty_candles_returns_zero(self):
         assert chandelier_stop([], Direction.LONG) == 0.0
+
+
+# --------------------------------------------------------------------------
+# Smart Money Concepts indikatörleri için yardımcılar
+# --------------------------------------------------------------------------
+
+def _mk_ohlc(i: int, open_: float, high: float, low: float, close: float,
+             volume: float = 1.0) -> Candle:
+    """open != close olabilen (kırmızı/yeşil mum ayrımı gereken testler
+    için) sentetik mum üretir."""
+    return Candle(
+        open_time=i, open=open_, high=high, low=low, close=close,
+        volume=volume, close_time=i,
+    )
+
+
+# --------------------------------------------------------------------------
+# mfi_series
+# --------------------------------------------------------------------------
+
+class TestMfiSeries:
+    def test_known_values_period_2(self):
+        # typical=H=L=C=fiyat (tek nokta), volume=1 -> raw_flow=fiyat
+        # fiyatlar: [10,12,11,13,9,14]
+        # pos_flow=[0,12,0,13,0,14] neg_flow=[0,0,11,0,9,0]
+        # i=2: pos(1..2)=12 neg=11 -> MFI=100-100/(1+12/11)=52.1739...
+        # i=3: pos(2..3)=13 neg=11 -> 54.1667 | i=4: pos=13 neg=9 -> 59.0909
+        # i=5: pos=14 neg=9 -> 60.8696
+        prices = [10.0, 12.0, 11.0, 13.0, 9.0, 14.0]
+        candles = [_mk_candle(i, p, p, p) for i, p in enumerate(prices)]
+        result = mfi_series(candles, period=2)
+        assert result[0] == pytest.approx(50.0)
+        assert result[1] == pytest.approx(50.0)
+        assert result[2] == pytest.approx(52.17391304, abs=1e-6)
+        assert result[3] == pytest.approx(54.16666667, abs=1e-6)
+        assert result[4] == pytest.approx(59.09090909, abs=1e-6)
+        assert result[5] == pytest.approx(60.86956522, abs=1e-6)
+
+    def test_same_length_as_input(self):
+        prices = [float(i) for i in range(30)]
+        candles = [_mk_candle(i, p, p, p) for i, p in enumerate(prices)]
+        assert len(mfi_series(candles, period=14)) == len(candles)
+
+    def test_negative_flow_zero_gives_100(self):
+        # yalnız artan typical fiyat -> hiç negatif akış yok -> MFI=100
+        prices = [100.0 + i for i in range(20)]
+        candles = [_mk_candle(i, p, p, p) for i, p in enumerate(prices)]
+        result = mfi_series(candles, period=14)
+        for v in result[14:]:
+            assert v == pytest.approx(100.0)
+
+    def test_insufficient_data_all_neutral(self):
+        candles = [_mk_candle(i, 10.0 + i, 10.0 + i, 10.0 + i) for i in range(3)]
+        assert mfi_series(candles, period=14) == [50.0, 50.0, 50.0]
+
+    def test_empty_input(self):
+        assert mfi_series([], period=14) == []
+
+
+# --------------------------------------------------------------------------
+# cmf
+# --------------------------------------------------------------------------
+
+class TestCmf:
+    def test_known_value(self):
+        # c1: H=12 L=8 C=10 V=100 -> mult=((10-8)-(12-10))/4=0 -> mfv=0
+        # c2: H=15 L=10 C=14 V=200 -> mult=((14-10)-(15-14))/5=0.6 -> mfv=120
+        # c3: H=20 L=15 C=16 V=150 -> mult=((16-15)-(20-16))/5=-0.6 -> mfv=-90
+        # cmf=(0+120-90)/(100+200+150)=30/450=0.0666...
+        c1 = _mk_ohlc(0, 9, 12, 8, 10, volume=100)
+        c2 = _mk_ohlc(1, 12, 15, 10, 14, volume=200)
+        c3 = _mk_ohlc(2, 18, 20, 15, 16, volume=150)
+        assert cmf([c1, c2, c3], period=3) == pytest.approx(0.06666667, abs=1e-6)
+
+    def test_doji_zero_range_gives_zero_multiplier(self):
+        c = _mk_ohlc(0, 10, 10, 10, 10, volume=50)
+        assert cmf([c, c, c], period=3) == pytest.approx(0.0)
+
+    def test_insufficient_data_returns_zero(self):
+        c1 = _mk_ohlc(0, 9, 12, 8, 10, volume=100)
+        c2 = _mk_ohlc(1, 12, 15, 10, 14, volume=200)
+        assert cmf([c1, c2], period=3) == 0.0
+
+    def test_empty_input_returns_zero(self):
+        assert cmf([], period=20) == 0.0
+
+
+# --------------------------------------------------------------------------
+# market_structure
+# --------------------------------------------------------------------------
+
+class TestMarketStructure:
+    def test_bull_trend_and_bos(self):
+        # swing highs (left=1,right=1): idx2=12, idx4=14 (HH); swing lows:
+        # idx1=6->? aslında lows dizisi: idx1,3,5 -> low=6,7,9? kontrol
+        # aşağıdaki mumlarla: highs=[10,6,12,7,14,9,11] lows=[8,4,9,5,11,6,8]
+        # swing highs: idx2(12>6,12>7)=True idx4(14>7,14>9)=True -> [2,4]
+        # swing lows: idx1(4<8,4<9)=True idx3(5<9,5<11)=True idx5(6<11,6<8)=True
+        # -> lows=[1,3,5] son iki: low[3]=5, low[5]=6 -> higher low (6>5)
+        # trend=bull (HH: 14>12, HL: 6>5)
+        highs = [10, 6, 12, 7, 14, 9, 11]
+        lows = [8, 4, 9, 5, 11, 6, 8]
+        candles = [_mk_candle(i, h, l) for i, (h, l) in enumerate(zip(highs, lows))]
+        # son mum: son swing-high(14) üzerine kapanış -> trend bull iken BOS
+        candles.append(_mk_candle(7, 17.0, 13.0, 16.0))
+        result = market_structure(candles, left=1, right=1)
+        assert result["trend"] == "bull"
+        assert result["last_event"] == "BOS"
+        assert result["event_index"] == 7
+
+    def test_bear_trend_and_choch(self):
+        highs = [14, 9, 12, 7, 10, 6, 8]
+        lows = [11, 6, 9, 5, 8, 4, 6]
+        candles = [_mk_candle(i, h, l) for i, (h, l) in enumerate(zip(highs, lows))]
+        # son mum: bear trendde son swing-high(10) üzerine kırılım -> CHOCH
+        candles.append(_mk_candle(7, 13.0, 9.0, 12.0))
+        result = market_structure(candles, left=1, right=1)
+        assert result["trend"] == "bear"
+        assert result["last_event"] == "CHOCH"
+        assert result["event_index"] == 7
+
+    def test_mixed_structure_trend_none(self):
+        # HH (12->14) ama LL (5->3) -> karışık, trend None, olay yok
+        highs = [10, 6, 12, 7, 14, 9, 11]
+        lows = [8, 4, 9, 5, 11, 3, 8]
+        candles = [_mk_candle(i, h, l) for i, (h, l) in enumerate(zip(highs, lows))]
+        result = market_structure(candles, left=1, right=1)
+        assert result["trend"] is None
+        assert result["last_event"] is None
+        assert result["event_index"] is None
+
+    def test_insufficient_data_returns_all_none(self):
+        candles = _mk_candles([10, 11, 12], [5, 6, 7])
+        result = market_structure(candles, left=3, right=3)
+        assert result == {"trend": None, "last_event": None, "event_index": None}
+
+
+# --------------------------------------------------------------------------
+# liquidity_sweep
+# --------------------------------------------------------------------------
+
+class TestLiquiditySweep:
+    def test_low_sweep_detected(self):
+        # swing-low idx1 (low=5, komşular 8 ve 7). Son mum(idx4): low=4.5
+        # (5'in altına sarkıyor) ama close=6 (5'in üstünde kalıyor) -> 'low'
+        c0 = _mk_candle(0, 10, 8)
+        c1 = _mk_candle(1, 9, 5)
+        c2 = _mk_candle(2, 10, 7)
+        c3 = _mk_candle(3, 9, 6)
+        c4 = _mk_candle(4, 8, 4.5, 6.0)
+        result = liquidity_sweep([c0, c1, c2, c3, c4], left=1, right=1, lookback=10)
+        assert result == "low"
+
+    def test_no_sweep_on_real_breakdown(self):
+        # aynı kurulum ama son mumun kapanışı da 5'in altında -> gerçek
+        # kırılım, süpürme değil -> None
+        c0 = _mk_candle(0, 10, 8)
+        c1 = _mk_candle(1, 9, 5)
+        c2 = _mk_candle(2, 10, 7)
+        c3 = _mk_candle(3, 9, 6)
+        c4 = _mk_candle(4, 8, 4.5, 4.0)
+        result = liquidity_sweep([c0, c1, c2, c3, c4], left=1, right=1, lookback=10)
+        assert result is None
+
+    def test_high_sweep_detected(self):
+        # swing-high idx1 (high=15). Son mum(idx4): high=16 (15'in üstüne
+        # sarkıyor) ama close=13 (15'in altında kalıyor) -> 'high'
+        h0 = _mk_candle(0, 12, 10)
+        h1 = _mk_candle(1, 15, 11)
+        h2 = _mk_candle(2, 13, 9)
+        h3 = _mk_candle(3, 14, 10)
+        h4 = _mk_candle(4, 16, 12, 13.0)
+        result = liquidity_sweep([h0, h1, h2, h3, h4], left=1, right=1, lookback=10)
+        assert result == "high"
+
+    def test_no_swing_returns_none(self):
+        candles = _mk_candles([10, 11, 12], [5, 6, 7])
+        assert liquidity_sweep(candles, left=3, right=3, lookback=30) is None
+
+
+# --------------------------------------------------------------------------
+# find_fvg
+# --------------------------------------------------------------------------
+
+class TestFindFvg:
+    def test_bull_gap_unfilled(self):
+        # mum[0].high=10 < mum[2].low=13 -> boğa FVG, index=1
+        candles = [
+            _mk_ohlc(0, 9, 10, 8, 9),
+            _mk_ohlc(1, 10, 11, 9, 10),
+            _mk_ohlc(2, 14, 15, 13, 14),
+        ]
+        gaps = find_fvg(candles, lookback=10)
+        assert gaps == [{"top": 13, "bottom": 10, "index": 1,
+                          "direction": "bull", "filled": False}]
+
+    def test_bull_gap_filled(self):
+        candles = [
+            _mk_ohlc(0, 9, 10, 8, 9),
+            _mk_ohlc(1, 10, 11, 9, 10),
+            _mk_ohlc(2, 14, 15, 13, 14),
+            _mk_ohlc(3, 13, 13.5, 9, 12),  # low=9 <= bottom(10) -> doldu
+        ]
+        gaps = find_fvg(candles, lookback=10)
+        assert len(gaps) == 1
+        assert gaps[0]["filled"] is True
+
+    def test_bear_gap_unfilled(self):
+        # mum[0].low=13 > mum[2].high=10 -> ayı FVG, index=1
+        candles = [
+            _mk_ohlc(0, 14, 15, 13, 14),
+            _mk_ohlc(1, 13, 14, 12, 13),
+            _mk_ohlc(2, 9, 10, 8, 9),
+        ]
+        gaps = find_fvg(candles, lookback=10)
+        assert gaps == [{"top": 13, "bottom": 10, "index": 1,
+                          "direction": "bear", "filled": False}]
+
+    def test_unfilled_gaps_sorted_first(self):
+        # index=1'deki boğa FVG sonradan dolar (idx3); index=4'teki boğa
+        # FVG sonuna kadar dolmaz. Kronolojik sıraya rağmen dolmamış olan
+        # (index=4) listede ÖNCE gelmeli.
+        candles = [
+            _mk_ohlc(0, 9, 10, 8, 9),
+            _mk_ohlc(1, 10, 11, 9, 10),
+            _mk_ohlc(2, 14, 15, 13, 14),
+            _mk_ohlc(3, 8, 9, 7, 8),
+            _mk_ohlc(4, 12, 14, 10, 12),
+            _mk_ohlc(5, 19, 20, 17, 19),
+        ]
+        gaps = find_fvg(candles, lookback=10)
+        assert [g["index"] for g in gaps] == [4, 1]
+        assert gaps[0]["filled"] is False
+        assert gaps[1]["filled"] is True
+
+    def test_no_gap_returns_empty(self):
+        candles = _mk_candles([10, 11, 12], [5, 6, 7])
+        assert find_fvg(candles, lookback=10) == []
+
+
+# --------------------------------------------------------------------------
+# find_order_block
+# --------------------------------------------------------------------------
+
+class TestFindOrderBlock:
+    def test_long_order_block_found(self):
+        # OB: kırmızı mum (open=100,close=95). Sonraki 3 mum toplam gövde
+        # 17 (>2*5=10) ve son kapanış(112) OB high(101) üzerinde -> impuls
+        # onaylı.
+        candles = [
+            _mk_ohlc(0, 100, 101, 94, 95),
+            _mk_ohlc(1, 95, 100.5, 94.5, 100),
+            _mk_ohlc(2, 100, 105.5, 99.5, 105),
+            _mk_ohlc(3, 105, 112.5, 104.5, 112),
+        ]
+        result = find_order_block(candles, Direction.LONG, lookback=40)
+        assert result == {"low": 94, "high": 101, "index": 0}
+
+    def test_long_order_block_none_when_impulse_too_small(self):
+        candles = [
+            _mk_ohlc(0, 100, 101, 94, 95),
+            _mk_ohlc(1, 95, 96.5, 94.5, 96),
+            _mk_ohlc(2, 96, 97.5, 95.5, 97),
+            _mk_ohlc(3, 97, 98.5, 96.5, 98),
+        ]
+        assert find_order_block(candles, Direction.LONG, lookback=40) is None
+
+    def test_short_order_block_found(self):
+        # OB: yeşil mum (open=100,close=105). Sonraki 3 mum aşağı impuls,
+        # son kapanış(88) OB low(99) altında -> onaylı.
+        candles = [
+            _mk_ohlc(0, 100, 106, 99, 105),
+            _mk_ohlc(1, 105, 105.5, 99.5, 100),
+            _mk_ohlc(2, 100, 100.5, 94.5, 95),
+            _mk_ohlc(3, 95, 95.5, 87.5, 88),
+        ]
+        result = find_order_block(candles, Direction.SHORT, lookback=40)
+        assert result == {"low": 99, "high": 106, "index": 0}
+
+    def test_returns_most_recent_match(self):
+        # iki bağımsız OB adayı var (idx0 ve idx4); ikisi de koşulu
+        # sağlıyor. En son (en yeni) olan idx4 döner.
+        candles = [
+            _mk_ohlc(0, 100, 101, 94, 95),
+            _mk_ohlc(1, 95, 100.5, 94.5, 100),
+            _mk_ohlc(2, 100, 105.5, 99.5, 105),
+            _mk_ohlc(3, 105, 112.5, 104.5, 112),
+            _mk_ohlc(4, 200, 202, 188, 190),
+            _mk_ohlc(5, 190, 206, 189, 205),
+            _mk_ohlc(6, 205, 221, 204, 220),
+            _mk_ohlc(7, 220, 241, 219, 240),
+        ]
+        result = find_order_block(candles, Direction.LONG, lookback=40)
+        assert result == {"low": 188, "high": 202, "index": 4}
+
+    def test_insufficient_data_returns_none(self):
+        candles = _mk_candles([10, 11, 12], [5, 6, 7])
+        assert find_order_block(candles, Direction.LONG, lookback=40) is None
+
+
+# --------------------------------------------------------------------------
+# equilibrium
+# --------------------------------------------------------------------------
+
+class TestEquilibrium:
+    def test_known_midpoint_from_last_swings(self):
+        # left=1,right=1, valid i in [1,7].
+        # highs: swing yükseklikler idx2(20) ve idx6(15) -> son swing-high=15
+        # lows: swing dipler idx4(1) ve idx7(3) -> son swing-low=3
+        # eq = (15+3)/2 = 9.0
+        highs = [10, 10, 20, 10, 10, 10, 15, 10, 10]
+        lows = [5, 5, 5, 5, 1, 5, 5, 3, 5]
+        candles = _mk_candles(highs, lows)
+        assert equilibrium(candles, left=1, right=1) == pytest.approx(9.0)
+
+    def test_none_when_no_swing_high(self):
+        # sabit high -> hiçbir swing-high üretilmez (swing-low'lar mevcut olsa da)
+        lows = [10, 8, 10, 6, 10, 8, 10]
+        highs = [20] * len(lows)
+        candles = _mk_candles(highs, lows)
+        assert equilibrium(candles, left=1, right=1) is None
+
+    def test_none_when_no_swing_low(self):
+        # sabit low -> hiçbir swing-low üretilmez (swing-high'lar mevcut olsa da)
+        highs = [5, 10, 5, 12, 5, 10, 5]
+        lows = [1] * len(highs)
+        candles = _mk_candles(highs, lows)
+        assert equilibrium(candles, left=1, right=1) is None
+
+    def test_none_when_insufficient_data(self):
+        candles = _mk_candles([10, 11, 12], [5, 6, 7])
+        assert equilibrium(candles) is None

@@ -546,6 +546,23 @@ def find_fvg(candles: list[Candle], lookback: int = 50) -> list[dict]:
     return gaps
 
 
+def equilibrium(candles: list[Candle], left: int = 3, right: int = 3) -> float | None:
+    """Son anlamlı dealing range'in orta noktası (ICT %50 seviyesi).
+
+    swing_points ile bulunan en son swing-high ve en son swing-low FİYATLARI
+    kullanılır (hangisi kronolojik olarak daha yeni olursa olsun ikisi de
+    gereklidir — biri eksikse aralık tanımsızdır). eq = (son_swing_high +
+    son_swing_low) / 2. Ya swing-high ya da swing-low bulunamazsa None.
+    """
+    highs_idx, lows_idx = swing_points(candles, left, right)
+    if not highs_idx or not lows_idx:
+        return None
+
+    last_high = candles[highs_idx[-1]].high
+    last_low = candles[lows_idx[-1]].low
+    return (last_high + last_low) / 2.0
+
+
 def find_order_block(candles: list[Candle], direction: Direction,
                       lookback: int = 40) -> dict | None:
     """Basitleştirilmiş order block (kurumsal emir bloğu) tespiti.
