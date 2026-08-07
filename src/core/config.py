@@ -3,39 +3,64 @@ Konfigürasyon yönetimi modülü.
 Tüm environment variables ve uygulama ayarları burada yönetilir.
 """
 
+import sys
+import warnings
 from typing import Optional
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+# Bilinen Binance testnet host'ları. Sadece "testnet" alt string'ine değil,
+# gerçek host isimlerine bakarak kontrol ediyoruz (daha sağlam).
+TESTNET_HOSTS = (
+    "testnet.binancefuture.com",  # Binance Futures testnet (klasik adres)
+    "demo-fapi.binance.com",      # AYNI hesabın yeni REST adresi ("Demo Trading")
+    "demo.binance.com",           # Demo Trading web arayüzü ile aynı alan adı
+    "testnet.binance.vision",     # Binance Spot testnet
+)
+# NOT: testnet.binancefuture.com ile demo-fapi.binance.com AYNI hesabı gösterir
+# (2026-08-06'da aynı API anahtarıyla doğrulandı: iki adreste de birebir aynı
+# bakiye ve pozisyonlar). Binance testnet'i "Demo Trading" olarak yeniden
+# markaladı; demo.binance.com bunun web arayüzüdür.
 
 
 class Settings(BaseSettings):
     """Uygulama ayarları"""
-    
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False
     )
-    
+
     # Binance Configuration
-    binance_api_key: str
-    binance_api_secret: str
-    binance_base_url: str = "https://fapi.binance.com"
-    
+    # GÜVENLİK: repr=False — pydantic'in varsayılan repr'i tüm alanları basar ve
+    # herhangi bir traceback / log satırı / CI çıktısı anahtarları sızdırır.
+    binance_api_key: str = Field(repr=False)
+    binance_api_secret: str = Field(repr=False)
+    # GÜVENLİK: Varsayılan olarak TESTNET kullanılır. Gerçek parayla (mainnet)
+    # işlem yapmak BİLİNÇLİ bir tercih olmalı — bkz. allow_mainnet ve
+    # _validate_binance_environment.
+    binance_base_url: str = "https://testnet.binancefuture.com"
+    # Gerçek parayla (mainnet) işlem yapmak için açık onay. Varsayılan False.
+    # binance_base_url mainnet'i gösteriyorsa ve bu False ise Settings() hata verir.
+    allow_mainnet: bool = False
+
     # Telegram Configuration
-    telegram_bot_token: str
+    telegram_bot_token: str = Field(repr=False)
     telegram_chat_id: str
     telegram_vip_channel_id: Optional[str] = None
     
     # OpenAI Configuration
-    openai_api_key: str
+    openai_api_key: str = Field(repr=False)
     openai_model: str = "gpt-4o"
     
     # Gemini (Fallback)
-    gemini_api_key: str
+    gemini_api_key: str = Field(repr=False)
     gemini_model: str = "gemini-2.0-flash-exp"
 
     # DeepSeek Configuration
-    deepseek_api_key: str
+    deepseek_api_key: str = Field(repr=False)
     deepseek_model: str = "deepseek-reasoner"
     deepseek_base_url: str = "https://api.deepseek.com"
     
@@ -66,8 +91,8 @@ class Settings(BaseSettings):
     api_port: int = 8000
     
     # Security
-    jwt_secret: str
-    api_key: Optional[str] = None
+    jwt_secret: str = Field(repr=False)
+    api_key: Optional[str] = Field(default=None, repr=False)
     
     # Monitoring
     enable_metrics: bool = True
@@ -98,16 +123,92 @@ class Settings(BaseSettings):
     # Entry Conditions
     waiting_mode_min_conditions: int = 2
     waiting_mode_price_improvement: float = 0.5
-    
+
+    # Scalper
+    scalper_enabled: bool = True
+    scalper_strategies: str = "A,B,C,D"        # virgülle: hangi varyantlar aktif
+    scalper_top_n: int = 12
+    scalper_scan_interval_seconds: int = 30
+    scalper_leverage: int = 20
+    scalper_risk_percentage: float = 2.0       # işlem başına bakiye riski (C yarısını kullanır)
+    scalper_max_positions: int = 3
+    scalper_tp1_roi: float = 20.0              # %ROI — 20x'te %1 fiyat
+    scalper_tp1_fraction: float = 0.40
+    scalper_tp2_roi: float = 50.0
+    scalper_tp2_fraction: float = 0.30
+    scalper_min_stop_pct: float = 0.15         # fiyat mesafesi sınırları
+    scalper_max_stop_pct: float = 3.0
+    scalper_breakeven_buffer_pct: float = 0.05
+    scalper_chandelier_atr_mult: float = 2.5
+    scalper_chandelier_atr_period: int = 14
+    scalper_daily_loss_limit_pct: float = 15.0 # 0 = kesici kapalı
+
     @property
     def is_production(self) -> bool:
         """Production ortamında mı?"""
         return self.app_env.lower() == "production"
-    
+
     @property
     def is_testnet(self) -> bool:
-        """Testnet kullanılıyor mu?"""
-        return "testnet" in self.binance_base_url.lower()
+        """
+        Testnet kullanılıyor mu?
+        Sadece "testnet" alt string'ine değil, bilinen testnet host'larına
+        (TESTNET_HOSTS) bakarak kontrol eder. Böylece "testnet" geçen ama
+        gerçek bir testnet host'u olmayan URL'ler yanlışlıkla testnet
+        sayılmaz.
+        """
+        base_url_lower = self.binance_base_url.lower()
+        return any(host in base_url_lower for host in TESTNET_HOSTS)
+
+    @model_validator(mode="after")
+    def _validate_binance_environment(self) -> "Settings":
+        """
+        GÜVENLİK KONTROLÜ: Gerçek parayla (mainnet) yanlışlıkla işlem
+        açılmasını engeller.
+
+        1) binance_base_url mainnet'i (bilinen bir testnet host'u DEĞİLSE)
+           gösteriyorsa VE allow_mainnet False ise -> ValueError fırlatılır.
+           Bot yanlışlıkla veya .env bozulduğunda sessizce gerçek parayla
+           işlem açamaz.
+        2) app_env "production" DEĞİLKEN binance_base_url mainnet'i
+           gösteriyorsa (allow_mainnet=True ile bilinçli olarak izin
+           verilmiş olsa bile) yüksek sesle uyarı basılır — geliştirme/test
+           ortamında gerçek parayla işlem açma riskine dikkat çekmek için.
+        """
+        if not self.is_testnet:
+            # binance_base_url bilinen bir testnet host'u değil -> mainnet
+            # veya bilinmeyen/özel bir host. Güvenlik açısından mainnet
+            # gibi ele alınır.
+            if not self.allow_mainnet:
+                raise ValueError(
+                    "GÜVENLİK HATASI: BINANCE_BASE_URL gerçek parayla işlem yapılan "
+                    f"MAINNET'i gösteriyor ({self.binance_base_url}) ama bu bilinçli "
+                    "olarak onaylanmadı. Gerçek parayla işlem için ALLOW_MAINNET=true "
+                    "ayarlayın. Testnet kullanmak istiyorsanız BINANCE_BASE_URL="
+                    "https://testnet.binancefuture.com olarak ayarlayın."
+                )
+
+            if not self.is_production:
+                warning_message = (
+                    "\n"
+                    + "!" * 70 + "\n"
+                    "UYARI: GERÇEK PARAYLA (MAINNET) İŞLEM YAPILANDIRMASI "
+                    "PRODUCTION OLMAYAN BİR ORTAMDA AKTİF!\n"
+                    f"  APP_ENV        = '{self.app_env}' (production değil)\n"
+                    f"  BINANCE_BASE_URL = '{self.binance_base_url}' (mainnet)\n"
+                    f"  ALLOW_MAINNET  = True\n"
+                    "Bu, geliştirme/test sırasında yanlışlıkla gerçek parayla işlem "
+                    "açma riski taşır. Emin değilseniz BINANCE_BASE_URL'i testnet'e "
+                    "çevirin veya APP_ENV=production yapın.\n"
+                    + "!" * 70
+                )
+                warnings.warn(warning_message, UserWarning, stacklevel=2)
+                # loguru henüz yapılandırılmamış olabilir (circular import
+                # riski nedeniyle burada app_logger kullanılmıyor); bu yüzden
+                # ayrıca stderr'e de basılıyor ki mutlaka görülsün.
+                print(warning_message, file=sys.stderr)
+
+        return self
 
 
 # Global settings instance

@@ -59,6 +59,7 @@ async def init_db():
     from src.models.signal import SignalModel
     from src.models.position import PositionModel
     from src.models.waiting_signal import WaitingSignalModel, IndicatorSnapshot, WaitingModeConfig
+    from src.models.scalp_trade import ScalpTradeModel
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

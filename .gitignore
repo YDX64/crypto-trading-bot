@@ -28,6 +28,7 @@ MANIFEST
 
 # Virtual Environment
 venv/
+.venv/
 ENV/
 env/
 
@@ -69,3 +70,7 @@ docker-compose.override.yml
 
 # N8N Workflows (optional backup files)
 *.json
+
+# .env yedekleri (anahtar icerir)
+.env.bak*
+nohup.out

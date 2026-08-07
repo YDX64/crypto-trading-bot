@@ -4,6 +4,8 @@ VIP kanallardan gelen sinyalleri yakalar ve orchestrator'a gönderir.
 """
 
 import asyncio
+from typing import Optional
+
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -24,11 +26,19 @@ from src.core.database import AsyncSessionLocal, get_db
 class TelegramBotService:
     """Telegram bot servisi"""
     
-    def __init__(self):
+    def __init__(self, orchestrator: Optional[TradingOrchestrator] = None):
+        """
+        Args:
+            orchestrator: Paylaşılan orchestrator. Verilmezse yeni bir tane
+                oluşturulur. UYGULAMADA MUTLAKA PAYLAŞILAN ÖRNEK VERİLMELİDİR:
+                iki ayrı orchestrator olursa sinyali işleyen örneğin izleme
+                döngüsü çalışmaz, izleme döngüsü çalışan örneğin de pozisyonu
+                olmaz — trailing stop ve break-even hiç devreye girmez.
+        """
         self.token = settings.telegram_bot_token
         self.chat_id = settings.telegram_chat_id
         self.logger = app_logger
-        self.orchestrator = TradingOrchestrator()
+        self.orchestrator = orchestrator or TradingOrchestrator()
         self.signal_queue = SignalQueue()
         self.parser = TelegramSignalParser()
         self.app = None

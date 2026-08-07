@@ -16,6 +16,15 @@ from src.core.logger import app_logger
 from src.core.rate_limiter import rate_limiter
 
 
+class AIAnalysisError(Exception):
+    """
+    Bir AI analizinin (DeepSeek + Gemini fallback ikisi de) tamamen başarısız
+    olduğunu belirtir. Bu, ASLA sahte bir BULLISH/BEARISH oyu olarak sayılmamalıdır -
+    bu güvenlik kapısı fail-open değil fail-closed davranmalıdır.
+    """
+    pass
+
+
 class AIAnalyzer:
     """DeepSeek Reasoner powered sinyal analiz motoru"""
 
@@ -46,34 +55,77 @@ class AIAnalyzer:
         """
         self.logger.info(f"🤖 DeepSeek AI analizi başlatılıyor: {signal.symbol} {signal.direction}")
 
-        # 3 farklı analizi SIRALIOLARAK çalıştır
+        # 3 farklı analizi SIRALIOLARAK çalıştır.
+        # Her analiz bağımsız olarak başarısız olabilir (AIAnalysisError) - bu durumda
+        # o analiz oy vermez ve boş metin olarak işaretlenir, GÜVENLİK KAPISI hiçbir zaman
+        # sahte bir oyla atlanamaz.
+        failed_analyses = []
+
         self.logger.debug("Analiz 1/3: Technical Analysis")
-        analysis_1 = await self._technical_analysis(signal)
+        try:
+            analysis_1 = await self._technical_analysis(signal)
+        except AIAnalysisError as e:
+            self.logger.error(f"❌ Technical Analysis tamamen başarısız oldu: {e}")
+            analysis_1 = ""
+            failed_analyses.append("Technical Analysis")
         await asyncio.sleep(1.5)  # Rate limit koruması
 
         self.logger.debug("Analiz 2/3: Risk Analysis")
-        analysis_2 = await self._risk_analysis(signal)
+        try:
+            analysis_2 = await self._risk_analysis(signal)
+        except AIAnalysisError as e:
+            self.logger.error(f"❌ Risk Analysis tamamen başarısız oldu: {e}")
+            analysis_2 = ""
+            failed_analyses.append("Risk Analysis")
         await asyncio.sleep(1.5)
 
         self.logger.debug("Analiz 3/3: Sentiment Analysis")
-        analysis_3 = await self._sentiment_analysis(signal)
+        try:
+            analysis_3 = await self._sentiment_analysis(signal)
+        except AIAnalysisError as e:
+            self.logger.error(f"❌ Sentiment Analysis tamamen başarısız oldu: {e}")
+            analysis_3 = ""
+            failed_analyses.append("Sentiment Analysis")
 
-        # Konsensüs oluştur
+        # Konsensüs oluştur (başarısız analizler boş string olduğu için hiç oy vermez)
         bullish_count, bearish_count = self._count_verdicts(
             analysis_1, analysis_2, analysis_3
         )
 
-        verdict = "BULLISH" if bullish_count > bearish_count else "BEARISH"
+        has_failures = len(failed_analyses) > 0
+        is_tie = bullish_count == bearish_count  # 0-0 dahil - belirsizlik
 
-        # Trend uyumluluğunu kontrol et
+        if bullish_count > bearish_count:
+            verdict = "BULLISH"
+        elif bearish_count > bullish_count:
+            verdict = "BEARISH"
+        else:
+            verdict = "UNAVAILABLE"
+
+        # Trend uyumluluğunu kontrol et - FAIL-CLOSED POLİTİKASI:
+        # - Herhangi bir analiz başarısız olduysa sinyalin yönü ne olursa olsun
+        #   trend_aligned=False (asla sahte bir oyla işlem açılamaz).
+        # - Oylar berabere ise (0-0 dahil) belirsizlik işlem açma gerekçesi olamaz.
         direction = signal.direction.value if signal.direction else ""
-        trend_aligned = (
-            (verdict == "BULLISH" and direction == "LONG") or
-            (verdict == "BEARISH" and direction == "SHORT")
-        )
+        if has_failures or is_tie:
+            trend_aligned = False
+        else:
+            trend_aligned = (
+                (verdict == "BULLISH" and direction == "LONG") or
+                (verdict == "BEARISH" and direction == "SHORT")
+            )
 
         # Confidence level
         confidence = self._calculate_confidence(bullish_count, bearish_count)
+
+        consensus = f"{bullish_count} BULLISH vs {bearish_count} BEARISH"
+        if has_failures:
+            consensus += (
+                f" | ⚠️ {len(failed_analyses)}/3 analiz başarısız oldu "
+                f"({', '.join(failed_analyses)}) - FAIL-CLOSED: işlem engellendi"
+            )
+        elif is_tie:
+            consensus += " | ⚠️ Berabere oy - belirsizlik nedeniyle FAIL-CLOSED: işlem engellendi"
 
         analyzed = SignalAnalyzed(
             signal=signal,
@@ -81,10 +133,10 @@ class AIAnalyzer:
             trend_aligned=trend_aligned,
             bullish_votes=bullish_count,
             bearish_votes=bearish_count,
-            consensus=f"{bullish_count} BULLISH vs {bearish_count} BEARISH",
-            analysis_1=analysis_1[:200],
-            analysis_2=analysis_2[:200],
-            analysis_3=analysis_3[:200],
+            consensus=consensus,
+            analysis_1=analysis_1[:200] if analysis_1 else "Analiz başarısız - AI modelleri yanıt vermedi",
+            analysis_2=analysis_2[:200] if analysis_2 else "Analiz başarısız - AI modelleri yanıt vermedi",
+            analysis_3=analysis_3[:200] if analysis_3 else "Analiz başarısız - AI modelleri yanıt vermedi",
             confidence=confidence,
         )
 
@@ -94,9 +146,14 @@ class AIAnalyzer:
                 f"Oy: {bullish_count}B-{bearish_count}Be, Güven: {confidence}"
             )
         else:
+            reason = ""
+            if has_failures:
+                reason = f" (Sebep: {len(failed_analyses)}/3 AI analizi başarısız oldu - fail-closed)"
+            elif is_tie:
+                reason = " (Sebep: berabere oy - fail-closed)"
             self.logger.warning(
                 f"⚠️ Trend uyumsuz! AI: {verdict}, Sinyal: {direction}, "
-                f"Oy: {bullish_count}B-{bearish_count}Be"
+                f"Oy: {bullish_count}B-{bearish_count}Be{reason}"
             )
 
         return analyzed
@@ -155,7 +212,15 @@ class AIAnalyzer:
 
             except Exception as gemini_error:
                 self.logger.error(f"{analysis_type}: ❌ Gemini hatası: {gemini_error}")
-                return "VERDICT: BEARISH\nREASONING: Both AI models failed - safety first"
+                # KRİTİK: Sahte bir BULLISH/BEARISH oyu ASLA döndürülmemeli - bu oy
+                # _count_verdicts tarafından gerçek bir oy gibi sayılıp güvenlik
+                # kapısını (trend_aligned) sinyalin yönüne göre yanlışlıkla açabilir.
+                # Bunun yerine ayırt edilebilir bir istisna fırlat; çağıran taraf
+                # (analyze_signal) bunu fail-closed politikasıyla ele alır.
+                raise AIAnalysisError(
+                    f"{analysis_type}: Hem DeepSeek hem Gemini başarısız oldu "
+                    f"(DeepSeek: {e}, Gemini: {gemini_error})"
+                ) from gemini_error
 
     async def _technical_analysis(self, signal: SignalParsed) -> str:
         """Teknik analiz perspektifi - DeepSeek'in derin analiz yeteneğini kullan"""
@@ -228,14 +293,51 @@ REASONING: [Your market sentiment analysis in 3-4 sentences]"""
         return await self._call_ai(prompt, "Sentiment Analysis")
 
     def _count_verdicts(self, *analyses: str) -> Tuple[int, int]:
-        """Analizlerdeki BULLISH/BEARISH sayılarını say"""
-        bullish_count = sum(1 for analysis in analyses if "VERDICT: BULLISH" in analysis.upper())
-        bearish_count = sum(1 for analysis in analyses if "VERDICT: BEARISH" in analysis.upper())
+        """
+        Analizlerdeki BULLISH/BEARISH oylarını say.
 
-        # Hiçbiri bulunamazsa, metinde BULLISH/BEARISH geçmesine bak
-        if bullish_count == 0 and bearish_count == 0:
-            bullish_count = sum(1 for analysis in analyses if "BULLISH" in analysis.upper())
-            bearish_count = sum(1 for analysis in analyses if "BEARISH" in analysis.upper())
+        Her analiz TEK TEK, bağımsız olarak değerlendirilir: önce kesin format
+        ("VERDICT: BULLISH"/"VERDICT: BEARISH") aranır; o analizde kesin format
+        yoksa YALNIZCA o analiz için serbest metin fallback'i kullanılır. Böylece
+        bir analiz kesin formatta bir diğeri serbest metinde olsa bile hiçbir oy
+        sessizce kaybolmaz (eski davranış: fallback yalnızca TÜM analizlerin
+        toplam kesin-format oyu 0 ise devreye giriyordu).
+
+        Hem BULLISH hem BEARISH geçen ya da hiçbirinin geçmediği bir analiz
+        "kararsız" sayılır ve oy vermez. Başarısız (boş/None) analizler de oy
+        vermez.
+        """
+        bullish_count = 0
+        bearish_count = 0
+
+        for analysis in analyses:
+            if not analysis:
+                continue
+
+            text = analysis.upper()
+            strict_bullish = "VERDICT: BULLISH" in text
+            strict_bearish = "VERDICT: BEARISH" in text
+
+            if strict_bullish and not strict_bearish:
+                bullish_count += 1
+                continue
+            if strict_bearish and not strict_bullish:
+                bearish_count += 1
+                continue
+            if strict_bullish and strict_bearish:
+                # Çelişkili kesin format - kararsız, oy yok
+                continue
+
+            # Bu analizde kesin format hiç yok -> sadece bu analiz için serbest
+            # metin fallback'i uygula
+            loose_bullish = "BULLISH" in text
+            loose_bearish = "BEARISH" in text
+
+            if loose_bullish and not loose_bearish:
+                bullish_count += 1
+            elif loose_bearish and not loose_bullish:
+                bearish_count += 1
+            # ikisi de var ya da ikisi de yok -> kararsız, oy yok
 
         return bullish_count, bearish_count
 

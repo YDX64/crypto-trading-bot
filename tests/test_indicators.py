@@ -126,7 +126,17 @@ class TestRSI:
 
     def test_rsi_custom_period(self):
         """Test RSI with custom period."""
-        prices = list(range(100, 130))
+        # A fluctuating (non-monotonic) price series is required here: a
+        # strictly increasing series has zero losses for every period, so
+        # RSI is mathematically 100.0 regardless of period (see
+        # test_rsi_all_gains) and no period comparison is meaningful. With
+        # genuine ups and downs, shorter vs. longer smoothing windows should
+        # produce different RSI values.
+        prices = [
+            100, 102, 101, 105, 103, 107, 104, 108, 106, 110,
+            107, 111, 108, 112, 109, 113, 111, 115, 112, 116,
+            113, 117, 114, 118, 116, 120, 117, 121, 118, 122,
+        ]
         rsi_14 = calculate_rsi(prices, period=14)
         rsi_7 = calculate_rsi(prices, period=7)
 
@@ -431,8 +441,13 @@ class TestIsGoodEntryPoint:
         )
 
         is_good, reason = is_good_entry_point(indicators, "LONG")
-        # Should likely be False due to overbought RSI
-        assert "score" in reason.lower()
+        # Overbought RSI and a bearish MACD are both unfavorable for a LONG
+        # entry, and with no current_price passed the Bollinger check can't
+        # contribute either, so no favorable conditions are found at all -
+        # the function reports this via "No favorable indicators" rather
+        # than a "score" string.
+        assert not is_good
+        assert "no favorable indicators" in reason.lower()
 
     def test_invalid_indicators(self):
         """Test entry point with invalid indicators."""

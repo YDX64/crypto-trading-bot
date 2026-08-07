@@ -73,31 +73,100 @@ class IndicatorValues:
             and self.macd_histogram < 0
         )
 
-    def near_bb_lower(self, threshold_pct: float = 5.0) -> bool:
+    def near_bb_lower(
+        self,
+        threshold_pct: float = 5.0,
+        current_price: Optional[float] = None
+    ) -> bool:
         """
-        Check if price is near lower Bollinger Band.
+        Check if price is near the lower Bollinger Band.
 
         Args:
-            threshold_pct: Percentage within lower band to consider "near"
+            threshold_pct: How close to the lower band counts as "near",
+                expressed as a percentage of the lower-half band width
+                (bb_middle - bb_lower). A price at or below the lower band
+                always counts as near.
+            current_price: Current market price to compare against the band.
+                If omitted, this falls back to the legacy (broken) behavior
+                of comparing the lower band's own value against a fraction
+                of the half band-width, which does NOT reflect proximity of
+                the actual price to the band and is effectively always
+                False/near-constant. Callers should always pass the current
+                price for a meaningful result; the fallback exists only for
+                backward compatibility with old call sites.
         """
         if self.bb_lower is None or self.bb_middle is None:
             return False
 
-        threshold = (self.bb_middle - self.bb_lower) * (threshold_pct / 100)
-        return abs(self.bb_lower) < threshold
+        band_half_width = self.bb_middle - self.bb_lower
 
-    def near_bb_upper(self, threshold_pct: float = 5.0) -> bool:
+        if current_price is None:
+            logger.warning(
+                "near_bb_lower() called without current_price - falling back "
+                "to legacy behavior that does not use the actual market "
+                "price and is effectively dead logic. Pass current_price "
+                "for an accurate Bollinger Band proximity check."
+            )
+            threshold = band_half_width * (threshold_pct / 100)
+            return abs(self.bb_lower) < threshold
+
+        if band_half_width <= 0:
+            return False
+
+        # Distance of the current price above the lower band, as a fraction
+        # of the lower-half band width. Zero or negative means the price is
+        # at or below the band (the strongest possible "near lower band"
+        # signal), which should always count as near.
+        distance = current_price - self.bb_lower
+        threshold = band_half_width * (threshold_pct / 100)
+        return distance <= threshold
+
+    def near_bb_upper(
+        self,
+        threshold_pct: float = 5.0,
+        current_price: Optional[float] = None
+    ) -> bool:
         """
-        Check if price is near upper Bollinger Band.
+        Check if price is near the upper Bollinger Band.
 
         Args:
-            threshold_pct: Percentage within upper band to consider "near"
+            threshold_pct: How close to the upper band counts as "near",
+                expressed as a percentage of the upper-half band width
+                (bb_upper - bb_middle). A price at or above the upper band
+                always counts as near.
+            current_price: Current market price to compare against the band.
+                If omitted, this falls back to the legacy (broken) behavior
+                of comparing the upper band's own value against a fraction
+                of the half band-width, which does NOT reflect proximity of
+                the actual price to the band. Callers should always pass the
+                current price for a meaningful result; the fallback exists
+                only for backward compatibility with old call sites.
         """
         if self.bb_upper is None or self.bb_middle is None:
             return False
 
-        threshold = (self.bb_upper - self.bb_middle) * (threshold_pct / 100)
-        return abs(self.bb_upper) < threshold
+        band_half_width = self.bb_upper - self.bb_middle
+
+        if current_price is None:
+            logger.warning(
+                "near_bb_upper() called without current_price - falling back "
+                "to legacy behavior that does not use the actual market "
+                "price and is effectively dead logic. Pass current_price "
+                "for an accurate Bollinger Band proximity check."
+            )
+            threshold = band_half_width * (threshold_pct / 100)
+            return abs(self.bb_upper) < threshold
+
+        if band_half_width <= 0:
+            return False
+
+        # Distance of the current price below the upper band, as a fraction
+        # of the upper-half band width. Zero or negative means the price is
+        # at or above the band (the strongest possible "near upper band"
+        # signal), which should always count as near.
+        distance = self.bb_upper - current_price
+        threshold = band_half_width * (threshold_pct / 100)
+        return distance <= threshold
 
 
 def calculate_ema(
@@ -481,7 +550,8 @@ def is_good_entry_point(
     indicators: IndicatorValues,
     signal_direction: str,
     rsi_oversold: float = 35.0,
-    rsi_overbought: float = 65.0
+    rsi_overbought: float = 65.0,
+    current_price: Optional[float] = None
 ) -> Tuple[bool, str]:
     """
     Determine if current indicators suggest a good entry point.
@@ -494,6 +564,11 @@ def is_good_entry_point(
         signal_direction: "LONG" or "SHORT"
         rsi_oversold: RSI threshold for oversold condition
         rsi_overbought: RSI threshold for overbought condition
+        current_price: Current market price, used to evaluate proximity to
+            the Bollinger Bands. If omitted, the Bollinger Band check falls
+            back to legacy (effectively dead) behavior - see
+            IndicatorValues.near_bb_lower/near_bb_upper. Callers should pass
+            the current price whenever available.
 
     Returns:
         Tuple of (is_good_entry: bool, reason: str)
@@ -530,7 +605,7 @@ def is_good_entry_point(
             reasons.append("MACD histogram positive")
 
         # Check Bollinger Bands
-        if indicators.near_bb_lower(threshold_pct=10):
+        if indicators.near_bb_lower(threshold_pct=10, current_price=current_price):
             score += 2
             reasons.append("Price near lower Bollinger Band")
 
@@ -557,7 +632,7 @@ def is_good_entry_point(
             reasons.append("MACD histogram negative")
 
         # Check Bollinger Bands
-        if indicators.near_bb_upper(threshold_pct=10):
+        if indicators.near_bb_upper(threshold_pct=10, current_price=current_price):
             score += 2
             reasons.append("Price near upper Bollinger Band")
 

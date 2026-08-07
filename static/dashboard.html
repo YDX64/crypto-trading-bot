@@ -1,473 +1,1372 @@
-<!DOCTYPE html>
-<html lang="tr">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>VIP Trading Bot - Professional Dashboard</title>
-    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+<title>TRADINGBOT — Kontrol Paneli</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root{
+    --bg:#0b0e14;
+    --bg-alt:#0d1119;
+    --panel:#11151d;
+    --panel-2:#141a24;
+    --border:rgba(255,255,255,0.08);
+    --border-strong:rgba(255,255,255,0.14);
+    --text:#e6e9ef;
+    --text-dim:#8b93a7;
+    --text-faint:#5b6274;
+    --profit:#2dd4a7;
+    --profit-bg:rgba(45,212,167,0.12);
+    --profit-border:rgba(45,212,167,0.35);
+    --loss:#f6465d;
+    --loss-bg:rgba(246,70,93,0.12);
+    --loss-border:rgba(246,70,93,0.35);
+    --gold:#d4a94e;
+    --gold-bg:rgba(212,169,78,0.12);
+    --gold-border:rgba(212,169,78,0.45);
+    --blue:#5b9dd9;
+    --blue-bg:rgba(91,157,217,0.12);
+    --purple:#a385da;
+    --purple-bg:rgba(163,133,218,0.12);
+    --orange:#e0954e;
+    --orange-bg:rgba(224,149,78,0.12);
+    --radius:8px;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Roboto Mono", monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+  }
 
-        body {
-            font-family: 'Inter', sans-serif;
-            background: #0f0f0f;
-            color: #ffffff;
-        }
+  *{box-sizing:border-box;}
 
-        .gradient-bg {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        }
+  html,body{
+    margin:0;
+    padding:0;
+    background:var(--bg);
+    color:var(--text);
+    font-family:var(--sans);
+    -webkit-font-smoothing:antialiased;
+  }
 
-        .card-bg {
-            background: rgba(31, 31, 31, 0.95);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-        }
+  body{
+    background-image:
+      radial-gradient(ellipse 900px 400px at 15% -5%, rgba(91,157,217,0.06), transparent 60%),
+      radial-gradient(ellipse 700px 400px at 90% 0%, rgba(212,169,78,0.05), transparent 60%);
+    min-height:100vh;
+    padding-bottom:40px;
+  }
 
-        .neon-green {
-            color: #00ff88;
-            text-shadow: 0 0 10px rgba(0, 255, 136, 0.5);
-        }
+  .mono{font-family:var(--mono);}
 
-        .neon-red {
-            color: #ff0055;
-            text-shadow: 0 0 10px rgba(255, 0, 85, 0.5);
-        }
+  a{color:var(--blue);}
 
-        .neon-yellow {
-            color: #ffcc00;
-            text-shadow: 0 0 10px rgba(255, 204, 0, 0.5);
-        }
+  /* ---------- layout ---------- */
+  .wrap{
+    max-width:1400px;
+    margin:0 auto;
+    padding:14px 18px 0;
+  }
 
-        .pulse-dot {
-            animation: pulse-animation 2s infinite;
-        }
+  /* ---------- connection banner ---------- */
+  #conn-banner{
+    display:none;
+    position:sticky;
+    top:0;
+    z-index:50;
+    background:linear-gradient(180deg, rgba(246,70,93,0.95), rgba(246,70,93,0.85));
+    color:#fff;
+    text-align:center;
+    padding:8px 12px;
+    font-size:13px;
+    font-weight:600;
+    letter-spacing:0.02em;
+    box-shadow:0 2px 12px rgba(0,0,0,0.4);
+  }
+  #conn-banner.show{display:block;}
 
-        @keyframes pulse-animation {
-            0% {
-                box-shadow: 0 0 0 0px rgba(0, 255, 136, 0.7);
-            }
-            100% {
-                box-shadow: 0 0 0 20px rgba(0, 255, 136, 0);
-            }
-        }
+  /* ---------- top bar ---------- */
+  .topbar{
+    display:flex;
+    flex-wrap:wrap;
+    align-items:center;
+    gap:10px 22px;
+    background:var(--panel);
+    border:1px solid var(--border);
+    border-radius:var(--radius);
+    padding:14px 18px;
+    margin-top:14px;
+  }
 
-        .loading-spinner {
-            border: 3px solid rgba(255, 255, 255, 0.1);
-            border-radius: 50%;
-            border-top: 3px solid #667eea;
-            width: 40px;
-            height: 40px;
-            animation: spin 1s linear infinite;
-        }
+  .brand{
+    display:flex;
+    align-items:center;
+    gap:10px;
+    margin-right:4px;
+  }
+  .brand-name{
+    font-weight:800;
+    font-size:17px;
+    letter-spacing:0.02em;
+  }
+  .brand-name .accent{color:var(--gold);}
 
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
+  .env-badge{
+    font-family:var(--mono);
+    font-size:11px;
+    font-weight:700;
+    letter-spacing:0.06em;
+    padding:3px 9px;
+    border-radius:999px;
+    border:1px solid;
+  }
+  .env-testnet{color:var(--profit); background:var(--profit-bg); border-color:var(--profit-border);}
+  .env-mainnet{color:var(--loss); background:var(--loss-bg); border-color:var(--loss-border);}
+  .env-unknown{color:var(--text-dim); background:rgba(255,255,255,0.04); border-color:var(--border);}
 
-        .signal-card {
-            background: linear-gradient(135deg, rgba(102, 126, 234, 0.1) 0%, rgba(118, 75, 162, 0.1) 100%);
-            border: 1px solid rgba(102, 126, 234, 0.3);
-            transition: all 0.3s ease;
-        }
+  .health-dot-wrap{
+    display:flex;
+    align-items:center;
+    gap:6px;
+    font-size:12px;
+    color:var(--text-dim);
+  }
+  .health-dot{
+    width:9px;height:9px;border-radius:50%;
+    background:var(--text-faint);
+    box-shadow:0 0 0 3px rgba(255,255,255,0.03);
+    flex:none;
+  }
+  .health-dot.ok{background:var(--profit); box-shadow:0 0 8px rgba(45,212,167,0.7);}
+  .health-dot.warn{background:#e0c24e; box-shadow:0 0 8px rgba(224,194,78,0.7);}
+  .health-dot.bad{background:var(--text-faint);}
 
-        .signal-card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 10px 40px rgba(102, 126, 234, 0.3);
-        }
+  .stat-sep{
+    width:1px;
+    align-self:stretch;
+    background:var(--border);
+    margin:0 2px;
+  }
 
-        .chart-container {
-            position: relative;
-            height: 200px;
-        }
+  .stat{
+    display:flex;
+    flex-direction:column;
+    gap:2px;
+    min-width:76px;
+  }
+  .stat-label{
+    font-size:10px;
+    text-transform:uppercase;
+    letter-spacing:0.07em;
+    color:var(--text-faint);
+    font-weight:700;
+  }
+  .stat-value{
+    font-family:var(--mono);
+    font-size:16px;
+    font-weight:700;
+    color:var(--text);
+  }
+  .stat-value.lg{font-size:19px;}
+  .stat-value.profit{color:var(--profit);}
+  .stat-value.loss{color:var(--loss);}
+  .stat-value.dim{color:var(--text-dim); font-weight:500; font-size:13px;}
 
-        .indicator-bar {
-            height: 8px;
-            background: rgba(255, 255, 255, 0.1);
-            border-radius: 4px;
-            overflow: hidden;
-        }
+  .topbar-right{
+    margin-left:auto;
+    display:flex;
+    align-items:center;
+    gap:12px;
+  }
 
-        .indicator-fill {
-            height: 100%;
-            background: linear-gradient(90deg, #00ff88 0%, #00cc66 100%);
-            border-radius: 4px;
-            transition: width 0.5s ease;
-        }
+  .refresh-toggle{
+    display:flex;
+    align-items:center;
+    gap:8px;
+    background:var(--panel-2);
+    border:1px solid var(--border);
+    padding:6px 10px;
+    border-radius:999px;
+    cursor:pointer;
+    user-select:none;
+    font-size:12px;
+    color:var(--text-dim);
+    transition:border-color .15s;
+  }
+  .refresh-toggle:hover{border-color:var(--border-strong);}
+  .refresh-toggle .switch{
+    width:28px;height:16px;border-radius:999px;
+    background:var(--text-faint);
+    position:relative;
+    transition:background .15s;
+    flex:none;
+  }
+  .refresh-toggle .switch::after{
+    content:"";
+    position:absolute;
+    top:2px;left:2px;
+    width:12px;height:12px;
+    border-radius:50%;
+    background:#fff;
+    transition:left .15s;
+  }
+  .refresh-toggle.on .switch{background:var(--profit);}
+  .refresh-toggle.on .switch::after{left:14px;}
+  .last-update{
+    font-family:var(--mono);
+    font-size:11px;
+    color:var(--text-faint);
+    white-space:nowrap;
+  }
 
-        /* Custom scrollbar */
-        ::-webkit-scrollbar {
-            width: 10px;
-        }
+  /* ---------- section shell ---------- */
+  .section{
+    margin-top:20px;
+  }
+  .section-head{
+    display:flex;
+    align-items:baseline;
+    justify-content:space-between;
+    margin-bottom:10px;
+    gap:10px;
+    flex-wrap:wrap;
+  }
+  .section-title{
+    font-size:13px;
+    font-weight:800;
+    text-transform:uppercase;
+    letter-spacing:0.08em;
+    color:var(--text-dim);
+    display:flex;
+    align-items:center;
+    gap:8px;
+  }
+  .section-title .num{
+    color:var(--text-faint);
+    font-family:var(--mono);
+  }
+  .section-sub{
+    font-size:11px;
+    color:var(--text-faint);
+    font-family:var(--mono);
+  }
 
-        ::-webkit-scrollbar-track {
-            background: #1f1f1f;
-        }
+  .panel{
+    background:var(--panel);
+    border:1px solid var(--border);
+    border-radius:var(--radius);
+    padding:16px;
+  }
 
-        ::-webkit-scrollbar-thumb {
-            background: #667eea;
-            border-radius: 5px;
-        }
+  .placeholder{
+    color:var(--text-faint);
+    font-size:13px;
+    text-align:center;
+    padding:26px 10px;
+    font-style:normal;
+  }
+  .placeholder.small{padding:14px 10px; font-size:12px;}
 
-        ::-webkit-scrollbar-thumb:hover {
-            background: #764ba2;
-        }
-    </style>
-</head>
-<body>
-    <div class="min-h-screen p-6">
-        <!-- Header -->
-        <header class="mb-8">
-            <div class="flex items-center justify-between">
-                <div>
-                    <h1 class="text-4xl font-bold mb-2 gradient-bg bg-clip-text text-transparent">
-                        VIP Trading Bot
-                    </h1>
-                    <p class="text-gray-400">Professional Autonomous Trading System</p>
-                </div>
-                <div class="flex items-center space-x-4">
-                    <div class="relative">
-                        <div class="w-3 h-3 bg-green-500 rounded-full absolute -top-1 -right-1 pulse-dot"></div>
-                        <span class="px-4 py-2 bg-green-900 bg-opacity-30 border border-green-500 rounded-lg text-green-400">
-                            <i class="fas fa-circle text-xs mr-2"></i>System Online
-                        </span>
-                    </div>
-                    <button onclick="refreshAll()" class="px-4 py-2 bg-purple-600 hover:bg-purple-700 rounded-lg transition">
-                        <i class="fas fa-sync-alt mr-2"></i>Refresh
-                    </button>
-                </div>
-            </div>
-        </header>
+  /* ---------- strategy cards ---------- */
+  .cards-grid{
+    display:grid;
+    grid-template-columns:repeat(4, 1fr);
+    gap:12px;
+  }
+  .strat-card{
+    background:var(--panel);
+    border:1px solid var(--border);
+    border-radius:var(--radius);
+    padding:14px 16px;
+    position:relative;
+    overflow:hidden;
+  }
+  .strat-card.leader{
+    border-color:var(--gold-border);
+    box-shadow:0 0 0 1px var(--gold-border), 0 0 18px rgba(212,169,78,0.12);
+  }
+  .strat-card.leader::before{
+    content:"LİDER";
+    position:absolute;
+    top:9px; right:-27px;
+    background:var(--gold);
+    color:#1a1204;
+    font-size:9px;
+    font-weight:800;
+    letter-spacing:0.08em;
+    padding:2px 30px;
+    transform:rotate(40deg);
+  }
+  .strat-card-title{
+    font-size:12px;
+    font-weight:700;
+    color:var(--text);
+    margin-bottom:2px;
+  }
+  .strat-card-title .letter{
+    color:var(--gold);
+  }
+  .strat-card-sub{
+    font-size:10.5px;
+    color:var(--text-faint);
+    margin-bottom:10px;
+  }
+  .strat-metrics{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:8px 10px;
+  }
+  .strat-metric-label{
+    font-size:9.5px;
+    text-transform:uppercase;
+    letter-spacing:0.06em;
+    color:var(--text-faint);
+    margin-bottom:1px;
+  }
+  .strat-metric-value{
+    font-family:var(--mono);
+    font-size:14px;
+    font-weight:700;
+  }
+  .strat-metric-value.full{grid-column:1 / -1; font-size:17px;}
 
-        <!-- Main Stats Grid -->
-        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
-            <!-- Account Balance -->
-            <div class="card-bg rounded-xl p-6">
-                <div class="flex items-center justify-between mb-4">
-                    <span class="text-gray-400 text-sm">Account Balance</span>
-                    <i class="fas fa-wallet text-purple-400"></i>
-                </div>
-                <div class="text-3xl font-bold" id="balance-value">$0.00</div>
-                <div class="text-xs text-gray-500 mt-2">USDT Testnet</div>
-            </div>
+  /* ---------- badges / chips ---------- */
+  .badge{
+    display:inline-flex;
+    align-items:center;
+    gap:3px;
+    padding:2px 8px;
+    border-radius:999px;
+    font-size:10px;
+    font-weight:800;
+    text-transform:uppercase;
+    letter-spacing:0.04em;
+    border:1px solid transparent;
+    white-space:nowrap;
+    font-family:var(--sans);
+  }
+  .badge-long{color:var(--profit); background:var(--profit-bg); border-color:var(--profit-border);}
+  .badge-short{color:var(--loss); background:var(--loss-bg); border-color:var(--loss-border);}
 
-            <!-- BTC Price -->
-            <div class="card-bg rounded-xl p-6">
-                <div class="flex items-center justify-between mb-4">
-                    <span class="text-gray-400 text-sm">BTC Price</span>
-                    <i class="fab fa-bitcoin text-orange-400"></i>
-                </div>
-                <div class="text-3xl font-bold" id="btc-value">$0.00</div>
-                <div class="text-xs" id="btc-change">
-                    <span class="text-gray-500">24h</span>
-                </div>
-            </div>
+  .badge-strat{font-family:var(--mono);}
+  .badge-strat-a{color:var(--blue); background:var(--blue-bg); border-color:rgba(91,157,217,0.35);}
+  .badge-strat-b{color:var(--purple); background:var(--purple-bg); border-color:rgba(163,133,218,0.35);}
+  .badge-strat-c{color:var(--orange); background:var(--orange-bg); border-color:rgba(224,149,78,0.35);}
+  .badge-strat-none{color:var(--text-faint); background:rgba(255,255,255,0.04); border-color:var(--border);}
 
-            <!-- Open Positions -->
-            <div class="card-bg rounded-xl p-6">
-                <div class="flex items-center justify-between mb-4">
-                    <span class="text-gray-400 text-sm">Open Positions</span>
-                    <i class="fas fa-chart-line text-green-400"></i>
-                </div>
-                <div class="text-3xl font-bold" id="positions-count">0</div>
-                <div class="text-xs text-gray-500 mt-2">Active Trades</div>
-            </div>
+  .badge-status{color:var(--text-dim); background:rgba(255,255,255,0.05); border-color:var(--border);}
+  .badge-tp1{color:var(--profit); background:var(--profit-bg); border-color:var(--profit-border);}
+  .badge-be{color:var(--blue); background:var(--blue-bg); border-color:rgba(91,157,217,0.35);}
+  .badge-trailing{color:var(--gold); background:var(--gold-bg); border-color:var(--gold-border);}
 
-            <!-- Waiting Signals -->
-            <div class="card-bg rounded-xl p-6">
-                <div class="flex items-center justify-between mb-4">
-                    <span class="text-gray-400 text-sm">Waiting Mode</span>
-                    <i class="fas fa-clock text-yellow-400"></i>
-                </div>
-                <div class="text-3xl font-bold neon-yellow" id="waiting-count">0</div>
-                <div class="text-xs text-gray-500 mt-2">Pending Signals</div>
-            </div>
-        </div>
+  .dot-pulse{
+    width:6px;height:6px;border-radius:50%;
+    background:var(--gold);
+    display:inline-block;
+    animation:pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes pulse{
+    0%{opacity:1; transform:scale(1);}
+    50%{opacity:0.35; transform:scale(1.6);}
+    100%{opacity:1; transform:scale(1);}
+  }
 
-        <!-- Waiting Mode Section -->
-        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
-            <!-- Waiting Signals List -->
-            <div class="lg:col-span-2 card-bg rounded-xl p-6">
-                <h2 class="text-xl font-semibold mb-6 flex items-center">
-                    <i class="fas fa-hourglass-half mr-3 text-purple-400"></i>
-                    Active Waiting Signals
-                </h2>
-                <div id="waiting-signals-container" class="space-y-4">
-                    <!-- Signals will be injected here -->
-                </div>
-            </div>
+  .exit-chip{
+    display:inline-flex;
+    align-items:center;
+    padding:2px 8px;
+    border-radius:5px;
+    font-size:10px;
+    font-weight:800;
+    letter-spacing:0.03em;
+    font-family:var(--mono);
+    border:1px solid transparent;
+  }
+  .exit-sl{color:var(--loss); background:var(--loss-bg); border-color:var(--loss-border);}
+  .exit-tp{color:var(--profit); background:var(--profit-bg); border-color:var(--profit-border);}
+  .exit-trail{color:var(--gold); background:var(--gold-bg); border-color:var(--gold-border);}
+  .exit-other{color:var(--text-dim); background:rgba(255,255,255,0.05); border-color:var(--border);}
 
-            <!-- Waiting Mode Configuration -->
-            <div class="card-bg rounded-xl p-6">
-                <h2 class="text-xl font-semibold mb-6 flex items-center">
-                    <i class="fas fa-cog mr-3 text-purple-400"></i>
-                    Waiting Mode Settings
-                </h2>
-                <div class="space-y-4">
-                    <div class="flex justify-between items-center">
-                        <span class="text-gray-400">Status</span>
-                        <span id="wm-status" class="font-semibold">Loading...</span>
-                    </div>
-                    <div class="flex justify-between items-center">
-                        <span class="text-gray-400">Max Positions</span>
-                        <span id="wm-max" class="font-semibold">0</span>
-                    </div>
-                    <div class="flex justify-between items-center">
-                        <span class="text-gray-400">Check Interval</span>
-                        <span id="wm-interval" class="font-semibold">0 min</span>
-                    </div>
-                    <div class="flex justify-between items-center">
-                        <span class="text-gray-400">Min Conditions</span>
-                        <span id="wm-conditions" class="font-semibold">0</span>
-                    </div>
-                    <div class="flex justify-between items-center">
-                        <span class="text-gray-400">Max Wait Time</span>
-                        <span id="wm-maxhours" class="font-semibold">0h</span>
-                    </div>
-                    <div class="flex justify-between items-center">
-                        <span class="text-gray-400">Price Target</span>
-                        <span id="wm-target" class="font-semibold">0%</span>
-                    </div>
-                </div>
-            </div>
-        </div>
+  .regime-chip{
+    display:inline-flex;
+    align-items:center;
+    gap:6px;
+    padding:6px 11px;
+    border-radius:999px;
+    border:1px solid var(--border);
+    background:var(--panel-2);
+    font-family:var(--mono);
+    font-size:12px;
+    font-weight:700;
+  }
+  .regime-chip .sym{color:var(--text);}
+  .regime-up{color:var(--profit);}
+  .regime-down{color:var(--loss);}
+  .regime-range{color:var(--text-dim);}
+  .regime-unknown{color:var(--text-faint); opacity:0.7;}
 
-        <!-- System Activity Log -->
-        <div class="card-bg rounded-xl p-6">
-            <h2 class="text-xl font-semibold mb-6 flex items-center">
-                <i class="fas fa-terminal mr-3 text-purple-400"></i>
-                System Activity
-            </h2>
-            <div id="activity-log" class="space-y-2 max-h-64 overflow-y-auto">
-                <!-- Activity logs will be injected here -->
-            </div>
-        </div>
+  .kill-switch-banner{
+    display:flex;
+    align-items:center;
+    gap:10px;
+    background:linear-gradient(90deg, rgba(224,194,78,0.18), rgba(224,194,78,0.08));
+    border:1px solid rgba(224,194,78,0.5);
+    color:#f0d878;
+    padding:10px 14px;
+    border-radius:var(--radius);
+    font-size:13px;
+    font-weight:700;
+    margin-bottom:12px;
+  }
+
+  /* ---------- tables ---------- */
+  .table-wrap{
+    overflow-x:auto;
+    -webkit-overflow-scrolling:touch;
+  }
+  table{
+    width:100%;
+    border-collapse:collapse;
+    font-size:12.5px;
+    min-width:640px;
+  }
+  thead th{
+    text-align:left;
+    font-size:10px;
+    text-transform:uppercase;
+    letter-spacing:0.06em;
+    color:var(--text-faint);
+    font-weight:700;
+    padding:0 10px 8px;
+    border-bottom:1px solid var(--border);
+    white-space:nowrap;
+  }
+  tbody td{
+    padding:9px 10px;
+    border-bottom:1px solid rgba(255,255,255,0.045);
+    white-space:nowrap;
+    color:var(--text);
+  }
+  tbody tr:last-child td{border-bottom:none;}
+  tbody tr:hover{background:rgba(255,255,255,0.02);}
+  td.num, th.num{font-family:var(--mono); text-align:right;}
+  .cell-symbol{font-weight:700; font-family:var(--mono);}
+  .cell-dim{color:var(--text-faint); font-family:var(--mono); font-size:11.5px;}
+  .roi-cell{font-family:var(--mono); font-weight:800; font-size:13.5px;}
+  .badges-cell{display:flex; gap:4px; flex-wrap:wrap;}
+
+  .profit-text{color:var(--profit);}
+  .loss-text{color:var(--text-faint);}
+  .loss-text.neg{color:var(--loss);}
+
+  /* ---------- sparkline ---------- */
+  .sparkline-wrap{
+    margin-bottom:12px;
+    background:var(--panel-2);
+    border:1px solid var(--border);
+    border-radius:6px;
+    padding:8px 10px 4px;
+  }
+  .sparkline-header{
+    display:flex;
+    justify-content:space-between;
+    font-size:10px;
+    color:var(--text-faint);
+    text-transform:uppercase;
+    letter-spacing:0.05em;
+    margin-bottom:2px;
+  }
+  #pnl-sparkline{
+    width:100%;
+    height:56px;
+    display:block;
+  }
+
+  /* ---------- waiting signals ---------- */
+  .waiting-grid{
+    display:grid;
+    grid-template-columns:repeat(auto-fill, minmax(240px, 1fr));
+    gap:10px;
+  }
+  .waiting-card{
+    background:var(--panel-2);
+    border:1px solid var(--border);
+    border-radius:6px;
+    padding:10px 12px;
+    font-size:12px;
+  }
+  .waiting-card-head{
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    margin-bottom:6px;
+  }
+  .waiting-card-sym{font-family:var(--mono); font-weight:700;}
+  .waiting-row{display:flex; justify-content:space-between; padding:2px 0; color:var(--text-dim);}
+  .waiting-row b{color:var(--text); font-family:var(--mono); font-weight:600;}
+
+  footer{
+    text-align:center;
+    color:var(--text-faint);
+    font-size:11px;
+    padding:28px 10px 10px;
+  }
+
+  @media (max-width:900px){
+    .cards-grid{grid-template-columns:1fr 1fr;}
+    .waiting-grid{grid-template-columns:1fr;}
+    .topbar{padding:12px;}
+    .topbar-right{margin-left:0; width:100%; justify-content:space-between;}
+  }
+  @media (max-width:560px){
+    .cards-grid{grid-template-columns:1fr;}
+    .wrap{padding:10px 10px 0;}
+  }
+</style>
+
+<div id="conn-banner">⚠ API'ye ulaşılamıyor — yeniden deneniyor</div>
+
+<div class="wrap">
+
+  <!-- 1. ÜST BAR -->
+  <div class="topbar" id="topbar">
+    <div class="brand">
+      <span class="brand-name">TRADING<span class="accent">BOT</span></span>
+      <span class="env-badge env-unknown" id="env-badge">—</span>
     </div>
 
-    <script>
-        const API_BASE = 'http://localhost:8080';
-        let refreshInterval;
+    <div class="health-dot-wrap" id="health-wrap">
+      <span class="health-dot" id="health-dot"></span>
+      <span id="health-text">bağlanıyor…</span>
+    </div>
 
-        // Format currency
-        function formatCurrency(value) {
-            return new Intl.NumberFormat('en-US', {
-                style: 'currency',
-                currency: 'USD',
-                minimumFractionDigits: 2,
-                maximumFractionDigits: 2
-            }).format(value);
-        }
+    <div class="stat-sep"></div>
 
-        // Format time ago
-        function timeAgo(dateString) {
-            const date = new Date(dateString);
-            const now = new Date();
-            const seconds = Math.floor((now - date) / 1000);
+    <div class="stat">
+      <span class="stat-label">Bakiye</span>
+      <span class="stat-value lg mono" id="stat-balance">—</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Gerçekleşmemiş K/Z</span>
+      <span class="stat-value lg mono" id="stat-unrealized">—</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Günlük K/Z</span>
+      <span class="stat-value lg mono" id="stat-daily">—</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">BTC</span>
+      <span class="stat-value mono" id="stat-btc">—</span>
+    </div>
 
-            if (seconds < 60) return `${seconds}s ago`;
-            const minutes = Math.floor(seconds / 60);
-            if (minutes < 60) return `${minutes}m ago`;
-            const hours = Math.floor(minutes / 60);
-            if (hours < 24) return `${hours}h ago`;
-            const days = Math.floor(hours / 24);
-            return `${days}d ago`;
-        }
+    <div class="topbar-right">
+      <span class="last-update" id="last-update">henüz güncellenmedi</span>
+      <div class="refresh-toggle on" id="refresh-toggle" title="Otomatik yenilemeyi aç/kapat">
+        <span class="switch"></span>
+        <span id="refresh-toggle-label">Otomatik Yenile</span>
+      </div>
+    </div>
+  </div>
 
-        // Add activity log entry
-        function addActivityLog(message, type = 'info') {
-            const log = document.getElementById('activity-log');
-            const entry = document.createElement('div');
-            entry.className = 'flex items-center space-x-2 text-sm';
+  <!-- 2. STRATEJİ SKOR TABLOSU -->
+  <div class="section">
+    <div class="section-head">
+      <div class="section-title">Strateji Skor Tablosu</div>
+      <div class="section-sub" id="strat-updated"></div>
+    </div>
+    <div class="cards-grid" id="strategy-cards">
+      <!-- doldurulacak -->
+    </div>
+  </div>
 
-            let icon = 'fa-info-circle';
-            let color = 'text-blue-400';
+  <!-- 3. AÇIK POZİSYONLAR -->
+  <div class="section">
+    <div class="section-head">
+      <div class="section-title">Açık Pozisyonlar <span class="num" id="positions-count"></span></div>
+    </div>
+    <div class="panel">
+      <div class="table-wrap" id="positions-wrap">
+        <div class="placeholder">yükleniyor…</div>
+      </div>
+    </div>
+  </div>
 
-            if (type === 'success') {
-                icon = 'fa-check-circle';
-                color = 'text-green-400';
-            } else if (type === 'warning') {
-                icon = 'fa-exclamation-triangle';
-                color = 'text-yellow-400';
-            } else if (type === 'error') {
-                icon = 'fa-times-circle';
-                color = 'text-red-400';
-            }
+  <!-- 4. REJİM HARİTASI -->
+  <div class="section">
+    <div class="section-head">
+      <div class="section-title">Rejim Haritası</div>
+      <div class="section-sub" id="regime-scan-info"></div>
+    </div>
+    <div class="panel" id="regime-panel">
+      <div class="placeholder">yükleniyor…</div>
+    </div>
+  </div>
 
-            entry.innerHTML = `
-                <i class="fas ${icon} ${color}"></i>
-                <span class="text-gray-400">${new Date().toLocaleTimeString()}</span>
-                <span class="text-gray-300">${message}</span>
-            `;
+  <!-- 5. SON İŞLEMLER -->
+  <div class="section">
+    <div class="section-head">
+      <div class="section-title">Son İşlemler</div>
+    </div>
+    <div class="panel">
+      <div class="sparkline-wrap">
+        <div class="sparkline-header">
+          <span>Kümülatif Gerçekleşen K/Z</span>
+          <span id="sparkline-last">—</span>
+        </div>
+        <canvas id="pnl-sparkline"></canvas>
+      </div>
+      <div class="table-wrap" id="trades-wrap">
+        <div class="placeholder">yükleniyor…</div>
+      </div>
+    </div>
+  </div>
 
-            log.insertBefore(entry, log.firstChild);
+  <!-- 6. BEKLEYEN SİNYALLER -->
+  <div class="section" id="waiting-section" style="display:none;">
+    <div class="section-head">
+      <div class="section-title">Bekleyen Sinyaller <span class="num" id="waiting-count"></span></div>
+    </div>
+    <div class="panel">
+      <div class="waiting-grid" id="waiting-grid"></div>
+    </div>
+  </div>
 
-            // Keep only last 20 logs
-            while (log.children.length > 20) {
-                log.removeChild(log.lastChild);
-            }
-        }
+  <footer>salt izleme paneli — bu sayfadan emir verilmez</footer>
+</div>
 
-        // Render waiting signal card
-        function renderWaitingSignal(signal, config) {
-            const scorePercent = (signal.last_score / 100) * 100;
-            const conditionsPercent = (signal.conditions_met_count / (config?.waiting_mode_min_conditions || 3)) * 100;
-            const waitPercent = Math.min((signal.wait_time_hours / (config?.waiting_mode_max_hours || 24)) * 100, 100);
+<script>
+(function(){
+  "use strict";
 
-            const directionClass = signal.direction === 'LONG' ? 'text-green-400' : 'text-red-400';
-            const verdictClass = signal.ai_verdict === 'BULLISH' ? 'text-green-400' : 'text-red-400';
+  var REFRESH_MS = 5000;
+  var STRAT_LABELS = {
+    A: "A — Trend Kırılması",
+    B: "B — Trend İçi Uç Avcısı",
+    C: "C — Saf Uç Avcısı"
+  };
+  var STRAT_ORDER = ["A","B","C"];
 
-            return `
-                <div class="signal-card rounded-lg p-4">
-                    <div class="flex justify-between items-start mb-4">
-                        <div>
-                            <h3 class="text-lg font-semibold flex items-center">
-                                <i class="fab fa-bitcoin mr-2 text-orange-400"></i>
-                                ${signal.symbol}
-                            </h3>
-                            <div class="flex items-center space-x-3 mt-1">
-                                <span class="${directionClass} font-semibold">${signal.direction}</span>
-                                <span class="text-gray-500">vs</span>
-                                <span class="${verdictClass} font-semibold">AI: ${signal.ai_verdict}</span>
-                            </div>
-                        </div>
-                        <div class="text-right">
-                            <div class="text-2xl font-bold">${formatCurrency(signal.current_price)}</div>
-                            <div class="text-xs text-gray-500">Current Price</div>
-                        </div>
-                    </div>
+  var autoRefresh = true;
+  var timer = null;
+  var networkDown = false;
 
-                    <div class="grid grid-cols-2 gap-4 mb-4">
-                        <div>
-                            <span class="text-xs text-gray-500">Entry Range</span>
-                            <div class="text-sm font-semibold">
-                                ${formatCurrency(signal.original_entry_min)} - ${formatCurrency(signal.original_entry_max)}
-                            </div>
-                        </div>
-                        <div>
-                            <span class="text-xs text-gray-500">Wait Time</span>
-                            <div class="text-sm font-semibold">${signal.wait_time_hours.toFixed(1)}h / ${config?.waiting_mode_max_hours || 24}h</div>
-                        </div>
-                    </div>
+  // ---------------------------------------------------------------
+  // yardımcılar
+  // ---------------------------------------------------------------
 
-                    <div class="space-y-3">
-                        <div>
-                            <div class="flex justify-between text-xs mb-1">
-                                <span class="text-gray-500">Score</span>
-                                <span>${signal.last_score.toFixed(1)}/100</span>
-                            </div>
-                            <div class="indicator-bar">
-                                <div class="indicator-fill" style="width: ${scorePercent}%"></div>
-                            </div>
-                        </div>
+  function qs(id){ return document.getElementById(id); }
 
-                        <div>
-                            <div class="flex justify-between text-xs mb-1">
-                                <span class="text-gray-500">Conditions Met</span>
-                                <span>${signal.conditions_met_count}/${config?.waiting_mode_min_conditions || 3}</span>
-                            </div>
-                            <div class="indicator-bar">
-                                <div class="indicator-fill" style="width: ${conditionsPercent}%"></div>
-                            </div>
-                        </div>
+  function escapeHtml(s){
+    if (s === null || s === undefined) return "";
+    return String(s)
+      .replace(/&/g,"&amp;")
+      .replace(/</g,"&lt;")
+      .replace(/>/g,"&gt;")
+      .replace(/"/g,"&quot;");
+  }
 
-                        <div>
-                            <div class="flex justify-between text-xs mb-1">
-                                <span class="text-gray-500">Time Remaining</span>
-                                <span>${((config?.waiting_mode_max_hours || 24) - signal.wait_time_hours).toFixed(1)}h</span>
-                            </div>
-                            <div class="indicator-bar">
-                                <div class="indicator-fill bg-gradient-to-r from-yellow-500 to-orange-500" style="width: ${waitPercent}%"></div>
-                            </div>
-                        </div>
-                    </div>
+  function isNum(n){ return typeof n === "number" && isFinite(n); }
 
-                    <div class="mt-4 flex justify-between items-center">
-                        <span class="text-xs text-gray-500">
-                            Checks: ${signal.total_checks} | Last: ${signal.last_checked_at ? timeAgo(signal.last_checked_at) : 'Never'}
-                        </span>
-                        <div class="flex items-center space-x-1">
-                            <div class="w-2 h-2 bg-yellow-500 rounded-full animate-pulse"></div>
-                            <span class="text-xs text-yellow-400">Monitoring</span>
-                        </div>
-                    </div>
-                </div>
-            `;
-        }
+  function fmtNum(n, decimals){
+    if (!isNum(n)) return "—";
+    decimals = decimals === undefined ? 2 : decimals;
+    return n.toLocaleString("tr-TR", { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+  }
 
-        // Fetch and update all data
-        async function refreshAll() {
-            try {
-                // Fetch all data in parallel
-                const [statusRes, configRes, waitingRes] = await Promise.all([
-                    fetch(`${API_BASE}/api/status`),
-                    fetch(`${API_BASE}/config`),
-                    fetch(`${API_BASE}/waiting-mode/active`)
-                ]);
+  function fmtUsdt(n, decimals){
+    if (!isNum(n)) return "—";
+    var sign = n > 0 ? "+" : "";
+    return sign + fmtNum(n, decimals === undefined ? 2 : decimals) + " USDT";
+  }
 
-                const status = await statusRes.json();
-                const config = await configRes.json();
-                const waitingSignals = await waitingRes.json();
+  function fmtPrice(n){
+    if (!isNum(n)) return "—";
+    var decimals = n >= 100 ? 2 : (n >= 1 ? 4 : 6);
+    return fmtNum(n, decimals);
+  }
 
-                // Update system status
-                if (status.account) {
-                    document.getElementById('balance-value').textContent = formatCurrency(status.account.balance);
-                    document.getElementById('btc-value').textContent = formatCurrency(status.account.btc_price);
-                    document.getElementById('positions-count').textContent = status.account.open_positions;
-                }
+  function fmtPct(n, decimals){
+    if (!isNum(n)) return "—";
+    var sign = n > 0 ? "+" : "";
+    return sign + fmtNum(n, decimals === undefined ? 2 : decimals) + "%";
+  }
 
-                // Update waiting mode config
-                document.getElementById('wm-status').innerHTML = config.waiting_mode_enabled
-                    ? '<span class="text-green-400">✅ Enabled</span>'
-                    : '<span class="text-red-400">❌ Disabled</span>';
-                document.getElementById('wm-max').textContent = config.waiting_mode_max_positions;
-                document.getElementById('wm-interval').textContent = `${config.waiting_mode_check_interval_minutes} min`;
-                document.getElementById('wm-conditions').textContent = config.waiting_mode_min_conditions;
-                document.getElementById('wm-maxhours').textContent = `${config.waiting_mode_max_hours}h`;
-                document.getElementById('wm-target').textContent = `${config.waiting_mode_price_improvement}%`;
+  function pnlClass(n){
+    if (!isNum(n)) return "";
+    if (n > 0) return "profit-text";
+    if (n < 0) return "loss-text neg";
+    return "";
+  }
 
-                // Update waiting signals
-                document.getElementById('waiting-count').textContent = waitingSignals.length;
-                const container = document.getElementById('waiting-signals-container');
+  function fmtClock(iso){
+    if (!iso) return "—";
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return "—";
+    return d.toLocaleTimeString("tr-TR", { hour12:false });
+  }
 
-                if (waitingSignals.length > 0) {
-                    container.innerHTML = waitingSignals.map(signal => renderWaitingSignal(signal, config)).join('');
-                    addActivityLog(`${waitingSignals.length} signals in waiting mode`, 'info');
-                } else {
-                    container.innerHTML = `
-                        <div class="text-center py-8 text-gray-500">
-                            <i class="fas fa-inbox text-4xl mb-4"></i>
-                            <p>No signals in waiting mode</p>
-                            <p class="text-sm mt-2">Signals with misaligned AI verdict will appear here</p>
-                        </div>
-                    `;
-                }
+  function fmtDateTime(iso){
+    if (!iso) return "—";
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return "—";
+    return d.toLocaleDateString("tr-TR") + " " + d.toLocaleTimeString("tr-TR", { hour12:false, hour:"2-digit", minute:"2-digit" });
+  }
 
-                addActivityLog('Dashboard refreshed successfully', 'success');
+  function fmtAge(iso){
+    if (!iso) return "—";
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return "—";
+    var ms = Date.now() - d.getTime();
+    if (ms < 0) ms = 0;
+    var mins = Math.floor(ms / 60000);
+    if (mins < 60) return mins + " dk";
+    var hours = Math.floor(mins / 60);
+    if (hours < 24) return hours + " sa " + (mins % 60) + " dk";
+    var days = Math.floor(hours / 24);
+    return days + " gün " + (hours % 24) + " sa";
+  }
 
-            } catch (error) {
-                console.error('Error refreshing data:', error);
-                addActivityLog(`Error: ${error.message}`, 'error');
-            }
-        }
+  function el(tag, cls, html){
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (html !== undefined) e.innerHTML = html;
+    return e;
+  }
 
-        // Initialize
-        document.addEventListener('DOMContentLoaded', () => {
-            refreshAll();
+  // fetch sarmalayıcı: ağ hatalarını (sunucuya ulaşılamıyor) HTTP durum
+  // hatalarından (404/503 — endpoint henüz yok) ayırt eder.
+  function fetchJSON(url){
+    return fetch(url, { cache: "no-store" }).then(function(res){
+      if (!res.ok){
+        return { ok:false, status:res.status, data:null, networkError:false };
+      }
+      return res.json().then(function(data){
+        return { ok:true, status:res.status, data:data, networkError:false };
+      }).catch(function(){
+        return { ok:false, status:res.status, data:null, networkError:false };
+      });
+    }).catch(function(){
+      return { ok:false, status:0, data:null, networkError:true };
+    });
+  }
 
-            // Auto-refresh every 5 seconds
-            refreshInterval = setInterval(refreshAll, 5000);
+  function notConnected(container, msg){
+    container.innerHTML = "";
+    container.appendChild(el("div", "placeholder", msg || "henüz bağlı değil / veri yok"));
+  }
 
-            addActivityLog('Dashboard initialized', 'success');
-            addActivityLog('Waiting mode monitoring active', 'info');
+  // ---------------------------------------------------------------
+  // 1. üst bar
+  // ---------------------------------------------------------------
+
+  function renderTopbar(health, status, positions, scalperStatus){
+    // ortam rozeti
+    var envBadge = qs("env-badge");
+    var network = health && health.data ? health.data.network : null;
+    if (network === "testnet"){
+      envBadge.textContent = "TESTNET";
+      envBadge.className = "env-badge env-testnet";
+    } else if (network === "mainnet"){
+      envBadge.textContent = "MAINNET";
+      envBadge.className = "env-badge env-mainnet";
+    } else {
+      envBadge.textContent = "BİLİNMİYOR";
+      envBadge.className = "env-badge env-unknown";
+    }
+
+    // sağlık noktası
+    var dot = qs("health-dot");
+    var text = qs("health-text");
+    if (health && health.ok && health.data){
+      var h = health.data;
+      if (h.status === "healthy"){
+        dot.className = "health-dot ok";
+        text.textContent = "sağlıklı";
+      } else {
+        dot.className = "health-dot warn";
+        var reasons = [];
+        if (h.position_monitoring && h.position_monitoring !== "running") reasons.push("izleme durdu");
+        if (h.telegram_bot && h.telegram_bot !== "running") reasons.push("telegram durdu");
+        if (h.orchestrator && h.orchestrator !== "running") reasons.push("orchestrator durdu");
+        text.textContent = "bozulmuş" + (reasons.length ? " — " + reasons.join(", ") : "");
+      }
+    } else {
+      dot.className = "health-dot bad";
+      text.textContent = "bağlanamıyor";
+    }
+
+    // bakiye / btc fiyatı
+    var balance = status && status.ok && status.data ? status.data.account.balance : null;
+    qs("stat-balance").textContent = isNum(balance) ? fmtNum(balance, 2) + " USDT" : "—";
+
+    var btcPrice = status && status.ok && status.data ? status.data.account.btc_price : null;
+    qs("stat-btc").textContent = isNum(btcPrice) ? "$" + fmtNum(btcPrice, 2) : "—";
+
+    // toplam gerçekleşmemiş k/z (mevcut pozisyonlardan)
+    var totalUnrealized = null;
+    if (positions && positions.ok && positions.data && Array.isArray(positions.data.positions)){
+      totalUnrealized = positions.data.positions.reduce(function(sum, p){
+        return sum + (isNum(p.unrealized_pnl) ? p.unrealized_pnl : 0);
+      }, 0);
+    }
+    var unrealEl = qs("stat-unrealized");
+    unrealEl.textContent = totalUnrealized === null ? "—" : fmtUsdt(totalUnrealized);
+    unrealEl.className = "stat-value lg mono" + (totalUnrealized === null ? "" : (totalUnrealized > 0 ? " profit" : (totalUnrealized < 0 ? " loss" : "")));
+
+    // günlük k/z (scalper)
+    var dailyEl = qs("stat-daily");
+    if (scalperStatus && scalperStatus.ok && scalperStatus.data && isNum(scalperStatus.data.daily_pnl)){
+      var dp = scalperStatus.data.daily_pnl;
+      dailyEl.textContent = fmtUsdt(dp);
+      dailyEl.className = "stat-value lg mono" + (dp > 0 ? " profit" : (dp < 0 ? " loss" : ""));
+    } else {
+      dailyEl.textContent = "—";
+      dailyEl.className = "stat-value lg mono dim";
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // 2. strateji skor tablosu
+  // ---------------------------------------------------------------
+
+  function strategyCardHtml(key, s, isLeader){
+    var title = STRAT_LABELS[key] || (key === "combined" ? "TOPLAM — Tüm Stratejiler" : key);
+    var hasData = s && isNum(s.trades) && s.trades > 0;
+
+    var card = el("div", "strat-card" + (isLeader ? " leader" : ""));
+    var head = el("div");
+    head.appendChild(el("div", "strat-card-title", escapeHtml(title)));
+    head.appendChild(el("div", "strat-card-sub", hasData ? (s.trades + " işlem") : "henüz işlem yok"));
+    card.appendChild(head);
+
+    if (!hasData){
+      card.appendChild(el("div", "placeholder small", "henüz işlem yok"));
+      return card;
+    }
+
+    var metrics = el("div", "strat-metrics");
+
+    var pnlVal = isNum(s.total_pnl) ? s.total_pnl : null;
+    var pnlCls = pnlVal === null ? "" : (pnlVal > 0 ? "profit-text" : (pnlVal < 0 ? "loss-text neg" : ""));
+    metrics.appendChild(el("div", "", '<div class="strat-metric-label">Toplam K/Z</div><div class="strat-metric-value full ' + pnlCls + '">' + fmtUsdt(pnlVal) + '</div>'));
+
+    metrics.appendChild(el("div", "", '<div class="strat-metric-label">Kazanma Oranı</div><div class="strat-metric-value">' + (isNum(s.winrate) ? fmtNum(s.winrate,1) + "%" : "—") + '</div>'));
+    metrics.appendChild(el("div", "", '<div class="strat-metric-label">İşlem</div><div class="strat-metric-value">' + (isNum(s.trades) ? s.trades : "—") + ' <span style="font-size:10px;color:var(--text-faint);font-weight:500;">(' + (isNum(s.wins) ? s.wins : "?") + ' K)</span></div>'));
+
+    var avgRoiCls = isNum(s.avg_roi) ? (s.avg_roi > 0 ? "profit-text" : (s.avg_roi < 0 ? "loss-text neg" : "")) : "";
+    metrics.appendChild(el("div", "", '<div class="strat-metric-label">Ort. ROI</div><div class="strat-metric-value ' + avgRoiCls + '">' + fmtPct(s.avg_roi) + '</div>'));
+
+    metrics.appendChild(el("div", "", '<div class="strat-metric-label">Profit Factor</div><div class="strat-metric-value">' + (isNum(s.profit_factor) ? fmtNum(s.profit_factor,2) : "—") + '</div>'));
+
+    card.appendChild(metrics);
+    return card;
+  }
+
+  function renderStrategyCards(stats){
+    var container = qs("strategy-cards");
+    container.innerHTML = "";
+
+    if (!stats || !stats.ok || !stats.data){
+      var msg = (stats && stats.status === 404) ? "scalper istatistikleri henüz bağlı değil" : "henüz bağlı değil / veri yok";
+      STRAT_ORDER.concat(["combined"]).forEach(function(key){
+        container.appendChild(strategyCardHtml(key, null, false));
+      });
+      qs("strat-updated").textContent = msg;
+      return;
+    }
+
+    qs("strat-updated").textContent = "";
+
+    var strategies = stats.data.strategies || {};
+    var combined = stats.data.combined || null;
+
+    var leaderKey = null;
+    var bestPnl = -Infinity;
+    STRAT_ORDER.forEach(function(k){
+      var s = strategies[k];
+      if (s && isNum(s.total_pnl) && s.trades > 0 && s.total_pnl > bestPnl){
+        bestPnl = s.total_pnl;
+        leaderKey = k;
+      }
+    });
+
+    STRAT_ORDER.forEach(function(k){
+      container.appendChild(strategyCardHtml(k, strategies[k], k === leaderKey));
+    });
+    container.appendChild(strategyCardHtml("combined", combined, false));
+  }
+
+  // ---------------------------------------------------------------
+  // 3. açık pozisyonlar (birleştirilmiş)
+  // ---------------------------------------------------------------
+
+  function strategyBadge(strategy){
+    if (!strategy) return '<span class="badge badge-strat badge-strat-none">MANUEL</span>';
+    var cls = "badge-strat-" + String(strategy).toLowerCase();
+    return '<span class="badge badge-strat ' + cls + '">' + escapeHtml(strategy) + '</span>';
+  }
+
+  function directionBadge(dir){
+    if (dir === "LONG" || dir === "BUY") return '<span class="badge badge-long">LONG</span>';
+    if (dir === "SHORT" || dir === "SELL") return '<span class="badge badge-short">SHORT</span>';
+    return '<span class="badge badge-status">' + escapeHtml(dir || "?") + '</span>';
+  }
+
+  function renderPositions(positionsRes, scalperRes){
+    var wrap = qs("positions-wrap");
+    var countEl = qs("positions-count");
+
+    var positions = (positionsRes && positionsRes.ok && positionsRes.data && Array.isArray(positionsRes.data.positions))
+      ? positionsRes.data.positions : null;
+    var tracked = (scalperRes && scalperRes.ok && scalperRes.data && Array.isArray(scalperRes.data.tracked))
+      ? scalperRes.data.tracked : [];
+
+    if (positions === null && tracked.length === 0){
+      countEl.textContent = "";
+      if (positionsRes && !positionsRes.ok && positionsRes.status !== 404 && !positionsRes.networkError){
+        notConnected(wrap, "pozisyon verisi alınamadı");
+      } else {
+        notConnected(wrap);
+      }
+      return;
+    }
+
+    // scalper tracked verisini sembole göre eşle
+    var trackedBySymbol = {};
+    tracked.forEach(function(t){ trackedBySymbol[t.symbol] = t; });
+
+    var rows = [];
+    var seen = {};
+
+    (positions || []).forEach(function(p){
+      seen[p.symbol] = true;
+      var t = trackedBySymbol[p.symbol];
+      rows.push({
+        symbol: p.symbol,
+        strategy: t ? t.strategy : null,
+        direction: p.side,
+        entry: p.entry_price,
+        current: p.current_price,
+        roi: (t && isNum(t.roi_pct)) ? t.roi_pct : p.pnl_percentage,
+        sl: p.current_stoploss,
+        tp1: t ? !!t.tp1_done : false,
+        trailing: !!(p.is_trailing || (t && t.trailing_active)),
+        be: !!p.is_break_even,
+        openedAt: p.opened_at || (t && t.opened_at)
+      });
+    });
+
+    // scalper'da izlenen ama /positions'ta görünmeyen (senkron dışı) satırlar
+    tracked.forEach(function(t){
+      if (seen[t.symbol]) return;
+      rows.push({
+        symbol: t.symbol,
+        strategy: t.strategy,
+        direction: t.direction,
+        entry: t.entry_price,
+        current: null,
+        roi: t.roi_pct,
+        sl: t.current_stoploss,
+        tp1: !!t.tp1_done,
+        trailing: !!t.trailing_active,
+        be: false,
+        openedAt: t.opened_at
+      });
+    });
+
+    countEl.textContent = rows.length ? "(" + rows.length + ")" : "";
+
+    if (rows.length === 0){
+      notConnected(wrap, "Açık pozisyon yok — motor tarıyor");
+      return;
+    }
+
+    var html = '<table><thead><tr>' +
+      '<th>Sembol</th><th>Strateji</th><th>Yön</th>' +
+      '<th class="num">Giriş</th><th class="num">Güncel</th>' +
+      '<th class="num">ROI</th><th class="num">SL</th>' +
+      '<th>Durum</th><th class="num">Yaş</th>' +
+      '</tr></thead><tbody>';
+
+    rows.forEach(function(r){
+      var slDist = (isNum(r.sl) && isNum(r.entry) && r.entry !== 0)
+        ? ((r.sl - r.entry) / r.entry * 100) : null;
+
+      var badges = "";
+      if (r.tp1) badges += '<span class="badge badge-tp1">TP1 ✓</span>';
+      if (r.trailing) badges += '<span class="badge badge-trailing"><span class="dot-pulse"></span>&nbsp;TRAILING</span>';
+      if (r.be) badges += '<span class="badge badge-be">BE</span>';
+      if (!badges) badges = '<span class="cell-dim">—</span>';
+
+      var roiCls = isNum(r.roi) ? (r.roi > 0 ? "profit-text" : (r.roi < 0 ? "loss-text neg" : "")) : "";
+
+      html += '<tr>' +
+        '<td class="cell-symbol">' + escapeHtml(r.symbol) + '</td>' +
+        '<td>' + strategyBadge(r.strategy) + '</td>' +
+        '<td>' + directionBadge(r.direction) + '</td>' +
+        '<td class="num">' + fmtPrice(r.entry) + '</td>' +
+        '<td class="num">' + fmtPrice(r.current) + '</td>' +
+        '<td class="num roi-cell ' + roiCls + '">' + fmtPct(r.roi) + '</td>' +
+        '<td class="num">' + fmtPrice(r.sl) + (slDist !== null ? '<div class="cell-dim">' + fmtPct(slDist,2) + '</div>' : '') + '</td>' +
+        '<td><div class="badges-cell">' + badges + '</div></td>' +
+        '<td class="num">' + fmtAge(r.openedAt) + '</td>' +
+        '</tr>';
+    });
+
+    html += '</tbody></table>';
+    wrap.innerHTML = html;
+  }
+
+  // ---------------------------------------------------------------
+  // 4. rejim haritası
+  // ---------------------------------------------------------------
+
+  function regimeChip(symbol, regime){
+    var cls, icon;
+    switch(regime){
+      case "UP": cls = "regime-up"; icon = "↑"; break;
+      case "DOWN": cls = "regime-down"; icon = "↓"; break;
+      case "RANGE": cls = "regime-range"; icon = "↔"; break;
+      default: cls = "regime-unknown"; icon = "?";
+    }
+    return '<span class="regime-chip"><span class="sym">' + escapeHtml(symbol) + '</span>' +
+      '<span class="' + cls + '">' + escapeHtml(regime || "UNKNOWN") + ' ' + icon + '</span></span>';
+  }
+
+  function renderRegimeMap(scalperRes){
+    var panel = qs("regime-panel");
+    var scanInfo = qs("regime-scan-info");
+
+    if (!scalperRes || !scalperRes.ok || !scalperRes.data){
+      notConnected(panel);
+      scanInfo.textContent = "";
+      return;
+    }
+
+    var d = scalperRes.data;
+    var universe = Array.isArray(d.universe) ? d.universe : [];
+    var regimes = d.regimes || {};
+
+    scanInfo.textContent = universe.length + " sembol · " + (isNum(d.scan_interval) ? d.scan_interval : "?") +
+      " sn'de bir · son tarama " + fmtClock(d.last_scan_at);
+
+    panel.innerHTML = "";
+
+    if (d.kill_switch_active){
+      panel.appendChild(el("div", "kill-switch-banner", "⛔ Günlük zarar limiti aşıldı — yeni giriş durduruldu"));
+    }
+
+    if (universe.length === 0){
+      panel.appendChild(el("div", "placeholder", "izlenen sembol yok"));
+      return;
+    }
+
+    var chipsWrap = el("div");
+    chipsWrap.style.display = "flex";
+    chipsWrap.style.flexWrap = "wrap";
+    chipsWrap.style.gap = "8px";
+    var html = "";
+    universe.forEach(function(sym){
+      html += regimeChip(sym, regimes[sym]);
+    });
+    chipsWrap.innerHTML = html;
+    panel.appendChild(chipsWrap);
+  }
+
+  // ---------------------------------------------------------------
+  // 5. son işlemler + sparkline
+  // ---------------------------------------------------------------
+
+  function exitReasonChip(reason){
+    var cls = "exit-other";
+    if (reason === "SL") cls = "exit-sl";
+    else if (reason === "TP_LADDER") cls = "exit-tp";
+    else if (reason === "TRAIL") cls = "exit-trail";
+    return '<span class="exit-chip ' + cls + '">' + escapeHtml(reason || "BİLİNMİYOR") + '</span>';
+  }
+
+  function drawSparkline(trades){
+    var canvas = qs("pnl-sparkline");
+    var ctx = canvas.getContext("2d");
+    var dpr = window.devicePixelRatio || 1;
+    var cssWidth = canvas.clientWidth || canvas.parentElement.clientWidth || 300;
+    var cssHeight = 56;
+    canvas.width = cssWidth * dpr;
+    canvas.height = cssHeight * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssWidth, cssHeight);
+
+    if (!trades || trades.length === 0){
+      qs("sparkline-last").textContent = "—";
+      return;
+    }
+
+    // kronolojik sıraya diz (en eskiden en yeniye), kümülatif gerçekleşen k/z hesapla
+    var sorted = trades.slice().sort(function(a,b){
+      var ta = a.closed_at ? new Date(a.closed_at).getTime() : 0;
+      var tb = b.closed_at ? new Date(b.closed_at).getTime() : 0;
+      return ta - tb;
+    });
+
+    var cum = 0;
+    var points = sorted.map(function(t){
+      cum += isNum(t.realized_pnl) ? t.realized_pnl : 0;
+      return cum;
+    });
+
+    var min = Math.min(0, points.reduce(function(a,b){return Math.min(a,b);}, points[0]));
+    var max = Math.max(0, points.reduce(function(a,b){return Math.max(a,b);}, points[0]));
+    if (min === max){ min -= 1; max += 1; }
+
+    var padding = 4;
+    var innerH = cssHeight - padding * 2;
+    var innerW = cssWidth - padding * 2;
+
+    function xAt(i){
+      if (points.length === 1) return padding;
+      return padding + (i / (points.length - 1)) * innerW;
+    }
+    function yAt(v){
+      return padding + innerH - ((v - min) / (max - min)) * innerH;
+    }
+
+    // sıfır çizgisi
+    ctx.strokeStyle = "rgba(255,255,255,0.12)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    var zeroY = yAt(0);
+    ctx.moveTo(padding, zeroY);
+    ctx.lineTo(cssWidth - padding, zeroY);
+    ctx.stroke();
+
+    var last = points[points.length - 1];
+    var lineColor = last >= 0 ? "#2dd4a7" : "#f6465d";
+
+    // dolgu
+    ctx.beginPath();
+    ctx.moveTo(xAt(0), yAt(points[0]));
+    points.forEach(function(v, i){ ctx.lineTo(xAt(i), yAt(v)); });
+    ctx.lineTo(xAt(points.length - 1), zeroY);
+    ctx.lineTo(xAt(0), zeroY);
+    ctx.closePath();
+    ctx.fillStyle = last >= 0 ? "rgba(45,212,167,0.12)" : "rgba(246,70,93,0.12)";
+    ctx.fill();
+
+    // çizgi
+    ctx.beginPath();
+    ctx.moveTo(xAt(0), yAt(points[0]));
+    points.forEach(function(v, i){ ctx.lineTo(xAt(i), yAt(v)); });
+    ctx.strokeStyle = lineColor;
+    ctx.lineWidth = 1.75;
+    ctx.lineJoin = "round";
+    ctx.stroke();
+
+    // son nokta
+    ctx.beginPath();
+    ctx.arc(xAt(points.length - 1), yAt(last), 2.5, 0, Math.PI * 2);
+    ctx.fillStyle = lineColor;
+    ctx.fill();
+
+    var lastLabel = qs("sparkline-last");
+    lastLabel.textContent = fmtUsdt(last);
+    lastLabel.className = last > 0 ? "profit-text" : (last < 0 ? "loss-text neg" : "");
+  }
+
+  function renderTrades(tradesRes){
+    var wrap = qs("trades-wrap");
+
+    if (!tradesRes || !tradesRes.ok || !Array.isArray(tradesRes.data)){
+      notConnected(wrap);
+      drawSparkline(null);
+      return;
+    }
+
+    var trades = tradesRes.data;
+    drawSparkline(trades);
+
+    if (trades.length === 0){
+      notConnected(wrap, "henüz kapanmış işlem yok");
+      return;
+    }
+
+    // en yeni önce göster
+    var sorted = trades.slice().sort(function(a,b){
+      var ta = a.closed_at ? new Date(a.closed_at).getTime() : 0;
+      var tb = b.closed_at ? new Date(b.closed_at).getTime() : 0;
+      return tb - ta;
+    }).slice(0, 30);
+
+    var html = '<table><thead><tr>' +
+      '<th>Zaman</th><th>Strateji</th><th>Sembol</th><th>Yön</th>' +
+      '<th class="num">Giriş → Çıkış</th><th class="num">K/Z</th>' +
+      '<th class="num">ROI</th><th>Çıkış</th>' +
+      '</tr></thead><tbody>';
+
+    sorted.forEach(function(t){
+      var pnlCls = pnlClass(t.realized_pnl);
+      html += '<tr>' +
+        '<td class="cell-dim">' + fmtDateTime(t.closed_at) + '</td>' +
+        '<td>' + strategyBadge(t.strategy) + '</td>' +
+        '<td class="cell-symbol">' + escapeHtml(t.symbol) + '</td>' +
+        '<td>' + directionBadge(t.direction) + '</td>' +
+        '<td class="num cell-dim">' + fmtPrice(t.entry_price) + ' → ' + fmtPrice(t.exit_price) + '</td>' +
+        '<td class="num ' + pnlCls + '" style="font-weight:700;">' + fmtUsdt(t.realized_pnl) + '</td>' +
+        '<td class="num ' + pnlCls + '">' + fmtPct(t.roi_pct) + '</td>' +
+        '<td>' + exitReasonChip(t.exit_reason) + '</td>' +
+        '</tr>';
+    });
+
+    html += '</tbody></table>';
+    wrap.innerHTML = html;
+  }
+
+  // ---------------------------------------------------------------
+  // 6. bekleyen sinyaller
+  // ---------------------------------------------------------------
+
+  function renderWaiting(waitingRes){
+    var section = qs("waiting-section");
+    var grid = qs("waiting-grid");
+    var countEl = qs("waiting-count");
+
+    if (!waitingRes || !waitingRes.ok || !Array.isArray(waitingRes.data) || waitingRes.data.length === 0){
+      section.style.display = "none";
+      return;
+    }
+
+    section.style.display = "";
+    var list = waitingRes.data;
+    countEl.textContent = "(" + list.length + ")";
+
+    grid.innerHTML = "";
+    list.forEach(function(w){
+      var card = el("div", "waiting-card");
+      var head = el("div", "waiting-card-head");
+      head.innerHTML = '<span class="waiting-card-sym">' + escapeHtml(w.symbol) + '</span>' + directionBadge(w.direction);
+      card.appendChild(head);
+
+      var rangeText = (isNum(w.original_entry_min) && isNum(w.original_entry_max))
+        ? fmtPrice(w.original_entry_min) + " – " + fmtPrice(w.original_entry_max) : "—";
+
+      var rows = [
+        ["Hedef Aralık", rangeText],
+        ["Güncel Fiyat", fmtPrice(w.current_price)],
+        ["AI Görüşü", escapeHtml(w.ai_verdict || "—")],
+        ["Skor", isNum(w.last_score) ? fmtNum(w.last_score, 1) : "—"],
+        ["Koşullar", (isNum(w.conditions_met_count) ? w.conditions_met_count : "?") + " / " + (isNum(w.total_checks) ? w.total_checks : "?")],
+        ["Bekleme", isNum(w.wait_time_hours) ? fmtNum(w.wait_time_hours,1) + " sa" : "—"]
+      ];
+      rows.forEach(function(r){
+        var row = el("div", "waiting-row");
+        row.innerHTML = "<span>" + r[0] + "</span><b>" + r[1] + "</b>";
+        card.appendChild(row);
+      });
+
+      grid.appendChild(card);
+    });
+  }
+
+  // ---------------------------------------------------------------
+  // ana döngü
+  // ---------------------------------------------------------------
+
+  function setLastUpdate(){
+    var now = new Date();
+    qs("last-update").textContent = "son güncelleme " + now.toLocaleTimeString("tr-TR", { hour12:false });
+  }
+
+  function setConnBanner(down){
+    var banner = qs("conn-banner");
+    if (down){
+      banner.classList.add("show");
+    } else {
+      banner.classList.remove("show");
+    }
+  }
+
+  function tick(){
+    var endpoints = [
+      fetchJSON("/health"),
+      fetchJSON("/api/status"),
+      fetchJSON("/positions"),
+      fetchJSON("/config"),
+      fetchJSON("/waiting-mode/active"),
+      fetchJSON("/scalper/status"),
+      fetchJSON("/scalper/stats"),
+      fetchJSON("/scalper/trades?limit=30")
+    ];
+
+    Promise.all(endpoints).then(function(results){
+      var health = results[0];
+      var status = results[1];
+      var positions = results[2];
+      // var config = results[3]; // şu an panelde ayrıca gösterilmiyor
+      var waiting = results[4];
+      var scalperStatus = results[5];
+      var scalperStats = results[6];
+      var scalperTrades = results[7];
+
+      // bağlantı bandı: sadece gerçek ağ hatalarında (sunucuya ulaşılamıyor)
+      // göster — 404/503 gibi uygulama düzeyi yanıtlar normal karşılanır.
+      var anyNetworkError = results.some(function(r){ return r.networkError; });
+      networkDown = anyNetworkError;
+      setConnBanner(networkDown);
+
+      renderTopbar(health, status, positions, scalperStatus);
+      renderStrategyCards(scalperStats);
+      renderPositions(positions, scalperStatus);
+      renderRegimeMap(scalperStatus);
+      renderTrades(scalperTrades);
+      renderWaiting(waiting);
+
+      setLastUpdate();
+    }).catch(function(err){
+      // beklenmeyen bir hata olsa bile sayfa çökmesin
+      console.error("dashboard tick hatası:", err);
+      setConnBanner(true);
+    });
+  }
+
+  function scheduleTick(){
+    if (timer) clearInterval(timer);
+    timer = setInterval(function(){
+      if (!autoRefresh) return;
+      if (document.hidden) return;
+      tick();
+    }, REFRESH_MS);
+  }
+
+  function updateToggleUI(){
+    var toggle = qs("refresh-toggle");
+    var label = qs("refresh-toggle-label");
+    if (autoRefresh){
+      toggle.classList.add("on");
+      label.textContent = "Otomatik Yenile";
+    } else {
+      toggle.classList.remove("on");
+      label.textContent = "Duraklatıldı";
+    }
+  }
+
+  qs("refresh-toggle").addEventListener("click", function(){
+    autoRefresh = !autoRefresh;
+    updateToggleUI();
+    if (autoRefresh) tick();
+  });
+
+  document.addEventListener("visibilitychange", function(){
+    if (!document.hidden && autoRefresh) tick();
+  });
+
+  window.addEventListener("resize", function(){
+    // sparkline'ı yeniden çizmek için son işlemleri tekrar iste — hafif,
+    // veri zaten önbellekte olmasa da tek seferlik bir istek sorun değil.
+    if (qs("pnl-sparkline")){
+      var wrap = qs("trades-wrap");
+      if (wrap && wrap.querySelector("table")){
+        fetchJSON("/scalper/trades?limit=30").then(function(res){
+          if (res.ok) drawSparkline(res.data);
         });
+      }
+    }
+  });
 
-        // Clean up on page unload
-        window.addEventListener('beforeunload', () => {
-            if (refreshInterval) {
-                clearInterval(refreshInterval);
-            }
-        });
-    </script>
-</body>
-</html>
+  updateToggleUI();
+  tick();
+  scheduleTick();
+})();
+</script>

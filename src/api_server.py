@@ -1,6 +1,18 @@
 """
 API Server for monitoring dashboard
 Provides real-time data and control endpoints for the trading bot
+
+DEPRECATED: Bu dosya artık aktif olarak kullanılmıyor / bakımı yapılmıyor.
+Botun güncel ve tam FastAPI uygulaması `src/main.py` içindedir (tüm gerçek
+endpoint'ler, waiting-mode, sinyal işleme, DB entegrasyonu vb. orada
+implemente edilmiştir — `uvicorn src.main:app` ile çalıştırın).
+
+Bu dosya önceden `src.core.database.DatabaseManager` diye var olmayan bir
+sınıfı import ediyordu ve bu yüzden import edilirken ImportError ile
+çöküyordu. Dosyanın en azından güvenle import edilebilmesi ve modülün
+tanımladığı endpoint'lerin (basit/örnek durumdaki DB sorguları hariç)
+çalışabilmesi için import düzeltildi. Yeni geliştirme için bu dosyayı değil
+`src/main.py`'ı kullanın.
 """
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -13,7 +25,7 @@ from datetime import datetime
 from contextlib import asynccontextmanager
 
 from src.core.logger import app_logger
-from src.core.database import DatabaseManager
+from src.core.database import init_db, AsyncSessionLocal
 from src.core.config import settings
 from src.trading.binance_client_improved import ImprovedBinanceClient
 
@@ -48,7 +60,7 @@ class ConnectionManager:
 # Global instances
 manager = ConnectionManager()
 bot_running = False
-db_manager = None
+db_initialized = False
 binance_client = None
 bot_task = None
 
@@ -56,14 +68,14 @@ bot_task = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events"""
-    global db_manager, binance_client
+    global db_initialized, binance_client
 
     # Startup
     app_logger.info("🚀 API Server başlatılıyor...")
 
     # Database bağlantısı
-    db_manager = DatabaseManager()
-    await db_manager.init_db()
+    await init_db()
+    db_initialized = True
 
     # Binance client
     binance_client = ImprovedBinanceClient()
@@ -139,8 +151,8 @@ async def get_status_data() -> Dict[str, Any]:
         open_positions = 0
         total_pnl = 0.0
 
-        if db_manager:
-            async with db_manager.get_session() as session:
+        if db_initialized:
+            async with AsyncSessionLocal() as session:
                 # Get positions (simplified for this example)
                 pass  # Database queries would go here
 
@@ -297,7 +309,7 @@ async def test_ai():
 async def get_positions():
     """Get all positions"""
     try:
-        if not db_manager:
+        if not db_initialized:
             return {"positions": []}
 
         # Database queries would go here
