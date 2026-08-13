@@ -1,0 +1,1449 @@
+"""
+ScalperEngine — scalper alt sisteminin orkestrasyon katmanı.
+
+Kendi ImprovedBinanceClient + PositionManager çiftini kurar (orchestrator'ın
+Telegram akışıyla PAYLAŞMAZ — iki bağımsız istemci, iki bağımsız bağlantı
+havuzu; scalper'ın hızlı tarama döngüsü Telegram sinyal akışını asla
+bloklamaz). KlineFetcher/UniverseScanner de public/imzasız endpoint'ler
+üzerinden kendi httpx havuzlarını kurar (data.py/scanner.py'nin kendi
+tasarım ilkeleri).
+
+İki bağımsız döngü vardır:
+  * Safety döngüsü (varsayılan 2sn): exits.step(), günlük zarar kesici ve
+    maker dolum takibi. Uzun sembol taraması bu koruma işlerini geciktiremez.
+  * Scan döngüsü (scalper_scan_interval_seconds): evreni ve stratejileri
+    tarar. Kill switch ve kapasite, emir açılmadan hemen önce tekrar
+    doğrulanır.
+
+Hata izolasyonu: bir sembolün hatası turu öldürmez (sembol başına
+try/except), ama asyncio.CancelledError her zaman yükseltilir (görev
+iptali yutulmaz).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from src.core.config import settings
+from src.core.logger import app_logger
+from src.strategies.scalper.data import KlineFetcher
+from src.strategies.scalper.executor import ScalpExecutor
+from src.strategies.scalper.exits import ExitManager
+from src.strategies.scalper.indicators import atr as compute_atr
+from src.strategies.scalper.regime import detect_regime
+from src.strategies.scalper.scanner import UniverseScanner
+from src.strategies.scalper.setups import apply_stop_policy, get_enabled
+from src.strategies.scalper.tracker import ScalpTracker
+from src.strategies.scalper.types import (
+    Direction,
+    Regime,
+    ScalpSignal,
+    StrategyContext,
+)
+from src.trading.binance_client_improved import ImprovedBinanceClient
+from src.trading.position_manager import PositionManager, UnprotectedPositionError
+from src.trading.symbol_reservations import symbol_reservations
+from src.trading.user_stream import BinanceUserDataStream
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+class _ExternalSignalStrategy:
+    """TradingView webhook'undan gelen tek-atımlık sinyal sarmalayıcısı.
+
+    StrategyProtocol uyumlu: _evaluate_symbol'ün normal akışına takılır,
+    böylece dış sinyal de İÇ sinyallerle AYNI hattan geçer — stop politikası
+    (fixed_roi/ATR taban), risk boyutlama, maker giriş, TP/BE/chandelier,
+    cooldown, kapasite ve rezervasyon kapılarının hiçbiri atlanmaz. Yalnız
+    setup koşulları (RSI/BB/diverjans) dışarıya devredilmiştir — yön ve
+    zamanlama TradingView'in işidir.
+
+    seed stop = giriş ∓ 1×ATR yalnız TOHUM değerdir; apply_stop_policy canlı
+    profile göre (örn. fixed_roi %50) yeniden yazar.
+    """
+
+    name = "TV"
+
+    def __init__(self, direction: Direction):
+        self._direction = direction
+
+    def evaluate(self, ctx: StrategyContext) -> Optional[ScalpSignal]:
+        if ctx.atr_5m <= 0.0 or ctx.current_price <= 0.0:
+            return None
+        if self._direction == Direction.LONG:
+            seed_stop = ctx.current_price - ctx.atr_5m
+            if seed_stop <= 0.0:
+                return None
+        else:
+            seed_stop = ctx.current_price + ctx.atr_5m
+        return ScalpSignal(
+            strategy=self.name,
+            symbol=ctx.symbol,
+            direction=self._direction,
+            entry_price=ctx.current_price,
+            stop_price=seed_stop,
+            reason="TradingView webhook sinyali",
+            regime=ctx.regime,
+            atr_5m=ctx.atr_5m,
+        )
+
+
+class ScalperEngine:
+    """Tarama → sinyal değerlendirme → giriş → çıkış döngüsünü yürütür."""
+
+    _REGIME_CACHE_TTL = 300.0    # saniye — sembol başına rejim önbelleği
+    _BALANCE_CACHE_TTL = 300.0   # saniye — kill switch için bakiye önbelleği
+    _INCOME_CACHE_TTL = 30.0
+    _EXCHANGE_PROBE_INTERVAL = 30.0
+    _RESERVATION_OWNER = "scalper"
+
+    def __init__(self) -> None:
+        self.cfg = settings
+        self.logger = app_logger
+
+        # Orchestrator'dan bağımsız kendi istemci çifti.
+        self.client = ImprovedBinanceClient()
+        self.pm = PositionManager(self.client)
+        self.fetcher = KlineFetcher()
+        self.scanner = UniverseScanner(top_n=settings.scalper_top_n)
+        self.tracker = ScalpTracker()
+        self.executor = ScalpExecutor(self.client, self.pm, self.tracker, self.cfg)
+        self.exits = ExitManager(
+            self.client, self.pm, self.tracker, self.cfg, self.fetcher.get_klines,
+            loss_cooldown_cb=self.executor.start_loss_cooldown,
+        )
+
+        # _task eski iç kullanımlar için scan task alias'ı olarak korunur.
+        self._task: Optional[asyncio.Task] = None
+        self._safety_task: Optional[asyncio.Task] = None
+        self._exchange_task: Optional[asyncio.Task] = None
+        self._entry_lock = asyncio.Lock()
+        # reserve() ile try_open() arasındaki await'ler sırasında safety
+        # döngüsü normal senkronizasyonda sembolü erken bırakmamalı. Başarılı
+        # giriş pending/tracked durumuna geçene kadar bu küme ownership'i canlı
+        # tutar; koruma hatasında ise global safety latch devralır.
+        self._opening_symbols: Set[str] = set()
+        self.running = False
+        self.user_stream = BinanceUserDataStream(
+            self.client,
+            self._handle_user_order_update,
+            ws_base_url=getattr(self.cfg, "binance_ws_base_url", None),
+        )
+
+        # Anlık durum — snapshot() bunları okur.
+        self._universe: List[str] = []
+        self._regimes: Dict[str, str] = {}
+        self._regime_cache: Dict[str, Tuple[Regime, float]] = {}
+        self._balance_cache: Tuple[Optional[float], float] = (None, 0.0)
+        self._daily_pnl: float = 0.0
+        self._daily_pnl_source: str = "unavailable"
+        self._risk_equity_usdt: Optional[float] = None
+        self._risk_equity_source: str = "unavailable"
+        self._daily_loss_threshold_usdt: Optional[float] = None
+        self._virtual_equity_cache: Tuple[Optional[float], float] = (None, 0.0)
+        self._daily_income_cache: Tuple[Optional[float], float, Optional[str]] = (
+            None,
+            0.0,
+            None,
+        )
+        self._risk_ready: bool = False
+        self._kill_switch: bool = False
+        self._kill_switch_day: Optional[str] = None
+        # UnprotectedPositionError görülürse restart/reconcile edilene kadar
+        # açılmaz. Safety döngüsü mevcut pozisyonları izlemeyi sürdürür.
+        self._entry_halted: bool = False
+        self._entry_halt_reason: Optional[str] = None
+        self._entry_halted_at: Optional[str] = None
+        configured_halt_path = getattr(
+            self.cfg, "scalper_entry_halt_path", None
+        )
+        self._entry_halt_path: Optional[Path] = (
+            Path(configured_halt_path).expanduser() if configured_halt_path else None
+        )
+        self._load_entry_halt()
+        self._exchange_ready: bool = False
+        self._recovery_ready: bool = False
+        self._exchange_last_success_at: Optional[str] = None
+        self._exchange_last_success_monotonic: Optional[float] = None
+        self._exchange_last_error: Optional[str] = None
+        self._exchange_last_error_at: Optional[str] = None
+        self._exchange_success_count: int = 0
+        self._signals_today: int = 0
+        self._last_scan_at: Optional[str] = None
+
+        # Döngü telemetrisi. ISO zamanlar API için, monotonic zamanlar
+        # saat ayarı değişimlerinden etkilenmeyen freshness hesabı içindir.
+        self._scan_last_started_at: Optional[str] = None
+        self._scan_last_success_at: Optional[str] = None
+        self._scan_last_success_monotonic: Optional[float] = None
+        self._scan_last_duration_seconds: Optional[float] = None
+        self._scan_last_error: Optional[str] = None
+        self._scan_last_error_at: Optional[str] = None
+        self._scan_consecutive_errors: int = 0
+        self._scan_success_count: int = 0
+
+        self._safety_last_started_at: Optional[str] = None
+        self._safety_last_success_at: Optional[str] = None
+        self._safety_last_success_monotonic: Optional[float] = None
+        self._safety_last_duration_seconds: Optional[float] = None
+        self._safety_last_error: Optional[str] = None
+        self._safety_last_error_at: Optional[str] = None
+        self._safety_consecutive_errors: int = 0
+        self._safety_success_count: int = 0
+
+    # ------------------------------------------------------------------
+    # Yaşam döngüsü
+    # ------------------------------------------------------------------
+
+    async def start(self) -> None:
+        if (
+            self.running
+            and self._task
+            and not self._task.done()
+            and self._safety_task
+            and not self._safety_task.done()
+            and self._exchange_task
+            and not self._exchange_task.done()
+        ):
+            self.logger.info("ℹ️ Scalper motoru zaten çalışıyor")
+            return
+
+        self.logger.info("⚡ Scalper motoru başlatılıyor...")
+        self.logger.info(
+            f"🎯 Evren={self.cfg.scalper_top_n} sembol, tarama={self.cfg.scalper_scan_interval_seconds}sn, "
+            f"safety={self._safety_interval_seconds():g}sn, "
+            f"stratejiler={self.cfg.scalper_strategies}, kaldıraç={self.cfg.scalper_leverage}x"
+        )
+        if await self._probe_exchange():
+            await self._attempt_recovery()
+            await self._update_kill_switch()
+
+        self.running = True
+        if not self._task or self._task.done():
+            self._task = asyncio.create_task(self._loop(), name="scalper-scan-loop")
+        if not self._safety_task or self._safety_task.done():
+            self._safety_task = asyncio.create_task(
+                self._safety_loop(), name="scalper-safety-loop"
+            )
+        if not self._exchange_task or self._exchange_task.done():
+            self._exchange_task = asyncio.create_task(
+                self._exchange_loop(), name="scalper-exchange-readiness-loop"
+            )
+        await self.user_stream.start()
+
+        self.logger.info("✅ Scalper scan ve safety görevleri başlatıldı")
+
+    async def stop(self) -> None:
+        self.logger.info("🛑 Scalper motoru durduruluyor...")
+        self.running = False
+        tasks = [
+            task
+            for task in (self._task, self._safety_task, self._exchange_task)
+            if task is not None
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Yeni WS fill olayı ile shutdown iptali yarışmasın; REST terminal
+        # reconciliation aşağıda executor kilidi altında devam eder.
+        await self.user_stream.stop()
+
+        # Maker modunda bekleyen tüm LIMIT girişlerini iptal et — temiz
+        # kapanış (client henüz kapatılmadan, aşağıdaki closer döngüsünden
+        # ÖNCE çalışmalı).
+        try:
+            opened_during_cancel = await self.executor.cancel_all_pending()
+            self._track_opened_positions(
+                opened_during_cancel, source="shutdown pending iptal yarışı"
+            )
+        except Exception as e:
+            self.logger.warning(f"⚠️ Bekleyen maker girişleri iptal edilirken hata: {e}")
+
+        self._sync_scalper_reservations()
+
+        for closer in (self.fetcher.close, self.scanner.close, self.client.close):
+            try:
+                await closer()
+            except Exception as e:
+                self.logger.warning(f"⚠️ Scalper motoru kapatılırken kaynak temizleme hatası: {e}")
+
+        self.logger.info("✅ Scalper motoru durduruldu")
+
+    # ------------------------------------------------------------------
+    # Restart recovery, signed readiness and persistent safety latch
+    # ------------------------------------------------------------------
+
+    def _load_entry_halt(self) -> None:
+        path = self._entry_halt_path
+        if path is None or not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict) or payload.get("active") is not True:
+                raise ValueError("entry halt state şeması geçersiz")
+            self._entry_halted = True
+            self._entry_halt_reason = str(
+                payload.get("reason") or "persisted safety hold"
+            )
+            self._entry_halted_at = str(payload.get("halted_at") or _utcnow_iso())
+            self.logger.critical(
+                f"🚨 Kalıcı scalper entry hold yüklendi: {self._entry_halt_reason}. "
+                "Restart yeni girişleri açmayacak.",
+                extra={"trade": True},
+            )
+        except Exception as e:
+            # Bozuk güvenlik dosyası fail-open olamaz.
+            self._entry_halted = True
+            self._entry_halt_reason = f"entry halt state okunamadı: {type(e).__name__}: {e}"
+            self._entry_halted_at = _utcnow_iso()
+            self.logger.critical(
+                f"🚨 {self._entry_halt_reason}; yeni girişler fail-closed kapalı",
+                extra={"trade": True},
+            )
+
+    def _persist_entry_halt(self) -> None:
+        path = self._entry_halt_path
+        if path is None:
+            return
+        tmp_path: Optional[Path] = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_name(
+                f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+            )
+            payload = {
+                "version": 1,
+                "active": True,
+                "reason": self._entry_halt_reason,
+                "halted_at": self._entry_halted_at,
+            }
+            with tmp_path.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, path)
+            try:
+                directory_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                pass
+        except Exception as e:
+            self.logger.critical(
+                f"🚨 Entry hold RAM'de aktif ancak kalıcılaştırılamadı ({path}): {e}",
+                extra={"trade": True},
+            )
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    async def _probe_exchange(self) -> bool:
+        """Prove signed Binance Futures account access; never fake readiness."""
+
+        try:
+            await self.client.get_all_positions()
+        except Exception as e:
+            self._exchange_ready = False
+            self._exchange_last_error = f"{type(e).__name__}: {e}"
+            self._exchange_last_error_at = _utcnow_iso()
+            self.logger.error(
+                f"❌ Scalper signed Binance readiness başarısız; yeni girişler kapalı: {e}"
+            )
+            return False
+
+        self._exchange_ready = True
+        self._exchange_last_success_at = _utcnow_iso()
+        self._exchange_last_success_monotonic = time.monotonic()
+        self._exchange_last_error = None
+        self._exchange_success_count += 1
+        return True
+
+    async def _attempt_recovery(self) -> bool:
+        """Reconcile persistent maker intents, then verify every OPEN scalp."""
+
+        try:
+            recovered_pending = await self.executor.recover_pending()
+            self._track_opened_positions(
+                recovered_pending, source="restart maker recovery"
+            )
+            exits_ok = await self.exits.recover()
+        except UnprotectedPositionError as e:
+            self._recovery_ready = False
+            await self._latch_entry_halt(e, source="restart recovery")
+        except Exception as e:
+            self._recovery_ready = False
+            self.logger.error(f"❌ Scalper restart recovery başarısız: {e}", exc_info=True)
+        else:
+            self._recovery_ready = bool(exits_ok)
+
+        # Başarısız/yarım recovery'de de RAM'e yüklenmiş journal sembolleri
+        # başka motor tarafından sahiplenilemez. Hold, ownership ile birlikte
+        # korunur; restart asla bu sınırı temizlemez.
+        for symbol in self.exits.tracked_symbols() | self.executor.pending_symbols():
+            if not symbol_reservations.reserve(symbol, self._RESERVATION_OWNER):
+                await self._latch_entry_halt(
+                    UnprotectedPositionError(
+                        f"{symbol}: restart recovery sırasında başka motor sahipliği bulundu"
+                    ),
+                    source="symbol ownership recovery",
+                )
+                self._recovery_ready = False
+                break
+
+        if not self._recovery_ready:
+            self.logger.error(
+                "⛔ Scalper recovery güvenliği kanıtlanamadı; safety izlemeye devam "
+                "ediyor ancak yeni girişler kapalı"
+            )
+        return self._recovery_ready
+
+    async def _exchange_loop(self) -> None:
+        self.logger.info("🔐 Scalper signed exchange readiness döngüsü başladı")
+        while self.running:
+            try:
+                ready = await self._probe_exchange()
+                if ready and not self._recovery_ready:
+                    await self._attempt_recovery()
+            except asyncio.CancelledError:
+                self.logger.info("🔐 Scalper exchange readiness döngüsü durduruldu")
+                raise
+            except Exception as e:
+                self._exchange_ready = False
+                self._exchange_last_error = f"{type(e).__name__}: {e}"
+                self._exchange_last_error_at = _utcnow_iso()
+                self.logger.error(f"❌ Exchange readiness döngüsü hatası: {e}", exc_info=True)
+            await asyncio.sleep(self._EXCHANGE_PROBE_INTERVAL)
+
+    async def _handle_user_order_update(self, event: Dict[str, Any]) -> None:
+        """Protect a maker fill immediately; REST safety loop remains fallback."""
+
+        try:
+            sp = await self.executor.handle_order_update(event)
+            if sp is not None:
+                self._track_opened_positions([sp], source="ORDER_TRADE_UPDATE")
+        except UnprotectedPositionError as e:
+            await self._latch_entry_halt(e, source="user-data stream")
+        except Exception as e:
+            self.logger.error(
+                f"❌ Binance order update işlenemedi; REST reconciliation sürecek: {e}",
+                exc_info=True,
+            )
+
+    def _entries_ready(self) -> bool:
+        exchange_age = (
+            time.monotonic() - self._exchange_last_success_monotonic
+            if self._exchange_last_success_monotonic is not None
+            else float("inf")
+        )
+        return bool(
+            self._exchange_ready
+            and exchange_age <= self._EXCHANGE_PROBE_INTERVAL * 3.0
+            and self._recovery_ready
+            and self._risk_ready
+            and not self._entry_halted
+            and not self._kill_switch
+        )
+
+    def _sync_scalper_reservations(self) -> None:
+        """Release normal closed/cancelled symbols, never an active safety hold."""
+
+        if self._entry_halted:
+            return
+        active = (
+            self.exits.tracked_symbols()
+            | self.executor.pending_symbols()
+            | set(self._opening_symbols)
+        )
+        for symbol, owner in symbol_reservations.snapshot().items():
+            if owner == self._RESERVATION_OWNER and symbol not in active:
+                symbol_reservations.release(symbol, self._RESERVATION_OWNER)
+
+    # ------------------------------------------------------------------
+    # Ana döngü
+    # ------------------------------------------------------------------
+
+    async def _loop(self) -> None:
+        self.logger.info("👁️ Scalper tarama döngüsü başladı")
+        while self.running:
+            started = time.monotonic()
+            self._scan_last_started_at = _utcnow_iso()
+            try:
+                await self._scan_tick()
+            except asyncio.CancelledError:
+                self.logger.info("👁️ Scalper tarama döngüsü durduruldu")
+                raise
+            except UnprotectedPositionError as e:
+                await self._latch_entry_halt(e, source="scan")
+                self._scan_consecutive_errors += 1
+                self._scan_last_error = f"{type(e).__name__}: {e}"
+                self._scan_last_error_at = _utcnow_iso()
+            except Exception as e:
+                self._scan_consecutive_errors += 1
+                self._scan_last_error = f"{type(e).__name__}: {e}"
+                self._scan_last_error_at = _utcnow_iso()
+                self.logger.error(f"❌ Scalper döngü hatası: {e}", exc_info=True)
+            else:
+                succeeded_at = _utcnow_iso()
+                self._scan_last_success_at = succeeded_at
+                self._scan_last_success_monotonic = time.monotonic()
+                self._scan_consecutive_errors = 0
+                self._scan_success_count += 1
+                self._last_scan_at = succeeded_at
+            finally:
+                self._scan_last_duration_seconds = time.monotonic() - started
+
+            await asyncio.sleep(self.cfg.scalper_scan_interval_seconds)
+
+    async def _safety_loop(self) -> None:
+        self.logger.info("🛡️ Scalper safety döngüsü başladı")
+        while self.running:
+            started = time.monotonic()
+            self._safety_last_started_at = _utcnow_iso()
+            try:
+                await self._safety_tick()
+            except asyncio.CancelledError:
+                self.logger.info("🛡️ Scalper safety döngüsü durduruldu")
+                raise
+            except UnprotectedPositionError as e:
+                await self._latch_entry_halt(e, source="safety")
+                self._safety_consecutive_errors += 1
+                self._safety_last_error = f"{type(e).__name__}: {e}"
+                self._safety_last_error_at = _utcnow_iso()
+            except Exception as e:
+                self._safety_consecutive_errors += 1
+                self._safety_last_error = f"{type(e).__name__}: {e}"
+                self._safety_last_error_at = _utcnow_iso()
+                self.logger.error(f"❌ Scalper safety döngü hatası: {e}", exc_info=True)
+            else:
+                self._safety_last_success_at = _utcnow_iso()
+                self._safety_last_success_monotonic = time.monotonic()
+                self._safety_consecutive_errors = 0
+                self._safety_success_count += 1
+            finally:
+                self._safety_last_duration_seconds = time.monotonic() - started
+
+            await asyncio.sleep(self._safety_interval_seconds())
+
+    async def _safety_tick(self) -> None:
+        # Pending giriş, gerçekleştiği anda henüz SL'sizdir; bu yüzden REST
+        # reconciliation yedeğinde bile exits/PNL gibi daha yavaş işlerden
+        # ÖNCE ele alınır. User-data stream ayrıca aynı olayı anlık işleyecek;
+        # executor kilidi iki yolun double-finalize etmesini engeller.
+        if self._kill_switch or self._entry_halted:
+            # Entry lock, tarama döngüsünün try_open() kritik kesitiyle
+            # serileştirir: tetik sonrası yeni pending eklenip iptal turunu
+            # kaçıramaz. Executor iptal-dolum yarışını borsa durumuyla
+            # uzlaştırmakla sorumludur.
+            async with self._entry_lock:
+                if self.executor.pending_symbols():
+                    opened_during_cancel = await self.executor.cancel_all_pending()
+                    self._track_opened_positions(
+                        opened_during_cancel, source="pending iptal yarışı"
+                    )
+        else:
+            # Maker modunda bekleyen LIMIT girişlerini hızlı ilerlet; yeni
+            # dolanlar hemen exits.track() ile izlemeye alınır.
+            self._track_opened_positions(
+                await self.executor.check_pending(), source="maker dolumu"
+            )
+
+        # Artık tüm yeni dolumlar korumalı ve izleniyor: açık pozisyon çıkış
+        # yönetimi ile gerçek günlük risk kapısı bundan sonra çalışabilir.
+        await self.exits.step()
+        self._sync_scalper_reservations()
+        was_blocked = self._kill_switch or self._entry_halted
+        await self._update_kill_switch()
+
+        # Kill switch bu turda yeni tetiklendiyse hâlâ NEW olan maker
+        # emirlerini aynı turda iptal et. Dolu/partial yarışları executor
+        # tarafından korunup izlemeye alınır.
+        if not was_blocked and (self._kill_switch or self._entry_halted):
+            async with self._entry_lock:
+                if self.executor.pending_symbols():
+                    opened_during_cancel = await self.executor.cancel_all_pending()
+                    self._track_opened_positions(
+                        opened_during_cancel, source="risk kapısı iptal yarışı"
+                    )
+
+    def _track_opened_positions(self, positions: list, *, source: str) -> None:
+        """Pending uzlaştırmasında gerçekleşmiş dolumları izlemeye al."""
+        for sp in positions:
+            symbol = sp.position.symbol
+            if not symbol_reservations.reserve(symbol, self._RESERVATION_OWNER):
+                self._entry_halted = True
+                self._entry_halt_reason = (
+                    f"{symbol}: korunmuş fill başka bir motorun sembol sahipliğiyle çakıştı"
+                )
+                self._entry_halted_at = _utcnow_iso()
+                self._persist_entry_halt()
+                self.logger.critical(
+                    f"🚨 {self._entry_halt_reason}; tüm yeni scalper girişleri durduruldu",
+                    extra={"trade": True},
+                )
+            self.exits.track(sp)
+            self._signals_today += 1
+            self.logger.info(
+                f"🎯 {sp.position.symbol}: {source} -> pozisyon korundu ve izlemeye alındı "
+                f"({sp.signal.direction.value} @ {sp.position.entry_price})",
+                extra={"trade": True},
+            )
+
+    async def _scan_tick(self) -> None:
+        # Evren taraması ve sinyal üretimi safety döngüsünden tamamen
+        # ayrıdır; yavaş bir sembol koruma izlemesini geciktiremez.
+        allowlist_csv = str(
+            getattr(self.cfg, "scalper_symbol_allowlist", "") or ""
+        ).strip()
+        if allowlist_csv:
+            # Kanıt disiplini: canlı evren, backtest'in kapsadığı sembollere
+            # sabitlenebilir — scanner'ın top_n listesi hiç sorgulanmaz.
+            self._universe = [
+                s.strip().upper() for s in allowlist_csv.split(",") if s.strip()
+            ]
+        else:
+            self._universe = await self.scanner.get_universe()
+
+        if not self._entries_ready():
+            return
+
+        # Sembol başına tek strateji denemesi.
+        enabled_strategies = get_enabled(self.cfg.scalper_strategies)
+        if not enabled_strategies:
+            return
+
+        # Pozisyon durumu TEK toplu çağrıyla (20× /positionRisk yerine 1×
+        # /fapi/v2/account) — 2026-08-12 IP ban kök nedeni istek ağırlığıydı.
+        # Tick içi bayatlama kabul edilir: entry_lock altındaki son kapı ve
+        # executor zaten yarışları yakalar.
+        try:
+            open_positions = await self.client.get_all_positions()
+        except Exception as e:
+            self.logger.warning(f"⛔ Tarama pozisyon özeti alınamadı, tur atlandı ({e})")
+            return
+        self._scan_open_symbols = {
+            str(p.get("symbol", "")).upper() for p in open_positions
+        }
+
+        for symbol in self._universe:
+            if not self._entries_ready():
+                break
+
+            # Koruma emri/çıkış kurulumu başarısız olmuş bir sembole,
+            # executor'ın kalıcı cooldown süresi dolmadan yeniden girme.
+            # Eski executor sürümleri için public API yoksa davranış
+            # geriye uyumlu biçimde değişmez.
+            if self._executor_entry_blocked(symbol):
+                continue
+
+            tracked = self.exits.tracked_symbols()
+            pending = self.executor.pending_symbols()
+            if symbol in tracked or symbol in pending:
+                continue
+            owner = symbol_reservations.owner(symbol)
+            if owner is not None and owner != self._RESERVATION_OWNER:
+                continue
+            if len(tracked | pending) >= self.cfg.scalper_max_positions:
+                # Sembol başına değil, TUR başına kesici: kapasite dolduysa bu
+                # turda başka hiçbir yeni sembol denenmez.
+                break
+
+            try:
+                await self._evaluate_symbol(symbol, enabled_strategies)
+            except asyncio.CancelledError:
+                raise
+            except UnprotectedPositionError:
+                # Bu, sembol bazında atlanabilecek normal bir API hatası
+                # değildir; üst döngü global entry latch'i kapatmalıdır.
+                raise
+            except Exception as e:
+                self.logger.error(f"❌ {symbol}: tur değerlendirmesi hata verdi ({e})", exc_info=True)
+
+    async def _evaluate_symbol(self, symbol: str, enabled_strategies: list) -> None:
+        owner = symbol_reservations.owner(symbol)
+        if owner is not None and owner != self._RESERVATION_OWNER:
+            return
+        if self._executor_entry_blocked(symbol):
+            return
+        # Tarama turunun başında toplu çekilen açık pozisyon kümesi (bkz.
+        # _scan_tick). getattr: eski test çiftleri bu alanı kurmayabilir.
+        if symbol.upper() in getattr(self, "_scan_open_symbols", set()):
+            # Telegram botu veya elle açılmış pozisyon — dokunma.
+            return
+
+        # Zaman dilimi profili konfigüre edilebilir (varsayılan 5m/15m/4h;
+        # hızlı profil 1m/5m/15m). Alan adları rol belirtir: candles_5m =
+        # giriş dilimi, candles_15m = bağlam, candles_4h = rejim.
+        tf_regime = str(getattr(self.cfg, "scalper_tf_regime", "4h") or "4h")
+        tf_context = str(getattr(self.cfg, "scalper_tf_context", "15m") or "15m")
+        tf_entry = str(getattr(self.cfg, "scalper_tf_entry", "5m") or "5m")
+        candles_4h = await self.fetcher.get_klines(symbol, tf_regime, 250)
+        candles_15m = await self.fetcher.get_klines(symbol, tf_context, 100)
+        candles_5m = await self.fetcher.get_klines(symbol, tf_entry, 150)
+
+        if not candles_5m:
+            return
+
+        regime = self._get_cached_regime(symbol, candles_4h)
+        self._regimes[symbol] = regime.value
+
+        current_price = candles_5m[-1].close
+        atr_5m = compute_atr(candles_5m, 14)
+
+        ctx = StrategyContext(
+            symbol=symbol,
+            regime=regime,
+            candles_4h=candles_4h,
+            candles_15m=candles_15m,
+            candles_5m=candles_5m,
+            current_price=current_price,
+            atr_5m=atr_5m,
+            leverage=self.cfg.scalper_leverage,
+        )
+
+        for strat in enabled_strategies:
+            sig = strat.evaluate(ctx)
+            if sig is None:
+                continue
+            # Ortak stop politikası: structural modda ATR tabanı, fixed_roi
+            # modda marj-yüzdesi stopu. Backtest'te simulate_symbol aynı
+            # dönüşümü uygular — canlı/backtest paritesi bozulmamalı.
+            sig = apply_stop_policy(sig, self.cfg)
+
+            # Veri toplama sırasında kill switch veya kapasite değişmiş
+            # olabilir. Emir açma kararını, safety kill-switch iptaliyle aynı
+            # kilit altında son kez doğrula.
+            async with self._entry_lock:
+                tracked = self.exits.tracked_symbols()
+                pending = self.executor.pending_symbols()
+                if not self._entries_ready():
+                    if self._entry_halted:
+                        reason = "entry safety latch"
+                    elif self._kill_switch:
+                        reason = "kill switch"
+                    else:
+                        reason = "exchange/recovery readiness"
+                    self.logger.info(f"⏭️ {symbol}: {reason} aktif, hazır sinyal açılmadı")
+                    return
+                # Mumlar indirilirken veya strateji hesaplanırken bir koruma
+                # hatası cooldown başlatmış olabilir. POST'tan hemen önceki
+                # bu ikinci kapı yarış penceresini kapatır.
+                if self._executor_entry_blocked(symbol):
+                    self.logger.info(
+                        f"⏭️ {symbol}: giriş cooldown aktif, hazır sinyal açılmadı"
+                    )
+                    return
+                if symbol in tracked or symbol in pending:
+                    return
+                if len(tracked | pending) >= self.cfg.scalper_max_positions:
+                    self.logger.info(f"⏭️ {symbol}: scalper pozisyon kapasitesi dolu, sinyal açılmadı")
+                    return
+                try:
+                    exchange_positions = await self.client.get_all_positions()
+                except Exception as e:
+                    self._exchange_ready = False
+                    self._exchange_last_error = f"{type(e).__name__}: {e}"
+                    self._exchange_last_error_at = _utcnow_iso()
+                    self.logger.error(
+                        f"⛔ {symbol}: hesap pozisyonları doğrulanamadı; giriş fail-closed reddedildi ({e})"
+                    )
+                    return
+
+                live_symbols = {
+                    str(raw.get("symbol", "")).upper()
+                    for raw in exchange_positions
+                    if float(raw.get("positionAmt", 0) or 0) != 0
+                }
+                if symbol in live_symbols:
+                    return
+                if not symbol_reservations.reserve(
+                    symbol,
+                    self._RESERVATION_OWNER,
+                    capacity=getattr(
+                        self.cfg,
+                        "max_positions",
+                        self.cfg.scalper_max_positions,
+                    ),
+                    exchange_symbols=live_symbols,
+                ):
+                    self.logger.info(
+                        f"⏭️ {symbol}: sembol başka motorun yönetiminde veya hesap kapasitesi dolu"
+                    )
+                    return
+
+                self._opening_symbols.add(symbol)
+                unsafe_failure = False
+                sp = None
+                try:
+                    sp = await self.executor.try_open(sig, ctx)
+                except UnprotectedPositionError:
+                    # Sembol, outer loop kalıcı entry latch'i etkinleştirene
+                    # kadar in-flight kümesinde kalır. Bu kısa aralıkta safety
+                    # sync fail-open biçimde ownership'i bırakamaz.
+                    unsafe_failure = True
+                    raise
+                except Exception:
+                    # Normal bir emir reddi/istemci hatasında try_open ya
+                    # journal+pending durumunu kurmuştur ya da aşağıdaki
+                    # finally rezervasyonu bırakacaktır. In-flight işareti
+                    # bu sembolü sonsuza dek kapasitede tutmamalı.
+                    self._opening_symbols.discard(symbol)
+                    raise
+                finally:
+                    if (
+                        not unsafe_failure
+                        and sp is None
+                        and symbol not in self.exits.tracked_symbols()
+                        and symbol not in self.executor.pending_symbols()
+                    ):
+                        symbol_reservations.release(symbol, self._RESERVATION_OWNER)
+
+            try:
+                if sp:
+                    self.exits.track(sp)
+                    self._signals_today += 1
+                    self.logger.info(
+                        f"🎯 {symbol}: strateji {sig.strategy} sinyali işlendi -> pozisyon açıldı "
+                        f"({sig.direction.value} @ {sp.position.entry_price})",
+                        extra={"trade": True},
+                    )
+            finally:
+                if not unsafe_failure:
+                    # try_open sonucunda ya pending journal ya da tracked
+                    # pozisyon artık ownership'i taşıyor; başarısız normal
+                    # denemede rezervasyon yukarıda zaten bırakıldı.
+                    self._opening_symbols.discard(symbol)
+            # Sembol başına tek deneme: sinyal bulunduğu an (başarılı ya da
+            # başarısız) bu sembol için tur biter.
+            break
+
+    def _safety_interval_seconds(self) -> float:
+        """Hatalı/negatif ayarı yoğun bir busy-loop'a çevirmeden sınırla."""
+        return max(0.5, float(getattr(self.cfg, "scalper_safety_interval_seconds", 2.0)))
+
+    def _executor_entry_blocked(self, symbol: str) -> bool:
+        """Executor'ın sembol cooldown kapısını güvenli/geriye uyumlu oku."""
+        checker = getattr(self.executor, "is_entry_blocked", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker(symbol))
+        except Exception as e:
+            # Koruma kapısı mevcutken durumunun okunamaması fail-open
+            # olmamalı. Yalnız bu sembol atlanır; safety döngüsü sürer.
+            self.logger.error(
+                f"⛔ {symbol}: giriş cooldown durumu okunamadı; giriş fail-closed atlandı ({e})"
+            )
+            return True
+
+    async def external_signal(self, symbol: str, direction: Direction) -> Dict[str, Any]:
+        """TradingView webhook köprüsü: dış sinyali normal giriş hattına sok.
+
+        Dönen sözlük teşhis içindir; kabul edilen sinyal bile risk
+        kapılarında reddedilebilir — kesin sonuç log + DB'dedir.
+        """
+        symbol = str(symbol).upper()
+        if not self.running:
+            return {"accepted": False, "reason": "scalper çalışmıyor"}
+        if not self._entries_ready():
+            reason = (
+                self._entry_halt_reason
+                if self._entry_halted
+                else ("kill switch" if self._kill_switch else "girişler hazır değil")
+            )
+            return {"accepted": False, "reason": reason}
+
+        before = self.exits.tracked_symbols() | self.executor.pending_symbols()
+        if symbol in before:
+            return {"accepted": False, "reason": "sembolde zaten pozisyon/pending var"}
+
+        self.logger.info(
+            f"📡 TradingView sinyali alındı: {symbol} {direction.value}",
+            extra={"trade": True},
+        )
+        await self._evaluate_symbol(symbol, [_ExternalSignalStrategy(direction)])
+
+        after = self.exits.tracked_symbols() | self.executor.pending_symbols()
+        opened = symbol in after
+        return {
+            "accepted": opened,
+            "reason": "giriş hattına alındı" if opened else
+            "risk/kapasite/cooldown kapısında reddedildi (log'a bakın)",
+        }
+
+    def _executor_reject_snapshot(self) -> Dict[str, int]:
+        """Kapı ret sayaçlarını güvenli/geriye uyumlu oku (eski executor'da yok)."""
+        snapshotter = getattr(self.executor, "reject_snapshot", None)
+        if snapshotter is None:
+            return {}
+        try:
+            return snapshotter()
+        except Exception as e:
+            self.logger.error(f"Scalper reject snapshot okunamadı: {e}")
+            return {}
+
+    def _executor_cooldown_snapshot(self) -> List[Dict[str, Any]]:
+        """Dashboard için secret içermeyen cooldown telemetrisi."""
+        snapshotter = getattr(self.executor, "cooldown_snapshot", None)
+        if not callable(snapshotter):
+            return []
+        try:
+            raw = snapshotter()
+        except Exception as e:
+            self.logger.error(f"Scalper cooldown snapshot okunamadı: {e}")
+            return []
+        if not isinstance(raw, list):
+            return []
+
+        safe: List[Dict[str, Any]] = []
+        for row in raw:
+            if not isinstance(row, dict):
+                continue
+            safe.append({
+                "symbol": str(row.get("symbol") or ""),
+                "reason": str(row.get("reason") or "protection_failure"),
+                "remaining_seconds": row.get("remaining_seconds"),
+                "expires_at": row.get("expires_at"),
+            })
+        return safe
+
+    def _executor_sizing_snapshot(self) -> Dict[str, Any]:
+        """Executor sermaye görünümünü geriye uyumlu ve JSON-güvenli oku."""
+        snapshotter = getattr(self.executor, "sizing_snapshot", None)
+        if callable(snapshotter):
+            try:
+                raw = snapshotter()
+                if isinstance(raw, dict):
+                    allowed = {
+                        "exchange_available",
+                        "virtual_capital",
+                        "eligible_realized_pnl",
+                        "effective_equity",
+                        "mode",
+                        "start_trade_id",
+                        "updated_at",
+                    }
+                    return {key: raw.get(key) for key in allowed}
+            except Exception as e:
+                self.logger.error(f"Scalper sizing snapshot okunamadı: {e}")
+
+        last_equity = getattr(self.executor, "last_sizing_equity", None)
+        return {
+            "exchange_available": None,
+            "virtual_capital": getattr(self.cfg, "scalper_virtual_capital_usdt", 0.0),
+            "eligible_realized_pnl": None,
+            "effective_equity": last_equity,
+            "mode": (
+                "virtual"
+                if float(getattr(self.cfg, "scalper_virtual_capital_usdt", 0.0) or 0.0) > 0
+                else "exchange"
+            ),
+            "start_trade_id": getattr(
+                self.cfg, "scalper_virtual_capital_start_trade_id", 0
+            ),
+            "updated_at": None,
+        }
+
+    async def _virtual_risk_equity(self) -> Optional[float]:
+        """Etkin TESTNET sanal sermayeyi günlük risk kapısı için çöz."""
+        try:
+            configured = float(
+                getattr(self.cfg, "scalper_virtual_capital_usdt", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            configured = 0.0
+        if configured <= 0:
+            return None
+
+        cached_equity, cached_at = getattr(
+            self, "_virtual_equity_cache", (None, 0.0)
+        )
+        now_monotonic = time.monotonic()
+        if (
+            cached_equity is not None
+            and now_monotonic - cached_at < self._INCOME_CACHE_TTL
+        ):
+            return cached_equity
+
+        # Engine startup'ında henüz try_open çalışmadığı için cached sizing
+        # snapshot "uninitialized" olabilir. Public resolver borsa available
+        # bakiyesi + doğrulanmış tracker ledger'ını burada hazırlar; böylece
+        # virtual-capital risk kapısı kendi kendini kilitlemez.
+        resolver = getattr(self.executor, "get_sizing_equity", None)
+        if callable(resolver):
+            try:
+                resolved = await resolver()
+                if resolved is not None and float(resolved) > 0:
+                    equity = float(resolved)
+                    self._virtual_equity_cache = (equity, now_monotonic)
+                    return equity
+            except Exception as e:
+                self.logger.error(f"Scalper sizing equity çözülemedi: {e}")
+
+        sizing = self._executor_sizing_snapshot()
+        candidates = (
+            sizing.get("effective_equity"),
+            getattr(self.executor, "last_sizing_equity", None),
+        )
+        for value in candidates:
+            try:
+                equity = float(value)
+            except (TypeError, ValueError):
+                continue
+            if equity > 0:
+                self._virtual_equity_cache = (equity, now_monotonic)
+                return equity
+        return None
+
+    async def _latch_entry_halt(
+        self, error: UnprotectedPositionError, *, source: str
+    ) -> None:
+        """Korunamayan pozisyon sinyalini process-restart'e kadar kilitle."""
+        if not self._entry_halted:
+            self._entry_halted = True
+            self._entry_halt_reason = f"{type(error).__name__}: {error}"
+            self._entry_halted_at = _utcnow_iso()
+            self.logger.critical(
+                f"🚨 Scalper YENİ GİRİŞLERİ DURDURULDU ({source}): {error}. "
+                "Safety izlemesi sürüyor; manuel kontrol ve restart/reconcile gerekli.",
+                extra={"trade": True},
+            )
+            self._persist_entry_halt()
+
+        # try_open ile aynı kilit: latch'ten hemen önce başlamış bir maker
+        # girişi varsa tamamlanınca bu iptal turuna yakalanır.
+        async with self._entry_lock:
+            if self.executor.pending_symbols():
+                try:
+                    opened_during_cancel = await self.executor.cancel_all_pending()
+                    self._track_opened_positions(
+                        opened_during_cancel, source="safety latch iptal yarışı"
+                    )
+                except Exception as cancel_error:
+                    self.logger.critical(
+                        f"🚨 Entry safety latch aktif ancak pending girişler iptal "
+                        f"edilemedi: {cancel_error}",
+                        extra={"trade": True},
+                    )
+
+    @staticmethod
+    def _task_exception(task: Optional[asyncio.Task]) -> Optional[str]:
+        """Bitmiş bir task'In exception'ını JSON-güvenli metin olarak döndür."""
+        if task is None or not task.done() or task.cancelled():
+            return None
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return None
+        return f"{type(exc).__name__}: {exc}" if exc is not None else None
+
+    def _loop_health(
+        self,
+        *,
+        task: Optional[asyncio.Task],
+        last_started_at: Optional[str],
+        last_success_at: Optional[str],
+        last_success_monotonic: Optional[float],
+        last_duration_seconds: Optional[float],
+        last_error: Optional[str],
+        last_error_at: Optional[str],
+        consecutive_errors: int,
+        success_count: int,
+        freshness_limit_seconds: float,
+    ) -> Dict[str, Any]:
+        now = time.monotonic()
+        success_age = (
+            max(0.0, now - last_success_monotonic)
+            if last_success_monotonic is not None
+            else None
+        )
+        task_alive = bool(task and not task.done())
+        fresh = bool(success_age is not None and success_age <= freshness_limit_seconds)
+        task_exception = self._task_exception(task)
+        healthy = bool(self.running and task_alive and fresh)
+
+        return {
+            "healthy": healthy,
+            "task_alive": task_alive,
+            "task_done": bool(task.done()) if task else None,
+            "task_cancelled": bool(task.cancelled()) if task else None,
+            "task_exception": task_exception,
+            "last_started_at": last_started_at,
+            "last_success_at": last_success_at,
+            "last_success_age_seconds": round(success_age, 3) if success_age is not None else None,
+            "freshness_limit_seconds": freshness_limit_seconds,
+            "fresh": fresh,
+            "last_duration_seconds": (
+                round(last_duration_seconds, 3)
+                if last_duration_seconds is not None
+                else None
+            ),
+            "last_error": last_error,
+            "last_error_at": last_error_at,
+            "consecutive_errors": consecutive_errors,
+            "success_count": success_count,
+        }
+
+    def health_snapshot(self) -> Dict[str, Any]:
+        """Scan ve safety task'larının gerçek liveness/freshness durumu."""
+        scan_freshness_limit = max(
+            180.0, float(self.cfg.scalper_scan_interval_seconds) * 5.0
+        )
+        safety_freshness_limit = max(30.0, self._safety_interval_seconds() * 10.0)
+
+        scan = self._loop_health(
+            task=self._task,
+            last_started_at=self._scan_last_started_at,
+            last_success_at=self._scan_last_success_at,
+            last_success_monotonic=self._scan_last_success_monotonic,
+            last_duration_seconds=self._scan_last_duration_seconds,
+            last_error=self._scan_last_error,
+            last_error_at=self._scan_last_error_at,
+            consecutive_errors=self._scan_consecutive_errors,
+            success_count=self._scan_success_count,
+            freshness_limit_seconds=scan_freshness_limit,
+        )
+        safety = self._loop_health(
+            task=self._safety_task,
+            last_started_at=self._safety_last_started_at,
+            last_success_at=self._safety_last_success_at,
+            last_success_monotonic=self._safety_last_success_monotonic,
+            last_duration_seconds=self._safety_last_duration_seconds,
+            last_error=self._safety_last_error,
+            last_error_at=self._safety_last_error_at,
+            consecutive_errors=self._safety_consecutive_errors,
+            success_count=self._safety_success_count,
+            freshness_limit_seconds=safety_freshness_limit,
+        )
+        exchange_age = (
+            max(0.0, time.monotonic() - self._exchange_last_success_monotonic)
+            if self._exchange_last_success_monotonic is not None
+            else None
+        )
+        exchange_task_alive = bool(
+            self._exchange_task and not self._exchange_task.done()
+        )
+        exchange_fresh = bool(
+            exchange_age is not None
+            and exchange_age <= self._EXCHANGE_PROBE_INTERVAL * 3.0
+        )
+        exchange = {
+            "healthy": bool(
+                exchange_task_alive and self._exchange_ready and exchange_fresh
+            ),
+            "task_alive": exchange_task_alive,
+            "signed_account_ready": self._exchange_ready,
+            "recovery_ready": self._recovery_ready,
+            "risk_ready": self._risk_ready,
+            "daily_pnl_source": self._daily_pnl_source,
+            "last_success_at": self._exchange_last_success_at,
+            "last_success_age_seconds": (
+                round(exchange_age, 3) if exchange_age is not None else None
+            ),
+            "freshness_limit_seconds": self._EXCHANGE_PROBE_INTERVAL * 3.0,
+            "last_error": self._exchange_last_error,
+            "last_error_at": self._exchange_last_error_at,
+            "success_count": self._exchange_success_count,
+        }
+        user_stream = {
+            "running": self.user_stream.running,
+            "connected": self.user_stream.connected,
+            "last_event_at": self.user_stream.last_event_at,
+            "last_error": self.user_stream.last_error,
+            "reconnect_count": self.user_stream.reconnect_count,
+            "rest_reconciliation_fallback": True,
+        }
+        return {
+            "healthy": bool(
+                self.running
+                and not self._entry_halted
+                and scan["healthy"]
+                and safety["healthy"]
+                and exchange["healthy"]
+                and self._recovery_ready
+                and self._risk_ready
+            ),
+            "running": self.running,
+            "entry_halted": self._entry_halted,
+            "entry_halt_reason": self._entry_halt_reason,
+            "entry_halted_at": self._entry_halted_at,
+            "scan": scan,
+            "safety": safety,
+            "exchange": exchange,
+            "user_stream": user_stream,
+        }
+
+    def _get_cached_regime(self, symbol: str, candles_4h: list) -> Regime:
+        now = time.monotonic()
+        cached = self._regime_cache.get(symbol)
+        if cached is not None and (now - cached[1]) < self._REGIME_CACHE_TTL:
+            return cached[0]
+        regime = detect_regime(candles_4h)
+        self._regime_cache[symbol] = (regime, now)
+        return regime
+
+    # ------------------------------------------------------------------
+    # Günlük zarar kesici
+    # ------------------------------------------------------------------
+
+    async def _update_kill_switch(self) -> None:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self._kill_switch_day != today:
+            self._kill_switch_day = today
+            self._kill_switch = False
+            self._signals_today = 0
+
+        if self.cfg.scalper_daily_loss_limit_pct <= 0:
+            self._risk_ready = True
+            self._daily_pnl_source = "disabled"
+            self._risk_equity_usdt = None
+            self._risk_equity_source = "disabled"
+            self._daily_loss_threshold_usdt = None
+            return  # kesici kapalı
+
+        try:
+            pnl = await self._get_account_daily_net_income(today)
+        except Exception as e:
+            self._risk_ready = False
+            self._daily_pnl_source = "unavailable"
+            self.logger.error(
+                f"❌ Binance net günlük PNL doğrulanamadı; yeni girişler fail-closed kapalı: {e}"
+            )
+            return
+        self._daily_pnl = pnl
+        self._daily_pnl_source = "binance_account_income"
+        self._risk_ready = True
+
+        if self._kill_switch:
+            return  # zaten tetiklenmiş — gün UTC değişene kadar kapalı kalır
+
+        virtual_capital_enabled = bool(
+            float(getattr(self.cfg, "scalper_virtual_capital_usdt", 0.0) or 0.0) > 0
+        )
+        if virtual_capital_enabled:
+            balance = await self._virtual_risk_equity()
+            self._risk_equity_source = "virtual_scalper_equity"
+            if balance is None or balance <= 0:
+                # Sanal sermaye seçilmişken tam TESTNET cüzdanına sessizce
+                # dönmek günlük kayıp eşiğini gereksiz büyütür. Sizing ledger
+                # hazır değilse yeni girişler fail-closed kalır.
+                self._risk_ready = False
+                self._risk_equity_usdt = None
+                self._daily_loss_threshold_usdt = None
+                self.logger.error(
+                    "❌ Sanal scalper sermayesi çözülemedi; günlük risk kapısı "
+                    "TESTNET wallet'a düşmeden fail-closed kapalı"
+                )
+                return
+        else:
+            balance = await self._get_cached_balance()
+            self._risk_equity_source = "exchange_wallet"
+            if balance is None or balance <= 0:
+                self._risk_ready = False
+                self._risk_equity_usdt = None
+                self._daily_loss_threshold_usdt = None
+                return
+
+        self._risk_equity_usdt = balance
+
+        approximate_day_start_balance = max(balance - pnl, 0.0)
+        threshold = (
+            -approximate_day_start_balance
+            * self.cfg.scalper_daily_loss_limit_pct
+            / 100.0
+        )
+        self._daily_loss_threshold_usdt = threshold
+        if pnl <= threshold:
+            self._kill_switch = True
+            self.logger.warning(
+                f"⛔ Scalper kill switch TETİKLENDİ: günlük PNL={pnl:.2f} <= eşik={threshold:.2f} "
+                f"(risk_sermayesi={balance:.2f}, kaynak={self._risk_equity_source}, "
+                f"limit=%{self.cfg.scalper_daily_loss_limit_pct}). "
+                f"Yeni giriş durduruldu, açık pozisyonların çıkış takibi sürüyor."
+            )
+
+    async def _get_account_daily_net_income(self, today: str) -> float:
+        """Account-level realized PnL + commissions + funding, signed by Binance."""
+
+        cached_value, cached_at, cached_day = self._daily_income_cache
+        now_monotonic = time.monotonic()
+        if (
+            cached_value is not None
+            and cached_day == today
+            and now_monotonic - cached_at < self._INCOME_CACHE_TTL
+        ):
+            return cached_value
+
+        start = datetime.strptime(today, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        start_ms = int(start.timestamp() * 1000)
+        end_ms = int(datetime.now(timezone.utc).timestamp() * 1000) + 1000
+        rows = await self.client.get_income_history(
+            start_time_ms=start_ms,
+            end_time_ms=end_ms,
+            limit=1000,
+        )
+        if len(rows) >= 1000:
+            raise RuntimeError(
+                "Günlük income sonucu 1000 satır sınırına ulaştı; eksik PNL riski"
+            )
+
+        allowed = {"REALIZED_PNL", "COMMISSION", "FUNDING_FEE"}
+        net = 0.0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("incomeType") or "") not in allowed:
+                continue
+            try:
+                net += float(row.get("income") or 0.0)
+            except (TypeError, ValueError):
+                raise RuntimeError(f"Geçersiz Binance income satırı: {row!r}")
+
+        self._daily_income_cache = (net, now_monotonic, today)
+        return net
+
+    async def _get_cached_balance(self) -> Optional[float]:
+        balance, cached_at = self._balance_cache
+        now = time.monotonic()
+        if balance is not None and (now - cached_at) < self._BALANCE_CACHE_TTL:
+            return balance
+        try:
+            fresh = await self.client.get_wallet_balance()
+        except Exception as e:
+            self.logger.error(f"❌ Wallet bakiye sorgusu hatası (kill switch): {e}")
+            return balance
+        self._balance_cache = (fresh, now)
+        return fresh
+
+    # ------------------------------------------------------------------
+    # API için anlık durum
+    # ------------------------------------------------------------------
+
+    def snapshot(self) -> Dict[str, Any]:
+        tracked = []
+        # ExitManager sembol->ScalpPosition eşlemesini herkese açık bir
+        # erişimci olarak sunmuyor (bkz. exits.py); bu paket-içi sıkı
+        # bağımlılık kasıtlıdır — exits.py bu amaçla DEĞİŞTİRİLMEDİ.
+        for symbol, sp in self.exits._positions.items():
+            entry = sp.position.entry_price
+            current_price = sp.position.current_price or entry
+            quantity = sp.position.quantity
+            leverage = sp.position.leverage or 1
+            direction = sp.signal.direction
+
+            unrealized_pnl = 0.0
+            roi_pct = 0.0
+            if entry > 0:
+                if direction.value == "LONG":
+                    unrealized_pnl = (current_price - entry) * quantity
+                    price_delta_pct = (current_price - entry) / entry * 100.0
+                else:
+                    unrealized_pnl = (entry - current_price) * quantity
+                    price_delta_pct = (entry - current_price) / entry * 100.0
+                roi_pct = price_delta_pct * leverage
+
+            plan = getattr(sp, "plan", None)
+            entry_fee_rate = getattr(plan, "entry_fee_rate", None)
+            exit_fee_rate = getattr(plan, "exit_fee_rate", None)
+            breakeven_cost_pct = getattr(plan, "breakeven_cost_pct", None)
+            fee_rate_source = getattr(plan, "fee_rate_source", None)
+            fee_aware_breakeven = bool(
+                breakeven_cost_pct is not None
+                or entry_fee_rate is not None
+                or exit_fee_rate is not None
+                or fee_rate_source
+            )
+
+            tracked.append({
+                "symbol": symbol,
+                "strategy": sp.signal.strategy,
+                "direction": direction.value,
+                "entry_price": entry,
+                "current_price": current_price,
+                "quantity": quantity,
+                "current_stoploss": sp.position.current_stoploss,
+                "tp1_done": sp.tp1_done,
+                "tp2_done": bool(getattr(sp, "tp2_done", False)),
+                "trailing_active": sp.trailing_active,
+                "breakeven_active": bool(
+                    getattr(sp, "breakeven_active", sp.tp1_done)
+                ),
+                "breakeven_price": getattr(plan, "breakeven_price", None),
+                "breakeven_cost_pct": breakeven_cost_pct,
+                "fee_aware_breakeven": fee_aware_breakeven,
+                "entry_fee_rate": entry_fee_rate,
+                "exit_fee_rate": exit_fee_rate,
+                "fee_rate_source": fee_rate_source,
+                "runner_floor_price": getattr(plan, "runner_floor_price", None),
+                "unrealized_pnl": unrealized_pnl,
+                "roi_pct": roi_pct,
+                "opened_at": sp.position.opened_at.isoformat() if sp.position.opened_at else None,
+            })
+
+        cooldowns = self._executor_cooldown_snapshot()
+        sizing = self._executor_sizing_snapshot()
+        sizing_equity = sizing.get("effective_equity")
+        if sizing_equity is None:
+            sizing_equity = getattr(self.executor, "last_sizing_equity", None)
+        configured_virtual_base = getattr(
+            self.cfg, "scalper_virtual_capital_usdt", 0.0
+        )
+        current_virtual_capital = sizing.get("virtual_capital")
+        virtual_start_trade_id = sizing.get("start_trade_id")
+        if virtual_start_trade_id is None:
+            virtual_start_trade_id = getattr(
+                self.cfg, "scalper_virtual_capital_start_trade_id", 0
+            )
+        virtual_enabled = bool(
+            str(sizing.get("mode") or "").startswith("virtual")
+            or float(configured_virtual_base or 0.0) > 0
+        )
+
+        return {
+            "enabled": self.cfg.scalper_enabled,
+            "running": self.running,
+            "scan_interval": self.cfg.scalper_scan_interval_seconds,
+            "safety_interval": self._safety_interval_seconds(),
+            "health": self.health_snapshot(),
+            "universe": list(self._universe),
+            "regimes": dict(self._regimes),
+            "daily_pnl": self._daily_pnl,
+            "daily_pnl_source": self._daily_pnl_source,
+            "risk_ready": self._risk_ready,
+            "risk_equity_usdt": self._risk_equity_usdt,
+            "risk_equity_source": self._risk_equity_source,
+            "daily_loss_threshold_usdt": self._daily_loss_threshold_usdt,
+            "daily_limit_pct": self.cfg.scalper_daily_loss_limit_pct,
+            "kill_switch_active": self._kill_switch,
+            "entry_halted": self._entry_halted,
+            "entry_halt_reason": self._entry_halt_reason,
+            "entry_halted_at": self._entry_halted_at,
+            "signals_today": self._signals_today,
+            "last_scan_at": self._last_scan_at,
+            "tracked": tracked,
+            "pending_entries": self.executor.pending_snapshot(),
+            "cooldowns": cooldowns,
+            "entry_rejects": self._executor_reject_snapshot(),
+            "stop_mode": str(getattr(self.cfg, "scalper_stop_mode", "structural")),
+            "sizing": sizing,
+            "sizing_equity_usdt": sizing_equity,
+            "virtual_capital_enabled": virtual_enabled,
+            "virtual_capital_base_usdt": configured_virtual_base,
+            "virtual_capital_current_usdt": current_virtual_capital,
+            "virtual_capital_start_trade_id": virtual_start_trade_id,
+            "symbol_reservations": symbol_reservations.snapshot(),
+        }

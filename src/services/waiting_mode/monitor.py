@@ -287,13 +287,14 @@ class WaitingModeMonitor:
                         await db_session.commit()
 
                     # Evaluate indicators
-                    should_execute, score, indicators = await self._evaluate_entry_conditions(
+                    should_execute, score, indicators, current_price = await self._evaluate_entry_conditions(
                         waiting_signal
                     )
 
-                    # Save snapshot
+                    # Save snapshot (reuse the current_price already fetched above
+                    # instead of hitting Binance again)
                     await self._save_indicator_snapshot(
-                        waiting_signal, indicators, score, db_session
+                        waiting_signal, indicators, score, db_session, current_price
                     )
 
                     # Update waiting signal stats
@@ -319,7 +320,12 @@ class WaitingModeMonitor:
                         if success:
                             waiting_signal.status = WaitingStatus.EXECUTED
                             waiting_signal.executed_at = datetime.utcnow()
-                            waiting_signal.executed_price = indicators.bb_middle  # Use current price
+                            # Fill price must be the real market price at execution
+                            # time, not the Bollinger middle band (SMA) - the SMA is
+                            # a historical average, not what was actually paid.
+                            waiting_signal.executed_price = (
+                                current_price if current_price is not None else indicators.bb_middle
+                            )
                             await db_session.commit()
                             self.logger.info(f"🎯 Successfully executed {waiting_signal.symbol}")
                             break
@@ -352,7 +358,7 @@ class WaitingModeMonitor:
     async def _evaluate_entry_conditions(
         self,
         waiting_signal: WaitingSignalModel
-    ) -> Tuple[bool, float, IndicatorValues]:
+    ) -> Tuple[bool, float, IndicatorValues, Optional[float]]:
         """
         Evaluate if current market conditions are favorable for entry.
 
@@ -360,10 +366,12 @@ class WaitingModeMonitor:
             waiting_signal: The waiting signal to evaluate
 
         Returns:
-            Tuple of (should_execute, score, indicators)
+            Tuple of (should_execute, score, indicators, current_price)
             - should_execute: True if conditions are met
             - score: Overall score (0-100)
             - indicators: Calculated indicator values
+            - current_price: The real market price used for the evaluation
+              (None if it could not be fetched)
         """
         symbol = waiting_signal.symbol
         direction = waiting_signal.direction
@@ -376,7 +384,19 @@ class WaitingModeMonitor:
 
         if not prices or len(prices) < 50:
             self.logger.warning(f"Insufficient price data for {symbol}")
-            return False, 0.0, IndicatorValues()
+            return False, 0.0, IndicatorValues(), None
+
+        # Fetch the real, current market price. This is used for Bollinger
+        # Band proximity checks, scoring, and (if executed) the fill price -
+        # it must NOT be confused with bb_middle (the SMA), which is a
+        # historical average and not an actual tradable price.
+        current_price = await self.binance.get_current_price(symbol)
+        if current_price is None:
+            self.logger.warning(
+                f"Could not fetch current price for {symbol}, falling back to "
+                f"last close from candle history"
+            )
+            current_price = prices[-1]
 
         # Calculate all indicators
         indicators = calculate_all_indicators(
@@ -391,18 +411,26 @@ class WaitingModeMonitor:
 
         if not indicators.is_valid():
             self.logger.warning(f"Invalid indicators for {symbol}: {indicators.error_message}")
-            return False, 0.0, indicators
+            return False, 0.0, indicators, current_price
 
-        # Check if it's a good entry point
+        # Check if it's a good entry point (uses the real current price for
+        # the Bollinger Band proximity check)
         is_good, reason = is_good_entry_point(
             indicators,
             direction,
             rsi_oversold=self.config.waiting_mode_rsi_oversold,
-            rsi_overbought=self.config.waiting_mode_rsi_overbought
+            rsi_overbought=self.config.waiting_mode_rsi_overbought,
+            current_price=current_price
         )
 
-        # Calculate score (0-100)
-        score = self._calculate_entry_score(indicators, direction)
+        # Calculate score (0-100) using the real current price
+        score = self._calculate_entry_score(indicators, direction, current_price)
+
+        # Count how many independent entry conditions (RSI / MACD / Bollinger /
+        # price improvement) are currently satisfied
+        conditions_met, _ = self._count_conditions_met(
+            waiting_signal, indicators, direction, current_price
+        )
 
         # Log evaluation
         if is_good:
@@ -413,19 +441,92 @@ class WaitingModeMonitor:
         else:
             self.logger.debug(f"⏳ {symbol}: {reason} (score: {score:.1f}/100)")
 
-        # Determine if we should execute
-        # Require score >= 50 (equivalent to 3/6 conditions in is_good_entry_point)
-        should_execute = score >= 50
+        # Determine if we should execute: require at least
+        # `waiting_mode_min_conditions` independent conditions to be met,
+        # as configured in settings (instead of a hardcoded score threshold).
+        should_execute = conditions_met >= self.config.waiting_mode_min_conditions
 
-        return should_execute, score, indicators
+        return should_execute, score, indicators, current_price
 
-    def _calculate_entry_score(self, indicators: IndicatorValues, direction: str) -> float:
+    def _count_conditions_met(
+        self,
+        waiting_signal: WaitingSignalModel,
+        indicators: IndicatorValues,
+        direction: str,
+        current_price: Optional[float]
+    ) -> Tuple[int, Dict[str, bool]]:
+        """
+        Count how many independent entry conditions are currently satisfied.
+
+        Conditions evaluated:
+        - RSI: oversold (LONG) / overbought (SHORT)
+        - MACD: favorable crossover or histogram direction
+        - Bollinger Bands: price near the relevant band (uses the real
+          current price, not the SMA)
+        - Price improvement: current price has moved at least
+          `settings.waiting_mode_price_improvement` percent past the
+          original signal's entry range, in the favorable direction
+
+        Args:
+            waiting_signal: The waiting signal being evaluated
+            indicators: Calculated indicator values
+            direction: "LONG" or "SHORT"
+            current_price: Real current market price (may be None)
+
+        Returns:
+            Tuple of (count_of_conditions_met, {condition_name: bool})
+        """
+        direction = direction.upper()
+
+        if direction == "LONG":
+            rsi_met = indicators.rsi is not None and indicators.rsi < 40
+            macd_met = indicators.is_bullish_crossover() or (
+                indicators.macd_histogram is not None and indicators.macd_histogram > 0
+            )
+            bb_met = indicators.near_bb_lower(threshold_pct=25, current_price=current_price)
+        else:  # SHORT
+            rsi_met = indicators.rsi is not None and indicators.rsi > 60
+            macd_met = indicators.is_bearish_crossover() or (
+                indicators.macd_histogram is not None and indicators.macd_histogram < 0
+            )
+            bb_met = indicators.near_bb_upper(threshold_pct=25, current_price=current_price)
+
+        # Price improvement: has the price moved at least
+        # waiting_mode_price_improvement percent past the original entry
+        # range, in the direction favorable to entry?
+        price_met = False
+        if current_price is not None:
+            improvement_fraction = self.config.waiting_mode_price_improvement / 100
+            if direction == "LONG":
+                price_met = current_price <= waiting_signal.original_entry_min * (1 - improvement_fraction)
+            else:  # SHORT
+                price_met = current_price >= waiting_signal.original_entry_max * (1 + improvement_fraction)
+
+        conditions = {
+            "rsi": rsi_met,
+            "macd": macd_met,
+            "bollinger": bb_met,
+            "price": price_met,
+        }
+        return sum(1 for met in conditions.values() if met), conditions
+
+    def _calculate_entry_score(
+        self,
+        indicators: IndicatorValues,
+        direction: str,
+        current_price: Optional[float] = None
+    ) -> float:
         """
         Calculate an entry score (0-100) based on technical indicators.
 
         Args:
             indicators: Calculated indicator values
             direction: Signal direction (LONG/SHORT)
+            current_price: Real current market price, used for the Bollinger
+                Band proximity component. If omitted, falls back to
+                bb_middle (the SMA) as a rough proxy, which is not an actual
+                tradable price and should be avoided when the real price is
+                available.
 
         Returns:
             Score from 0 to 100
@@ -456,8 +557,10 @@ class WaitingModeMonitor:
                 # Check how close to lower band (as percentage of band width)
                 band_width = indicators.bb_upper - indicators.bb_lower
                 if band_width > 0:
-                    current_price = indicators.bb_middle  # Using middle as proxy for current
-                    distance_from_lower = (current_price - indicators.bb_lower) / band_width
+                    # Real market price - NOT the SMA (bb_middle) - falling
+                    # back to bb_middle only if no real price was supplied.
+                    price = current_price if current_price is not None else indicators.bb_middle
+                    distance_from_lower = (price - indicators.bb_lower) / band_width
 
                     if distance_from_lower < 0.1:  # Within 10% of lower band
                         score += 30
@@ -486,8 +589,10 @@ class WaitingModeMonitor:
             if indicators.bb_lower and indicators.bb_middle and indicators.bb_upper:
                 band_width = indicators.bb_upper - indicators.bb_lower
                 if band_width > 0:
-                    current_price = indicators.bb_middle
-                    distance_from_upper = (indicators.bb_upper - current_price) / band_width
+                    # Real market price - NOT the SMA (bb_middle) - falling
+                    # back to bb_middle only if no real price was supplied.
+                    price = current_price if current_price is not None else indicators.bb_middle
+                    distance_from_upper = (indicators.bb_upper - price) / band_width
 
                     if distance_from_upper < 0.1:  # Within 10% of upper band
                         score += 30
@@ -504,7 +609,8 @@ class WaitingModeMonitor:
         waiting_signal: WaitingSignalModel,
         indicators: IndicatorValues,
         score: float,
-        db_session: AsyncSession
+        db_session: AsyncSession,
+        current_price: Optional[float] = None
     ):
         """
         Save a snapshot of current indicator values.
@@ -514,42 +620,32 @@ class WaitingModeMonitor:
             indicators: Current indicator values
             score: Overall entry score
             db_session: Database session
+            current_price: Real current market price. When provided (the
+                normal path, coming from `_evaluate_entry_conditions`, which
+                already fetched it this cycle), it is reused instead of
+                making another Binance request. If omitted, it is fetched
+                here.
         """
         if not indicators.is_valid():
             return
 
-        # Determine which conditions are met
         direction = waiting_signal.direction.upper()
 
-        if direction == "LONG":
-            rsi_met = indicators.rsi is not None and indicators.rsi < 40
-            macd_met = indicators.is_bullish_crossover() or (
-                indicators.macd_histogram is not None and indicators.macd_histogram > 0
-            )
-            bb_met = indicators.near_bb_lower(threshold_pct=25)
-        else:  # SHORT
-            rsi_met = indicators.rsi is not None and indicators.rsi > 60
-            macd_met = indicators.is_bearish_crossover() or (
-                indicators.macd_histogram is not None and indicators.macd_histogram < 0
-            )
-            bb_met = indicators.near_bb_upper(threshold_pct=25)
+        if current_price is None:
+            current_price = await self.binance.get_current_price(waiting_signal.symbol)
 
-        # Get current price
-        current_price = await self.binance.get_current_price(waiting_signal.symbol)
-        price_met = False
-
-        if current_price:
-            # Check if price improved from original entry range
-            if direction == "LONG":
-                price_met = current_price < waiting_signal.original_entry_min
-            else:  # SHORT
-                price_met = current_price > waiting_signal.original_entry_max
+        # Determine which conditions are met (RSI / MACD / Bollinger / price
+        # improvement), using the real current price for the Bollinger Band
+        # proximity and price-improvement checks.
+        conditions_met, condition_flags = self._count_conditions_met(
+            waiting_signal, indicators, direction, current_price
+        )
 
         # Create snapshot
         snapshot = IndicatorSnapshot(
             waiting_signal_id=waiting_signal.id,
             timestamp=datetime.utcnow(),
-            price=current_price or indicators.bb_middle,
+            price=current_price if current_price is not None else indicators.bb_middle,
             rsi=indicators.rsi,
             macd=indicators.macd,
             macd_signal=indicators.macd_signal,
@@ -557,17 +653,17 @@ class WaitingModeMonitor:
             bb_upper=indicators.bb_upper,
             bb_middle=indicators.bb_middle,
             bb_lower=indicators.bb_lower,
-            rsi_condition_met=rsi_met,
-            macd_condition_met=macd_met,
-            bb_condition_met=bb_met,
-            price_condition_met=price_met,
+            rsi_condition_met=condition_flags["rsi"],
+            macd_condition_met=condition_flags["macd"],
+            bb_condition_met=condition_flags["bollinger"],
+            price_condition_met=condition_flags["price"],
             overall_score=score
         )
 
         db_session.add(snapshot)
 
         # Also update waiting signal with latest values
-        waiting_signal.current_price = current_price or indicators.bb_middle
+        waiting_signal.current_price = current_price if current_price is not None else indicators.bb_middle
         waiting_signal.rsi_value = indicators.rsi
         waiting_signal.macd_value = indicators.macd
         waiting_signal.macd_signal = indicators.macd_signal
@@ -627,29 +723,38 @@ class WaitingModeMonitor:
         """
         Execute a trade for a waiting signal.
 
-        This method should integrate with your position manager to actually
-        open the trade. For now, it's a placeholder.
+        NOT YET WIRED UP: this method does not open a real position. Actual
+        order placement requires integrating with the position manager
+        (e.g. `await self.position_manager.open_position(...)`), which is a
+        separate piece of work. Until that integration exists, this method
+        deliberately always returns False instead of a real order call or a
+        silent `return True` - reporting success here without ever
+        submitting an order would make the rest of the system believe a
+        trade was opened when it wasn't, corrupting position tracking, PnL,
+        and risk limits.
 
         Args:
             waiting_signal: The waiting signal to execute
             db_session: Database session
 
         Returns:
-            True if execution was successful, False otherwise
+            Always False until position_manager integration is implemented.
         """
-        # TODO: Integrate with position manager to actually open the trade
-        # For now, just log that we would execute
-
-        self.logger.info(
-            f"🚀 EXECUTING TRADE: {waiting_signal.symbol} {waiting_signal.direction} "
-            f"at price {waiting_signal.current_price}"
+        self.logger.error(
+            f"⛔ Waiting signal #{waiting_signal.id} ({waiting_signal.symbol} "
+            f"{waiting_signal.direction}) reached favorable entry conditions at "
+            f"price {waiting_signal.current_price}, but execution was NOT performed: "
+            f"position_manager integration is not implemented yet (separate work item). "
+            f"Refusing to report success to avoid a phantom/untracked position."
         )
 
-        # This is where you would call:
-        # await self.position_manager.open_position(signal_with_position)
+        # Keep the signal in an honest, still-monitored state rather than
+        # marking it EXECUTED (which would be false) or EXPIRED/CANCELLED
+        # (which would drop it prematurely). It will be re-evaluated on the
+        # next check interval once real execution is wired up.
+        waiting_signal.status = WaitingStatus.MONITORING
 
-        # For now, return True to simulate successful execution
-        return True
+        return False
 
     async def cancel_waiting_signal(
         self,

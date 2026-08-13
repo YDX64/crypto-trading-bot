@@ -28,6 +28,7 @@ MANIFEST
 
 # Virtual Environment
 venv/
+.venv/
 ENV/
 env/
 
@@ -69,3 +70,13 @@ docker-compose.override.yml
 
 # N8N Workflows (optional backup files)
 *.json
+
+# .env yedekleri (anahtar icerir)
+.env.bak*
+nohup.out
+
+# Deploy yedekleri (env.backup = .env tam kopyasi, ANAHTAR ICERIR)
+backups/
+
+# pytest log yonlendirmesi (conftest.py)
+.test-logs/

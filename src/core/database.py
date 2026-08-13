@@ -3,6 +3,7 @@ Veritabanı bağlantı ve session yönetimi.
 """
 
 from typing import AsyncGenerator
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import declarative_base
 
@@ -22,6 +23,25 @@ engine = create_async_engine(
     future=True,
     pool_pre_ping=True,
 )
+
+
+if database_url.startswith("sqlite"):
+    @event.listens_for(engine.sync_engine, "connect")
+    def _configure_sqlite(dbapi_connection, _connection_record):
+        """Make the local trade journal resilient to concurrent access/crashes.
+
+        SQLAlchemy exposes an adapted synchronous connection in this event even
+        when the application uses aiosqlite.  These PRAGMAs therefore run once
+        for every pooled connection before it is handed to application code.
+        """
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("PRAGMA busy_timeout=5000")
+        finally:
+            cursor.close()
 
 # Session factory
 AsyncSessionLocal = async_sessionmaker(
@@ -59,6 +79,7 @@ async def init_db():
     from src.models.signal import SignalModel
     from src.models.position import PositionModel
     from src.models.waiting_signal import WaitingSignalModel, IndicatorSnapshot, WaitingModeConfig
+    from src.models.scalp_trade import ScalpTradeModel
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
