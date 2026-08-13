@@ -680,6 +680,133 @@ def equal_level_clusters(candles: list[Candle], left: int = 3, right: int = 3,
     return {"eqh": eqh, "eql": eql}
 
 
+def nearest_level(price: float, levels: list[dict],
+                   max_distance: float) -> dict | None:
+    """Fiyata `max_distance` (mutlak fiyat birimi) içindeki EN YAKIN seviye.
+
+    `levels`, equal_level_clusters()'ın ürettiği biçimdedir:
+    {"price", "count", "last_index"}. Menzilde seviye yoksa None döner.
+
+    Mesafe mutlak birimdedir (yüzde değil) çünkü çağıran genellikle ATR
+    cinsinden bir tolerans verir: böylece volatil sembolde tolerans kendiliğinden
+    genişler, sakin sembolde daraltır.
+    """
+    if price <= 0.0 or max_distance <= 0.0 or not levels:
+        return None
+
+    best: dict | None = None
+    best_distance = max_distance
+    for level in levels:
+        level_price = float(level.get("price", 0.0))
+        if level_price <= 0.0:
+            continue
+        distance = abs(price - level_price)
+        if distance <= best_distance:
+            best_distance = distance
+            best = level
+    return best
+
+
+# --------------------------------------------------------------------------
+# Osilatör kesişimleri (Stochastic RSI / MACD) ve Pine tarzı cross yardımcıları
+# --------------------------------------------------------------------------
+
+def _sma_series(values: list[float], period: int) -> list[float]:
+    """Basit hareketli ortalama serisi; girdiyle aynı uzunlukta.
+
+    Pencere dolmadan önce o ana kadarki kümülatif ortalama kullanılır —
+    ema() ile aynı ısınma örüntüsü, böylece seriler hizalı kalır.
+    """
+    n = len(values)
+    result: list[float] = [0.0] * n
+    if n == 0 or period <= 0:
+        return result
+    running = 0.0
+    for i in range(n):
+        running += values[i]
+        if i < period:
+            result[i] = running / (i + 1)
+        else:
+            running -= values[i - period]
+            result[i] = running / period
+    return result
+
+
+def stoch_rsi_series(closes: list[float], rsi_period: int = 14,
+                      stoch_period: int = 14, k_smooth: int = 3,
+                      d_smooth: int = 3) -> tuple[list[float], list[float]]:
+    """Stochastic RSI: (%K serisi, %D serisi). Girdiyle aynı uzunlukta.
+
+    RSI'ın kendi min/max aralığındaki konumunu 0-100'e normalize eder; saf
+    RSI eşiğinden daha erken dönüş sinyali verir. %K, ham stokastiğin
+    `k_smooth` SMA'sı; %D, %K'nın `d_smooth` SMA'sıdır (sinyal hattı).
+
+    Isınma döneminde (RSI henüz gerçek değer üretmiyorken) nötr 50.0 dolgu
+    kullanılır — rsi_series ile aynı sözleşme. Bu, ısınma sırasında sahte
+    kesişim üretilmesini önler (50/50 kesişmez).
+    """
+    n = len(closes)
+    if n == 0:
+        return ([], [])
+
+    rsi_values = rsi_series(closes, rsi_period)
+    raw: list[float] = [50.0] * n
+
+    # RSI ancak `rsi_period` indeksinden itibaren gerçek değer üretir.
+    first_real = rsi_period
+    for i in range(first_real + stoch_period - 1, n):
+        window = rsi_values[i - stoch_period + 1:i + 1]
+        lowest = min(window)
+        highest = max(window)
+        span = highest - lowest
+        if span <= 0.0:
+            raw[i] = 50.0  # düz RSI — yön bilgisi yok
+        else:
+            raw[i] = (rsi_values[i] - lowest) / span * 100.0
+
+    k = _sma_series(raw, k_smooth)
+    d = _sma_series(k, d_smooth)
+    return (k, d)
+
+
+def macd(closes: list[float], fast: int = 12, slow: int = 26,
+          signal: int = 9) -> tuple[list[float], list[float], list[float]]:
+    """MACD: (macd_hatti, sinyal_hatti, histogram). Girdiyle aynı uzunlukta.
+
+    macd = EMA(fast) - EMA(slow); sinyal = EMA(macd, signal);
+    histogram = macd - sinyal. Isınma döneminde ema()'nın kümülatif SMA
+    seed'i kullanılır, dolayısıyla seriler baştan itibaren tanımlıdır.
+    """
+    n = len(closes)
+    if n == 0:
+        return ([], [], [])
+
+    ema_fast = ema(closes, fast)
+    ema_slow = ema(closes, slow)
+    macd_line = [ema_fast[i] - ema_slow[i] for i in range(n)]
+    signal_line = ema(macd_line, signal)
+    histogram = [macd_line[i] - signal_line[i] for i in range(n)]
+    return (macd_line, signal_line, histogram)
+
+
+def crossover(fast: list[float], slow: list[float]) -> bool:
+    """Pine tarzı yukarı kesişim: önceki mumda fast <= slow, son mumda fast > slow.
+
+    Yalnız SON mumdaki geçişi bildirir; "halen üzerinde" durumunu DEĞİL.
+    Böylece aynı kesişim ardı ardına tekrar sinyal üretmez.
+    """
+    if len(fast) < 2 or len(slow) < 2:
+        return False
+    return fast[-2] <= slow[-2] and fast[-1] > slow[-1]
+
+
+def crossunder(fast: list[float], slow: list[float]) -> bool:
+    """Pine tarzı aşağı kesişim: önceki mumda fast >= slow, son mumda fast < slow."""
+    if len(fast) < 2 or len(slow) < 2:
+        return False
+    return fast[-2] >= slow[-2] and fast[-1] < slow[-1]
+
+
 def sweep_of_level(candles: list[Candle], level_price: float, side: str,
                     reclaim_within: int = 3) -> bool:
     """İki aşamalı likidite süpürmesi ("run & failure").

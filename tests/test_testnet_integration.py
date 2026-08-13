@@ -25,6 +25,15 @@ from src.trading.binance_client_improved import (
     ImprovedBinanceClient,
 )
 
+# Bu dosya gerçek TESTNET hesabına bağlanır ve bazı testlerde emir oluşturur.
+# Tam regresyon koşuları hiçbir zaman bunu örtük biçimde yapmamalı; canlı
+# entegrasyon yalnız açıkça talep edildiğinde etkinleşir.
+if os.getenv("RUN_TESTNET_INTEGRATION") != "1":
+    pytest.skip(
+        "TESTNET entegrasyonu yalnız RUN_TESTNET_INTEGRATION=1 ile çalışır.",
+        allow_module_level=True,
+    )
+
 # ---------------------------------------------------------------------------
 # Güvenlik kilidi: mainnet'e karşı asla çalışma.
 # ---------------------------------------------------------------------------

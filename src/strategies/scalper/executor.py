@@ -22,7 +22,7 @@ Akış (try_open, "taker" modu — varsayılan):
 "maker" modu (settings.scalper_entry_mode == "maker") — İKİ FAZLI GİRİŞ:
   Backtest'te limit giriş her strateji varyantının PF'sini iyileştirdiği
   için canlıya taşındı. 1-6 adımları AYNEN yukarıdaki gibi çalışır; adım 7
-  MARKET yerine LIMIT GTC emri kor ve PendingEntry olarak kaydeder (try_open
+  MARKET yerine LIMIT GTX (post-only) emri kor ve PendingEntry olarak kaydeder (try_open
   bu modda None döner, pozisyon HENÜZ yok). Dolum takibi engine'in her
   turunda çağırdığı check_pending() ile yapılır: FILLED olduğunda 9-11
   adımları (SL → TP merdiveni → kayıt) GERÇEK dolum fiyatından çalışır —
@@ -32,10 +32,16 @@ Akış (try_open, "taker" modu — varsayılan):
 
 from __future__ import annotations
 
+import asyncio
+import json
+import math
+import os
 import time
+import uuid
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Set
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from src.core.logger import app_logger
 from src.models.position import PositionModel, PositionStatus, PositionSide
@@ -43,15 +49,17 @@ from src.strategies.scalper.tracker import ScalpTracker
 from src.strategies.scalper.types import (
     Direction,
     ExitPlan,
+    Regime,
     ScalpSignal,
     StrategyContext,
+    fee_aware_breakeven_price,
     price_at_roi,
 )
 from src.trading.binance_client_improved import (
     ImprovedBinanceClient,
     BinanceAPIError,
 )
-from src.trading.position_manager import PositionManager
+from src.trading.position_manager import PositionManager, UnprotectedPositionError
 
 
 @dataclass
@@ -67,6 +75,7 @@ class ScalpPosition:
     plan: ExitPlan                   # types.ExitPlan
     entry_candle_time: int           # chandelier since hesabı için (ms)
     tp1_done: bool = False
+    tp2_done: bool = False
     trailing_active: bool = False
     mae_pct: float = 0.0             # en kötü (olumsuz) ROI% ucu — negatif veya 0
     mfe_pct: float = 0.0             # en iyi (olumlu) ROI% ucu — pozitif veya 0
@@ -76,22 +85,62 @@ class ScalpPosition:
 class PendingEntry:
     """Maker modunda bekleyen (henüz dolmamış) LIMIT giriş emri.
 
-    check_pending() her motor turunda bunları borsadan sorgular; FILLED
-    olunca ScalpPosition'a dönüşür, NEW kalırsa scans_waited artar ve
-    timeout'ta iptal edilir. PARTIALLY_FILLED durumunda scans_waited
-    ARTIRILMAZ (kısmi dolumda timeout dondurulur — bkz. ScalpExecutor.
-    _check_one_pending).
+    client_order_id, POST yanıtı kaybolsa bile aynı emir niyetini borsada
+    sorgulayabilmek için kalıcı kimliktir. order_id uzlaştırma tamamlanana
+    kadar None olabilir. PARTIALLY_FILLED görüldüğü anda kalan miktar iptal
+    edilir ve gerçekleşen miktar derhal SL/TP ile korunur; kısmi dolum asla
+    süresiz bekletilmez.
     """
     signal: ScalpSignal
-    order_id: int
+    order_id: Optional[int]
+    client_order_id: str
     limit_price: float
     quantity: float
     created_monotonic: float
+    created_at_ms: int = 0
+    expires_at_ms: int = 0
+    phase: str = "INTENT"
+    last_status: Optional[str] = None
+    executed_qty: float = 0.0
+    avg_price: float = 0.0
     scans_waited: int = 0
+
+
+@dataclass(frozen=True)
+class _FailedExecutionLedger:
+    """İlk koruma başarısızlığından sonra uzlaştırılan tek execution özeti."""
+
+    exit_price: float
+    realized_pnl: float
+    pnl_source: str
+    notes: str
+
+
+class _MakerOrderStateUnknown(Exception):
+    """LIMIT POST sonucu ile sorgu sonucu birlikte belirsiz kaldı.
+
+    Bu durumda aynı clientOrderId ile niyet pending tutulur; yeni bir POST
+    gönderilmez. Böylece cevap kaybı mükerrer pozisyona dönüşmez.
+    """
+
+
+class PendingRecoveryError(UnprotectedPositionError):
+    """Kalıcı maker niyeti güvenle uzlaştırılmadan işlem açılamaz.
+
+    UnprotectedPositionError alt sınıfıdır; engine'in mevcut global güvenlik
+    latch'i bu hatayı da fail-closed yakalar. Journal bozulması, borsa
+    durumunun belirsiz kalması veya koruma/DB tamamlanmadan restart edilmesi
+    bu sınıfla yüzeye çıkar.
+    """
 
 
 class ScalpExecutor:
     """Scalper sinyalinden güvenli, korumalı bir pozisyon açar."""
+
+    # userTrades, matching-engine cevabından kısa süre sonra görünür olabilir.
+    # Pozisyon bu noktada zaten flat olduğundan 2.5 sn toplam bounded bekleme,
+    # gerçek fee ledger'ı kaybetmekten daha güvenlidir.
+    FAILED_LEDGER_RETRY_DELAYS = (0.0, 0.25, 0.75, 1.5)
 
     def __init__(
         self,
@@ -106,6 +155,259 @@ class ScalpExecutor:
         self.cfg = cfg
         self.logger = app_logger
         self._pending: Dict[str, PendingEntry] = {}
+        self._pending_lock = asyncio.Lock()
+        # İlk SL'nin kurulamadığı bir sembol hemen yeniden denenmez. Bu latch
+        # process ömrü boyunca en az 60 dakika sürer; kalıcı global entry halt
+        # gerektirecek belirsizlikler zaten PendingRecoveryError yolundadır.
+        self._cooldowns: Dict[str, Dict[str, Any]] = {}
+        self._reject_counters: Dict[str, int] = {}
+        self._last_sizing_snapshot: Dict[str, Any] = {
+            "mode": "uninitialized",
+            "exchange_available": None,
+            "virtual_capital": None,
+            "eligible_realized_pnl": None,
+            "effective_equity": None,
+            "start_trade_id": None,
+            "updated_at": None,
+        }
+
+        # Gerçek Settings bu alanı varsayılan olarak tanımlar. Minimal/fake
+        # test cfg'sinde alan YOKSA persistence bilinçli olarak kapalıdır.
+        configured_path = getattr(cfg, "scalper_pending_journal_path", None)
+        self._journal_path: Optional[Path] = (
+            Path(configured_path).expanduser() if configured_path else None
+        )
+        self._journal_records: Dict[str, Dict[str, Any]] = {}
+        self._journal_error: Optional[str] = None
+        self._recovery_needed = False
+        self._load_journal()
+
+        # Sembol cooldown'ları restart'a dayanmalı: SL'den 2 dk sonra restart
+        # edilen bot aynı düşen bıçağa anında geri girmemeli (2026-08-11 BEAT).
+        # Journal ile aynı ilke: test cfg'sinde alan yoksa persistence kapalı.
+        cooldown_path = getattr(cfg, "scalper_cooldown_state_path", None)
+        self._cooldown_state_path: Optional[Path] = (
+            Path(cooldown_path).expanduser() if cooldown_path else None
+        )
+        self._load_cooldowns()
+
+    # ------------------------------------------------------------------
+    # Kalıcı maker intent journal'ı.
+    # ------------------------------------------------------------------
+
+    def _load_journal(self) -> None:
+        path = self._journal_path
+        if path is None or not path.exists():
+            return
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict) or raw.get("version") != 1:
+                raise ValueError("journal version/root geçersiz")
+            entries = raw.get("entries")
+            if not isinstance(entries, dict):
+                raise ValueError("journal entries nesne değil")
+            validated: Dict[str, Dict[str, Any]] = {}
+            for symbol, record in entries.items():
+                if not isinstance(symbol, str) or not isinstance(record, dict):
+                    raise ValueError("journal entry şeması geçersiz")
+                if record.get("symbol") != symbol:
+                    raise ValueError(f"journal sembol anahtarı uyuşmuyor: {symbol}")
+                client_id = record.get("client_order_id")
+                signal = record.get("signal")
+                if not isinstance(client_id, str) or not client_id:
+                    raise ValueError(f"{symbol}: client_order_id eksik")
+                if not isinstance(signal, dict):
+                    raise ValueError(f"{symbol}: signal eksik")
+                validated[symbol] = dict(record)
+            self._journal_records = validated
+            self._recovery_needed = bool(validated)
+        except Exception as e:
+            self._journal_error = f"{type(e).__name__}: {e}"
+            self.logger.critical(
+                f"🚨 Maker pending journal okunamadı ({path}): {self._journal_error}. "
+                "Yeni maker girişleri recovery tamamlanana kadar KAPALI."
+            )
+
+    def _assert_recovery_ready(self) -> None:
+        if self._journal_error:
+            raise PendingRecoveryError(
+                f"Maker pending journal bozuk/okunamıyor: {self._journal_error}"
+            )
+        if self._recovery_needed:
+            raise PendingRecoveryError(
+                "Restart sonrası maker pending journal henüz uzlaştırılmadı; "
+                "önce recover_pending() çalıştırılmalı"
+            )
+
+    def _atomic_write_journal(self, records: Dict[str, Dict[str, Any]]) -> None:
+        path = self._journal_path
+        if path is None:
+            return
+        if self._journal_error:
+            raise PendingRecoveryError(
+                f"Maker pending journal kullanılamıyor: {self._journal_error}"
+            )
+
+        tmp_path: Optional[Path] = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_name(
+                f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+            )
+            payload = {"version": 1, "entries": records}
+            with tmp_path.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, path)
+            # Rename'in kendisini de mümkün olduğunca kalıcılaştır. Bazı
+            # platform/filesystem'lerde dizin fsync desteklenmeyebilir.
+            try:
+                dir_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
+        except PendingRecoveryError:
+            raise
+        except Exception as e:
+            self._journal_error = f"{type(e).__name__}: {e}"
+            raise PendingRecoveryError(
+                f"Maker pending journal atomik yazılamadı ({path}): {e}"
+            ) from e
+        finally:
+            if tmp_path is not None and tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _serialize_signal(signal: ScalpSignal) -> Dict[str, Any]:
+        return {
+            "strategy": signal.strategy,
+            "symbol": signal.symbol,
+            "direction": signal.direction.value,
+            "entry_price": signal.entry_price,
+            "stop_price": signal.stop_price,
+            "reason": signal.reason,
+            "regime": signal.regime.value,
+            "atr_5m": signal.atr_5m,
+            "score": signal.score,
+            "risk_multiplier": signal.risk_multiplier,
+        }
+
+    @staticmethod
+    def _deserialize_signal(raw: Dict[str, Any]) -> ScalpSignal:
+        try:
+            return ScalpSignal(
+                strategy=str(raw["strategy"]),
+                symbol=str(raw["symbol"]),
+                direction=Direction(str(raw["direction"])),
+                entry_price=float(raw["entry_price"]),
+                stop_price=float(raw["stop_price"]),
+                reason=str(raw["reason"]),
+                regime=Regime(str(raw["regime"])),
+                atr_5m=float(raw["atr_5m"]),
+                score=float(raw.get("score", 0.0)),
+                risk_multiplier=float(raw.get("risk_multiplier", 1.0)),
+            )
+        except Exception as e:
+            raise PendingRecoveryError(f"Journal signal kaydı geçersiz: {e}") from e
+
+    def _serialize_pending(self, pending: PendingEntry) -> Dict[str, Any]:
+        return {
+            "symbol": pending.signal.symbol,
+            "signal": self._serialize_signal(pending.signal),
+            "client_order_id": pending.client_order_id,
+            "order_id": pending.order_id,
+            "limit_price": pending.limit_price,
+            "quantity": pending.quantity,
+            "created_at_ms": pending.created_at_ms,
+            "expires_at_ms": pending.expires_at_ms,
+            "phase": pending.phase,
+            "last_status": pending.last_status,
+            "executed_qty": pending.executed_qty,
+            "avg_price": pending.avg_price,
+        }
+
+    def _deserialize_pending(self, record: Dict[str, Any]) -> PendingEntry:
+        signal = self._deserialize_signal(record["signal"])
+        now_ms = int(time.time() * 1000)
+        created_at_ms = int(record.get("created_at_ms") or now_ms)
+        elapsed_seconds = max(0.0, (now_ms - created_at_ms) / 1000.0)
+        order_id = record.get("order_id")
+        return PendingEntry(
+            signal=signal,
+            order_id=int(order_id) if order_id is not None else None,
+            client_order_id=str(record["client_order_id"]),
+            limit_price=float(record["limit_price"]),
+            quantity=float(record["quantity"]),
+            created_monotonic=time.monotonic() - elapsed_seconds,
+            created_at_ms=created_at_ms,
+            expires_at_ms=int(record.get("expires_at_ms") or now_ms),
+            phase=str(record.get("phase") or "INTENT"),
+            last_status=(
+                str(record["last_status"])
+                if record.get("last_status") is not None
+                else None
+            ),
+            executed_qty=max(0.0, float(record.get("executed_qty") or 0.0)),
+            avg_price=max(0.0, float(record.get("avg_price") or 0.0)),
+        )
+
+    def _store_pending_record(self, pending: PendingEntry) -> None:
+        if self._journal_path is None:
+            return
+        records = dict(self._journal_records)
+        records[pending.signal.symbol] = self._serialize_pending(pending)
+        self._atomic_write_journal(records)
+        self._journal_records = records
+
+    def _remove_pending_record(self, symbol: str) -> None:
+        if self._journal_path is None:
+            return
+        records = dict(self._journal_records)
+        records.pop(symbol, None)
+        self._atomic_write_journal(records)
+        self._journal_records = records
+
+    def _drop_pending(self, symbol: str, pending: PendingEntry) -> None:
+        """Journal'ı ÖNCE temizle; başarılı olursa RAM kaydını düşür."""
+        self._remove_pending_record(symbol)
+        if self._pending.get(symbol) is pending:
+            self._pending.pop(symbol, None)
+
+    def _record_order_state(
+        self, pending: PendingEntry, order: Dict[str, Any], *, phase: Optional[str] = None
+    ) -> None:
+        changed = False
+        order_id = order.get("orderId")
+        if order_id is not None and pending.order_id != int(order_id):
+            pending.order_id = int(order_id)
+            changed = True
+        status = order.get("status")
+        if status is not None and pending.last_status != str(status):
+            pending.last_status = str(status)
+            changed = True
+        executed = self._executed_qty(order)
+        if executed > pending.executed_qty:
+            pending.executed_qty = executed
+            changed = True
+        try:
+            avg_price = max(0.0, float(order.get("avgPrice") or 0.0))
+        except (TypeError, ValueError):
+            avg_price = 0.0
+        if avg_price > 0 and avg_price != pending.avg_price:
+            pending.avg_price = avg_price
+            changed = True
+        if phase is not None and pending.phase != phase:
+            pending.phase = phase
+            changed = True
+        if changed:
+            self._store_pending_record(pending)
 
     def pending_symbols(self) -> Set[str]:
         """Bekleyen (henüz dolmamış) maker girişlerinin sembol kümesi.
@@ -120,11 +422,258 @@ class ScalpExecutor:
         return [
             {
                 "symbol": symbol,
+                "order_id": pending.order_id,
+                "client_order_id": pending.client_order_id,
                 "limit_price": pending.limit_price,
                 "scans_waited": pending.scans_waited,
             }
             for symbol, pending in self._pending.items()
         ]
+
+    @property
+    def last_sizing_equity(self) -> Optional[float]:
+        """Son giriş denemesinde kullanılan etkin özsermaye (telemetry)."""
+        value = self._last_sizing_snapshot.get("effective_equity")
+        return float(value) if value is not None else None
+
+    def sizing_snapshot(self) -> Dict[str, Any]:
+        """Borsa/sanal sermaye kırpmasının son güvenli anlık görüntüsü."""
+        return dict(self._last_sizing_snapshot)
+
+    async def get_sizing_equity(self) -> Optional[float]:
+        """Startup/kill-switch için özsermayeyi giriş açmadan hazırla."""
+        try:
+            exchange_available = await self.client.get_account_balance()
+        except Exception as exc:
+            self.logger.error(f"❌ Scalper sizing bakiyesi okunamadı ({exc})")
+            return None
+        if exchange_available is None or float(exchange_available) <= 0:
+            return None
+        return await self._resolve_sizing_equity(float(exchange_available))
+
+    def _resolve_leverage(self, signal: Any) -> int:
+        """Sinyalin coin-bazlı dinamik kaldıracı; yoksa global cfg kaldıracı.
+
+        apply_stop_policy fixed_roi modunda volatiliteye göre çözer ve sinyale
+        yazar — stop mesafesi o kaldıraçla hesaplandığı için TP fiyatları,
+        boyutlama ve borsa set_leverage AYNI değeri kullanmak ZORUNDA.
+        """
+        try:
+            lev = int(getattr(signal, "leverage", None) or 0)
+        except (TypeError, ValueError):
+            lev = 0
+        return lev if lev > 0 else int(self.cfg.scalper_leverage)
+
+    def _count_reject(self, reason: str) -> None:
+        """Sessiz durma görünür olsun: kapı retlerini süreç-ömrü sayaçla izle.
+
+        'Bot healthy görünüyor ama hiç işlem açmıyor' durumunda dashboard'dan
+        HANGİ kapının reddettiği okunabilmeli (2026-08-12 inceleme bulgusu).
+        """
+        self._reject_counters[reason] = self._reject_counters.get(reason, 0) + 1
+
+    def reject_snapshot(self) -> Dict[str, int]:
+        """API/dashboard için kapı ret sayaçları (süreç başlangıcından beri)."""
+        return dict(self._reject_counters)
+
+    def _prune_cooldowns(self) -> None:
+        now = time.time()
+        for symbol, state in list(self._cooldowns.items()):
+            if float(state.get("expires_at") or 0.0) <= now:
+                self._cooldowns.pop(symbol, None)
+
+    def _load_cooldowns(self) -> None:
+        """Diskteki cooldown state'ini yükle (restart koruması).
+
+        Dosya bozuksa fail-open DEĞİL, boş yükle + WARNING: cooldown eksikliği
+        pozisyonu korumasız bırakmaz, yalnız fazladan giriş riski doğurur —
+        journal'daki gibi girişleri kilitlemek orantısız olur.
+        """
+        path = self._cooldown_state_path
+        if path is None or not path.exists():
+            return
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict) or raw.get("version") != 1:
+                raise ValueError("cooldown state version/root geçersiz")
+            entries = raw.get("entries")
+            if not isinstance(entries, dict):
+                raise ValueError("cooldown entries nesne değil")
+            now = time.time()
+            loaded: Dict[str, Dict[str, Any]] = {}
+            for symbol, state in entries.items():
+                expires_at = float((state or {}).get("expires_at") or 0.0)
+                if expires_at > now:
+                    loaded[str(symbol).upper()] = {
+                        "reason": str((state or {}).get("reason") or "unknown"),
+                        "expires_at": expires_at,
+                    }
+            self._cooldowns.update(loaded)
+            if loaded:
+                self.logger.info(
+                    f"🧊 Restart sonrası {len(loaded)} sembol cooldown'u diskten yüklendi: "
+                    f"{sorted(loaded)}"
+                )
+        except Exception as e:
+            self.logger.warning(f"⚠️ Cooldown state okunamadı, boş başlıyor: {e}")
+
+    def _persist_cooldowns(self) -> None:
+        """Aktif cooldown'ları atomik yaz (tmp + fsync + os.replace).
+
+        Yazım hatası cooldown akışını asla bozmamalı — in-memory koruma sürer.
+        """
+        path = self._cooldown_state_path
+        if path is None:
+            return
+        tmp_path: Optional[Path] = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_name(
+                f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+            )
+            payload = {"version": 1, "entries": self._cooldowns}
+            with tmp_path.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, path)
+        except Exception as e:
+            self.logger.warning(f"⚠️ Cooldown state yazılamadı ({e}); RAM'de sürüyor")
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _set_cooldown(self, symbol: str, reason: str, expires_at: float) -> bool:
+        """Ortak cooldown yazıcı: UZUN OLAN KAZANIR, sonra diske kalıcılaştır.
+
+        Mevcut girdinin süresi daha uzunsa hiçbir şey yazılmaz (False döner) —
+        ne loss_exit ne protection-failure yolu birbirinin süresini kısaltabilir.
+        """
+        key = str(symbol).upper()
+        existing = self._cooldowns.get(key)
+        if existing and float(existing.get("expires_at") or 0.0) >= expires_at:
+            return False
+        self._cooldowns[key] = {"reason": reason, "expires_at": expires_at}
+        self._persist_cooldowns()
+        return True
+
+    def is_entry_blocked(self, symbol: str) -> bool:
+        """Sembol giriş cooldown'unda mı? (loss_exit VEYA koruma hatası)"""
+        self._prune_cooldowns()
+        return str(symbol).upper() in self._cooldowns
+
+    def cooldown_snapshot(self) -> List[Dict[str, Any]]:
+        """API/dashboard için aktif sembol cooldown'ları."""
+        self._prune_cooldowns()
+        now = time.time()
+        rows: List[Dict[str, Any]] = []
+        for symbol, state in sorted(self._cooldowns.items()):
+            expires_at = float(state["expires_at"])
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "reason": str(state.get("reason") or "protection_failure"),
+                    "remaining_seconds": max(0.0, expires_at - now),
+                    "expires_at": datetime.fromtimestamp(
+                        expires_at, tz=timezone.utc
+                    ).isoformat(),
+                }
+            )
+        return rows
+
+    def start_loss_cooldown(self, symbol: str) -> None:
+        """SL/negatif net kapanış sonrası sembolü yeni girişe geçici kapat.
+
+        ExitManager kapanış kaydından sonra çağırır (2026-08-11 BEAT bulgusu:
+        düşen bıçağa 7 dakikada 4 ardışık yeniden giriş). Mevcut daha uzun bir
+        cooldown'u (örn. koruma hatası) KISALTMAZ; yalnız yoksa veya daha kısa
+        ise yazar. scalper_loss_cooldown_minutes<=0 → kapalı.
+        """
+        try:
+            configured = float(
+                getattr(self.cfg, "scalper_loss_cooldown_minutes", 0) or 0
+            )
+        except (TypeError, ValueError):
+            configured = 0.0
+        if configured <= 0.0:
+            return
+        key = str(symbol).upper()
+        if self._set_cooldown(key, "loss_exit", time.time() + configured * 60.0):
+            self.logger.info(
+                f"🧊 {key}: kayıp sonrası giriş cooldown'u {configured:.0f} dk"
+            )
+
+    def _start_protection_failure_cooldown(self, symbol: str) -> None:
+        configured = float(
+            getattr(self.cfg, "scalper_protection_failure_cooldown_minutes", 60)
+            or 60
+        )
+        duration_seconds = max(60.0, configured) * 60.0
+        self._set_cooldown(
+            symbol, "initial_sl_failed_emergency_close",
+            time.time() + duration_seconds,
+        )
+
+    async def _resolve_sizing_equity(self, exchange_available: float) -> Optional[float]:
+        """Gerçek available balance'ı opsiyonel doğrulanmış sanal kasa ile kırp."""
+        virtual_base = float(getattr(self.cfg, "scalper_virtual_capital_usdt", 0.0) or 0.0)
+        now = datetime.now(timezone.utc).isoformat()
+        if virtual_base <= 0:
+            effective = max(0.0, float(exchange_available))
+            self._last_sizing_snapshot = {
+                "mode": "exchange_available",
+                "exchange_available": float(exchange_available),
+                "virtual_capital": None,
+                "eligible_realized_pnl": None,
+                "effective_equity": effective,
+                "start_trade_id": None,
+                "updated_at": now,
+            }
+            return effective
+
+        start_id = max(
+            0,
+            int(getattr(self.cfg, "scalper_virtual_capital_start_trade_id", 0) or 0),
+        )
+        try:
+            snapshot_method = getattr(self.tracker, "compounding_snapshot", None)
+            if snapshot_method is not None:
+                tracker_snapshot = await snapshot_method(start_id)
+                eligible_pnl = float(tracker_snapshot["eligible_realized_pnl"])
+            else:
+                eligible_method = getattr(self.tracker, "eligible_compounding_pnl")
+                eligible_pnl = float(await eligible_method(start_id))
+        except Exception as exc:
+            # Sanal kasa doğrulanamıyorsa tam borsa bakiyesine sessizce dönmek,
+            # kullanıcının 1000-USDT risk sınırını aşar. Giriş fail-closed.
+            self.logger.error(
+                f"❌ Sanal scalper sermayesi doğrulanamadı ({exc}); yeni giriş atlandı"
+            )
+            self._last_sizing_snapshot = {
+                "mode": "virtual_capital_error",
+                "exchange_available": float(exchange_available),
+                "virtual_capital": None,
+                "eligible_realized_pnl": None,
+                "effective_equity": None,
+                "start_trade_id": start_id,
+                "updated_at": now,
+            }
+            return None
+
+        virtual_capital = max(0.0, virtual_base + eligible_pnl)
+        effective = min(max(0.0, float(exchange_available)), virtual_capital)
+        self._last_sizing_snapshot = {
+            "mode": "virtual_compounding",
+            "exchange_available": float(exchange_available),
+            "virtual_capital": virtual_capital,
+            "eligible_realized_pnl": eligible_pnl,
+            "effective_equity": effective,
+            "start_trade_id": start_id,
+            "updated_at": now,
+        }
+        return effective
 
     async def try_open(
         self, signal: ScalpSignal, ctx: StrategyContext
@@ -133,6 +682,21 @@ class ScalpExecutor:
         direction = signal.direction
         entry_hint = signal.entry_price
         stop_price = signal.stop_price
+        leverage = self._resolve_leverage(signal)
+
+        if self.is_entry_blocked(symbol):
+            state = next(
+                (row for row in self.cooldown_snapshot() if row["symbol"] == symbol.upper()),
+                None,
+            )
+            remaining = float((state or {}).get("remaining_seconds") or 0.0)
+            reason = str((state or {}).get("reason") or "cooldown")
+            self._count_reject("cooldown")
+            self.logger.warning(
+                f"⏸️ {symbol}: giriş cooldown aktif ({reason}, "
+                f"{remaining / 60.0:.1f} dk kaldı), giriş atlandı"
+            )
+            return None
 
         # --- 1. Bakiye ---
         try:
@@ -145,6 +709,13 @@ class ScalpExecutor:
                 f"❌ {symbol}: bakiye bilinmiyor veya sıfır ({balance}), scalp girişi iptal"
             )
             return None
+        balance = await self._resolve_sizing_equity(float(balance))
+        if balance is None or balance <= 0:
+            self.logger.error(
+                f"❌ {symbol}: etkin scalper sermayesi bilinmiyor veya sıfır ({balance}), "
+                "giriş iptal"
+            )
+            return None
 
         # --- 2. Stop mesafesi risk kapısı ---
         if entry_hint <= 0:
@@ -152,6 +723,7 @@ class ScalpExecutor:
             return None
         stop_distance_pct = abs(entry_hint - stop_price) / entry_hint * 100.0
         if not (self.cfg.scalper_min_stop_pct <= stop_distance_pct <= self.cfg.scalper_max_stop_pct):
+            self._count_reject("stop_distance")
             self.logger.info(
                 f"⏭️ {symbol}: stop mesafesi sınır dışı (%{stop_distance_pct:.3f}, izin verilen "
                 f"[%{self.cfg.scalper_min_stop_pct}-%{self.cfg.scalper_max_stop_pct}]), sinyal atlandı"
@@ -174,12 +746,13 @@ class ScalpExecutor:
                 + self.cfg.scalper_tp2_roi * tp2_frac
                 + self.cfg.scalper_tp1_roi * runner_frac
             )
-            sl_risk_roi = stop_distance_pct * self.cfg.scalper_leverage
+            sl_risk_roi = stop_distance_pct * leverage
             if sl_risk_roi <= 0:
                 self.logger.error(f"❌ {symbol}: SL riski hesaplanamadı (sl_risk_roi<=0), sinyal atlandı")
                 return None
             rr = expected_roi / sl_risk_roi
             if rr < min_rr:
+                self._count_reject("min_rr")
                 self.logger.info(
                     f"⏭️ {symbol}: R:R yetersiz (rr={rr:.2f} < min={min_rr:.2f}, "
                     f"beklenen_getiri=%{expected_roi:.2f}, sl_riski=%{sl_risk_roi:.2f}), sinyal atlandı"
@@ -199,7 +772,7 @@ class ScalpExecutor:
         # (nominal = marj × kaldıraç). getattr: eski sahte-cfg testleri alan
         # tanımlamaz — onlarda tarihsel %50 davranışı korunur.
         margin_pct = getattr(self.cfg, "scalper_max_margin_pct", 50.0) / 100.0
-        nominal_cap = balance * self.cfg.scalper_leverage * margin_pct
+        nominal_cap = balance * leverage * margin_pct
         nominal = qty * entry_hint
         if nominal > nominal_cap and entry_hint > 0:
             qty = nominal_cap / entry_hint
@@ -221,7 +794,7 @@ class ScalpExecutor:
         # --- 6. Margin type + leverage (emirden ÖNCE — burada hata zararsız) ---
         try:
             await self.client.set_margin_type(symbol, "ISOLATED")
-            await self.client.set_leverage(symbol, self.cfg.scalper_leverage)
+            await self.client.set_leverage(symbol, leverage)
         except BinanceAPIError as e:
             self.logger.error(
                 f"❌ {symbol}: margin/leverage ayarlanamadı (kod={e.code}: {e.msg}), pozisyon açılmadı"
@@ -233,7 +806,7 @@ class ScalpExecutor:
 
         side = "BUY" if direction == Direction.LONG else "SELL"
 
-        # --- 7a. Maker modu: LIMIT GTC emri kor, PendingEntry olarak sakla ---
+        # --- 7a. Maker modu: LIMIT GTX emri kor, PendingEntry olarak sakla ---
         if getattr(self.cfg, "scalper_entry_mode", "taker") == "maker":
             await self._open_maker_entry(signal=signal, ctx=ctx, side=side, quantity=qty)
             return None
@@ -282,6 +855,335 @@ class ScalpExecutor:
             entry_candle_time=entry_candle_time,
         )
 
+    def _configured_conservative_fee_rate(self) -> float:
+        """Config fallback'ında maker/taker oranlarının yüksek olanını seç."""
+        maker = max(0.0, float(getattr(self.cfg, "scalper_maker_fee_pct", 0.02))) / 100.0
+        taker = max(0.0, float(getattr(self.cfg, "scalper_taker_fee_pct", 0.05))) / 100.0
+        return max(maker, taker)
+
+    @staticmethod
+    def _valid_fee_rate(value: Any) -> Optional[float]:
+        try:
+            rate = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(rate) or rate < 0 or rate >= 1:
+            return None
+        return rate
+
+    @staticmethod
+    def _coerce_price(value: Any) -> Optional[float]:
+        """Bir borsa/emir alanını pozitif sonlu fiyata çevir, olmuyorsa None."""
+        try:
+            price = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(price) or price <= 0:
+            return None
+        return price
+
+    async def _resolve_commission_rates(self, symbol: str) -> Tuple[float, float, str]:
+        """Sembolün gerçek entry/exit fee oranlarını veya güvenli fallback'i al."""
+        fallback = self._configured_conservative_fee_rate()
+        getter = getattr(self.client, "get_user_commission_rate", None)
+        if getter is None:
+            return fallback, fallback, "config_conservative"
+        try:
+            raw = await getter(symbol)
+            maker = self._valid_fee_rate((raw or {}).get("makerCommissionRate"))
+            taker = self._valid_fee_rate((raw or {}).get("takerCommissionRate"))
+            if maker is None or taker is None:
+                raise ValueError(f"eksik/geçersiz commission response: {raw!r}")
+            entry_rate = maker if getattr(self.cfg, "scalper_entry_mode", "taker") == "maker" else taker
+            return entry_rate, taker, "binance_user_commission"
+        except Exception as exc:
+            self.logger.warning(
+                f"⚠️ {symbol}: gerçek komisyon oranı okunamadı ({exc}); "
+                f"iki bacakta muhafazakâr config oranı {fallback:.8f} kullanılacak"
+            )
+            return fallback, fallback, "config_conservative"
+
+    @staticmethod
+    def _trade_quantity(row: Dict[str, Any]) -> Optional[float]:
+        try:
+            value = float(row.get("qty") or row.get("quantity") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) and value > 0 else None
+
+    @staticmethod
+    def _trade_price(row: Dict[str, Any]) -> Optional[float]:
+        try:
+            value = float(row.get("price") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) and value > 0 else None
+
+    @staticmethod
+    def _trade_is_buyer(row: Dict[str, Any]) -> Optional[bool]:
+        value = row.get("buyer")
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.lower() in ("true", "false"):
+            return value.lower() == "true"
+        side = str(row.get("side") or "").upper()
+        if side in ("BUY", "SELL"):
+            return side == "BUY"
+        return None
+
+    @staticmethod
+    def _trade_order_id(row: Dict[str, Any]) -> Optional[int]:
+        try:
+            return int(row.get("orderId"))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _trade_time_ms(row: Dict[str, Any]) -> Optional[int]:
+        try:
+            value = int(row.get("time"))
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    @staticmethod
+    def _estimated_gross(
+        direction: Direction, entry_price: float, exit_price: float, quantity: float
+    ) -> float:
+        if direction == Direction.LONG:
+            return (exit_price - entry_price) * quantity
+        return (entry_price - exit_price) * quantity
+
+    async def _fallback_failed_execution_ledger(
+        self,
+        *,
+        symbol: str,
+        direction: Direction,
+        entry_price: float,
+        filled_qty: float,
+        detail: str,
+    ) -> _FailedExecutionLedger:
+        try:
+            exit_price = float(await self.client.get_current_price(symbol))
+        except Exception:
+            exit_price = entry_price
+        if not math.isfinite(exit_price) or exit_price <= 0:
+            exit_price = entry_price
+        return _FailedExecutionLedger(
+            exit_price=exit_price,
+            realized_pnl=self._estimated_gross(
+                direction, entry_price, exit_price, filled_qty
+            ),
+            pnl_source="estimated_gross",
+            notes=f"ledger_uncertain={detail}",
+        )
+
+    async def _fetch_failed_execution_ledger(
+        self,
+        *,
+        symbol: str,
+        direction: Direction,
+        entry_price: float,
+        filled_qty: float,
+        entry_order_id: str,
+    ) -> _FailedExecutionLedger:
+        """Acil kapanan fill'i exact account-trade satırlarıyla uzlaştır.
+
+        Giriş orderId ile birebir alınır. Ardından aynı dar zaman penceresindeki
+        ters-yön fill'leri, tam giriş miktarını kapatana kadar toplanır. Miktar,
+        yön veya commission asset belirsizse gerçekmiş gibi davranılmaz.
+        """
+        getter = getattr(self.client, "get_account_trades", None)
+        try:
+            numeric_entry_id = int(entry_order_id)
+        except (TypeError, ValueError):
+            numeric_entry_id = 0
+        if getter is None or numeric_entry_id <= 0:
+            return await self._fallback_failed_execution_ledger(
+                symbol=symbol,
+                direction=direction,
+                entry_price=entry_price,
+                filled_qty=filled_qty,
+                detail="account_trade_api_or_entry_id_missing",
+            )
+
+        last_detail = "account_trades_empty"
+        for delay in self.FAILED_LEDGER_RETRY_DELAYS:
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                entry_rows = await getter(
+                    symbol, order_id=numeric_entry_id, limit=500
+                )
+                if not isinstance(entry_rows, list) or not entry_rows:
+                    last_detail = "entry_trades_missing"
+                    continue
+                entry_rows = [
+                    row for row in entry_rows
+                    if isinstance(row, dict)
+                    and self._trade_order_id(row) == numeric_entry_id
+                ]
+                entry_times = [
+                    value for value in (self._trade_time_ms(row) for row in entry_rows)
+                    if value is not None
+                ]
+                if not entry_rows or not entry_times:
+                    last_detail = "entry_trade_identity_invalid"
+                    continue
+
+                entry_is_buyer = direction == Direction.LONG
+                if any(self._trade_is_buyer(row) != entry_is_buyer for row in entry_rows):
+                    last_detail = "entry_trade_side_mismatch"
+                    continue
+                entry_qtys = [self._trade_quantity(row) for row in entry_rows]
+                if any(qty is None for qty in entry_qtys):
+                    last_detail = "entry_trade_qty_invalid"
+                    continue
+                entry_qty = sum(float(qty) for qty in entry_qtys if qty is not None)
+                tolerance = max(1e-12, filled_qty * 1e-6)
+                if abs(entry_qty - filled_qty) > tolerance:
+                    last_detail = "entry_trade_qty_mismatch"
+                    continue
+
+                start_ms = min(entry_times) - 1000
+                end_ms = int(time.time() * 1000) + 2000
+                window_rows = await getter(
+                    symbol,
+                    start_time=start_ms,
+                    end_time=end_ms,
+                    limit=500,
+                )
+                if not isinstance(window_rows, list):
+                    last_detail = "trade_window_invalid"
+                    continue
+
+                close_candidates = sorted(
+                    (
+                        row for row in window_rows
+                        if isinstance(row, dict)
+                        and self._trade_is_buyer(row) is (not entry_is_buyer)
+                        and (self._trade_time_ms(row) or 0) >= min(entry_times)
+                    ),
+                    key=lambda row: (
+                        self._trade_time_ms(row) or 0,
+                        int(row.get("id") or 0),
+                    ),
+                )
+                selected_close: List[Dict[str, Any]] = []
+                close_qty = 0.0
+                ambiguous = False
+                for row in close_candidates:
+                    qty = self._trade_quantity(row)
+                    if qty is None:
+                        ambiguous = True
+                        break
+                    if close_qty + qty > filled_qty + tolerance:
+                        ambiguous = True
+                        break
+                    selected_close.append(row)
+                    close_qty += qty
+                    if abs(close_qty - filled_qty) <= tolerance:
+                        break
+                if ambiguous or abs(close_qty - filled_qty) > tolerance:
+                    last_detail = "exact_close_fill_not_proven"
+                    continue
+
+                selected = entry_rows + selected_close
+                commission_assets = {
+                    str(row.get("commissionAsset") or "") for row in selected
+                }
+                commission_assets.discard("")
+                # Virtual capital USDT cinsindedir. USDC/FDUSD/BNB komisyonunu
+                # burada 1:1 varsaymak doğrulanmış sermayeyi şişirebilir; kur
+                # dönüşümü yoksa exact etiketi yalnız USDT'ye verilir.
+                if commission_assets != {"USDT"}:
+                    last_detail = "commission_asset_not_additive"
+                    continue
+
+                realized_pnl = 0.0
+                valid_money = True
+                for row in selected:
+                    try:
+                        realized = float(row.get("realizedPnl") or 0.0)
+                        commission = float(row.get("commission") or 0.0)
+                    except (TypeError, ValueError):
+                        valid_money = False
+                        break
+                    if not math.isfinite(realized) or not math.isfinite(commission) or commission < 0:
+                        valid_money = False
+                        break
+                    realized_pnl += realized - commission
+                if not valid_money:
+                    last_detail = "trade_money_invalid"
+                    continue
+
+                close_notional = 0.0
+                for row in selected_close:
+                    price = self._trade_price(row)
+                    qty = self._trade_quantity(row)
+                    if price is None or qty is None:
+                        valid_money = False
+                        break
+                    close_notional += price * qty
+                if not valid_money or close_qty <= 0:
+                    last_detail = "close_price_invalid"
+                    continue
+
+                return _FailedExecutionLedger(
+                    exit_price=close_notional / close_qty,
+                    realized_pnl=realized_pnl,
+                    pnl_source="binance_account_trades_net",
+                    notes=(
+                        f"ledger_entry_fills={len(entry_rows)},"
+                        f"close_fills={len(selected_close)}"
+                    ),
+                )
+            except Exception as exc:
+                last_detail = f"account_trade_query_error:{type(exc).__name__}"
+
+        return await self._fallback_failed_execution_ledger(
+            symbol=symbol,
+            direction=direction,
+            entry_price=entry_price,
+            filled_qty=filled_qty,
+            detail=last_detail,
+        )
+
+    async def _record_initial_protection_failure(
+        self,
+        *,
+        signal: ScalpSignal,
+        direction: Direction,
+        entry_price: float,
+        filled_qty: float,
+        entry_order_id: str,
+    ) -> None:
+        symbol = signal.symbol
+        self._start_protection_failure_cooldown(symbol)
+        ledger = await self._fetch_failed_execution_ledger(
+            symbol=symbol,
+            direction=direction,
+            entry_price=entry_price,
+            filled_qty=filled_qty,
+            entry_order_id=entry_order_id,
+        )
+        try:
+            await self.tracker.record_failed_execution(
+                signal=signal,
+                entry_price=entry_price,
+                exit_price=ledger.exit_price,
+                quantity=filled_qty,
+                leverage=self._resolve_leverage(signal),
+                realized_pnl=ledger.realized_pnl,
+                pnl_source=ledger.pnl_source,
+                entry_order_id=entry_order_id,
+                notes=ledger.notes,
+            )
+        except Exception as exc:
+            self.logger.critical(
+                f"🚨 {symbol}: acil kapatılan başarısız execution ledger'a yazılamadı ({exc})"
+            )
+
     # ------------------------------------------------------------------
     # Ortak kod yolu: SL → TP merdiveni → PositionModel/DB/tracker kaydı.
     #
@@ -290,6 +1192,73 @@ class ScalpExecutor:
     # gerçek entry_price'tan (sinyal anındaki tahmini fiyattan DEĞİL)
     # yeniden hesaplanır.
     # ------------------------------------------------------------------
+
+    def _delay_adjusted_stop(
+        self, *, signal: ScalpSignal, direction: Direction, entry_price: float
+    ) -> float:
+        """Yapısal stop'u GERÇEK dolum fiyatına göre yeniden çapala.
+
+        Sinyalin üretildiği an ile emrin gerçekten dolduğu an arasında saniyeler
+        geçer; maker (GTX post-only) modunda bu süre bir tarama turunu aşabilir.
+        TP fiyatları zaten gerçek ``entry_price``'tan hesaplanıyor, fakat stop
+        sinyal anındaki fiyata çapalı kalıyordu. Bu asimetri iki soruna yol açar:
+
+        1. Maker LONG emri ancak fiyat DÜŞERKEN dolar (SHORT'ta yükselirken).
+           Yani dolum, stop'a doğru bir hareketin içinde gerçekleşir. Sinyal
+           anına çapalı stop bu yüzden sık sık "zaten geçilmiş" olur ve Binance
+           koruma emrini -2021 ile reddeder; pozisyon açılır açılmaz kapatılır.
+        2. Gerçekleşen risk, boyutlamada varsayılan riskten sapar.
+
+        Çözüm: stop'u dolum kayması kadar ötele. Böylece giriş–stop MESAFESİ
+        (dolayısıyla boyutlamada kullanılan birim risk) birebir korunur ve stop
+        piyasanın doğru tarafında kalır.
+
+        Öteleme yalnız güvenliyse uygulanır: stop girisin yanlış tarafına
+        düşüyorsa veya mesafe risk tavanını aşıyorsa yapısal seviye korunur.
+        """
+        signal_entry = float(getattr(signal, "entry_price", 0.0) or 0.0)
+        structural_stop = float(getattr(signal, "stop_price", 0.0) or 0.0)
+        if signal_entry <= 0 or structural_stop <= 0 or entry_price <= 0:
+            return structural_stop
+
+        drift = entry_price - signal_entry
+        if drift == 0.0:
+            return structural_stop
+
+        adjusted = structural_stop + drift
+        if adjusted <= 0:
+            return structural_stop
+
+        # Stop, pozisyonun koruma tarafında kalmalı.
+        if direction == Direction.LONG and adjusted >= entry_price:
+            return structural_stop
+        if direction == Direction.SHORT and adjusted <= entry_price:
+            return structural_stop
+
+        max_pct = float(getattr(self.cfg, "scalper_max_stop_pct", 0.0) or 0.0)
+        if max_pct > 0:
+            distance_pct = abs(entry_price - adjusted) / entry_price * 100.0
+            if distance_pct > max_pct:
+                # Tavan aşıldığında yapısal seviyeye DÖNMEK yanlış olur: büyük bir
+                # dolum kaymasından sonra o seviye girişin ters tarafında kalmış
+                # olabilir. Doğrusu stop'u risk tavanına tam oturtmaktır.
+                capped = (
+                    entry_price * (1.0 - max_pct / 100.0)
+                    if direction == Direction.LONG
+                    else entry_price * (1.0 + max_pct / 100.0)
+                )
+                self.logger.info(
+                    f"✂️ {signal.symbol}: dolum kayması telafisi risk tavanına kırpıldı "
+                    f"(%{distance_pct:.3f} -> %{max_pct:.3f}), stop={capped}"
+                )
+                return capped
+
+        self.logger.info(
+            f"🎯 {signal.symbol}: stop dolum kaymasına göre çapalandı "
+            f"{structural_stop} -> {adjusted} "
+            f"(sinyal={signal_entry}, dolum={entry_price}, kayma={drift:+.10g})"
+        )
+        return adjusted
 
     async def _finalize_position(
         self,
@@ -303,22 +1272,50 @@ class ScalpExecutor:
         entry_candle_time: int,
     ) -> Optional[ScalpPosition]:
         symbol = signal.symbol
-        stop_price = signal.stop_price
+        stop_price = self._delay_adjusted_stop(
+            signal=signal, direction=direction, entry_price=entry_price
+        )
 
         # --- 9. Stop-loss: BAŞARISIZ OLURSA pm zaten pozisyonu acil kapattı ---
+        # reference_price/max_distance_pct: -2021 gelirse pm stop'u canlı fiyata
+        # göre yeniden çapalar, ama asla risk tavanının ötesine genişletmez.
         sl_order = await self.pm.place_stop_loss_or_close(
-            symbol=symbol, sl_side=sl_side, stop_price=stop_price
+            symbol=symbol,
+            sl_side=sl_side,
+            stop_price=stop_price,
+            reference_price=entry_price,
+            max_distance_pct=float(getattr(self.cfg, "scalper_max_stop_pct", 0.0) or 0.0)
+            or None,
         )
         if sl_order is None:
             self.logger.error(
                 f"❌ {symbol}: SL konulamadı — pozisyon PositionManager tarafından kapatıldı"
             )
+            await self._record_initial_protection_failure(
+                signal=signal,
+                direction=direction,
+                entry_price=entry_price,
+                filled_qty=filled_qty,
+                entry_order_id=entry_order_id,
+            )
             return None
         sl_algo_id = self._extract_id(sl_order)
 
+        # pm, -2021 sonrası stop'u canlı fiyata göre yeniden çapalamış olabilir.
+        # Kayıt ve çıkış planı borsadaki GERÇEK tetik fiyatını yansıtmalı; aksi
+        # halde breakeven/trailing mantığı var olmayan bir seviyeye göre çalışır.
+        effective_stop = self._coerce_price(sl_order.get("effectiveStopPrice"))
+        if effective_stop is not None and effective_stop != stop_price:
+            self.logger.warning(
+                f"📌 {symbol}: kayıtlı stop borsadaki etkin tetik fiyatına hizalandı "
+                f"{stop_price} -> {effective_stop}"
+            )
+            stop_price = effective_stop
+
         # --- 10. TP merdiveni: başarısızlık pozisyonu tehlikeye atmaz (SL var) ---
-        tp1_price = price_at_roi(entry_price, self.cfg.scalper_tp1_roi, self.cfg.scalper_leverage, direction)
-        tp2_price = price_at_roi(entry_price, self.cfg.scalper_tp2_roi, self.cfg.scalper_leverage, direction)
+        trade_leverage = self._resolve_leverage(signal)
+        tp1_price = price_at_roi(entry_price, self.cfg.scalper_tp1_roi, trade_leverage, direction)
+        tp2_price = price_at_roi(entry_price, self.cfg.scalper_tp2_roi, trade_leverage, direction)
         tp1_qty = filled_qty * self.cfg.scalper_tp1_fraction
         tp2_qty = filled_qty * self.cfg.scalper_tp2_fraction
         runner_qty = max(filled_qty - tp1_qty - tp2_qty, 0.0)
@@ -326,8 +1323,20 @@ class ScalpExecutor:
         tp1_algo_id = await self._place_tp_safely(symbol, sl_side, tp1_price, tp1_qty, "TP1")
         tp2_algo_id = await self._place_tp_safely(symbol, sl_side, tp2_price, tp2_qty, "TP2")
 
+        entry_fee_rate, exit_fee_rate, fee_rate_source = await self._resolve_commission_rates(
+            symbol
+        )
+        breakeven_price = fee_aware_breakeven_price(
+            entry=entry_price,
+            direction=direction,
+            entry_fee_rate=entry_fee_rate,
+            exit_fee_rate=exit_fee_rate,
+            buffer_pct=float(getattr(self.cfg, "scalper_breakeven_buffer_pct", 0.05)),
+        )
+        breakeven_cost_pct = abs(breakeven_price - entry_price) / entry_price * 100.0
+
         # --- 11. Kayıt: PositionModel + DB + tracker + ExitPlan ---
-        leverage = self.cfg.scalper_leverage
+        leverage = trade_leverage
         margin_usdt = (filled_qty * entry_price) / leverage if leverage else filled_qty * entry_price
 
         position_side = PositionSide.LONG if direction == Direction.LONG else PositionSide.SHORT
@@ -357,12 +1366,6 @@ class ScalpExecutor:
             notes=f"scalper:{signal.strategy}",
         )
 
-        buffer_frac = self.cfg.scalper_breakeven_buffer_pct / 100.0
-        breakeven_price = (
-            entry_price * (1 + buffer_frac) if direction == Direction.LONG
-            else entry_price * (1 - buffer_frac)
-        )
-
         plan = ExitPlan(
             tp1_price=tp1_price,
             tp1_quantity=tp1_qty,
@@ -372,6 +1375,11 @@ class ScalpExecutor:
             initial_stop=stop_price,
             breakeven_price=breakeven_price,
             chandelier_atr_mult=self.cfg.scalper_chandelier_atr_mult,
+            entry_fee_rate=entry_fee_rate,
+            exit_fee_rate=exit_fee_rate,
+            fee_rate_source=fee_rate_source,
+            breakeven_cost_pct=breakeven_cost_pct,
+            runner_floor_price=tp1_price,
             tp1_algo_id=tp1_algo_id,
             tp2_algo_id=tp2_algo_id,
         )
@@ -409,23 +1417,44 @@ class ScalpExecutor:
         )
 
     # ------------------------------------------------------------------
-    # Maker modu — Faz 1: LIMIT GTC girişini kor, PendingEntry olarak sakla.
+    # Maker modu — Faz 1: LIMIT GTX girişini kor, PendingEntry olarak sakla.
     # ------------------------------------------------------------------
 
     async def _open_maker_entry(
         self, signal: ScalpSignal, ctx: StrategyContext, side: str, quantity: float
     ) -> None:
+        async with self._pending_lock:
+            await self._open_maker_entry_locked(signal, ctx, side, quantity)
+
+    async def _open_maker_entry_locked(
+        self, signal: ScalpSignal, ctx: StrategyContext, side: str, quantity: float
+    ) -> None:
+        self._assert_recovery_ready()
         symbol = signal.symbol
+        if symbol in self._pending:
+            self.logger.warning(
+                f"⚠️ {symbol}: zaten bekleyen maker girişi var, ikinci emir gönderilmedi"
+            )
+            return
+
+        # BUY yalnızca en iyi bid'e, SELL yalnızca en iyi ask'e yazılır.
+        # GTX, kotasyon GET'i ile POST arasında spread değişse emri taker'a
+        # dönüştürmek yerine reddeder.
         try:
-            limit_price = await self.client.quantize_price(symbol, ctx.current_price)
+            book = await self.client.get_book_ticker(symbol)
+            price_key = "bidPrice" if side == "BUY" else "askPrice"
+            book_price = float(book[price_key])
+            limit_price = await self.client.quantize_maker_price(
+                symbol, book_price, side
+            )
         except BinanceAPIError as e:
             self.logger.error(
-                f"❌ {symbol}: limit fiyatı yuvarlanamadı (kod={e.code}: {e.msg}), maker giriş iptal"
+                f"❌ {symbol}: maker kotasyonu alınamadı (kod={e.code}: {e.msg}), giriş iptal"
             )
             return
         except Exception as e:
             self.logger.error(
-                f"❌ {symbol}: limit fiyatı yuvarlanırken beklenmeyen hata ({e}), maker giriş iptal"
+                f"❌ {symbol}: maker kotasyonu hazırlanırken beklenmeyen hata ({e}), giriş iptal"
             )
             return
 
@@ -433,39 +1462,78 @@ class ScalpExecutor:
             self.logger.error(f"❌ {symbol}: geçersiz limit fiyatı ({limit_price}), maker giriş iptal")
             return
 
-        try:
-            order = await self._place_limit_entry(symbol, side, quantity, limit_price)
-        except BinanceAPIError as e:
-            self.logger.error(f"❌ {symbol}: limit order başarısız (kod={e.code}: {e.msg})")
-            return
-        except Exception as e:
-            self.logger.error(f"❌ {symbol}: limit order sırasında beklenmeyen hata ({e})")
-            return
-
-        order_id = order.get("orderId")
-        if order_id is None:
-            self.logger.error(
-                f"❌ {symbol}: limit order yanıtında orderId yok, pending kaydı düşürülmedi"
-            )
-            return
-
-        self._pending[symbol] = PendingEntry(
+        client_order_id = self._new_client_order_id()
+        created_at_ms = int(time.time() * 1000)
+        timeout_candles = max(
+            0, int(getattr(self.cfg, "scalper_maker_fill_timeout_candles", 3))
+        )
+        pending = PendingEntry(
             signal=signal,
-            order_id=int(order_id),
+            order_id=None,
+            client_order_id=client_order_id,
             limit_price=limit_price,
             quantity=quantity,
             created_monotonic=time.monotonic(),
+            created_at_ms=created_at_ms,
+            expires_at_ms=created_at_ms + timeout_candles * 300_000,
         )
+        # KRİTİK SIRA: kalıcı intent atomik olarak diske yazılmadan POST yok.
+        # Ağ yanıtı kaybolursa restart sonrası aynı clientOrderId ile
+        # uzlaştırılır; ikinci bir emir gönderilmez.
+        self._store_pending_record(pending)
+        self._pending[symbol] = pending
+
+        try:
+            order = await self._place_limit_entry(
+                symbol, side, quantity, limit_price, client_order_id
+            )
+        except _MakerOrderStateUnknown as e:
+            pending.phase = "SUBMIT_UNKNOWN"
+            self._store_pending_record(pending)
+            self.logger.critical(
+                f"🚨 {symbol}: maker emir sonucu belirsiz ({e}); clientOrderId="
+                f"{client_order_id} pending tutuluyor ve POST tekrarlanmayacak"
+            )
+            return
+        except BinanceAPIError as e:
+            # _place_limit_entry yalnız POST'un kesin reddedildiğini ve aynı
+            # client ID'nin borsada bulunmadığını kanıtladığında bu dalı açar.
+            self._drop_pending(symbol, pending)
+            self.logger.error(f"❌ {symbol}: limit order başarısız (kod={e.code}: {e.msg})")
+            return
+        except Exception as e:
+            pending.phase = "SUBMIT_UNKNOWN"
+            self._store_pending_record(pending)
+            raise PendingRecoveryError(
+                f"{symbol}: maker POST durumu beklenmeyen biçimde belirsiz: {e}"
+            ) from e
+
+        order_id = order.get("orderId")
+        if order_id is None:
+            pending.phase = "SUBMIT_UNKNOWN"
+            self._store_pending_record(pending)
+            self.logger.critical(
+                f"🚨 {symbol}: limit order yanıtında orderId yok; clientOrderId="
+                f"{client_order_id} pending korunuyor"
+            )
+            return
+
+        self._record_order_state(pending, order, phase="WORKING")
         self.logger.info(
             f"📝 Maker giriş emri kondu: {symbol} {side} {quantity} @ {limit_price} "
-            f"(orderId={order_id}, GTC)",
+            f"(orderId={order_id}, clientOrderId={client_order_id}, GTX/post-only)",
             extra={"trade": True},
         )
 
     async def _place_limit_entry(
-        self, symbol: str, side: str, quantity: float, price: float
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        price: float,
+        client_order_id: str,
     ) -> Dict[str, Any]:
-        """LIMIT GTC giriş emri gönder.
+        """LIMIT GTX giriş emrini idempotent bir istemci kimliğiyle gönder.
 
         ImprovedBinanceClient'ta market dışında public bir emir sarmalayıcısı
         YOK; mevcut _request_with_retry katmanı DOĞRUDAN kullanılır — tıpkı
@@ -473,19 +1541,65 @@ class ScalpExecutor:
         (imzalama, retry, hata sınıflandırması AYNEN yeniden kullanılır,
         yeniden yazılmaz).
         """
-        return await self.client._request_with_retry(
-            "POST", "/fapi/v1/order",
-            params={
-                "symbol": symbol,
-                "side": side,
-                "type": "LIMIT",
-                "timeInForce": "GTC",
-                "quantity": quantity,
-                "price": price,
-                "newOrderRespType": "RESULT",
-            },
-            signed=True,
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": "LIMIT",
+            "timeInForce": "GTX",
+            "quantity": quantity,
+            "price": price,
+            "newClientOrderId": client_order_id,
+            "newOrderRespType": "RESULT",
+        }
+        placement_error: Optional[Exception] = None
+        try:
+            response = await self.client._request_with_retry(
+                "POST", "/fapi/v1/order", params=params, signed=True
+            )
+            if response.get("orderId") is not None:
+                return response
+            placement_error = RuntimeError("başarılı POST yanıtında orderId yok")
+        except Exception as e:
+            placement_error = e
+
+        try:
+            reconciled = await self.client.get_order_by_client_id(
+                symbol, client_order_id
+            )
+        except BinanceAPIError as query_error:
+            # Kesin bir 4xx ret + borsada kimliğin bulunmaması, emrin
+            # oluşmadığını kanıtlar. Ağ/5xx/duplicate sonuçlarında ise
+            # "bulunamadı" anlık gecikme olabilir; niyet fail-closed tutulur.
+            definitive_reject = (
+                isinstance(placement_error, BinanceAPIError)
+                and placement_error.status_code < 500
+                and placement_error.status_code != 429
+                and "duplicate" not in placement_error.msg.lower()
+                and "client order" not in placement_error.msg.lower()
+            )
+            if query_error.code == -2013 and definitive_reject:
+                raise placement_error
+            raise _MakerOrderStateUnknown(
+                f"POST={placement_error}; query={query_error}"
+            ) from placement_error
+        except Exception as query_error:
+            raise _MakerOrderStateUnknown(
+                f"POST={placement_error}; query={query_error}"
+            ) from placement_error
+
+        if reconciled.get("orderId") is None:
+            raise _MakerOrderStateUnknown(
+                f"clientOrderId sorgusu orderId döndürmedi: {reconciled!r}"
+            )
+        self.logger.warning(
+            f"♻️ {symbol}: maker POST sonucu clientOrderId={client_order_id} ile uzlaştırıldı"
         )
+        return reconciled
+
+    @staticmethod
+    def _new_client_order_id() -> str:
+        """Binance regex/36 karakter sınırına uyan benzersiz kimlik."""
+        return f"awa2sc_{uuid.uuid4().hex[:24]}"
 
     # ------------------------------------------------------------------
     # Maker modu — Faz 2: her motor turunda bekleyen girişleri kontrol et.
@@ -498,6 +1612,18 @@ class ScalpExecutor:
         girişler ScalpPosition olarak döner; çağıran taraf bunları
         exits.track() ile izlemeye almalıdır.
         """
+        async with self._pending_lock:
+            if self._journal_error:
+                raise PendingRecoveryError(
+                    f"Maker pending journal bozuk/okunamıyor: {self._journal_error}"
+                )
+            if self._recovery_needed:
+                # Engine değişikliği gerektirmeden ilk güvenlik polling turu
+                # restart journal'ını otomatik uzlaştırır.
+                return await self._recover_pending_locked()
+            return await self._check_pending_locked()
+
+    async def _check_pending_locked(self) -> List[ScalpPosition]:
         opened: List[ScalpPosition] = []
         for symbol in list(self._pending.keys()):
             pending = self._pending.get(symbol)
@@ -505,6 +1631,10 @@ class ScalpExecutor:
                 continue
             try:
                 sp = await self._check_one_pending(symbol, pending)
+            except UnprotectedPositionError:
+                # Engine bu istisnayı global giriş latch'ine dönüştürür.
+                # Burada yutmak botun yeni pozisyon açmaya devam etmesine yol açar.
+                raise
             except Exception as e:
                 self.logger.error(
                     f"❌ {symbol}: pending giriş kontrolünde beklenmeyen hata ({e}), "
@@ -519,7 +1649,7 @@ class ScalpExecutor:
         self, symbol: str, pending: PendingEntry
     ) -> Optional[ScalpPosition]:
         try:
-            order = await self.client.get_order(symbol, pending.order_id)
+            order = await self._get_pending_order(symbol, pending)
         except Exception as e:
             # Sorgu hatası: "bilinmiyor" ASLA "iptal" sayılmaz — pending
             # olduğu gibi kalır, sonraki turda tekrar denenir.
@@ -529,37 +1659,84 @@ class ScalpExecutor:
             )
             return None
 
+        return await self._process_pending_order(symbol, pending, order)
+
+    async def _process_pending_order(
+        self, symbol: str, pending: PendingEntry, order: Dict[str, Any]
+    ) -> Optional[ScalpPosition]:
+        """REST sorgusu ve WS eventi için ortak, exactly-once durum makinesi."""
+        self._record_order_state(pending, order)
+
         status = order.get("status")
 
         if status == "FILLED":
             return await self._on_pending_filled(symbol, pending, order)
 
         if status == "PARTIALLY_FILLED":
-            # Kısmi dolumda timeout sayacı DONDURULUR.
-            self.logger.debug(f"⏳ {symbol}: maker giriş kısmen doldu, bekleniyor")
-            return None
+            # Kalan miktarı bekletmek, dolan miktarı süresiz SL'siz bırakır.
+            # Görülür görülmez iptal et; terminal iptal yanıtındaki
+            # executedQty _on_pending_filled ile derhal korumaya alınır.
+            self.logger.warning(
+                f"⚠️ {symbol}: maker giriş kısmen doldu; kalan miktar hemen iptal ediliyor"
+            )
+            return await self._cancel_pending(
+                symbol, pending, observed_order=order, reason="partial_fill"
+            )
 
         if status == "NEW":
+            self._record_order_state(pending, order, phase="WORKING")
             pending.scans_waited += 1
             timeout_candles = max(0, int(getattr(self.cfg, "scalper_maker_fill_timeout_candles", 3)))
-            # 30sn tarama ≈ 5m mumun 1/10'u -> timeout_candles*10 tarama ≈
-            # timeout_candles*5dk.
-            max_scans = timeout_candles * 10
-            if pending.scans_waited > max_scans:
-                return await self._cancel_pending(symbol, pending)
+            # Poll sıklığı engine tarafında değişebilir (güvenlik döngüsü
+            # 2sn, ana tarama 30sn vb.). Timeout bu nedenle tur sayısına değil
+            # gerçek monotonic zamana bağlıdır: bir mum = 300 saniye.
+            elapsed = max(0.0, time.monotonic() - pending.created_monotonic)
+            timeout_seconds = timeout_candles * 300.0
+            wall_expired = (
+                pending.expires_at_ms > 0
+                and int(time.time() * 1000) >= pending.expires_at_ms
+            )
+            if timeout_candles == 0 or elapsed >= timeout_seconds or wall_expired:
+                return await self._cancel_pending(
+                    symbol, pending, reason="timeout"
+                )
             return None
 
-        if status in ("CANCELED", "EXPIRED", "REJECTED"):
+        if status in ("CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED"):
+            if self._executed_qty(order) > 0:
+                self.logger.warning(
+                    f"⚠️ {symbol}: maker giriş {status} ama kısmi dolum var; "
+                    f"gerçekleşen miktar korunuyor"
+                )
+                return await self._on_pending_filled(symbol, pending, order)
             self.logger.info(
                 f"⏭️ {symbol}: maker giriş {status} — pending kaydı düşürüldü "
                 f"(orderId={pending.order_id})"
             )
-            self._pending.pop(symbol, None)
+            self._drop_pending(symbol, pending)
             return None
 
         # Bilinmeyen/işlenmemiş durum — dokunma, sonraki turda tekrar bak.
         self.logger.debug(f"{symbol}: bekleyen emir durumu bilinmiyor ({status!r}), tur atlanıyor")
         return None
+
+    async def _get_pending_order(
+        self, symbol: str, pending: PendingEntry
+    ) -> Dict[str, Any]:
+        """Pending emri orderId varsa onunla, yoksa clientOrderId ile sorgula."""
+        if pending.order_id is not None:
+            return await self.client.get_order(symbol, pending.order_id)
+
+        order = await self.client.get_order_by_client_id(
+            symbol, pending.client_order_id
+        )
+        order_id = order.get("orderId")
+        if order_id is not None:
+            self._record_order_state(pending, order)
+            self.logger.info(
+                f"♻️ {symbol}: belirsiz maker niyeti orderId={order_id} ile uzlaştırıldı"
+            )
+        return order
 
     async def _on_pending_filled(
         self, symbol: str, pending: PendingEntry, order: Dict[str, Any]
@@ -570,70 +1747,197 @@ class ScalpExecutor:
         kaydı silinmeden ÖNCE değil, dolum bilgisi çözüldükten HEMEN sonra
         kurulur (bkz. _finalize_position).
         """
+        if pending.phase == "DB_OPEN":
+            # DB commit olmuş, yalnız journal cleanup başarısız kalmış olabilir.
+            # Aynı dolumu tekrar finalize etmek çift SL/TP üretir.
+            raise PendingRecoveryError(
+                f"{symbol}: DB_OPEN maker kaydı journal'da kaldı; yeniden finalize edilmiyor"
+            )
+        if pending.phase in ("PROTECTING", "RECOVERY_REQUIRED"):
+            await self._recover_uncertain_protection(symbol, pending)
+            return None
+
         signal = pending.signal
         direction = signal.direction
         sl_side = "SELL" if direction == Direction.LONG else "BUY"
 
+        # Crash sınırı: bundan sonraki restart, DB'de OPEN bulamazsa yeniden
+        # stop/TP kurmak yerine pozisyonu fail-closed acil kapatır.
+        self._record_order_state(pending, order, phase="PROTECTING")
+
         try:
             entry_price, filled_qty = await self.pm.resolve_fill(symbol, order)
+        except UnprotectedPositionError:
+            raise
         except Exception as e:
+            pending.phase = "RECOVERY_REQUIRED"
+            self._store_pending_record(pending)
             self.logger.critical(
                 f"🚨 {symbol}: maker dolum bilgisi hiçbir kaynaktan okunamadı ({e}). Pozisyon "
                 f"açık olabilir — PositionManager'ın acil kapatma akışı devreye sokuluyor."
             )
-            await self.pm.place_stop_loss_or_close(
-                symbol=symbol, sl_side=sl_side, stop_price=signal.stop_price
-            )
-            self._pending.pop(symbol, None)
-            return None
-
-        self._pending.pop(symbol, None)
+            try:
+                protection = await self.pm.place_stop_loss_or_close(
+                    symbol=symbol, sl_side=sl_side, stop_price=signal.stop_price
+                )
+            except UnprotectedPositionError:
+                raise
+            except Exception as protection_error:
+                raise PendingRecoveryError(
+                    f"{symbol}: dolum ve koruma sonucu belirsiz: {protection_error}"
+                ) from protection_error
+            if protection is None and await self._position_is_flat(symbol):
+                self._drop_pending(symbol, pending)
+                return None
+            raise PendingRecoveryError(
+                f"{symbol}: dolum çözülemedi; pozisyon korumalı/açık olabilir, "
+                "manuel recovery gerekli"
+            ) from e
 
         if filled_qty <= 0:
-            self.logger.error(f"❌ {symbol}: maker emir dolmamış görünüyor (executedQty=0), pozisyon yok")
-            return None
+            pending.phase = "RECOVERY_REQUIRED"
+            self._store_pending_record(pending)
+            raise PendingRecoveryError(
+                f"{symbol}: FILLED durumunda resolved executedQty=0; pozisyon durumu belirsiz"
+            )
+
+        if filled_qty > pending.executed_qty:
+            pending.executed_qty = filled_qty
+        if entry_price > 0:
+            pending.avg_price = entry_price
+        self._store_pending_record(pending)
 
         self.logger.info(f"✅ Maker dolum: {symbol} {filled_qty} @ {entry_price}")
 
         entry_candle_time = int(datetime.utcnow().timestamp() * 1000)
 
-        return await self._finalize_position(
-            signal=signal,
-            direction=direction,
-            sl_side=sl_side,
-            entry_price=entry_price,
-            filled_qty=filled_qty,
-            entry_order_id=str(order.get("orderId") or pending.order_id),
-            entry_candle_time=entry_candle_time,
+        try:
+            scalp_position = await self._finalize_position(
+                signal=signal,
+                direction=direction,
+                sl_side=sl_side,
+                entry_price=entry_price,
+                filled_qty=filled_qty,
+                entry_order_id=str(order.get("orderId") or pending.order_id),
+                entry_candle_time=entry_candle_time,
+            )
+        except UnprotectedPositionError:
+            pending.phase = "RECOVERY_REQUIRED"
+            self._store_pending_record(pending)
+            raise
+        except Exception as e:
+            pending.phase = "RECOVERY_REQUIRED"
+            self._store_pending_record(pending)
+            raise PendingRecoveryError(
+                f"{symbol}: maker finalize beklenmeyen hata verdi: {e}"
+            ) from e
+
+        if scalp_position is not None:
+            # DB commit tamamlandı. Önce bunu journal'a işaretle; ardından
+            # atomik cleanup. Cleanup hata verirse DB_OPEN kaydı korunur ve
+            # aynı dolum ikinci kez finalize edilmez.
+            pending.phase = "DB_OPEN"
+            self._store_pending_record(pending)
+            self._drop_pending(symbol, pending)
+            return scalp_position
+
+        # _finalize_position None: SL kurulamadığı için emergency close
+        # başarılı olmuş OLABİLİR veya DB yazımı başarısızken SL korumalı
+        # pozisyon açık kalmış olabilir. Yalnız kesin flat ise kayıt silinir.
+        pending.phase = "RECOVERY_REQUIRED"
+        self._store_pending_record(pending)
+        if await self._position_is_flat(symbol):
+            self._drop_pending(symbol, pending)
+            return None
+        raise PendingRecoveryError(
+            f"{symbol}: finalize tamamlanmadı ve borsada pozisyon hâlâ açık; "
+            "journal korunuyor"
+        )
+
+    async def _position_is_flat(self, symbol: str) -> bool:
+        try:
+            position = await self.client.get_position_risk(symbol)
+            if position is None:
+                return True
+            return abs(float(position.get("positionAmt") or 0.0)) <= 0.0
+        except Exception as e:
+            raise PendingRecoveryError(
+                f"{symbol}: pozisyon flat doğrulaması başarısız: {e}"
+            ) from e
+
+    async def _recover_uncertain_protection(
+        self, symbol: str, pending: PendingEntry
+    ) -> None:
+        """Crash koruma sınırında kalmış pozisyonu tekrar finalize etme.
+
+        STOP zaten kurulmuş olabilir; yeniden finalize çift koşullu emir
+        üretir. DB kaydı yoksa güvenli seçenek reduceOnly emergency close ve
+        ardından kesin flat doğrulamasıdır.
+        """
+        if await self._position_is_flat(symbol):
+            self._drop_pending(symbol, pending)
+            return
+        emergency_close = getattr(self.pm, "emergency_close", None)
+        if emergency_close is None:
+            emergency_close = getattr(self.pm, "_emergency_close", None)
+        if emergency_close is None:
+            raise PendingRecoveryError(
+                f"{symbol}: recovery emergency_close desteği yok; journal korunuyor"
+            )
+        try:
+            closed = await emergency_close(symbol)
+        except Exception as e:
+            raise PendingRecoveryError(
+                f"{symbol}: recovery emergency close hata verdi: {e}"
+            ) from e
+        if closed and await self._position_is_flat(symbol):
+            self._drop_pending(symbol, pending)
+            return
+        raise PendingRecoveryError(
+            f"{symbol}: recovery emergency close sonrası flat doğrulanamadı; "
+            "journal korunuyor"
         )
 
     async def _cancel_pending(
-        self, symbol: str, pending: PendingEntry
+        self,
+        symbol: str,
+        pending: PendingEntry,
+        *,
+        observed_order: Optional[Dict[str, Any]] = None,
+        reason: str = "timeout",
     ) -> Optional[ScalpPosition]:
-        """Timeout'ta pending girişi iptal et — İPTAL-DOLUM YARIŞINA karşı korumalı.
+        """Pending girişi iptal et ve tüm dolum yarışlarını uzlaştır.
 
-        Sıra: (1) iptalden ÖNCE son bir get_order ile FILLED olmadığı
-        doğrulanır; (2) cancel_order çağrılır; (3) cancel -2011 (emir zaten
-        yok) dönerse emir dolmuş olabilir — tekrar sorgulanır, FILLED ise
-        koruma akışı işletilir. Pozisyonun asla korumasız kalmaması
-        birincil kural: hiçbir adımda "bilinmiyor" "iptal edildi" sayılmaz.
+        PARTIALLY_FILLED için `observed_order` ilk bilinen dolumu taşır;
+        cancel yanıtıyla birleştirilir ve terminal durum kesinleştiğinde
+        gerçekleşen miktar derhal korunur. Herhangi bir sorgu/iptal belirsizliği
+        pending kaydını korur. "Bilinmiyor" asla "iptal edildi" sayılmaz.
         """
-        try:
-            fresh = await self.client.get_order(symbol, pending.order_id)
-        except Exception as e:
-            self.logger.warning(
-                f"⚠️ {symbol}: iptal öncesi son doğrulama sorgusu başarısız ({e}), "
-                f"bu tur atlanıyor (pending korunuyor)"
-            )
-            return None
-        if fresh.get("status") == "FILLED":
+        known = observed_order
+        if known is None:
+            try:
+                known = await self._get_pending_order(symbol, pending)
+            except Exception as e:
+                self.logger.warning(
+                    f"⚠️ {symbol}: iptal öncesi son doğrulama sorgusu başarısız ({e}), "
+                    f"bu tur atlanıyor (pending korunuyor)"
+                )
+                return None
+
+        if known.get("status") == "FILLED":
             self.logger.info(
-                f"✅ {symbol}: iptal denemesi sırasında emrin dolduğu görüldü, FILLED akışı işleniyor"
+                f"✅ {symbol}: iptal denemesi sırasında emir dolmuş; koruma akışı işleniyor"
             )
-            return await self._on_pending_filled(symbol, pending, fresh)
+            return await self._on_pending_filled(symbol, pending, known)
+
+        if (
+            known.get("status") in ("CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED")
+            and self._executed_qty(known) > 0
+        ):
+            return await self._on_pending_filled(symbol, pending, known)
 
         try:
-            cancel_resp = await self.client.cancel_order(symbol, pending.order_id)
+            cancel_resp = await self._cancel_pending_order(symbol, pending)
         except BinanceAPIError as e:
             if e.code == -2011:
                 cancel_resp = {"status": "ALREADY_GONE"}
@@ -650,39 +1954,349 @@ class ScalpExecutor:
             return None
 
         if cancel_resp.get("status") == "ALREADY_GONE":
-            # -2011: emir zaten yok — dolmuş olabilir, tekrar sorgula.
+            # -2011: emir zaten yok — dolmuş/kısmen dolup iptal olmuş olabilir.
             try:
-                fresh2 = await self.client.get_order(symbol, pending.order_id)
+                final_order = await self._get_pending_order(symbol, pending)
             except Exception as e:
                 self.logger.error(
                     f"🚨 {symbol}: iptal sonrası doğrulama sorgusu başarısız ({e}). Pozisyon açık "
                     f"olabilir ama pending kaydı BELİRSİZ — korunuyor, sonraki turda tekrar denenecek."
                 )
                 return None
-            if fresh2.get("status") == "FILLED":
-                self.logger.info(
-                    f"✅ {symbol}: emir iptalden hemen önce dolmuş, FILLED akışı işleniyor"
-                )
-                return await self._on_pending_filled(symbol, pending, fresh2)
+        else:
+            final_order = self._merge_order_states(known, cancel_resp)
 
-        self.logger.info(
-            f"⏭️ {symbol}: maker giriş zaman aşımına uğradı, iptal edildi "
-            f"(kaçırıldı, orderId={pending.order_id}, scans_waited={pending.scans_waited})"
+        status = final_order.get("status")
+        executed_qty = self._executed_qty(final_order)
+        if status == "FILLED" or (
+            status in ("CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED")
+            and executed_qty > 0
+        ):
+            self.logger.warning(
+                f"⚠️ {symbol}: maker iptali sonrası {executed_qty} miktar gerçekleşmiş; "
+                f"SL/TP koruması kuruluyor"
+            )
+            return await self._on_pending_filled(symbol, pending, final_order)
+
+        if status in ("CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED"):
+            self.logger.info(
+                f"⏭️ {symbol}: maker giriş iptal edildi "
+                f"(neden={reason}, orderId={pending.order_id}, "
+                f"clientOrderId={pending.client_order_id}, scans_waited={pending.scans_waited})"
+            )
+            self._drop_pending(symbol, pending)
+            return None
+
+        # Cancel yanıtı terminal değilse sonucu kesinleştirmek için bir
+        # kez daha sorgula. Bu sorgu başarısızsa pending fail-closed kalır.
+        try:
+            reconciled = await self._get_pending_order(symbol, pending)
+        except Exception as e:
+            self.logger.error(
+                f"🚨 {symbol}: iptal sonucu terminal değil ({status!r}) ve tekrar "
+                f"doğrulanamadı ({e}); pending korunuyor"
+            )
+            return None
+
+        reconciled_status = reconciled.get("status")
+        reconciled_qty = self._executed_qty(reconciled)
+        if reconciled_status == "FILLED" or (
+            reconciled_status in ("CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED")
+            and reconciled_qty > 0
+        ):
+            return await self._on_pending_filled(symbol, pending, reconciled)
+        if reconciled_status in ("CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED"):
+            self._drop_pending(symbol, pending)
+            return None
+
+        self.logger.error(
+            f"🚨 {symbol}: iptal sonrası emir hâlâ terminal değil "
+            f"({reconciled_status!r}); pending korunuyor"
         )
-        self._pending.pop(symbol, None)
         return None
 
-    async def cancel_all_pending(self) -> None:
-        """Motor kapanışında: tüm bekleyen limit girişlerini iptal et (temiz kapanış)."""
+    async def _cancel_pending_order(
+        self, symbol: str, pending: PendingEntry
+    ) -> Dict[str, Any]:
+        if pending.order_id is not None:
+            return await self.client.cancel_order(symbol, pending.order_id)
+        return await self.client.cancel_order_by_client_id(
+            symbol, pending.client_order_id
+        )
+
+    @staticmethod
+    def _executed_qty(order: Dict[str, Any]) -> float:
+        try:
+            return max(0.0, float(order.get("executedQty") or 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    @classmethod
+    def _merge_order_states(
+        cls, *states: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Cancel yanıtı eksik olsa bile bilinen kümülatif dolumu kaybetme."""
+        merged: Dict[str, Any] = {}
+        max_executed = 0.0
+        fill_price: Any = None
+        for state in states:
+            if not state:
+                continue
+            merged.update({k: v for k, v in state.items() if v is not None})
+            executed = cls._executed_qty(state)
+            if executed > max_executed:
+                max_executed = executed
+                fill_price = None
+                try:
+                    if float(state.get("avgPrice") or 0.0) > 0:
+                        fill_price = state.get("avgPrice")
+                except (TypeError, ValueError):
+                    pass
+            elif executed == max_executed:
+                try:
+                    if float(state.get("avgPrice") or 0.0) > 0:
+                        fill_price = state.get("avgPrice")
+                except (TypeError, ValueError):
+                    pass
+        merged["executedQty"] = str(max_executed)
+        if fill_price is not None:
+            merged["avgPrice"] = fill_price
+        elif max_executed > 0:
+            # Daha yüksek kümülatif qty'nin ortalama fiyatı yoksa eski,
+            # daha küçük dolumun avgPrice'ını yanlış qty ile eşleme;
+            # resolve_fill borsayı tekrar sorgulasın.
+            merged["avgPrice"] = "0"
+        return merged
+
+    async def recover_pending(self) -> List[ScalpPosition]:
+        """Restart journal'ındaki maker niyetlerini borsayla uzlaştır.
+
+        Aynı sembol DB'de OPEN ise executor yeniden SL/TP üretmez; journal
+        temizlenir ve pozisyon exits recovery'ye bırakılır. DB yoksa emir
+        yalnız clientOrderId ile üç kez sorgulanır. Kesin üç adet -2013/no
+        order sonucu intent'in hiç oluşmadığını kanıtlar; diğer belirsizlikler
+        journal'ı korur ve PendingRecoveryError ile yeni girişleri kilitler.
+        """
+        async with self._pending_lock:
+            return await self._recover_pending_locked()
+
+    async def _recover_pending_locked(self) -> List[ScalpPosition]:
+        if self._journal_error:
+            raise PendingRecoveryError(
+                f"Maker pending journal bozuk/okunamıyor: {self._journal_error}"
+            )
+        if self._journal_path is None or not self._journal_records:
+            self._recovery_needed = False
+            return []
+
+        try:
+            open_rows = await self.tracker.open_trades()
+        except Exception as e:
+            raise PendingRecoveryError(
+                f"Maker recovery DB OPEN kayıtlarını okuyamadı: {e}"
+            ) from e
+
+        open_symbols: Set[str] = set()
+        for row in open_rows:
+            symbol = row.get("symbol") if isinstance(row, dict) else getattr(row, "symbol", None)
+            if symbol:
+                open_symbols.add(str(symbol))
+
+        opened: List[ScalpPosition] = []
+        unresolved: List[str] = []
+        for symbol, record in list(self._journal_records.items()):
+            if symbol in open_symbols:
+                # DB commit crash'ten önce tamamlanmış. Aynı fill'i yeniden
+                # finalize etmek çift SL/TP yaratır; exits recover sorumludur.
+                existing = self._pending.get(symbol)
+                self._remove_pending_record(symbol)
+                if existing is not None:
+                    self._pending.pop(symbol, None)
+                self.logger.warning(
+                    f"♻️ {symbol}: DB'de OPEN bulundu; maker journal temizlendi, "
+                    "pozisyon exits recovery'ye bırakıldı"
+                )
+                continue
+
+            try:
+                pending = self._pending.get(symbol) or self._deserialize_pending(record)
+            except PendingRecoveryError as e:
+                self._journal_error = str(e)
+                raise
+            self._pending[symbol] = pending
+
+            order: Optional[Dict[str, Any]] = None
+            not_found = 0
+            last_error: Optional[Exception] = None
+            for attempt in range(3):
+                try:
+                    candidate = await self.client.get_order_by_client_id(
+                        symbol, pending.client_order_id
+                    )
+                    if not candidate or (
+                        candidate.get("orderId") is None
+                        and candidate.get("status") is None
+                    ):
+                        not_found += 1
+                    else:
+                        order = dict(candidate)
+                        break
+                except BinanceAPIError as e:
+                    if e.code == -2013:
+                        not_found += 1
+                    else:
+                        last_error = e
+                except Exception as e:
+                    last_error = e
+                if attempt < 2:
+                    await asyncio.sleep(0)
+
+            if order is None:
+                if not_found == 3 and last_error is None:
+                    self.logger.warning(
+                        f"♻️ {symbol}: maker intent üç sorguda kesin bulunamadı; "
+                        "journal kaydı temizleniyor"
+                    )
+                    self._drop_pending(symbol, pending)
+                    continue
+                unresolved.append(f"{symbol}: clientOrderId sorgusu belirsiz ({last_error})")
+                continue
+
+            self._record_order_state(pending, order)
+
+            # Crash, koruma kurulurken veya DB commit/cleanup arasında olmuş
+            # olabilir. DB kaydı yoksa tekrar finalize etmek yerine güvenli
+            # emergency close + flat doğrulaması yapılır.
+            if pending.phase in ("PROTECTING", "RECOVERY_REQUIRED", "DB_OPEN"):
+                if order.get("status") in ("NEW", "PARTIALLY_FILLED"):
+                    unresolved.append(
+                        f"{symbol}: koruma-phase journal ile non-terminal emir "
+                        f"durumu çelişiyor ({order.get('status')}); kayıt korunuyor"
+                    )
+                    continue
+                try:
+                    await self._recover_uncertain_protection(symbol, pending)
+                except PendingRecoveryError as e:
+                    unresolved.append(str(e))
+                continue
+
+            status = order.get("status")
+            if status not in (
+                "NEW",
+                "PARTIALLY_FILLED",
+                "FILLED",
+                "CANCELED",
+                "EXPIRED",
+                "EXPIRED_IN_MATCH",
+                "REJECTED",
+            ):
+                unresolved.append(f"{symbol}: bilinmeyen recovery emir durumu {status!r}")
+                continue
+
+            try:
+                scalp_position = await self._process_pending_order(
+                    symbol, pending, order
+                )
+            except UnprotectedPositionError as e:
+                unresolved.append(str(e))
+                continue
+            if scalp_position is not None:
+                opened.append(scalp_position)
+            remaining = self._pending.get(symbol)
+            if remaining is not None and (
+                remaining.phase in ("PROTECTING", "RECOVERY_REQUIRED", "DB_OPEN")
+                or remaining.last_status == "PARTIALLY_FILLED"
+            ):
+                unresolved.append(
+                    f"{symbol}: kısmi dolum/koruma recovery'si terminal olmadı"
+                )
+
+        if unresolved:
+            self._recovery_needed = True
+            raise PendingRecoveryError("; ".join(unresolved))
+
+        self._recovery_needed = False
+        return opened
+
+    async def handle_order_update(
+        self, event: Dict[str, Any]
+    ) -> Optional[ScalpPosition]:
+        """ORDER_TRADE_UPDATE eventini REST polling ile aynı kilitte işle.
+
+        Yalnız awa2sc_ prefix'li ve RAM pending ile clientOrderId'si birebir
+        eşleşen giriş eventleri kabul edilir. Kilit, WS ile REST aynı FILLED'i
+        eşzamanlı görse bile finalize/SL/DB akışının exactly-once olmasını
+        sağlar.
+        """
+        if event.get("e") != "ORDER_TRADE_UPDATE":
+            return None
+        raw_order = event.get("o")
+        if not isinstance(raw_order, dict):
+            return None
+        client_order_id = str(raw_order.get("c") or "")
+        if not client_order_id.startswith("awa2sc_"):
+            return None
+        symbol = str(raw_order.get("s") or "")
+        if not symbol:
+            return None
+
+        async with self._pending_lock:
+            if self._journal_error:
+                raise PendingRecoveryError(
+                    f"Maker pending journal bozuk/okunamıyor: {self._journal_error}"
+                )
+            if self._recovery_needed:
+                raise PendingRecoveryError(
+                    "User stream eventi geldi ancak restart journal recovery tamamlanmadı"
+                )
+            pending = self._pending.get(symbol)
+            if pending is None or pending.client_order_id != client_order_id:
+                return None
+
+            order: Dict[str, Any] = {
+                "symbol": symbol,
+                "clientOrderId": client_order_id,
+                "orderId": raw_order.get("i"),
+                "status": raw_order.get("X"),
+                "executedQty": raw_order.get("z", "0"),
+                "avgPrice": raw_order.get("ap", "0"),
+                "origQty": raw_order.get("q"),
+                "price": raw_order.get("p"),
+                "side": raw_order.get("S"),
+            }
+            return await self._process_pending_order(symbol, pending, order)
+
+    async def cancel_all_pending(self) -> List[ScalpPosition]:
+        """Tüm pending girişleri race-safe iptal et; belirsiz olanı koru."""
+        async with self._pending_lock:
+            if self._journal_error:
+                raise PendingRecoveryError(
+                    f"Maker pending journal bozuk/okunamıyor: {self._journal_error}"
+                )
+            opened: List[ScalpPosition] = []
+            if self._recovery_needed:
+                opened.extend(await self._recover_pending_locked())
+            opened.extend(await self._cancel_all_pending_locked())
+            return opened
+
+    async def _cancel_all_pending_locked(self) -> List[ScalpPosition]:
+        opened: List[ScalpPosition] = []
         for symbol, pending in list(self._pending.items()):
             try:
-                await self.client.cancel_order(symbol, pending.order_id)
+                sp = await self._cancel_pending(
+                    symbol, pending, reason="cancel_all"
+                )
+            except UnprotectedPositionError:
+                raise
             except Exception as e:
                 self.logger.warning(
-                    f"⚠️ {symbol}: kapanışta pending giriş iptal edilemedi ({e})"
+                    f"⚠️ {symbol}: toplu pending iptalinde beklenmeyen hata ({e}); "
+                    f"pending korunuyor"
                 )
-            finally:
-                self._pending.pop(symbol, None)
+                continue
+            if sp is not None:
+                opened.append(sp)
+        return opened
 
     async def _place_tp_safely(
         self, symbol: str, side: str, price: float, quantity: float, label: str

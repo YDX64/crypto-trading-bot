@@ -14,6 +14,7 @@ TASARIM NOTLARI:
 
 import asyncio
 import json
+import time
 from typing import Optional, Dict
 from datetime import datetime
 
@@ -32,6 +33,7 @@ from src.trading.binance_client_improved import (
     BinanceAPIError,
 )
 from src.trading.position_manager import PositionManager, UnprotectedPositionError
+from src.trading.symbol_reservations import symbol_reservations
 from src.core.config import settings
 from src.core.database import AsyncSessionLocal
 from src.core.logger import app_logger
@@ -43,6 +45,8 @@ class TradingOrchestrator:
 
     # Pozisyon açılırken kullanılabilir marjın en fazla bu oranı bağlanır
     MAX_MARGIN_UTILISATION = 0.5
+    RESERVATION_OWNER = "telegram"
+    EXCHANGE_PROBE_INTERVAL_SECONDS = 60.0
 
     def __init__(self):
         self.parser = TelegramSignalParser()
@@ -61,6 +65,15 @@ class TradingOrchestrator:
         # açma arasına başka bir sinyal giremez (TOCTOU koruması).
         self._signal_lock = asyncio.Lock()
         self._running = False
+        self._exchange_ready = False
+        self._recovery_ready = False
+        self._last_exchange_probe_monotonic: Optional[float] = None
+        self._last_exchange_success_at: Optional[str] = None
+        self._last_exchange_error: Optional[str] = None
+        self._entry_halted = False
+        self._entry_halt_reason: Optional[str] = None
+        self._last_monitoring_success_monotonic: Optional[float] = None
+        self._last_monitoring_success_at: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Yaşam döngüsü
@@ -79,7 +92,8 @@ class TradingOrchestrator:
                 "❌ Binance bağlantısı kurulamadı! Orchestrator sinyal kabul etmeyecek."
             )
 
-        await self.recover_open_positions()
+        self._recovery_ready = await self.recover_open_positions()
+        self._exchange_ready = self._recovery_ready and self._exchange_ready
 
         self._running = True
         if not self.monitoring_task or self.monitoring_task.done():
@@ -109,7 +123,7 @@ class TradingOrchestrator:
     # Yeniden başlatma sonrası kurtarma
     # ------------------------------------------------------------------
 
-    async def recover_open_positions(self):
+    async def recover_open_positions(self) -> bool:
         """Borsadaki açık pozisyonları belleğe ve veritabanına geri yükle.
 
         Bot yeniden başladığında active_positions boştur. Borsada gerçekten
@@ -120,11 +134,18 @@ class TradingOrchestrator:
             exchange_positions = await self.binance.get_all_positions()
         except Exception as e:
             self.logger.error(f"⚠️ Açık pozisyonlar borsadan sorgulanamadı: {e}")
-            return
+            self._exchange_ready = False
+            self._last_exchange_error = f"{type(e).__name__}: {e}"
+            return False
+
+        self._exchange_ready = True
+        self._last_exchange_probe_monotonic = time.monotonic()
+        self._last_exchange_success_at = datetime.utcnow().isoformat() + "Z"
+        self._last_exchange_error = None
 
         if not exchange_positions:
             self.logger.info("📭 Borsada açık pozisyon yok")
-            return
+            return True
 
         self.logger.warning(
             f"🔁 Borsada {len(exchange_positions)} açık pozisyon bulundu, kurtarılıyor..."
@@ -132,6 +153,7 @@ class TradingOrchestrator:
 
         from src.models.scalp_trade import ScalpTradeModel
 
+        recovery_ok = True
         async with AsyncSessionLocal() as session:
             for raw in exchange_positions:
                 symbol = raw["symbol"]
@@ -149,6 +171,15 @@ class TradingOrchestrator:
                 if scalp_row:
                     self.logger.info(
                         f"  ⏭️ {symbol}: scalper yönetiyor (scalp_trades #{scalp_row[0]}), atlanıyor"
+                    )
+                    continue
+
+                if not symbol_reservations.reserve(symbol, self.RESERVATION_OWNER):
+                    recovery_ok = False
+                    self.logger.critical(
+                        f"🚨 {symbol}: başka bir motor tarafından sahiplenilmiş; "
+                        "çifte pozisyon yönetimini önlemek için orchestrator atladı.",
+                        extra={"trade": True},
                     )
                     continue
 
@@ -199,14 +230,33 @@ class TradingOrchestrator:
                         f"Stop-loss durumu kontrol edilmeli!"
                     )
 
-                await self._ensure_protected(position)
+                try:
+                    protection = await self._ensure_protected(position)
+                except UnprotectedPositionError as e:
+                    recovery_ok = False
+                    self._entry_halted = True
+                    self._entry_halt_reason = str(e)
+                    self.active_positions[symbol] = position
+                    self.logger.critical(
+                        f"🚨 {symbol}: kurtarılan pozisyon korunamadı; yeni Telegram "
+                        f"girişleri durduruldu ({e})",
+                        extra={"trade": True},
+                    )
+                    continue
+
+                if protection is False:
+                    symbol_reservations.release(symbol, self.RESERVATION_OWNER)
+                    continue
+                if protection is None:
+                    recovery_ok = False
                 self.active_positions[symbol] = position
 
             await session.commit()
 
         self.logger.info(f"✅ {len(self.active_positions)} pozisyon izlemeye alındı")
+        return recovery_ok
 
-    async def _ensure_protected(self, position: PositionModel):
+    async def _ensure_protected(self, position: PositionModel) -> Optional[bool]:
         """Pozisyonun borsada aktif bir stop emri var mı, kontrol et ve uyar.
 
         Koşullu emirler /fapi/v1/openOrders'ta görünmediği için algo emir
@@ -216,7 +266,7 @@ class TradingOrchestrator:
             algo_orders = await self.binance.get_open_algo_orders(position.symbol)
         except Exception as e:
             self.logger.warning(f"{position.symbol}: koşullu emirler kontrol edilemedi: {e}")
-            return
+            return None
 
         stops = [o for o in algo_orders if o.get("orderType") in ("STOP_MARKET", "STOP")]
         if stops:
@@ -225,11 +275,24 @@ class TradingOrchestrator:
             self.logger.info(
                 f"  🛡️ {position.symbol}: aktif SL bulundu @ {position.current_stoploss}"
             )
+            return True
         else:
             self.logger.critical(
-                f"🚨 {position.symbol}: AÇIK POZİSYONUN STOP-LOSS EMRİ YOK! "
-                f"Elle stop-loss koyun veya pozisyonu kapatın.",
+                f"🚨 {position.symbol}: AÇIK POZİSYONUN STOP-LOSS EMRİ YOK; "
+                "fail-closed acil kapatma deneniyor.",
                 extra={"trade": True},
+            )
+            if await self.position_manager.emergency_close(position.symbol):
+                position.status = PositionStatus.CLOSED
+                position.closed_at = datetime.utcnow()
+                position.notes = ((position.notes or "") + " | STOP yoktu; recovery acil kapattı").strip()
+                self.logger.critical(
+                    f"🛑 {position.symbol}: STOP'suz kurtarılan pozisyon acil kapatıldı",
+                    extra={"trade": True},
+                )
+                return False
+            raise UnprotectedPositionError(
+                f"{position.symbol}: STOP yok ve acil kapatma başarısız"
             )
 
     # ------------------------------------------------------------------
@@ -242,6 +305,7 @@ class TradingOrchestrator:
 
         while self._running:
             try:
+                await self._refresh_exchange_readiness_if_due()
                 if self.active_positions:
                     async with AsyncSessionLocal() as session:
                         for symbol in list(self.active_positions.keys()):
@@ -251,6 +315,8 @@ class TradingOrchestrator:
                             await self._monitor_single_position(position, session)
                         await session.commit()
 
+                self._last_monitoring_success_monotonic = time.monotonic()
+                self._last_monitoring_success_at = datetime.utcnow().isoformat() + "Z"
                 await asyncio.sleep(self.config.check_interval_seconds)
 
             except asyncio.CancelledError:
@@ -259,6 +325,32 @@ class TradingOrchestrator:
             except Exception as e:
                 self.logger.error(f"❌ İzleme döngüsü hatası: {e}", exc_info=True)
                 await asyncio.sleep(10)
+
+    async def _refresh_exchange_readiness_if_due(self) -> None:
+        """Periodically prove that signed Futures account access still works."""
+
+        now = time.monotonic()
+        if (
+            self._last_exchange_probe_monotonic is not None
+            and now - self._last_exchange_probe_monotonic
+            < self.EXCHANGE_PROBE_INTERVAL_SECONDS
+        ):
+            return
+
+        self._last_exchange_probe_monotonic = now
+        try:
+            await self.binance.get_all_positions()
+        except Exception as e:
+            self._exchange_ready = False
+            self._last_exchange_error = f"{type(e).__name__}: {e}"
+            self.logger.error(
+                f"❌ Signed Binance readiness probe başarısız; yeni girişler kapalı: {e}"
+            )
+            return
+
+        self._exchange_ready = True
+        self._last_exchange_success_at = datetime.utcnow().isoformat() + "Z"
+        self._last_exchange_error = None
 
     async def _monitor_single_position(
         self, position: PositionModel, db_session: AsyncSession
@@ -275,6 +367,7 @@ class TradingOrchestrator:
                 self.logger.info(f"🏁 Pozisyon kapandı: {position.symbol}")
                 await self.position_manager.close_position_record(position)
                 self.active_positions.pop(position.symbol, None)
+                symbol_reservations.release(position.symbol, self.RESERVATION_OWNER)
                 if position not in db_session:
                     db_session.add(position)
                 return
@@ -295,6 +388,15 @@ class TradingOrchestrator:
             if position not in db_session:
                 db_session.add(position)
 
+        except UnprotectedPositionError as e:
+            self._entry_halted = True
+            self._entry_halt_reason = f"{type(e).__name__}: {e}"
+            self.logger.critical(
+                f"🚨 Pozisyon izleme koruma hatası [{position.symbol}]: {e}. "
+                "Yeni Telegram girişleri durduruldu.",
+                extra={"trade": True},
+            )
+            raise
         except Exception as e:
             self.logger.error(f"Pozisyon takip hatası [{position.symbol}]: {e}")
 
@@ -316,7 +418,12 @@ class TradingOrchestrator:
         self.logger.info("🚀 YENİ SİNYAL İŞLENİYOR")
         self.logger.info("=" * 80)
 
-        active_count = len(self.active_positions)
+        if not self._exchange_ready or not self._recovery_ready or self._entry_halted:
+            reason = self._entry_halt_reason or self._last_exchange_error or "exchange/recovery not ready"
+            self.logger.error(f"⛔ Yeni Telegram girişi güvenlik nedeniyle kapalı: {reason}")
+            return None
+
+        active_count = len(symbol_reservations.snapshot())
         if active_count >= self.config.max_positions:
             self.logger.warning(
                 f"⚠️ Max pozisyon limitine ulaşıldı ({active_count}/"
@@ -325,6 +432,8 @@ class TradingOrchestrator:
             return None
 
         signal_model: Optional[SignalModel] = None
+        reserved_symbol: Optional[str] = None
+        keep_reservation = False
         try:
             # 1. PARSE
             self.logger.info("ADIM 1: Sinyal parse ediliyor...")
@@ -383,6 +492,42 @@ class TradingOrchestrator:
 
             # 5. POZİSYON AÇ
             self.logger.info("ADIM 5: Pozisyon açılıyor...")
+            try:
+                exchange_positions = await self.binance.get_all_positions()
+            except Exception as e:
+                self._exchange_ready = False
+                self._last_exchange_error = f"{type(e).__name__}: {e}"
+                self.logger.error(
+                    f"⛔ Hesap pozisyonları doğrulanamadı; giriş fail-closed reddedildi: {e}"
+                )
+                await self._set_status(db_session, signal_model, SignalStatus.FAILED)
+                return None
+
+            live_symbols = {
+                str(raw.get("symbol", "")).upper()
+                for raw in exchange_positions
+                if float(raw.get("positionAmt", 0) or 0) != 0
+            }
+            symbol = str(parsed_signal.symbol or "").upper()
+            if symbol in live_symbols:
+                self.logger.warning(f"⚠️ {symbol}: borsada zaten açık pozisyon var, giriş reddedildi")
+                await self._set_status(db_session, signal_model, SignalStatus.REJECTED)
+                return None
+            if not symbol_reservations.reserve(
+                symbol,
+                self.RESERVATION_OWNER,
+                capacity=self.config.max_positions,
+                exchange_symbols=live_symbols,
+            ):
+                owner = symbol_reservations.owner(symbol)
+                self.logger.warning(
+                    f"⚠️ {symbol}: sembol başka motorun yönetiminde veya hesap kapasitesi dolu "
+                    f"(owner={owner or 'capacity'}); giriş reddedildi"
+                )
+                await self._set_status(db_session, signal_model, SignalStatus.REJECTED)
+                return None
+            reserved_symbol = symbol
+
             position = await self.position_manager.open_position(signal_with_position)
 
             if not position:
@@ -402,6 +547,7 @@ class TradingOrchestrator:
             # 6. İZLEMEYE AL
             self.logger.info("ADIM 6: Pozisyon takibi başlatılıyor...")
             self.active_positions[position.symbol] = position
+            keep_reservation = True
 
             self.logger.info("=" * 80)
             self.logger.info(f"✅ İŞLEM TAMAMLANDI: {position.symbol}")
@@ -413,6 +559,9 @@ class TradingOrchestrator:
             self.logger.critical(f"🚨 KORUMASIZ POZİSYON: {e}", extra={"trade": True})
             if signal_model is not None:
                 await self._set_status(db_session, signal_model, SignalStatus.FAILED)
+            self._entry_halted = True
+            self._entry_halt_reason = f"{type(e).__name__}: {e}"
+            keep_reservation = reserved_symbol is not None
             raise
 
         except Exception as e:
@@ -423,6 +572,45 @@ class TradingOrchestrator:
                 except Exception:
                     pass
             return None
+        finally:
+            if reserved_symbol and not keep_reservation:
+                symbol_reservations.release(reserved_symbol, self.RESERVATION_OWNER)
+
+    def health_snapshot(self) -> Dict[str, object]:
+        task_alive = bool(self.monitoring_task and not self.monitoring_task.done())
+        success_age = (
+            max(0.0, time.monotonic() - self._last_monitoring_success_monotonic)
+            if self._last_monitoring_success_monotonic is not None
+            else None
+        )
+        freshness_limit = max(
+            180.0, float(self.config.check_interval_seconds) * 5.0
+        )
+        fresh = bool(success_age is not None and success_age <= freshness_limit)
+        return {
+            "healthy": bool(
+                self._running
+                and task_alive
+                and fresh
+                and self._exchange_ready
+                and self._recovery_ready
+                and not self._entry_halted
+            ),
+            "running": self._running,
+            "monitoring_task_alive": task_alive,
+            "monitoring_fresh": fresh,
+            "last_monitoring_success_at": self._last_monitoring_success_at,
+            "last_monitoring_success_age_seconds": (
+                round(success_age, 3) if success_age is not None else None
+            ),
+            "exchange_ready": self._exchange_ready,
+            "recovery_ready": self._recovery_ready,
+            "entry_halted": self._entry_halted,
+            "entry_halt_reason": self._entry_halt_reason,
+            "last_exchange_success_at": self._last_exchange_success_at,
+            "last_exchange_error": self._last_exchange_error,
+            "reservations": symbol_reservations.snapshot(),
+        }
 
     async def _handle_unaligned(
         self,

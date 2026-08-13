@@ -10,7 +10,11 @@ doğrulanmıştır (elle tahmin edilmemiştir).
 
 from __future__ import annotations
 
+import asyncio
+import json
 import math
+import os
+import re
 from dataclasses import dataclass
 
 import pytest
@@ -20,7 +24,11 @@ import pytest
 # yapılandırması sırasında çözülebilsin diye bu modül de içe aktarılmalı
 # (aksi halde PositionModel() ilk kez örneklendiğinde InvalidRequestError).
 import src.models.waiting_signal  # noqa: F401
-from src.strategies.scalper.executor import ScalpExecutor, ScalpPosition
+from src.strategies.scalper.executor import (
+    PendingRecoveryError,
+    ScalpExecutor,
+    ScalpPosition,
+)
 from src.strategies.scalper.indicators import atr
 from src.strategies.scalper.regime import detect_regime
 from src.strategies.scalper import setups as setups_module
@@ -40,6 +48,8 @@ from src.strategies.scalper.types import (
     ScalpSignal,
     StrategyContext,
 )
+from src.trading.binance_client_improved import BinanceAPIError
+from src.trading.position_manager import UnprotectedPositionError
 
 
 # --------------------------------------------------------------------------
@@ -459,7 +469,11 @@ class TestGetEnabled:
         assert strategies[0].name == "D"
 
     def test_all_strategies_contains_d(self):
-        assert [s.name for s in ALL_STRATEGIES] == ["A", "B", "C", "D"]
+        # Kayıt defteri anlık görüntüsü: E, S/R + osilatör kesişimi stratejisi
+        # olarak eklendi (tests/test_sr_crossover.py kendi davranış testlerini
+        # taşır). Canlıda hangi varyantın çalıştığını SCALPER_STRATEGIES
+        # belirler; bu liste yalnız kayıt sırasını doğrular.
+        assert [s.name for s in ALL_STRATEGIES] == ["A", "B", "C", "D", "E"]
 
 
 # --------------------------------------------------------------------------
@@ -655,18 +669,35 @@ class _FakePm:
         self.calls.append("resolve_fill")
         return self.entry_price, self.filled_qty
 
-    async def place_stop_loss_or_close(self, symbol, sl_side, stop_price):
+    async def place_stop_loss_or_close(
+        self, symbol, sl_side, stop_price, *,
+        reference_price=None, max_distance_pct=None,
+    ):
+        # Gerçek PositionManager, yürütme gecikmesi telafisi için dolum fiyatını
+        # ve risk tavanını keyword olarak alır; sahte nesne aynı sözleşmeyi taşır.
         self.calls.append("place_stop_loss_or_close")
+        self.last_stop_price = stop_price
+        self.last_reference_price = reference_price
+        self.last_max_distance_pct = max_distance_pct
         return {"orderId": 333}
+
+    async def emergency_close(self, symbol):
+        self.calls.append("emergency_close")
+        return True
 
 
 class _FakeTracker:
-    def __init__(self):
+    def __init__(self, open_rows=None):
         self.calls: list[str] = []
+        self.open_rows = list(open_rows or [])
 
     async def record_open(self, **kwargs):
         self.calls.append("record_open")
         return 1
+
+    async def open_trades(self):
+        self.calls.append("open_trades")
+        return list(self.open_rows)
 
 
 def _mk_exec_signal(entry_price: float, stop_price: float,
@@ -764,20 +795,43 @@ class _FakeClientMaker(_FakeClient):
         super().__init__(balance=balance)
         self.limit_order_id = limit_order_id
         self.last_limit_params: dict | None = None
+        self.limit_post_calls = 0
+        self.limit_post_error: Exception | None = None
+        self.limit_post_response: dict | None = None
+        self.book_ticker = {
+            "symbol": "TESTUSDT",
+            "bidPrice": "99.9",
+            "askPrice": "100.1",
+        }
         # order_id -> get_order()'ın döneceği YANIT SIRASI (pop(0) ile
         # tüketilir); boşsa varsayılan {"status": "NEW"} döner.
         self.get_order_responses: dict[int, list[dict]] = {}
+        # Eleman dict veya raise edilecek Exception olabilir.
+        self.client_order_query_responses: list[dict | Exception] = []
+        self.client_order_query_calls: list[str] = []
         self.cancel_calls: list[int] = []
+        self.cancel_client_id_calls: list[str] = []
         self.cancel_response: dict = {"status": "CANCELED"}
+        self.cancel_error: Exception | None = None
+        self.position_amt = 0.0
 
-    async def quantize_price(self, symbol, price):
-        self.calls.append("quantize_price")
+    async def get_book_ticker(self, symbol):
+        self.calls.append("get_book_ticker")
+        return dict(self.book_ticker)
+
+    async def quantize_maker_price(self, symbol, price, side):
+        self.calls.append("quantize_maker_price")
         return price
 
     async def _request_with_retry(self, method, endpoint, params=None, signed=False):
         self.calls.append(f"_request_with_retry:{method}:{endpoint}")
         if method == "POST" and endpoint == "/fapi/v1/order" and (params or {}).get("type") == "LIMIT":
+            self.limit_post_calls += 1
             self.last_limit_params = dict(params or {})
+            if self.limit_post_error is not None:
+                raise self.limit_post_error
+            if self.limit_post_response is not None:
+                return dict(self.limit_post_response)
             return {
                 "orderId": self.limit_order_id,
                 "status": "NEW",
@@ -793,16 +847,44 @@ class _FakeClientMaker(_FakeClient):
             return queue.pop(0)
         return {"orderId": order_id, "status": "NEW"}
 
+    async def get_order_by_client_id(self, symbol, client_order_id):
+        self.calls.append("get_order_by_client_id")
+        self.client_order_query_calls.append(client_order_id)
+        if self.client_order_query_responses:
+            response = self.client_order_query_responses.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return dict(response)
+        return {
+            "orderId": self.limit_order_id,
+            "clientOrderId": client_order_id,
+            "status": "NEW",
+            "executedQty": "0",
+        }
+
     async def cancel_order(self, symbol, order_id):
         self.calls.append("cancel_order")
         self.cancel_calls.append(order_id)
+        if self.cancel_error is not None:
+            raise self.cancel_error
         return dict(self.cancel_response)
+
+    async def cancel_order_by_client_id(self, symbol, client_order_id):
+        self.calls.append("cancel_order_by_client_id")
+        self.cancel_client_id_calls.append(client_order_id)
+        if self.cancel_error is not None:
+            raise self.cancel_error
+        return dict(self.cancel_response)
+
+    async def get_position_risk(self, symbol):
+        self.calls.append("get_position_risk")
+        return {"symbol": symbol, "positionAmt": str(self.position_amt)}
 
 
 class TestExecutorMakerEntry:
-    """maker modda try_open: FAZ 1 (LIMIT GTC kor, pending kaydı düşer)."""
+    """maker modda try_open: FAZ 1 (LIMIT GTX kor, pending kaydı düşer)."""
 
-    async def test_try_open_places_gtc_limit_order_and_records_pending(self):
+    async def test_try_open_places_gtx_at_best_bid_with_unique_client_id(self):
         cfg = _mk_maker_cfg()
         client = _FakeClientMaker(balance=10_000.0, limit_order_id=555)
         pm = _FakePm(entry_price=100.0, filled_qty=1.0)
@@ -823,11 +905,15 @@ class TestExecutorMakerEntry:
         # LIMIT emri doğru parametrelerle kondu.
         assert client.last_limit_params is not None
         assert client.last_limit_params["type"] == "LIMIT"
-        assert client.last_limit_params["timeInForce"] == "GTC"
+        assert client.last_limit_params["timeInForce"] == "GTX"
         assert client.last_limit_params["newOrderRespType"] == "RESULT"
-        assert client.last_limit_params["price"] == pytest.approx(ctx.current_price)
+        assert client.last_limit_params["price"] == pytest.approx(99.9)
         assert client.last_limit_params["side"] == "BUY"
-        assert "quantize_price" in client.calls
+        client_order_id = client.last_limit_params["newClientOrderId"]
+        assert len(client_order_id) <= 36
+        assert re.fullmatch(r"[.A-Za-z0-9_:/-]{1,36}", client_order_id)
+        assert "get_book_ticker" in client.calls
+        assert "quantize_maker_price" in client.calls
 
         # Market emri hiç açılmadı (taker yolu tetiklenmedi).
         assert "open_market_order" not in client.calls
@@ -837,8 +923,113 @@ class TestExecutorMakerEntry:
         snap = executor.pending_snapshot()
         assert len(snap) == 1
         assert snap[0]["symbol"] == "TESTUSDT"
-        assert snap[0]["limit_price"] == pytest.approx(ctx.current_price)
+        assert snap[0]["order_id"] == 555
+        assert snap[0]["client_order_id"] == client_order_id
+        assert snap[0]["limit_price"] == pytest.approx(99.9)
         assert snap[0]["scans_waited"] == 0
+
+    async def test_short_uses_best_ask_and_sell_side(self):
+        cfg = _mk_maker_cfg()
+        client = _FakeClientMaker()
+        executor = ScalpExecutor(
+            client=client,
+            pm=_FakePm(entry_price=100.0, filled_qty=1.0),
+            tracker=_FakeTracker(),
+            cfg=cfg,
+        )
+
+        signal = _mk_exec_signal(100.0, 100.5, direction=Direction.SHORT)
+        await executor.try_open(signal, _mk_exec_ctx())
+
+        assert client.last_limit_params is not None
+        assert client.last_limit_params["side"] == "SELL"
+        assert client.last_limit_params["price"] == pytest.approx(100.1)
+        assert client.last_limit_params["timeInForce"] == "GTX"
+
+    async def test_duplicate_post_response_reconciles_by_same_client_id(self):
+        cfg = _mk_maker_cfg()
+        client = _FakeClientMaker(limit_order_id=777)
+        client.limit_post_error = BinanceAPIError(
+            400, -4116, "Duplicate client order id", "/fapi/v1/order"
+        )
+        client.client_order_query_responses = [{
+            "orderId": 777,
+            "clientOrderId": "server-copy",
+            "status": "NEW",
+            "executedQty": "0",
+        }]
+        executor = ScalpExecutor(
+            client=client,
+            pm=_FakePm(entry_price=100.0, filled_qty=1.0),
+            tracker=_FakeTracker(),
+            cfg=cfg,
+        )
+
+        await executor.try_open(_mk_exec_signal(100.0, 99.5), _mk_exec_ctx())
+
+        assert client.limit_post_calls == 1
+        assert len(client.client_order_query_calls) == 1
+        assert (
+            client.client_order_query_calls[0]
+            == client.last_limit_params["newClientOrderId"]
+        )
+        assert executor.pending_snapshot()[0]["order_id"] == 777
+
+    async def test_transport_and_query_unknown_preserves_intent_without_repost(self):
+        cfg = _mk_maker_cfg()
+        client = _FakeClientMaker()
+        client.limit_post_error = TimeoutError("POST response lost")
+        client.client_order_query_responses = [TimeoutError("query unavailable")]
+        executor = ScalpExecutor(
+            client=client,
+            pm=_FakePm(entry_price=100.0, filled_qty=1.0),
+            tracker=_FakeTracker(),
+            cfg=cfg,
+        )
+        signal = _mk_exec_signal(100.0, 99.5)
+
+        await executor.try_open(signal, _mk_exec_ctx())
+
+        snap = executor.pending_snapshot()
+        assert len(snap) == 1
+        assert snap[0]["order_id"] is None
+        assert client.limit_post_calls == 1
+
+        # Aynı sembolde ikinci sinyal, belirsiz ilk niyet varken POST atamaz.
+        await executor.try_open(signal, _mk_exec_ctx())
+        assert client.limit_post_calls == 1
+
+        # Sonraki polling turu aynı clientOrderId ile emri bulup uzlaştırır.
+        client.limit_post_error = None
+        client.client_order_query_responses = [{
+            "orderId": 888,
+            "status": "NEW",
+            "executedQty": "0",
+        }]
+        await executor.check_pending()
+        assert executor.pending_snapshot()[0]["order_id"] == 888
+        assert client.limit_post_calls == 1
+
+    async def test_definitive_gtx_rejection_drops_unaccepted_intent(self):
+        cfg = _mk_maker_cfg()
+        client = _FakeClientMaker()
+        client.limit_post_error = BinanceAPIError(
+            400, -5022, "Post Only order will be rejected", "/fapi/v1/order"
+        )
+        client.client_order_query_responses = [
+            BinanceAPIError(400, -2013, "Order does not exist", "/fapi/v1/order")
+        ]
+        executor = ScalpExecutor(
+            client=client,
+            pm=_FakePm(entry_price=100.0, filled_qty=1.0),
+            tracker=_FakeTracker(),
+            cfg=cfg,
+        )
+
+        await executor.try_open(_mk_exec_signal(100.0, 99.5), _mk_exec_ctx())
+
+        assert client.limit_post_calls == 1
+        assert executor.pending_symbols() == set()
 
     async def test_taker_mode_behavior_unchanged(self):
         # cfg varsayılanı taker'dır (_ExecCfg'de scalper_entry_mode alanı
@@ -926,6 +1117,136 @@ class TestExecutorCheckPendingFilled:
         assert "cancel_order" not in client.calls
 
 
+class TestExecutorPartialFillSafety:
+    """Kısmi dolum kalanı beklemez; iptal edip gerçekleşeni korur."""
+
+    def test_cancel_with_larger_qty_but_no_avg_price_forces_requery(self):
+        merged = ScalpExecutor._merge_order_states(
+            {
+                "orderId": 555,
+                "status": "PARTIALLY_FILLED",
+                "executedQty": "0.4",
+                "avgPrice": "100.0",
+            },
+            {
+                "orderId": 555,
+                "status": "CANCELED",
+                "executedQty": "0.6",
+            },
+        )
+        assert merged["status"] == "CANCELED"
+        assert float(merged["executedQty"]) == pytest.approx(0.6)
+        assert float(merged["avgPrice"]) == 0.0
+
+    async def test_partial_fill_cancels_remainder_and_protects_filled_quantity(self):
+        cfg = _mk_maker_cfg()
+        client = _FakeClientMaker(limit_order_id=555)
+        pm = _FakePm(entry_price=100.25, filled_qty=0.4)
+        tracker = _FakeTracker()
+        executor = ScalpExecutor(client=client, pm=pm, tracker=tracker, cfg=cfg)
+        await executor.try_open(
+            _mk_exec_signal(100.0, 99.5), _mk_exec_ctx()
+        )
+        client.get_order_responses[555] = [{
+            "orderId": 555,
+            "status": "PARTIALLY_FILLED",
+            "avgPrice": "100.25",
+            "executedQty": "0.4",
+            "origQty": "1.0",
+        }]
+        # Binance cancel yanıtı bazen ilk GET'teki fill alanlarını
+        # tekrar etmeyebilir; executor bilinen kümülatif dolumu kaybetmemeli.
+        client.cancel_response = {
+            "orderId": 555,
+            "status": "CANCELED",
+        }
+
+        opened = await executor.check_pending()
+
+        assert len(opened) == 1
+        assert opened[0].position.quantity == pytest.approx(0.4)
+        assert client.cancel_calls == [555]
+        assert pm.calls[:2] == ["resolve_fill", "place_stop_loss_or_close"]
+        assert "record_open" in tracker.calls
+        assert executor.pending_symbols() == set()
+
+    async def test_partial_cancel_error_keeps_pending_and_does_not_fake_terminal(self):
+        cfg = _mk_maker_cfg()
+        client = _FakeClientMaker(limit_order_id=555)
+        pm = _FakePm(entry_price=100.0, filled_qty=0.4)
+        tracker = _FakeTracker()
+        executor = ScalpExecutor(client=client, pm=pm, tracker=tracker, cfg=cfg)
+        await executor.try_open(
+            _mk_exec_signal(100.0, 99.5), _mk_exec_ctx()
+        )
+        client.get_order_responses[555] = [{
+            "orderId": 555,
+            "status": "PARTIALLY_FILLED",
+            "avgPrice": "100.0",
+            "executedQty": "0.4",
+        }]
+        client.cancel_error = TimeoutError("cancel response unknown")
+
+        opened = await executor.check_pending()
+
+        assert opened == []
+        assert executor.pending_symbols() == {"TESTUSDT"}
+        assert client.cancel_calls == [555]
+        assert pm.calls == []
+        assert tracker.calls == []
+
+    async def test_terminal_canceled_with_executed_qty_is_protected(self):
+        cfg = _mk_maker_cfg()
+        client = _FakeClientMaker(limit_order_id=555)
+        pm = _FakePm(entry_price=100.0, filled_qty=0.25)
+        tracker = _FakeTracker()
+        executor = ScalpExecutor(client=client, pm=pm, tracker=tracker, cfg=cfg)
+        await executor.try_open(
+            _mk_exec_signal(100.0, 99.5), _mk_exec_ctx()
+        )
+        client.get_order_responses[555] = [{
+            "orderId": 555,
+            "status": "CANCELED",
+            "avgPrice": "100.0",
+            "executedQty": "0.25",
+        }]
+
+        opened = await executor.check_pending()
+
+        assert len(opened) == 1
+        assert "place_stop_loss_or_close" in pm.calls
+        assert executor.pending_symbols() == set()
+
+    async def test_unprotected_position_error_is_not_swallowed(self):
+        cfg = _mk_maker_cfg()
+        client = _FakeClientMaker(limit_order_id=555)
+        pm = _FakePm(entry_price=100.0, filled_qty=1.0)
+
+        async def fail_protection(
+            symbol, sl_side, stop_price, *,
+            reference_price=None, max_distance_pct=None,
+        ):
+            pm.calls.append("place_stop_loss_or_close")
+            raise UnprotectedPositionError("ne SL ne acil kapanış başardı")
+
+        pm.place_stop_loss_or_close = fail_protection
+        executor = ScalpExecutor(
+            client=client, pm=pm, tracker=_FakeTracker(), cfg=cfg
+        )
+        await executor.try_open(
+            _mk_exec_signal(100.0, 99.5), _mk_exec_ctx()
+        )
+        client.get_order_responses[555] = [{
+            "orderId": 555,
+            "status": "FILLED",
+            "avgPrice": "100.0",
+            "executedQty": "1.0",
+        }]
+
+        with pytest.raises(UnprotectedPositionError):
+            await executor.check_pending()
+
+
 class TestExecutorCheckPendingTimeout:
     """FAZ 2: check_pending — timeout'ta emir iptal edilir, pending düşer."""
 
@@ -961,6 +1282,35 @@ class TestExecutorCheckPendingTimeout:
         assert executor.pending_symbols() == set()
         assert pm.calls == []  # pozisyon hiç açılmadı — SL/TP kurulmadı
         assert tracker.calls == []
+
+    async def test_timeout_uses_elapsed_time_not_fast_poll_count(self):
+        cfg = _mk_maker_cfg(scalper_maker_fill_timeout_candles=3)
+        client = _FakeClientMaker(limit_order_id=555)
+        executor = ScalpExecutor(
+            client=client,
+            pm=_FakePm(entry_price=100.0, filled_qty=1.0),
+            tracker=_FakeTracker(),
+            cfg=cfg,
+        )
+        await executor.try_open(
+            _mk_exec_signal(100.0, 99.5), _mk_exec_ctx()
+        )
+
+        # Yüzlerce 2sn polling turu tek başına timeout sayılmamalı.
+        for _ in range(100):
+            await executor.check_pending()
+        assert executor.pending_symbols() == {"TESTUSDT"}
+        assert client.cancel_calls == []
+
+        # 3 mum = 900 saniye gerçek monotonic süre geçince iptal edilir.
+        executor._pending["TESTUSDT"].created_monotonic -= 901.0
+        client.get_order_responses[555] = [
+            {"orderId": 555, "status": "NEW"},
+            {"orderId": 555, "status": "NEW"},
+        ]
+        await executor.check_pending()
+        assert client.cancel_calls == [555]
+        assert executor.pending_symbols() == set()
 
     async def test_cancel_fill_race_second_query_sees_filled_position_opened_protected(self):
         # -2011 (iptal edilecek emir yok) simülasyonu: cancel_order
@@ -999,3 +1349,372 @@ class TestExecutorCheckPendingTimeout:
         assert "place_stop_loss_or_close" in pm.calls  # pozisyon KORUMALI kuruldu
         assert "place_take_profit" in client.calls
         assert executor.pending_symbols() == set()
+
+
+class TestExecutorCancelAllPending:
+    async def test_cancel_failure_preserves_pending_instead_of_finally_pop(self):
+        cfg = _mk_maker_cfg()
+        client = _FakeClientMaker(limit_order_id=555)
+        executor = ScalpExecutor(
+            client=client,
+            pm=_FakePm(entry_price=100.0, filled_qty=1.0),
+            tracker=_FakeTracker(),
+            cfg=cfg,
+        )
+        await executor.try_open(
+            _mk_exec_signal(100.0, 99.5), _mk_exec_ctx()
+        )
+        client.get_order_responses[555] = [{
+            "orderId": 555, "status": "NEW", "executedQty": "0",
+        }]
+        client.cancel_error = TimeoutError("cancel unknown")
+
+        opened = await executor.cancel_all_pending()
+
+        assert opened == []
+        assert executor.pending_symbols() == {"TESTUSDT"}
+
+    async def test_cancel_fill_race_returns_protected_position(self):
+        cfg = _mk_maker_cfg()
+        client = _FakeClientMaker(limit_order_id=555)
+        pm = _FakePm(entry_price=100.0, filled_qty=1.0)
+        executor = ScalpExecutor(
+            client=client, pm=pm, tracker=_FakeTracker(), cfg=cfg
+        )
+        await executor.try_open(
+            _mk_exec_signal(100.0, 99.5), _mk_exec_ctx()
+        )
+        client.get_order_responses[555] = [
+            {"orderId": 555, "status": "NEW", "executedQty": "0"},
+            {
+                "orderId": 555,
+                "status": "FILLED",
+                "avgPrice": "100.0",
+                "executedQty": "1.0",
+            },
+        ]
+        client.cancel_response = {"status": "ALREADY_GONE"}
+
+        opened = await executor.cancel_all_pending()
+
+        assert len(opened) == 1
+        assert "place_stop_loss_or_close" in pm.calls
+        assert executor.pending_symbols() == set()
+
+
+class TestExecutorPendingJournalRecovery:
+    """Disk journal + hard-crash recovery güvenlik sınırları (AĞ YOK)."""
+
+    @staticmethod
+    def _cfg(tmp_path, **overrides):
+        return _mk_maker_cfg(
+            scalper_pending_journal_path=str(tmp_path / "pending.json"),
+            **overrides,
+        )
+
+    async def test_intent_is_atomically_persisted_before_limit_post(self, tmp_path):
+        cfg = self._cfg(tmp_path)
+        client = _FakeClientMaker()
+        original_post = client._request_with_retry
+        observed = {"journal_before_post": False}
+
+        async def assert_journal_first(method, endpoint, params=None, signed=False):
+            if method == "POST" and endpoint == "/fapi/v1/order":
+                payload = json.loads((tmp_path / "pending.json").read_text())
+                record = payload["entries"]["TESTUSDT"]
+                assert record["client_order_id"] == params["newClientOrderId"]
+                assert record["phase"] == "INTENT"
+                observed["journal_before_post"] = True
+            return await original_post(method, endpoint, params=params, signed=signed)
+
+        client._request_with_retry = assert_journal_first
+        executor = ScalpExecutor(
+            client, _FakePm(100.0, 1.0), _FakeTracker(), cfg
+        )
+
+        await executor.try_open(_mk_exec_signal(100.0, 99.5), _mk_exec_ctx())
+
+        assert observed["journal_before_post"] is True
+        payload = json.loads((tmp_path / "pending.json").read_text())
+        assert payload["entries"]["TESTUSDT"]["phase"] == "WORKING"
+        assert payload["entries"]["TESTUSDT"]["order_id"] == 555
+        assert not list(tmp_path.glob(".*.tmp"))
+
+    async def test_hard_crash_recovery_new_restores_pending(self, tmp_path):
+        cfg = self._cfg(tmp_path)
+        client = _FakeClientMaker()
+        first = ScalpExecutor(client, _FakePm(100.0, 1.0), _FakeTracker(), cfg)
+        await first.try_open(_mk_exec_signal(100.0, 99.5), _mk_exec_ctx())
+        client_id = first.pending_snapshot()[0]["client_order_id"]
+
+        restarted = ScalpExecutor(
+            client, _FakePm(100.0, 1.0), _FakeTracker(), cfg
+        )
+        assert restarted.pending_symbols() == set()
+
+        opened = await restarted.recover_pending()
+
+        assert opened == []
+        assert restarted.pending_symbols() == {"TESTUSDT"}
+        assert restarted.pending_snapshot()[0]["client_order_id"] == client_id
+        assert client.client_order_query_calls[-1] == client_id
+        assert json.loads((tmp_path / "pending.json").read_text())["entries"]
+
+    async def test_terminal_cleanup_uses_atomic_replace_and_leaves_no_temp(
+        self, tmp_path, monkeypatch
+    ):
+        cfg = self._cfg(tmp_path, scalper_maker_fill_timeout_candles=0)
+        replace_calls = []
+        original_replace = os.replace
+
+        def replace_spy(source, destination):
+            replace_calls.append((str(source), str(destination)))
+            return original_replace(source, destination)
+
+        monkeypatch.setattr(
+            "src.strategies.scalper.executor.os.replace", replace_spy
+        )
+        client = _FakeClientMaker()
+        executor = ScalpExecutor(
+            client, _FakePm(100.0, 1.0), _FakeTracker(), cfg
+        )
+        await executor.try_open(_mk_exec_signal(100.0, 99.5), _mk_exec_ctx())
+        client.get_order_responses[555] = [
+            {"orderId": 555, "status": "NEW", "executedQty": "0"},
+            {"orderId": 555, "status": "NEW", "executedQty": "0"},
+        ]
+        client.cancel_response = {
+            "orderId": 555, "status": "CANCELED", "executedQty": "0",
+        }
+
+        await executor.check_pending()
+
+        assert replace_calls
+        assert all(dst == str(tmp_path / "pending.json") for _, dst in replace_calls)
+        assert json.loads((tmp_path / "pending.json").read_text())["entries"] == {}
+        assert not list(tmp_path.glob(".*.tmp"))
+
+    async def test_hard_crash_recovery_partial_cancels_and_protects(self, tmp_path):
+        cfg = self._cfg(tmp_path)
+        client = _FakeClientMaker()
+        first = ScalpExecutor(client, _FakePm(100.0, 1.0), _FakeTracker(), cfg)
+        await first.try_open(_mk_exec_signal(100.0, 99.5), _mk_exec_ctx())
+        client.client_order_query_responses = [{
+            "orderId": 555,
+            "status": "PARTIALLY_FILLED",
+            "executedQty": "0.4",
+            "avgPrice": "100.25",
+            "origQty": "1.0",
+        }]
+        client.cancel_response = {"orderId": 555, "status": "CANCELED"}
+        pm = _FakePm(100.25, 0.4)
+        tracker = _FakeTracker()
+        restarted = ScalpExecutor(client, pm, tracker, cfg)
+
+        opened = await restarted.recover_pending()
+
+        assert len(opened) == 1
+        assert opened[0].position.quantity == pytest.approx(0.4)
+        assert client.cancel_calls == [555]
+        assert pm.calls[:2] == ["resolve_fill", "place_stop_loss_or_close"]
+        assert tracker.calls.count("record_open") == 1
+        assert json.loads((tmp_path / "pending.json").read_text())["entries"] == {}
+        assert restarted.pending_symbols() == set()
+
+    async def test_hard_crash_recovery_filled_finalizes_once(self, tmp_path):
+        cfg = self._cfg(tmp_path)
+        client = _FakeClientMaker()
+        first = ScalpExecutor(client, _FakePm(100.0, 1.0), _FakeTracker(), cfg)
+        await first.try_open(_mk_exec_signal(100.0, 99.5), _mk_exec_ctx())
+        client.client_order_query_responses = [{
+            "orderId": 555,
+            "status": "FILLED",
+            "executedQty": "1.0",
+            "avgPrice": "100.0",
+        }]
+        pm = _FakePm(100.0, 1.0)
+        tracker = _FakeTracker()
+        restarted = ScalpExecutor(client, pm, tracker, cfg)
+
+        opened = await restarted.recover_pending()
+
+        assert len(opened) == 1
+        assert tracker.calls.count("record_open") == 1
+        assert pm.calls.count("place_stop_loss_or_close") == 1
+        assert restarted.pending_symbols() == set()
+        assert json.loads((tmp_path / "pending.json").read_text())["entries"] == {}
+
+    async def test_protecting_crash_does_not_double_finalize_and_closes_flat(self, tmp_path):
+        cfg = self._cfg(tmp_path)
+        client = _FakeClientMaker()
+        first = ScalpExecutor(client, _FakePm(100.0, 1.0), _FakeTracker(), cfg)
+        await first.try_open(_mk_exec_signal(100.0, 99.5), _mk_exec_ctx())
+
+        journal_path = tmp_path / "pending.json"
+        payload = json.loads(journal_path.read_text())
+        payload["entries"]["TESTUSDT"]["phase"] = "PROTECTING"
+        journal_path.write_text(json.dumps(payload))
+
+        client.position_amt = 1.0
+        client.client_order_query_responses = [{
+            "orderId": 555,
+            "status": "FILLED",
+            "executedQty": "1.0",
+            "avgPrice": "100.0",
+        }]
+        pm = _FakePm(100.0, 1.0)
+
+        async def emergency_close(symbol):
+            pm.calls.append("emergency_close")
+            client.position_amt = 0.0
+            return True
+
+        pm.emergency_close = emergency_close
+        tracker = _FakeTracker()
+        restarted = ScalpExecutor(client, pm, tracker, cfg)
+
+        opened = await restarted.recover_pending()
+
+        assert opened == []
+        assert pm.calls == ["emergency_close"]
+        assert "record_open" not in tracker.calls
+        assert json.loads(journal_path.read_text())["entries"] == {}
+
+    async def test_db_open_same_symbol_cleans_journal_without_refinalize(self, tmp_path):
+        cfg = self._cfg(tmp_path)
+        client = _FakeClientMaker()
+        first = ScalpExecutor(client, _FakePm(100.0, 1.0), _FakeTracker(), cfg)
+        await first.try_open(_mk_exec_signal(100.0, 99.5), _mk_exec_ctx())
+        pm = _FakePm(100.0, 1.0)
+        tracker = _FakeTracker(open_rows=[{"symbol": "TESTUSDT"}])
+        restarted = ScalpExecutor(client, pm, tracker, cfg)
+
+        assert await restarted.recover_pending() == []
+        assert pm.calls == []
+        assert "record_open" not in tracker.calls
+        assert json.loads((tmp_path / "pending.json").read_text())["entries"] == {}
+
+    async def test_three_definitive_no_order_results_remove_intent(self, tmp_path):
+        cfg = self._cfg(tmp_path)
+        client = _FakeClientMaker()
+        first = ScalpExecutor(client, _FakePm(100.0, 1.0), _FakeTracker(), cfg)
+        await first.try_open(_mk_exec_signal(100.0, 99.5), _mk_exec_ctx())
+        no_order = BinanceAPIError(
+            400, -2013, "Order does not exist", "/fapi/v1/order"
+        )
+        client.client_order_query_responses = [no_order, no_order, no_order]
+        restarted = ScalpExecutor(
+            client, _FakePm(100.0, 1.0), _FakeTracker(), cfg
+        )
+
+        assert await restarted.recover_pending() == []
+        assert len(client.client_order_query_calls) >= 3
+        assert restarted.pending_symbols() == set()
+        assert json.loads((tmp_path / "pending.json").read_text())["entries"] == {}
+
+    async def test_corrupted_journal_blocks_recovery_and_new_post(self, tmp_path):
+        cfg = self._cfg(tmp_path)
+        (tmp_path / "pending.json").write_text("{ definitely-not-json")
+        client = _FakeClientMaker()
+        executor = ScalpExecutor(
+            client, _FakePm(100.0, 1.0), _FakeTracker(), cfg
+        )
+
+        with pytest.raises(PendingRecoveryError, match="journal"):
+            await executor.recover_pending()
+        with pytest.raises(PendingRecoveryError, match="journal"):
+            await executor.try_open(
+                _mk_exec_signal(100.0, 99.5), _mk_exec_ctx()
+            )
+        assert client.limit_post_calls == 0
+        assert (tmp_path / "pending.json").read_text() == "{ definitely-not-json"
+
+    async def test_cleanup_failure_keeps_db_open_pending_and_prevents_refinalize(
+        self, tmp_path, monkeypatch
+    ):
+        cfg = self._cfg(tmp_path)
+        client = _FakeClientMaker()
+        pm = _FakePm(100.0, 1.0)
+        tracker = _FakeTracker()
+        executor = ScalpExecutor(client, pm, tracker, cfg)
+        await executor.try_open(_mk_exec_signal(100.0, 99.5), _mk_exec_ctx())
+        client.get_order_responses[555] = [{
+            "orderId": 555,
+            "status": "FILLED",
+            "executedQty": "1.0",
+            "avgPrice": "100.0",
+        }]
+
+        def fail_cleanup(symbol):
+            raise PendingRecoveryError("simulated atomic cleanup failure")
+
+        monkeypatch.setattr(executor, "_remove_pending_record", fail_cleanup)
+        with pytest.raises(PendingRecoveryError, match="cleanup failure"):
+            await executor.check_pending()
+
+        assert tracker.calls.count("record_open") == 1
+        assert executor.pending_symbols() == {"TESTUSDT"}
+        record = json.loads((tmp_path / "pending.json").read_text())["entries"]["TESTUSDT"]
+        assert record["phase"] == "DB_OPEN"
+
+
+class TestExecutorOrderUpdateRace:
+    async def test_ws_event_and_rest_poll_finalize_exactly_once(self, tmp_path):
+        cfg = _mk_maker_cfg(
+            scalper_pending_journal_path=str(tmp_path / "pending.json")
+        )
+        client = _FakeClientMaker()
+        pm = _FakePm(100.0, 1.0)
+        tracker = _FakeTracker()
+        executor = ScalpExecutor(client, pm, tracker, cfg)
+        await executor.try_open(_mk_exec_signal(100.0, 99.5), _mk_exec_ctx())
+        pending = executor.pending_snapshot()[0]
+        filled = {
+            "orderId": 555,
+            "status": "FILLED",
+            "executedQty": "1.0",
+            "avgPrice": "100.0",
+        }
+        client.get_order_responses[555] = [dict(filled)]
+        event = {
+            "e": "ORDER_TRADE_UPDATE",
+            "o": {
+                "s": "TESTUSDT",
+                "c": pending["client_order_id"],
+                "i": 555,
+                "X": "FILLED",
+                "z": "1.0",
+                "ap": "100.0",
+                "q": "1.0",
+                "p": "99.9",
+                "S": "BUY",
+            },
+        }
+
+        event_result, poll_result = await asyncio.gather(
+            executor.handle_order_update(event), executor.check_pending()
+        )
+        all_positions = ([event_result] if event_result is not None else []) + poll_result
+
+        assert len(all_positions) == 1
+        assert tracker.calls.count("record_open") == 1
+        assert pm.calls.count("resolve_fill") == 1
+        assert pm.calls.count("place_stop_loss_or_close") == 1
+        assert executor.pending_symbols() == set()
+        assert json.loads((tmp_path / "pending.json").read_text())["entries"] == {}
+
+    async def test_unrelated_or_wrong_client_id_event_is_ignored(self):
+        executor = ScalpExecutor(
+            _FakeClientMaker(), _FakePm(100.0, 1.0), _FakeTracker(), _mk_maker_cfg()
+        )
+        await executor.try_open(_mk_exec_signal(100.0, 99.5), _mk_exec_ctx())
+        event = {
+            "e": "ORDER_TRADE_UPDATE",
+            "o": {
+                "s": "TESTUSDT", "c": "awa2sc_not_the_pending_id",
+                "i": 999, "X": "FILLED", "z": "1", "ap": "100",
+            },
+        }
+
+        assert await executor.handle_order_update(event) is None
+        assert executor.pending_symbols() == {"TESTUSDT"}

@@ -324,6 +324,22 @@
   }
   .strat-metric-value.full{grid-column:1 / -1; font-size:17px;}
 
+  .pnl-quality{
+    display:none;
+    margin:0 0 12px;
+    padding:10px 12px;
+    border:1px solid rgba(224,149,78,0.38);
+    border-radius:8px;
+    background:rgba(224,149,78,0.09);
+    color:#f1bd82;
+    font-size:12px;
+    line-height:1.45;
+  }
+  .pnl-quality.show{display:block;}
+  .pnl-source-verified{color:var(--green);}
+  .pnl-source-fallback{color:var(--orange);}
+  .pnl-source-legacy{color:var(--text-faint);}
+
   /* ---------- badges / chips ---------- */
   .badge{
     display:inline-flex;
@@ -350,8 +366,11 @@
 
   .badge-status{color:var(--text-dim); background:rgba(255,255,255,0.05); border-color:var(--border);}
   .badge-tp1{color:var(--profit); background:var(--profit-bg); border-color:var(--profit-border);}
+  .badge-tp2{color:var(--purple); background:var(--purple-bg); border-color:rgba(163,133,218,0.35);}
   .badge-be{color:var(--blue); background:var(--blue-bg); border-color:rgba(91,157,217,0.35);}
+  .badge-be-plan{opacity:0.72;}
   .badge-trailing{color:var(--gold); background:var(--gold-bg); border-color:var(--gold-border);}
+  .badge-floor{color:var(--text-dim); background:rgba(255,255,255,0.04); border-color:var(--border);}
 
   .dot-pulse{
     width:6px;height:6px;border-radius:50%;
@@ -411,6 +430,32 @@
     font-size:13px;
     font-weight:700;
     margin-bottom:12px;
+  }
+  .cooldown-banner{
+    display:flex;
+    flex-wrap:wrap;
+    align-items:center;
+    gap:8px;
+    background:linear-gradient(90deg, rgba(224,149,78,0.16), rgba(224,149,78,0.06));
+    border:1px solid rgba(224,149,78,0.42);
+    color:#f1bd82;
+    padding:10px 12px;
+    border-radius:var(--radius);
+    font-size:12px;
+    margin-bottom:12px;
+  }
+  .cooldown-banner strong{font-size:12px; margin-right:2px;}
+  .cooldown-chip{
+    display:inline-flex;
+    align-items:center;
+    gap:5px;
+    border:1px solid rgba(224,149,78,0.32);
+    background:rgba(11,14,20,0.35);
+    border-radius:999px;
+    padding:3px 8px;
+    font-family:var(--mono);
+    font-size:10px;
+    color:#f1bd82;
   }
 
   /* ---------- tables ---------- */
@@ -537,7 +582,7 @@
     <div class="stat-sep"></div>
 
     <div class="stat">
-      <span class="stat-label">Bakiye</span>
+      <span class="stat-label" id="stat-balance-label">Bakiye</span>
       <span class="stat-value lg mono" id="stat-balance">—</span>
     </div>
     <div class="stat">
@@ -568,6 +613,7 @@
       <div class="section-title">Strateji Skor Tablosu</div>
       <div class="section-sub" id="strat-updated"></div>
     </div>
+    <div class="pnl-quality" id="pnl-quality"></div>
     <div class="cards-grid" id="strategy-cards">
       <!-- doldurulacak -->
     </div>
@@ -720,6 +766,17 @@
     return days + " gün " + (hours % 24) + " sa";
   }
 
+  function fmtDurationSeconds(seconds){
+    if (!isNum(seconds)) return "—";
+    seconds = Math.max(0, Math.ceil(seconds));
+    if (seconds < 60) return seconds + " sn";
+    var mins = Math.ceil(seconds / 60);
+    if (mins < 60) return mins + " dk";
+    var hours = Math.floor(mins / 60);
+    var rest = mins % 60;
+    return hours + " sa" + (rest ? " " + rest + " dk" : "");
+  }
+
   function el(tag, cls, html){
     var e = document.createElement(tag);
     if (cls) e.className = cls;
@@ -731,11 +788,8 @@
   // hatalarından (404/503 — endpoint henüz yok) ayırt eder.
   function fetchJSON(url){
     return fetch(url, { cache: "no-store" }).then(function(res){
-      if (!res.ok){
-        return { ok:false, status:res.status, data:null, networkError:false };
-      }
       return res.json().then(function(data){
-        return { ok:true, status:res.status, data:data, networkError:false };
+        return { ok:res.ok, status:res.status, data:data, networkError:false };
       }).catch(function(){
         return { ok:false, status:res.status, data:null, networkError:false };
       });
@@ -771,7 +825,7 @@
     // sağlık noktası
     var dot = qs("health-dot");
     var text = qs("health-text");
-    if (health && health.ok && health.data){
+    if (health && health.data){
       var h = health.data;
       if (h.status === "healthy"){
         dot.className = "health-dot ok";
@@ -782,7 +836,13 @@
         if (h.position_monitoring && h.position_monitoring !== "running") reasons.push("izleme durdu");
         if (h.telegram_bot && h.telegram_bot !== "running") reasons.push("telegram durdu");
         if (h.orchestrator && h.orchestrator !== "running") reasons.push("orchestrator durdu");
-        text.textContent = "bozulmuş" + (reasons.length ? " — " + reasons.join(", ") : "");
+        var sh = h.scalper_details || {};
+        var ex = sh.exchange || {};
+        if (sh.entry_halted) reasons.push("güvenlik kilidi aktif");
+        if (ex.recovery_ready === false) reasons.push("recovery hazır değil");
+        if (ex.signed_account_ready === false) reasons.push("Binance bağlantısı doğrulanmadı");
+        if (ex.risk_ready === false) reasons.push("net PNL/risk kapısı hazır değil");
+        text.textContent = "degraded" + (reasons.length ? " — " + reasons.join(", ") : "");
       }
     } else {
       dot.className = "health-dot bad";
@@ -790,8 +850,21 @@
     }
 
     // bakiye / btc fiyatı
-    var balance = status && status.ok && status.data ? status.data.account.balance : null;
-    qs("stat-balance").textContent = isNum(balance) ? fmtNum(balance, 2) + " USDT" : "—";
+    var walletBalance = status && status.ok && status.data ? status.data.account.balance : null;
+    var scalperData = scalperStatus && scalperStatus.ok && scalperStatus.data
+      ? scalperStatus.data : null;
+    var sizingEquity = scalperData && isNum(scalperData.sizing_equity_usdt)
+      ? scalperData.sizing_equity_usdt : null;
+    var usingVirtual = !!(scalperData && scalperData.virtual_capital_enabled);
+    var balance = usingVirtual && sizingEquity !== null ? sizingEquity : walletBalance;
+    var balanceLabel = qs("stat-balance-label");
+    var balanceEl = qs("stat-balance");
+    balanceLabel.textContent = usingVirtual ? "Strateji Sermayesi" : "Bakiye";
+    balanceEl.textContent = isNum(balance) ? fmtNum(balance, 2) + " USDT" : "—";
+    balanceEl.title = usingVirtual
+      ? "Sanal sermaye + uygun gerçekleşmiş net K/Z" +
+        (isNum(walletBalance) ? " · TESTNET cüzdanı " + fmtNum(walletBalance, 2) + " USDT" : "")
+      : "";
 
     var btcPrice = status && status.ok && status.data ? status.data.account.btc_price : null;
     qs("stat-btc").textContent = isNum(btcPrice) ? "$" + fmtNum(btcPrice, 2) : "—";
@@ -812,9 +885,13 @@
     if (scalperStatus && scalperStatus.ok && scalperStatus.data && isNum(scalperStatus.data.daily_pnl)){
       var dp = scalperStatus.data.daily_pnl;
       dailyEl.textContent = fmtUsdt(dp);
+      if (scalperStatus.data.daily_pnl_source){
+        dailyEl.title = "Kaynak: " + scalperStatus.data.daily_pnl_source;
+      }
       dailyEl.className = "stat-value lg mono" + (dp > 0 ? " profit" : (dp < 0 ? " loss" : ""));
     } else {
       dailyEl.textContent = "—";
+      dailyEl.title = "";
       dailyEl.className = "stat-value lg mono dim";
     }
   }
@@ -830,7 +907,11 @@
     var card = el("div", "strat-card" + (isLeader ? " leader" : ""));
     var head = el("div");
     head.appendChild(el("div", "strat-card-title", escapeHtml(title)));
-    head.appendChild(el("div", "strat-card-sub", hasData ? (s.trades + " işlem") : "henüz işlem yok"));
+    var quality = "";
+    if (hasData && isNum(s.verified_trades)){
+      quality = " · " + s.verified_trades + " net doğrulanmış";
+    }
+    head.appendChild(el("div", "strat-card-sub", hasData ? (s.trades + " işlem" + quality) : "henüz işlem yok"));
     card.appendChild(head);
 
     if (!hasData){
@@ -858,6 +939,7 @@
 
   function renderStrategyCards(stats){
     var container = qs("strategy-cards");
+    var quality = qs("pnl-quality");
     container.innerHTML = "";
 
     if (!stats || !stats.ok || !stats.data){
@@ -866,6 +948,8 @@
         container.appendChild(strategyCardHtml(key, null, false));
       });
       qs("strat-updated").textContent = msg;
+      quality.className = "pnl-quality";
+      quality.textContent = "";
       return;
     }
 
@@ -873,6 +957,19 @@
 
     var strategies = stats.data.strategies || {};
     var combined = stats.data.combined || null;
+    var allVerified = combined && combined.trades > 0 && combined.pnl_basis === "binance_income_net";
+
+    if (combined && combined.trades > 0 && !allVerified){
+      quality.textContent = "Veri kalitesi uyarısı: tarihsel K/Z net performans kanıtı değildir. " +
+        (combined.verified_trades || 0) + " işlem Binance net, " +
+        (combined.fallback_trades || 0) + " işlem tahmini brüt, " +
+        (combined.legacy_trades || 0) + " işlem legacy kaynaktır. " +
+        "Üst bardaki Günlük K/Z, Binance hesap income toplamıdır.";
+      quality.className = "pnl-quality show";
+    } else {
+      quality.textContent = "";
+      quality.className = "pnl-quality";
+    }
 
     var leaderKey = null;
     var bestPnl = -Infinity;
@@ -880,7 +977,7 @@
       var s = strategies[k];
       if (s && isNum(s.total_pnl) && s.trades > 0 && s.total_pnl > bestPnl){
         bestPnl = s.total_pnl;
-        leaderKey = k;
+        leaderKey = allVerified ? k : null;
       }
     });
 
@@ -944,8 +1041,13 @@
         roi: (t && isNum(t.roi_pct)) ? t.roi_pct : p.pnl_percentage,
         sl: p.current_stoploss,
         tp1: t ? !!t.tp1_done : false,
+        tp2: t ? !!t.tp2_done : false,
         trailing: !!(p.is_trailing || (t && t.trailing_active)),
-        be: !!p.is_break_even,
+        be: !!(p.is_break_even || (t && t.breakeven_active)),
+        bePrice: t ? t.breakeven_price : null,
+        beCostPct: t ? t.breakeven_cost_pct : null,
+        feeAwareBe: !!(t && t.fee_aware_breakeven),
+        runnerFloor: t ? t.runner_floor_price : null,
         openedAt: p.opened_at || (t && t.opened_at)
       });
     });
@@ -958,12 +1060,17 @@
         strategy: t.strategy,
         direction: t.direction,
         entry: t.entry_price,
-        current: null,
+        current: t.current_price,
         roi: t.roi_pct,
         sl: t.current_stoploss,
         tp1: !!t.tp1_done,
+        tp2: !!t.tp2_done,
         trailing: !!t.trailing_active,
-        be: false,
+        be: !!t.breakeven_active,
+        bePrice: t.breakeven_price,
+        beCostPct: t.breakeven_cost_pct,
+        feeAwareBe: !!t.fee_aware_breakeven,
+        runnerFloor: t.runner_floor_price,
         openedAt: t.opened_at
       });
     });
@@ -988,8 +1095,20 @@
 
       var badges = "";
       if (r.tp1) badges += '<span class="badge badge-tp1">TP1 ✓</span>';
+      if (r.tp2) badges += '<span class="badge badge-tp2">TP2 ✓</span>';
       if (r.trailing) badges += '<span class="badge badge-trailing"><span class="dot-pulse"></span>&nbsp;TRAILING</span>';
-      if (r.be) badges += '<span class="badge badge-be">BE</span>';
+      if (r.feeAwareBe && isNum(r.bePrice)){
+        var beTitle = isNum(r.beCostPct)
+          ? ' title="Tahmini ücret maliyeti ' + fmtNum(r.beCostPct, 4) + '% + yapılandırılmış buffer"'
+          : '';
+        badges += '<span class="badge badge-be' + (r.be ? '' : ' badge-be-plan') + '"' + beTitle + '>' +
+          (r.be ? 'NET BE @ ' : 'NET BE PLAN @ ') + fmtPrice(r.bePrice) + '</span>';
+      } else if (r.be){
+        badges += '<span class="badge badge-be">BE</span>';
+      }
+      if (r.trailing && isNum(r.runnerFloor)){
+        badges += '<span class="badge badge-floor">TABAN @ ' + fmtPrice(r.runnerFloor) + '</span>';
+      }
       if (!badges) badges = '<span class="cell-dim">—</span>';
 
       var roiCls = isNum(r.roi) ? (r.roi > 0 ? "profit-text" : (r.roi < 0 ? "loss-text neg" : "")) : "";
@@ -1040,14 +1159,30 @@
     var d = scalperRes.data;
     var universe = Array.isArray(d.universe) ? d.universe : [];
     var regimes = d.regimes || {};
+    var pending = Array.isArray(d.pending_entries) ? d.pending_entries : [];
+    var cooldowns = Array.isArray(d.cooldowns) ? d.cooldowns.filter(function(c){
+      return c && (!isNum(c.remaining_seconds) || c.remaining_seconds > 0);
+    }) : [];
 
     scanInfo.textContent = universe.length + " sembol · " + (isNum(d.scan_interval) ? d.scan_interval : "?") +
-      " sn'de bir · son tarama " + fmtClock(d.last_scan_at);
+      " sn'de bir · " + pending.length + " bekleyen · " + cooldowns.length + " cooldown · son tarama " + fmtClock(d.last_scan_at);
 
     panel.innerHTML = "";
 
     if (d.kill_switch_active){
       panel.appendChild(el("div", "kill-switch-banner", "⛔ Günlük zarar limiti aşıldı — yeni giriş durduruldu"));
+    }
+
+    if (cooldowns.length){
+      var cooldownBanner = el("div", "cooldown-banner");
+      var cooldownHtml = '<strong>⏳ Giriş cooldown — yeni giriş geçici olarak kapalı:</strong>';
+      cooldowns.forEach(function(c){
+        var reason = c.reason ? " · " + escapeHtml(c.reason) : "";
+        cooldownHtml += '<span class="cooldown-chip"><b>' + escapeHtml(c.symbol || "?") + '</b> ' +
+          fmtDurationSeconds(c.remaining_seconds) + reason + '</span>';
+      });
+      cooldownBanner.innerHTML = cooldownHtml;
+      panel.appendChild(cooldownBanner);
     }
 
     if (universe.length === 0){
@@ -1193,11 +1328,16 @@
     var html = '<table><thead><tr>' +
       '<th>Zaman</th><th>Strateji</th><th>Sembol</th><th>Yön</th>' +
       '<th class="num">Giriş → Çıkış</th><th class="num">K/Z</th>' +
-      '<th class="num">ROI</th><th>Çıkış</th>' +
+      '<th class="num">ROI</th><th>Kaynak</th><th>Çıkış</th>' +
       '</tr></thead><tbody>';
 
     sorted.forEach(function(t){
       var pnlCls = pnlClass(t.realized_pnl);
+      var isVerified = t.pnl_source === "verified" ||
+        t.pnl_source === "binance_account_trades_net" ||
+        t.pnl_source === "binance_income_net";
+      var source = isVerified ? "NET" : (t.pnl_source === "fallback" ? "BRÜT TAHMİN" : "LEGACY");
+      var sourceCls = isVerified ? "pnl-source-verified" : (t.pnl_source === "fallback" ? "pnl-source-fallback" : "pnl-source-legacy");
       html += '<tr>' +
         '<td class="cell-dim">' + fmtDateTime(t.closed_at) + '</td>' +
         '<td>' + strategyBadge(t.strategy) + '</td>' +
@@ -1206,6 +1346,7 @@
         '<td class="num cell-dim">' + fmtPrice(t.entry_price) + ' → ' + fmtPrice(t.exit_price) + '</td>' +
         '<td class="num ' + pnlCls + '" style="font-weight:700;">' + fmtUsdt(t.realized_pnl) + '</td>' +
         '<td class="num ' + pnlCls + '">' + fmtPct(t.roi_pct) + '</td>' +
+        '<td class="' + sourceCls + '">' + source + '</td>' +
         '<td>' + exitReasonChip(t.exit_reason) + '</td>' +
         '</tr>';
     });
@@ -1287,7 +1428,7 @@
       fetchJSON("/waiting-mode/active"),
       fetchJSON("/scalper/status"),
       fetchJSON("/scalper/stats"),
-      fetchJSON("/scalper/trades?limit=30")
+      fetchJSON("/scalper/trades")
     ];
 
     Promise.all(endpoints).then(function(results){
@@ -1358,7 +1499,7 @@
     if (qs("pnl-sparkline")){
       var wrap = qs("trades-wrap");
       if (wrap && wrap.querySelector("table")){
-        fetchJSON("/scalper/trades?limit=30").then(function(res){
+        fetchJSON("/scalper/trades").then(function(res){
           if (res.ok) drawSparkline(res.data);
         });
       }

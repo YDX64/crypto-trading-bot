@@ -74,3 +74,9 @@ docker-compose.override.yml
 # .env yedekleri (anahtar icerir)
 .env.bak*
 nohup.out
+
+# Deploy yedekleri (env.backup = .env tam kopyasi, ANAHTAR ICERIR)
+backups/
+
+# pytest log yonlendirmesi (conftest.py)
+.test-logs/

@@ -23,6 +23,7 @@ from src.models.signal import SignalWithPosition, SignalDirection
 from src.trading.binance_client_improved import (
     ImprovedBinanceClient as BinanceClient,
     BinanceAPIError,
+    ERR_IMMEDIATE_TRIGGER,
 )
 from src.core.config import settings
 from src.core.logger import app_logger
@@ -36,6 +37,19 @@ class PositionManager:
     """Pozisyon yönetim motoru"""
 
     SL_PLACEMENT_ATTEMPTS = 3
+
+    # Sinyal ile gerçek dolum arasında saniyeler geçer (maker/GTX girişte
+    # onlarca saniye). Bu sürede fiyat stop seviyesinin ötesine kayarsa
+    # Binance koşullu emri -2021 "Order would immediately trigger" ile
+    # reddeder. Stop'u canlı fiyatın güvenli tarafına taşıyıp yeniden
+    # denemek, pozisyonu daha açılır açılmaz zararla kapatmaktan iyidir.
+    #
+    # Buffer iki tabandan büyüğü olur: yüzdesel pay (volatil sembollerde
+    # tetik ile emrin borsaya ulaşması arasındaki hareketi karşılar) ve
+    # tick tabanı (quantize_protective_price koruyucu fiyatı piyasaya doğru
+    # yuvarladığı için saf yüzde yetmeyebilir).
+    SL_LIVE_PRICE_BUFFER_PCT = 0.15
+    SL_MIN_TICK_BUFFER = 3
 
     def __init__(self, binance_client: BinanceClient):
         self.binance = binance_client
@@ -111,9 +125,14 @@ class PositionManager:
         self.logger.info(f"✅ Dolum: {filled_qty} @ {entry_price}")
 
         # --- 4. Stop-loss: BAŞARISIZ OLURSA POZİSYONU KAPAT ---
+        # reference_price gerçek dolum fiyatıdır: -2021 durumunda stop bu fiyata
+        # göre yeniden çapalanır, sinyaldeki tahmini fiyata göre değil.
         sl_side = "SELL" if signal.direction == SignalDirection.LONG else "BUY"
         sl_order = await self._place_stop_loss_or_close(
-            symbol=symbol, sl_side=sl_side, stop_price=signal.stoploss
+            symbol=symbol,
+            sl_side=sl_side,
+            stop_price=signal.stoploss,
+            reference_price=entry_price,
         )
         if sl_order is None:
             # _place_stop_loss_or_close pozisyonu kapattı ya da fırlattı
@@ -229,28 +248,142 @@ class PositionManager:
             f"(avgPrice={entry_order.get('avgPrice')!r})",
         )
 
+    async def _reanchor_stop_price(
+        self,
+        symbol: str,
+        sl_side: str,
+        desired_stop: float,
+        *,
+        reference_price: Optional[float] = None,
+        max_distance_pct: Optional[float] = None,
+    ) -> Optional[float]:
+        """Canlı fiyatın anında tetiklemeyeceği en yakın koruyucu stop'u bul.
+
+        Sinyal üretimi ile emrin gerçekten dolması arasında geçen sürede fiyat,
+        hesaplanmış stop seviyesinin ötesine geçmiş olabilir. Bu durumda stop'u
+        "şu anki fiyatın güvenli tarafına" taşımak, pozisyonu daha açılır açılmaz
+        piyasa emriyle kapatmaktan hem daha ucuz hem de işlem tezini korur.
+
+        Stop yalnız pozisyonun ZARARINA doğru genişletilir; asla kâra doğru
+        daraltılmaz. ``max_distance_pct`` verildiğinde genişleme risk bütçesiyle
+        sınırlıdır: bütçe aşılıyorsa ``None`` döner ve çağıran pozisyonu kapatır —
+        çünkü o noktada işlem zaten planlanan riskini kaybetmiştir.
+        """
+        try:
+            price = await self.binance.get_current_price(symbol)
+        except Exception as e:
+            self.logger.error(f"{symbol}: yeniden fiyatlama için canlı fiyat alınamadı ({e})")
+            return None
+        if price is None or price <= 0:
+            self.logger.error(f"{symbol}: yeniden fiyatlama için canlı fiyat alınamadı")
+            return None
+
+        tick = 0.0
+        try:
+            filters = await self.binance.get_symbol_filters(symbol)
+            tick = float(filters["tickSize"])
+        except Exception as e:
+            self.logger.warning(
+                f"{symbol}: tickSize okunamadı ({e}), yalnız yüzdesel buffer kullanılıyor"
+            )
+
+        buffer = max(
+            tick * self.SL_MIN_TICK_BUFFER,
+            price * self.SL_LIVE_PRICE_BUFFER_PCT / 100.0,
+        )
+
+        if sl_side.upper() == "SELL":
+            # LONG pozisyonu koruyor — stop canlı fiyatın ALTINDA kalmalı.
+            candidate = min(desired_stop, price - buffer)
+        else:
+            # BUY: SHORT pozisyonu koruyor — stop canlı fiyatın ÜSTÜNDE kalmalı.
+            candidate = max(desired_stop, price + buffer)
+
+        if candidate <= 0:
+            self.logger.error(
+                f"⛔ {symbol}: gecikme telafili stop pozitif bir fiyata çözülemedi "
+                f"(aday={candidate}, canlı={price})"
+            )
+            return None
+
+        if reference_price and reference_price > 0 and max_distance_pct and max_distance_pct > 0:
+            distance_pct = abs(candidate - reference_price) / reference_price * 100.0
+            if distance_pct > max_distance_pct:
+                self.logger.error(
+                    f"⛔ {symbol}: gecikme telafili stop risk bütçesini aşıyor "
+                    f"(%{distance_pct:.3f} > %{max_distance_pct:.3f}) — "
+                    f"pozisyon korunmak yerine kapatılacak"
+                )
+                return None
+
+        self.logger.warning(
+            f"🔄 {symbol}: stop yürütme gecikmesine göre yeniden çapalandı "
+            f"{desired_stop} -> {candidate} (canlı fiyat={price}, buffer={buffer:.10g})"
+        )
+        return candidate
+
     async def _place_stop_loss_or_close(
-        self, symbol: str, sl_side: str, stop_price: float
+        self,
+        symbol: str,
+        sl_side: str,
+        stop_price: float,
+        *,
+        reference_price: Optional[float] = None,
+        max_distance_pct: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         """Stop-loss koymayı dene; başarısız olursa pozisyonu acil kapat.
 
         Korumasız bir kaldıraçlı pozisyon, kapatılmış bir pozisyondan çok daha
         tehlikelidir. Bu yüzden koruma kurulamıyorsa pozisyondan çıkılır.
+
+        İSTISNA — ``-2021 Order would immediately trigger``: bu kod hatalı girdi
+        DEĞİL, "stop fiyatı piyasanın yanlış tarafında kaldı" demektir ve giriş
+        ile koruma arasındaki gecikmenin doğal sonucudur. Aynı fiyatla tekrar
+        denemek anlamsızdır, ancak canlı fiyata göre YENİDEN HESAPLANMIŞ bir
+        fiyatla denemek doğru davranıştır. Yeniden çapalama risk bütçesiyle
+        sınırlıdır; bütçe aşılırsa acil kapatmaya düşülür.
+
+        ``reference_price``/``max_distance_pct`` verilmezse genişleme ölçülemez;
+        bu durumda tek bir yeniden çapalama denenir (buffer kadar, sınırlı).
         """
         last_error: Optional[Exception] = None
+        current_stop = stop_price
+        risk_bounded = bool(
+            reference_price and reference_price > 0
+            and max_distance_pct and max_distance_pct > 0
+        )
+        reprices_left = self.SL_PLACEMENT_ATTEMPTS - 1 if risk_bounded else 1
 
         for attempt in range(self.SL_PLACEMENT_ATTEMPTS):
             try:
-                return await self.binance.place_stop_loss(
+                placed = await self.binance.place_stop_loss(
                     symbol=symbol, side=sl_side,
-                    stop_price=stop_price, close_position=True,
+                    stop_price=current_stop, close_position=True,
                 )
+                if isinstance(placed, dict):
+                    # Yeniden çapalama sonrası gerçekte konan tetik fiyatı çağırana
+                    # bildir: DB kaydı ve çıkış planı borsadaki emirle uyuşmalı.
+                    placed["effectiveStopPrice"] = current_stop
+                return placed
             except BinanceAPIError as e:
                 last_error = e
                 self.logger.error(
                     f"⚠️ SL denemesi {attempt + 1}/{self.SL_PLACEMENT_ATTEMPTS} "
                     f"başarısız ({symbol}) kod={e.code}: {e.msg}"
                 )
+                if e.code == ERR_IMMEDIATE_TRIGGER and reprices_left > 0:
+                    reprices_left -= 1
+                    repriced = await self._reanchor_stop_price(
+                        symbol, sl_side, current_stop,
+                        reference_price=reference_price,
+                        max_distance_pct=max_distance_pct,
+                    )
+                    if repriced is None:
+                        break  # risk bütçesi aşıldı veya fiyat okunamadı
+                    if repriced == current_stop:
+                        break  # aynı fiyat — tekrar denemek anlamsız
+                    current_stop = repriced
+                    continue
                 if not e.is_retryable and e.code is not None:
                     break  # tekrar denemek aynı sonucu verir
                 await asyncio.sleep(1.0 * (attempt + 1))
@@ -271,6 +404,14 @@ class PositionManager:
                 f"DERHAL ELLE MÜDAHALE EDİN. Son hata: {last_error}"
             )
         return None
+
+    async def emergency_close(self, symbol: str) -> bool:
+        """Korumasız pozisyonu reduceOnly piyasa emriyle güvenle kapat.
+
+        Restart/reconciliation katmanları özel metoda bağlanmadan aynı güvenlik
+        akışını kullanabilsin diye sağlanan public sarmalayıcıdır.
+        """
+        return await self._emergency_close(symbol)
 
     async def _emergency_close(self, symbol: str) -> bool:
         """Pozisyonu piyasa emriyle reduceOnly olarak kapat."""
@@ -449,6 +590,23 @@ class PositionManager:
                 close_position=False, quantity=live_qty,
             )
         except BinanceAPIError as e:
+            if e.code == -2021:
+                # The market has already crossed the proposed protective
+                # trigger. Keeping only the older, looser stop silently
+                # violates the trailing/BE exit decision and caused repeated
+                # -2021 loops in production telemetry. Enforce that decision
+                # by flattening reduceOnly now.
+                self.logger.critical(
+                    f"🚨 {symbol}: yeni SL seviyesi piyasa tarafından geçilmiş "
+                    f"(kod=-2021). Koruma kararı uygulanıyor: pozisyon acil kapatılacak.",
+                    extra={"trade": True},
+                )
+                closed = await self._emergency_close(symbol)
+                if not closed:
+                    raise UnprotectedPositionError(
+                        f"{symbol}: stop seviyesi geçildi ve acil kapatma başarısız oldu"
+                    ) from e
+                return False
             self.logger.error(
                 f"❌ {symbol}: yeni SL konulamadı (kod={e.code}: {e.msg}). "
                 f"ESKİ SL YERİNDE KALDI — pozisyon korumasız değil."
@@ -615,14 +773,29 @@ class PositionManager:
         return await self._resolve_fill(symbol, entry_order)
 
     async def place_stop_loss_or_close(
-        self, symbol: str, sl_side: str, stop_price: float
+        self,
+        symbol: str,
+        sl_side: str,
+        stop_price: float,
+        *,
+        reference_price: Optional[float] = None,
+        max_distance_pct: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         """_place_stop_loss_or_close'un public sarmalayıcısı: SL koymayı dener,
 
         başarısız olursa pozisyonu acil kapatır (korumasız pozisyon bırakılmaz).
+
+        ``reference_price`` gerçek dolum fiyatı, ``max_distance_pct`` ise o
+        fiyattan izin verilen azami stop mesafesidir. İkisi birlikte verildiğinde
+        -2021 sonrası yeniden çapalama risk bütçesi içinde kalacak şekilde
+        sınırlanır; verilmezse tek ve dar bir yeniden deneme yapılır.
         """
         return await self._place_stop_loss_or_close(
-            symbol=symbol, sl_side=sl_side, stop_price=stop_price
+            symbol=symbol,
+            sl_side=sl_side,
+            stop_price=stop_price,
+            reference_price=reference_price,
+            max_distance_pct=max_distance_pct,
         )
 
     async def replace_stop_loss(self, position: PositionModel, new_stop: float) -> bool:

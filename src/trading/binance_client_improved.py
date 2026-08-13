@@ -16,8 +16,11 @@ import hmac
 import hashlib
 import time
 import asyncio
+import re
+import uuid
 from typing import Dict, Any, Optional, List, Tuple
-from decimal import Decimal, ROUND_DOWN
+from datetime import datetime, timezone
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from urllib.parse import urlencode
 
 import httpx
@@ -36,6 +39,12 @@ ERR_NO_NEED_MARGIN = -4046        # margin type zaten ayarlı
 ERR_IMMEDIATE_TRIGGER = -2021     # emir anında tetiklenirdi
 ERR_INSUFFICIENT_MARGIN = -2019   # marj yetersiz
 ERR_REDUCE_ONLY_REJECTED = -2022  # reduceOnly emri reddedildi
+ERR_DUPLICATE_CLIENT_ORDER_ID = -4116
+
+# Binance bu kodlarda POST'un eşleştirme motoruna ulaşıp ulaşmadığını kesin
+# söylemez. Koşullu emir için yeni kimlikle tekrar POST atmak yerine mevcut
+# clientAlgoId ile durum sorgulanmalıdır.
+UNKNOWN_EXECUTION_CODES = frozenset({-1000, -1001, -1006, -1007})
 
 # Çağıranın normal akışta ele aldığı, gerçek arıza olmayan kodlar.
 # Bunlar ERROR yerine DEBUG seviyesinde loglanır.
@@ -81,6 +90,57 @@ class ImprovedBinanceClient:
 
     # Borsa filtreleri nadiren değişir; süreç ömrü boyunca önbellek yeterli
     _FILTER_CACHE_TTL = 3600.0
+    # /commissionRate IP weight=20; işlem başına çağrılmamalıdır.
+    _COMMISSION_CACHE_TTL = 3600.0
+    _CLIENT_ALGO_ID_RE = re.compile(r"^[.A-Za-z0-9_:/-]{1,36}$")
+    _ALGO_RECONCILE_DELAYS = (0.0, 0.1, 0.3)
+
+    # Ban devre kesicisi — SINIF düzeyinde: süreçteki tüm istemci örnekleri
+    # (engine + orchestrator + telegram) aynı yasağa birlikte uyar.
+    _rest_blocked_until: float = 0.0
+    _breaker_last_log: float = 0.0
+    _BAN_UNTIL_RE = re.compile(r"banned until (\d{10,16})")
+
+    def _ensure_rest_allowed(self, endpoint: str) -> None:
+        """Küresel ban devre kesicisi: -1003/418 sonrası ban bitene kadar
+        HİÇBİR istek ağa çıkmaz. Ban sırasında atılan her istek yasağı uzatır
+        (2026-08-12: 24 adet -1003, bot gün içinde saatlerce kilitli kaldı).
+        Sınıf düzeyinde paylaşılır — süreçteki TÜM istemciler birlikte uyar.
+        """
+        blocked_until = type(self)._rest_blocked_until
+        now = time.time()
+        if now >= blocked_until:
+            return
+        if now - type(self)._breaker_last_log > 30.0:
+            type(self)._breaker_last_log = now
+            self.logger.warning(
+                f"🚫 REST devre kesici aktif: Binance IP ban bitişine "
+                f"{blocked_until - now:.0f} sn var, {endpoint} isteği atılmadı"
+            )
+        raise BinanceAPIError(
+            418, -1003,
+            f"REST devre kesici aktif (ban bitişine {blocked_until - now:.0f} sn)",
+            endpoint,
+        )
+
+    @classmethod
+    def _trip_breaker(cls, message: str, default_seconds: float) -> float:
+        """-1003/418 mesajından ban bitişini çöz ve kesiciyi kur.
+
+        Mesajda "banned until <epoch_ms>" varsa o zamana +5 sn tampon; yoksa
+        default_seconds. Mevcut daha uzun bir kesici asla KISALTILMAZ.
+        Kurulan bitiş zamanını (epoch saniye) döndürür.
+        """
+        until = time.time() + default_seconds
+        match = cls._BAN_UNTIL_RE.search(message or "")
+        if match:
+            raw = float(match.group(1))
+            # epoch saniye mi milisaniye mi? 10^12 üstü kesin ms'dir.
+            parsed = raw / 1000.0 if raw > 1e12 else raw
+            if parsed > time.time():
+                until = parsed + 5.0
+        cls._rest_blocked_until = max(cls._rest_blocked_until, until)
+        return cls._rest_blocked_until
 
     def __init__(self):
         self.api_key = settings.binance_api_key
@@ -104,6 +164,14 @@ class ImprovedBinanceClient:
         # symbol -> (filtreler, önbelleğe alma zamanı)
         self._symbol_filters: Dict[str, Tuple[Dict[str, Any], float]] = {}
         self._filter_lock = asyncio.Lock()
+
+        # symbol -> (doğrulanmış oranlar, önbelleğe alma zamanı)
+        self._commission_rates: Dict[str, Tuple[Dict[str, Any], float]] = {}
+        self._commission_lock = asyncio.Lock()
+
+        # USDⓈ-M user-data stream anahtarı. Bu endpoint'ler API-key header
+        # ister fakat HMAC imzası/timestamp istemez.
+        self._listen_key: Optional[str] = None
 
     # ------------------------------------------------------------------
     # İmzalama
@@ -185,6 +253,8 @@ class ImprovedBinanceClient:
         url = f"{self.base_url}{endpoint}"
         last_error: Optional[Exception] = None
 
+        self._ensure_rest_allowed(endpoint)
+
         for attempt in range(self.max_retries):
             try:
                 await rate_limiter.wait_for_binance()
@@ -228,14 +298,22 @@ class ImprovedBinanceClient:
                             continue
 
                     if response.status_code == 429:
-                        self.logger.warning("Rate limit, 60s bekleniyor...")
+                        # Soft limit: devre kesiciyi kısa süre kapat ki DİĞER
+                        # coroutine'ler de istek yağdırıp 418'e tırmandırmasın.
+                        type(self)._trip_breaker(msg, default_seconds=90.0)
+                        self.logger.warning("Rate limit (429), 60s bekleniyor + kesici aktif")
                         last_error = err
                         if attempt < self.max_retries - 1:
                             await asyncio.sleep(60)
                             continue
 
-                    if response.status_code == 418:
-                        self.logger.critical("IP ban algılandı! Yönetici müdahalesi gerekli.")
+                    if response.status_code == 418 or code == -1003:
+                        until = type(self)._trip_breaker(msg, default_seconds=180.0)
+                        self.logger.critical(
+                            f"🚫 IP ban ({code}): TÜM REST istekleri "
+                            f"{datetime.fromtimestamp(until, tz=timezone.utc).isoformat()}'e "
+                            f"kadar durduruldu — ban sırasında istek atmak yasağı uzatır"
+                        )
                         raise err
 
                     if err.is_retryable and attempt < self.max_retries - 1:
@@ -273,6 +351,50 @@ class ImprovedBinanceClient:
         raise last_error or Exception(
             f"API isteği {self.max_retries} denemeden sonra başarısız: {endpoint}"
         )
+
+    async def _request_api_key_only(
+        self, method: str, endpoint: str
+    ) -> Dict[str, Any]:
+        """USER_STREAM endpoint'i: API-key header var, imza/timestamp yok.
+
+        Genel imzalı POST retry semantiğine dokunmaz. listenKey create aynı
+        hesapta aktif anahtarı döndürüp süresini uzattığından tekrarı
+        idempotenttir; PUT/DELETE de aynı şekilde güvenle tekrarlanabilir.
+        """
+        url = f"{self.base_url}{endpoint}"
+        last_error: Optional[Exception] = None
+        self._ensure_rest_allowed(endpoint)
+        for attempt in range(self.max_retries):
+            try:
+                await rate_limiter.wait_for_binance()
+                response = await self.client.request(
+                    method, url, headers=self._get_headers()
+                )
+                if response.status_code >= 400:
+                    code, msg = self._parse_error(response)
+                    error = BinanceAPIError(
+                        response.status_code, code, msg, endpoint
+                    )
+                    last_error = error
+                    if response.status_code == 418 or code == -1003:
+                        type(self)._trip_breaker(msg, default_seconds=180.0)
+                    if error.is_retryable and attempt < self.max_retries - 1:
+                        await asyncio.sleep(self.retry_delay * (attempt + 1))
+                        continue
+                    raise error
+                if not response.content:
+                    return {}
+                body = response.json()
+                return body if isinstance(body, dict) else {}
+            except BinanceAPIError:
+                raise
+            except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as e:
+                last_error = e
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(self.retry_delay * (attempt + 1))
+                    continue
+                raise
+        raise last_error or RuntimeError(f"USER_STREAM isteği başarısız: {endpoint}")
 
     # ------------------------------------------------------------------
     # Borsa filtreleri
@@ -345,6 +467,52 @@ class ImprovedBinanceClient:
         f = await self.get_symbol_filters(symbol)
         p = self._quantize_down(price, f["tickSize"])
         return float(p)
+
+    async def quantize_maker_price(self, symbol: str, price: float, side: str) -> float:
+        """Post-only LIMIT fiyatını defterin dışına doğru yuvarla.
+
+        BUY için aşağı, SELL için yukarı yuvarlamak fiyatın tick-size
+        düzeltmesi sırasında spread'in karşı tarafına taşınmasını engeller.
+        GTX yine son ve otoriter post-only kapısıdır.
+        """
+        normalized_side = side.upper()
+        if normalized_side not in {"BUY", "SELL"}:
+            raise ValueError(f"Geçersiz emir tarafı: {side}")
+
+        f = await self.get_symbol_filters(symbol)
+        step = f["tickSize"]
+        value = Decimal(str(price))
+        if step > 0:
+            rounding = ROUND_DOWN if normalized_side == "BUY" else ROUND_UP
+            value = (value / step).to_integral_value(rounding=rounding) * step
+        return float(value)
+
+    async def quantize_protective_price(
+        self, symbol: str, price: float, side: str
+    ) -> float:
+        """Koruyucu STOP/TP tetik fiyatını pozisyon yönüne göre yuvarla.
+
+        Koruyucu emrin ``side`` değeri kapatılan pozisyonu tanımlar:
+
+        - SELL (LONG kapatır): yukarı yuvarla; hesaplanan fiyat tabanının
+          tick dönüşümünde aşağı aşılmasını engeller.
+        - BUY (SHORT kapatır): aşağı yuvarla; hesaplanan fiyat tavanının
+          tick dönüşümünde yukarı aşılmasını engeller.
+
+        Bu yardımcı yalnız koşullu koruma emirleri içindir; GTX maker fiyat
+        yuvarlamasının ters-taraf mantığını değiştirmez.
+        """
+        normalized_side = side.upper()
+        if normalized_side not in {"BUY", "SELL"}:
+            raise ValueError(f"Geçersiz emir tarafı: {side}")
+
+        f = await self.get_symbol_filters(symbol)
+        step = f["tickSize"]
+        value = Decimal(str(price))
+        if step > 0:
+            rounding = ROUND_UP if normalized_side == "SELL" else ROUND_DOWN
+            value = (value / step).to_integral_value(rounding=rounding) * step
+        return float(value)
 
     async def validate_order(
         self, symbol: str, quantity: float, reference_price: float
@@ -426,6 +594,105 @@ class ImprovedBinanceClient:
         except Exception as e:
             self.logger.error(f"Bakiye sorgusu hatası: {e}")
             return None
+
+    async def get_wallet_balance(self) -> Optional[float]:
+        """USDT wallet equity before open-order/position margin deductions."""
+
+        try:
+            response = await self._request_with_retry(
+                "GET", "/fapi/v2/account", signed=True
+            )
+            total = response.get("totalWalletBalance")
+            if total not in (None, ""):
+                return float(total)
+            for asset in response.get("assets", []):
+                if asset.get("asset") == "USDT":
+                    return float(asset.get("walletBalance"))
+            self.logger.error("USDT wallet bakiyesi hesapta bulunamadı")
+            return None
+        except Exception as e:
+            self.logger.error(f"Wallet bakiyesi sorgusu hatası: {e}")
+            return None
+
+    @staticmethod
+    def _validated_commission_decimal(value: Any, field: str) -> Decimal:
+        """Binance komisyon değerini sonlu, oran biçimli Decimal'e çevir."""
+        try:
+            rate = Decimal(str(value))
+        except Exception as exc:
+            raise BinanceAPIError(
+                502,
+                None,
+                f"commissionRate yanıtında geçersiz {field}: {value!r}",
+                "/fapi/v1/commissionRate",
+            ) from exc
+        if not rate.is_finite() or rate < 0 or rate >= 1:
+            raise BinanceAPIError(
+                502,
+                None,
+                f"commissionRate yanıtında aralık dışı {field}: {value!r}",
+                "/fapi/v1/commissionRate",
+            )
+        return rate
+
+    async def get_user_commission_rate(self, symbol: str) -> Dict[str, Any]:
+        """Kullanıcının sembol bazlı maker/taker oranlarını getir (cache'li).
+
+        Oranlar kayan nokta yuvarlama hatası taşımamaları için ``Decimal``
+        döner. Endpoint IP weight=20 olduğundan aynı sembol bir saat boyunca
+        yeniden sorgulanmaz.
+        """
+        normalized_symbol = str(symbol).strip().upper()
+        if not normalized_symbol:
+            raise ValueError("Komisyon oranı için sembol boş olamaz")
+
+        now = time.monotonic()
+        cached = self._commission_rates.get(normalized_symbol)
+        if cached and (now - cached[1]) < self._COMMISSION_CACHE_TTL:
+            return dict(cached[0])
+
+        async with self._commission_lock:
+            cached = self._commission_rates.get(normalized_symbol)
+            if cached and (
+                time.monotonic() - cached[1]
+            ) < self._COMMISSION_CACHE_TTL:
+                return dict(cached[0])
+
+            response = await self._request_with_retry(
+                "GET",
+                "/fapi/v1/commissionRate",
+                params={"symbol": normalized_symbol},
+                signed=True,
+            )
+            if not isinstance(response, dict):
+                raise BinanceAPIError(
+                    502,
+                    None,
+                    "commissionRate yanıtı nesne değil",
+                    "/fapi/v1/commissionRate",
+                )
+            response_symbol = str(response.get("symbol", normalized_symbol)).upper()
+            if response_symbol != normalized_symbol:
+                raise BinanceAPIError(
+                    502,
+                    None,
+                    f"commissionRate sembol uyuşmazlığı: {response_symbol}",
+                    "/fapi/v1/commissionRate",
+                )
+
+            validated = dict(response)
+            validated["symbol"] = normalized_symbol
+            validated["makerCommissionRate"] = self._validated_commission_decimal(
+                response.get("makerCommissionRate"), "makerCommissionRate"
+            )
+            validated["takerCommissionRate"] = self._validated_commission_decimal(
+                response.get("takerCommissionRate"), "takerCommissionRate"
+            )
+            self._commission_rates[normalized_symbol] = (
+                validated,
+                time.monotonic(),
+            )
+            return dict(validated)
 
     async def set_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
         try:
@@ -518,6 +785,20 @@ class ImprovedBinanceClient:
             params={"symbol": symbol, "orderId": order_id}, signed=True,
         )
 
+    async def get_order_by_client_id(
+        self, symbol: str, client_order_id: str
+    ) -> Dict[str, Any]:
+        """Emri deterministik istemci kimliğiyle sorgula.
+
+        POST yanıtı kaybolduğunda Binance sonucu "unknown" kabul edilmelidir;
+        aynı emri yeni bir kimlikle tekrar göndermek yerine bu uçla uzlaştırılır.
+        """
+        return await self._request_with_retry(
+            "GET", "/fapi/v1/order",
+            params={"symbol": symbol, "origClientOrderId": client_order_id},
+            signed=True,
+        )
+
     # --- Koşullu emirler: Algo Order API ------------------------------
     #
     # 2025-12-09'dan itibaren Binance USDⓈ-M Futures'ta koşullu emirler
@@ -536,20 +817,184 @@ class ImprovedBinanceClient:
     # kimliğini saklayan mevcut kod (PositionModel.sl_order_id vb.) değişmeden
     # çalışır.
 
+    async def get_algo_order(
+        self,
+        *,
+        algo_id: Optional[int] = None,
+        client_algo_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Koşullu emri ``algoId`` VEYA ``clientAlgoId`` ile sorgula."""
+        if (algo_id is None) == (client_algo_id is None):
+            raise ValueError(
+                "Tam olarak bir algo_id veya client_algo_id gönderilmelidir"
+            )
+
+        params: Dict[str, Any]
+        if algo_id is not None:
+            normalized_algo_id = int(algo_id)
+            if normalized_algo_id <= 0:
+                raise ValueError("algo_id pozitif olmalıdır")
+            params = {"algoId": normalized_algo_id}
+        else:
+            normalized_client_id = str(client_algo_id or "")
+            if not self._CLIENT_ALGO_ID_RE.fullmatch(normalized_client_id):
+                raise ValueError("client_algo_id Binance biçimine uymuyor")
+            params = {"clientAlgoId": normalized_client_id}
+
+        response = await self._request_with_retry(
+            "GET", "/fapi/v1/algoOrder", params=params, signed=True
+        )
+        if not isinstance(response, dict):
+            raise BinanceAPIError(
+                502, None, "algoOrder yanıtı nesne değil", "/fapi/v1/algoOrder"
+            )
+        return response
+
+    @staticmethod
+    def _conditional_post_needs_reconciliation(exc: Exception) -> bool:
+        """POST sonucu belirsiz veya istemci kimliği mükerrer mi?"""
+        if not isinstance(exc, BinanceAPIError):
+            # Transport/timeout/JSON decode gibi POST sonrası hatalarda emir
+            # eşleştirme motoruna ulaşmış olabilir.
+            return True
+        message = exc.msg.lower()
+        return (
+            exc.code == ERR_DUPLICATE_CLIENT_ORDER_ID
+            or exc.code in UNKNOWN_EXECUTION_CODES
+            or exc.status_code >= 500
+            or ("duplicate" in message and "client" in message)
+        )
+
+    @staticmethod
+    def _algo_query_not_found(exc: Exception) -> bool:
+        """Eventual-consistency sırasında henüz görünmeyen algo cevabı mı?"""
+        if not isinstance(exc, BinanceAPIError):
+            return False
+        message = exc.msg.lower()
+        return exc.code in {-2011, -2013} or "not exist" in message
+
+    @staticmethod
+    def _normalized_conditional_response(
+        response: Dict[str, Any],
+        *,
+        expected_client_algo_id: str,
+        reconciled: bool,
+    ) -> Dict[str, Any]:
+        """Algo cevabını doğrula ve eski ``orderId`` alias'ını ekle."""
+        if not isinstance(response, dict):
+            raise BinanceAPIError(
+                502, None, "algoOrder yanıtı nesne değil", "/fapi/v1/algoOrder"
+            )
+
+        normalized = dict(response)
+        returned_client_id = normalized.get("clientAlgoId")
+        if returned_client_id not in (None, "") and (
+            str(returned_client_id) != expected_client_algo_id
+        ):
+            raise BinanceAPIError(
+                502,
+                None,
+                "algoOrder clientAlgoId uyuşmazlığı",
+                "/fapi/v1/algoOrder",
+            )
+        normalized["clientAlgoId"] = expected_client_algo_id
+
+        algo_id = normalized.get("algoId")
+        try:
+            valid_algo_id = int(algo_id)
+        except (TypeError, ValueError) as exc:
+            raise BinanceAPIError(
+                502,
+                None,
+                f"algoOrder yanıtında geçersiz algoId: {algo_id!r}",
+                "/fapi/v1/algoOrder",
+            ) from exc
+        if valid_algo_id <= 0:
+            raise BinanceAPIError(
+                502,
+                None,
+                f"algoOrder yanıtında geçersiz algoId: {algo_id!r}",
+                "/fapi/v1/algoOrder",
+            )
+        normalized["algoId"] = valid_algo_id
+        # Geriye uyumluluk: bu alias gerçek tetiklenen orderId DEĞİL, algoId.
+        # Gerçek dolum emri Query Algo yanıtındaki actualOrderId alanındadır.
+        normalized["orderId"] = valid_algo_id
+        normalized["isAlgo"] = True
+        if reconciled:
+            normalized["reconciled"] = True
+        return normalized
+
     async def _place_conditional(
         self, symbol: str, params: Dict[str, Any], label: str
     ) -> Dict[str, Any]:
-        response = await self._request_with_retry(
-            "POST", "/fapi/v1/algoOrder",
-            params={"algoType": "CONDITIONAL", "symbol": symbol, **params},
-            signed=True,
+        # Bir mantıksal emir = bir clientAlgoId. _request_with_retry kendi
+        # denemelerinde base_params kopyaladığı için tüm POST retry'ları AYNI
+        # kimliği taşır; burada asla ikinci/yeni kimlik üretilmez.
+        client_algo_id = f"awa_{uuid.uuid4().hex}"
+        request_params = {
+            "algoType": "CONDITIONAL",
+            "symbol": symbol,
+            **params,
+            "clientAlgoId": client_algo_id,
+        }
+        reconciled = False
+        try:
+            response = await self._request_with_retry(
+                "POST",
+                "/fapi/v1/algoOrder",
+                params=request_params,
+                signed=True,
+            )
+            normalized = self._normalized_conditional_response(
+                response,
+                expected_client_algo_id=client_algo_id,
+                reconciled=False,
+            )
+        except Exception as post_error:
+            if not self._conditional_post_needs_reconciliation(post_error):
+                raise
+            # Cevap kaybı/5xx/-1007 veya -4116: yeni kimlikle kör tekrar yok.
+            # Binance'te aynı clientAlgoId ile kabul edilmiş emri sorgula.
+            # Yeni kayıt kısa süreli eventual-consistency gecikmesiyle -2013
+            # dönebildiği için yalnız GET, sınırlı ve kısa aralıklarla yinelenir.
+            last_query_error: Optional[Exception] = None
+            for delay in self._ALGO_RECONCILE_DELAYS:
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                try:
+                    response = await self.get_algo_order(
+                        client_algo_id=client_algo_id
+                    )
+                    break
+                except Exception as query_error:
+                    last_query_error = query_error
+                    if not self._algo_query_not_found(query_error) and not isinstance(
+                        query_error,
+                        (httpx.TransportError, TimeoutError),
+                    ):
+                        self.logger.error(
+                            f"{label}: clientAlgoId sorgusu kesin hata verdi "
+                            f"({client_algo_id}): {query_error}"
+                        )
+                        raise post_error from query_error
+            else:
+                self.logger.error(
+                    f"{label}: koşullu POST sonucu belirsiz ve clientAlgoId "
+                    f"uzlaştırılamadı ({client_algo_id}): {last_query_error}"
+                )
+                raise post_error from last_query_error
+            reconciled = True
+            normalized = self._normalized_conditional_response(
+                response,
+                expected_client_algo_id=client_algo_id,
+                reconciled=True,
+            )
+        self.logger.debug(
+            f"{label}: algoId={normalized['algoId']} "
+            f"clientAlgoId={client_algo_id} reconciled={reconciled}"
         )
-        algo_id = response.get("algoId")
-        # Eski çağıranlar için takma ad
-        response["orderId"] = algo_id
-        response["isAlgo"] = True
-        self.logger.debug(f"{label}: algoId={algo_id}")
-        return response
+        return normalized
 
     async def place_stop_loss(
         self,
@@ -573,7 +1018,8 @@ class ImprovedBinanceClient:
           yeni emir konup sonra eskisi iptal edilebilir ve pozisyon bir an bile
           korumasız kalmaz.
         """
-        stop_price = await self.quantize_price(symbol, stop_price)
+        side = side.upper()
+        stop_price = await self.quantize_protective_price(symbol, stop_price, side)
         if stop_price <= 0:
             raise BinanceAPIError(
                 400, ERR_PRECISION,
@@ -612,8 +1058,9 @@ class ImprovedBinanceClient:
         reduceOnly olmadan, pozisyon SL ile kapandıktan sonra bekleyen TP emri
         tetiklenirse TERS YÖNDE YENİ bir pozisyon açar.
         """
+        side = side.upper()
         quantity = await self.quantize_quantity(symbol, quantity)
-        stop_price = await self.quantize_price(symbol, stop_price)
+        stop_price = await self.quantize_protective_price(symbol, stop_price, side)
 
         if quantity <= 0:
             raise BinanceAPIError(
@@ -683,6 +1130,28 @@ class ImprovedBinanceClient:
                 return {"status": "ALREADY_GONE"}
             raise
 
+    async def cancel_order_by_client_id(
+        self, symbol: str, client_order_id: str
+    ) -> Dict[str, Any]:
+        """Normal emri istemci kimliğiyle idempotent olarak iptal et."""
+        try:
+            response = await self._request_with_retry(
+                "DELETE", "/fapi/v1/order",
+                params={"symbol": symbol, "origClientOrderId": client_order_id},
+                signed=True,
+            )
+            self.logger.info(
+                f"❌ Order iptal edildi: {symbol} clientOrderId={client_order_id}"
+            )
+            return response
+        except BinanceAPIError as e:
+            if e.code == -2011:
+                self.logger.debug(
+                    f"Order clientOrderId={client_order_id} zaten yok"
+                )
+                return {"status": "ALREADY_GONE"}
+            raise
+
     async def get_open_orders(self, symbol: str) -> List[Dict[str, Any]]:
         """Açık emirleri getir.
 
@@ -746,6 +1215,91 @@ class ImprovedBinanceClient:
             if float(p.get("positionAmt", 0)) != 0
         ]
 
+    async def get_income_history(
+        self,
+        *,
+        start_time_ms: Optional[int] = None,
+        end_time_ms: Optional[int] = None,
+        symbol: Optional[str] = None,
+        income_type: Optional[str] = None,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        """Get signed USD-M income rows for verified net-PnL accounting."""
+
+        params: Dict[str, Any] = {"limit": max(1, min(int(limit), 1000))}
+        if start_time_ms is not None:
+            params["startTime"] = int(start_time_ms)
+        if end_time_ms is not None:
+            params["endTime"] = int(end_time_ms)
+        if symbol:
+            params["symbol"] = str(symbol).upper()
+        if income_type:
+            params["incomeType"] = str(income_type).upper()
+
+        rows = await self._request_with_retry(
+            "GET", "/fapi/v1/income", params=params, signed=True
+        )
+        if not isinstance(rows, list):
+            raise BinanceAPIError(
+                502, None, "Income history yanıtı liste değil", "/fapi/v1/income"
+            )
+        return rows
+
+    async def get_account_trades(
+        self,
+        symbol: str,
+        *,
+        order_id: Optional[int] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """Sembolün imzalı gerçek fill/komisyon satırlarını getir.
+
+        Binance ``userTrades`` yanıtı her fill için ``commission``,
+        ``commissionAsset``, ``realizedPnl`` ve maker/taker bilgisini taşır.
+        Böylece tahmini brüt PnL yerine emir bazlı net muhasebe kurulabilir.
+        """
+        normalized_symbol = str(symbol).strip().upper()
+        if not normalized_symbol:
+            raise ValueError("Trade geçmişi için sembol boş olamaz")
+
+        params: Dict[str, Any] = {
+            "symbol": normalized_symbol,
+            "limit": max(1, min(int(limit), 1000)),
+        }
+        if order_id is not None and (start_time is not None or end_time is not None):
+            raise ValueError("order_id ile start_time/end_time birlikte gönderilemez")
+        if order_id is not None:
+            normalized_order_id = int(order_id)
+            if normalized_order_id <= 0:
+                raise ValueError("order_id pozitif olmalıdır")
+            params["orderId"] = normalized_order_id
+        if start_time is not None:
+            params["startTime"] = int(start_time)
+        if end_time is not None:
+            params["endTime"] = int(end_time)
+        if (
+            start_time is not None
+            and end_time is not None
+            and int(start_time) > int(end_time)
+        ):
+            raise ValueError("start_time end_time'dan büyük olamaz")
+
+        response = await self._request_with_retry(
+            "GET", "/fapi/v1/userTrades", params=params, signed=True
+        )
+        if not isinstance(response, list) or not all(
+            isinstance(row, dict) for row in response
+        ):
+            raise BinanceAPIError(
+                502,
+                None,
+                "userTrades yanıtı nesne listesi değil",
+                "/fapi/v1/userTrades",
+            )
+        return response
+
     async def get_current_price(self, symbol: str) -> Optional[float]:
         try:
             response = await self._request_with_retry(
@@ -755,6 +1309,64 @@ class ImprovedBinanceClient:
         except Exception as e:
             self.logger.error(f"Fiyat sorgusu hatası: {e}")
             return None
+
+    async def get_book_ticker(self, symbol: str) -> Dict[str, Any]:
+        """Sembolün anlık en iyi alış/satış kotasyonunu getir."""
+        response = await self._request_with_retry(
+            "GET", "/fapi/v1/ticker/bookTicker", params={"symbol": symbol}
+        )
+        if not isinstance(response, dict):
+            raise BinanceAPIError(
+                502, None, f"{symbol}: bookTicker yanıtı nesne değil"
+            )
+        try:
+            bid = float(response["bidPrice"])
+            ask = float(response["askPrice"])
+        except (KeyError, TypeError, ValueError) as e:
+            raise BinanceAPIError(
+                502, None, f"{symbol}: bookTicker fiyatları okunamadı ({e})"
+            ) from e
+        if bid <= 0 or ask <= 0 or bid > ask:
+            raise BinanceAPIError(
+                502, None, f"{symbol}: geçersiz bookTicker (bid={bid}, ask={ask})"
+            )
+        return response
+
+    # ------------------------------------------------------------------
+    # USDⓈ-M User Data Stream (API-key header, imzasız)
+    # ------------------------------------------------------------------
+
+    @property
+    def listen_key(self) -> Optional[str]:
+        return self._listen_key
+
+    async def create_listen_key(self) -> str:
+        response = await self._request_api_key_only(
+            "POST", "/fapi/v1/listenKey"
+        )
+        listen_key = response.get("listenKey")
+        if not isinstance(listen_key, str) or not listen_key:
+            raise BinanceAPIError(
+                502, None, "listenKey yanıtında geçerli anahtar yok",
+                "/fapi/v1/listenKey",
+            )
+        self._listen_key = listen_key
+        return listen_key
+
+    async def keepalive_listen_key(self) -> None:
+        if not self._listen_key:
+            raise RuntimeError("Keepalive için aktif listenKey yok")
+        await self._request_api_key_only("PUT", "/fapi/v1/listenKey")
+
+    async def delete_listen_key(self) -> None:
+        if not self._listen_key:
+            return
+        await self._request_api_key_only("DELETE", "/fapi/v1/listenKey")
+        self._listen_key = None
+
+    def invalidate_listen_key(self) -> None:
+        """Binance listenKeyExpired eventi sonrası local anahtarı unut."""
+        self._listen_key = None
 
     async def get_server_time(self) -> int:
         try:

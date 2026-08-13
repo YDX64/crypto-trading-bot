@@ -14,6 +14,9 @@ bağımlıdır. Strateji sınıflarının evaluate() metodları hiçbir IO/log
 
 from __future__ import annotations
 
+from dataclasses import replace
+from typing import Optional
+
 from src.core.config import settings
 from src.core.logger import app_logger
 from src.strategies.scalper.indicators import (
@@ -21,6 +24,8 @@ from src.strategies.scalper.indicators import (
     bollinger,
     bullish_divergence,
     cmf,
+    crossover,
+    crossunder,
     donchian,
     equal_level_clusters,
     equilibrium,
@@ -29,9 +34,12 @@ from src.strategies.scalper.indicators import (
     last_swing_high,
     last_swing_low,
     liquidity_sweep,
+    macd,
     market_structure,
     mfi_series,
+    nearest_level,
     rsi_series,
+    stoch_rsi_series,
     sweep_of_level,
     swing_points,
 )
@@ -42,6 +50,145 @@ from src.strategies.scalper.types import (
     StrategyContext,
     StrategyProtocol,
 )
+
+
+def apply_stop_atr_floor(signal: ScalpSignal, mult: float) -> ScalpSignal:
+    """Stop'u girişten en az ATR×mult uzağa genişlet (yalnız genişletir).
+
+    Yapısal stop (swing ucu / 40-mum dibi) düşen/yükselen piyasada girişin
+    kılpayı altında/üstünde kalabilir — fiyat zaten ucu yapıyorken yapısal
+    referans girişe yapışır ve pozisyon gürültüyle anında stoplanır
+    (2026-08-11 BEATUSDT: 4 giriş, hepsi saniyeler içinde SL). Bu taban,
+    stop mesafesini volatiliteye (ATR) bağlar; yapısal stop zaten ATR×mult'tan
+    uzaksa DOKUNULMAZ. Boyutlama stop mesafesinden türediği için USD riski
+    değişmez; risk kapısı [min_stop_pct, max_stop_pct] denetimi executor'da
+    aynen sürer.
+
+    mult<=0 veya signal.atr_5m<=0 → sinyal değişmeden döner.
+    """
+    if mult <= 0.0 or signal.atr_5m <= 0.0:
+        return signal
+    floor_distance = signal.atr_5m * mult
+    if signal.direction == Direction.LONG:
+        floored = signal.entry_price - floor_distance
+        if floored <= 0.0 or signal.stop_price <= floored:
+            return signal
+    else:
+        floored = signal.entry_price + floor_distance
+        if signal.stop_price >= floored:
+            return signal
+    return replace(signal, stop_price=floored)
+
+
+# fixed_roi stop tavanı: likidasyon (~-%95 ROI) ile SL arasında pay kalmalı.
+_FIXED_STOP_ROI_CAP_PCT = 70.0
+
+
+def apply_stop_policy(signal: ScalpSignal, cfg) -> ScalpSignal:
+    """Sinyal stopunu canlı/backtest ORTAK stop politikasından geçir.
+
+    - "structural" (varsayılan): yapısal stop + ATR tabanı
+      (apply_stop_atr_floor) — mevcut davranış birebir.
+    - "fixed_roi": stop mesafesi = fixed_stop_roi_pct / kaldıraç (fiyat %).
+      SL, marjın o yüzdesi kaybedilince vurur (2026-08-12 isteği: "SL çok
+      hızlı vuruyor, %50 marja esnet"). Risk boyutlama stop mesafesinden
+      türediği için işlem başına USD riski değişmez; pozisyon küçülür.
+
+    Engine (_evaluate_symbol) ve backtest (simulate_symbol) İKİSİ DE bunu
+    çağırır — parite bozulmamalı.
+    """
+    mode = str(getattr(cfg, "scalper_stop_mode", "structural") or "structural").lower()
+    if mode == "fixed_roi":
+        roi_pct = float(getattr(cfg, "scalper_fixed_stop_roi_pct", 0.0) or 0.0)
+        leverage = float(getattr(cfg, "scalper_leverage", 0) or 0)
+        resolved_leverage: Optional[int] = None
+        # Coin-bazlı dinamik kaldıraç: hedef stop mesafesi = ATR × mult olacak
+        # şekilde kaldıraç çözülür (SL yine marjın roi_pct'si; mesafe coin'in
+        # gerçek oynaklığını izler — sakin coin yüksek, vahşi coin düşük lev).
+        if (bool(getattr(cfg, "scalper_dynamic_leverage", False))
+                and signal.atr_5m > 0.0 and signal.entry_price > 0.0
+                and roi_pct > 0.0):
+            atr_pct = signal.atr_5m / signal.entry_price * 100.0
+            mult = float(getattr(cfg, "scalper_dyn_lev_stop_atr_mult", 3.0) or 3.0)
+            if atr_pct > 0.0 and mult > 0.0:
+                lo = max(1, int(getattr(cfg, "scalper_dyn_lev_min", 3) or 3))
+                hi = max(lo, int(getattr(cfg, "scalper_dyn_lev_max", 20) or 20))
+                raw = roi_pct / (mult * atr_pct)
+                resolved_leverage = max(lo, min(hi, int(round(raw))))
+                leverage = float(resolved_leverage)
+        if roi_pct <= 0.0 or leverage <= 0.0:
+            return signal
+        # Likidasyon koruması: ISOLATED'da likidasyon ≈ -%95 ROI civarındadır
+        # (mmr'a bağlı). %70 tavan, "biraz daha esnet" tırmanışının SL'i
+        # likidasyonun ötesine taşımasını engeller — SL'siz pozisyon marjın
+        # TAMAMINI + likidasyon ücretini kaybeder.
+        if roi_pct > _FIXED_STOP_ROI_CAP_PCT:
+            app_logger.warning(
+                f"⚠️ scalper_fixed_stop_roi_pct={roi_pct:g} tavana kırpıldı "
+                f"({_FIXED_STOP_ROI_CAP_PCT:g}): daha genişi likidasyona yaklaşır"
+            )
+            roi_pct = _FIXED_STOP_ROI_CAP_PCT
+        distance = signal.entry_price * (roi_pct / 100.0 / leverage)
+        if signal.direction == Direction.LONG:
+            stop = signal.entry_price - distance
+            if stop <= 0.0:
+                return signal
+        else:
+            stop = signal.entry_price + distance
+        return replace(signal, stop_price=stop, leverage=resolved_leverage)
+    return apply_stop_atr_floor(
+        signal, float(getattr(cfg, "scalper_stop_atr_floor_mult", 0.0) or 0.0)
+    )
+
+
+def passes_flow_confirm(ctx: StrategyContext, direction: Direction, enabled: bool) -> bool:
+    """Para akışı (MFI) dönüş teyidi.
+
+    LONG: MFI bir önceki mumda aşırı satım bölgesinde olmalı (≤ long_max) VE
+    son mumda yukarı dönmüş olmalı — akış hâlâ satış yönündeyken (düşen bıçak)
+    dip almayı engeller. SHORT tam aynası. Kapalıyken (enabled=False) her
+    zaman geçer.
+    """
+    if not enabled:
+        return True
+    period = int(getattr(settings, "scalper_c_flow_mfi_period", 14) or 14)
+    mfi = mfi_series(ctx.candles_5m, period)
+    if len(mfi) < 2 or len(ctx.candles_5m) <= period + 1:
+        return False
+    if direction == Direction.LONG:
+        long_max = float(getattr(settings, "scalper_c_flow_long_max", 30.0))
+        return mfi[-2] <= long_max and mfi[-1] > mfi[-2]
+    short_min = float(getattr(settings, "scalper_c_flow_short_min", 70.0))
+    return mfi[-2] >= short_min and mfi[-1] < mfi[-2]
+
+
+def passes_reversal_zone(ctx: StrategyContext, direction: Direction, enabled: bool) -> bool:
+    """Dönüş bölgesi teyidi: fiyat, tepki beklenen bir bölgede mi?
+
+    Bölge = order block (find_order_block: kurumsal emir bloğu) VEYA EQL/EQH
+    destek-direnç kümesi (equal_level_clusters). Yakınlık toleransı ATR×
+    scalper_c_zone_atr_tolerance — volatil sembolde kendiliğinden genişler.
+    "Boşlukta" (hiçbir yapısal seviyeye yaslanmadan) dip/tepe avlamayı
+    engeller. Kapalıyken her zaman geçer.
+    """
+    if not enabled:
+        return True
+    tolerance = (
+        float(getattr(settings, "scalper_c_zone_atr_tolerance", 0.75) or 0.0)
+        * ctx.atr_5m
+    )
+    if tolerance <= 0.0:
+        return False
+    price = ctx.current_price
+    ob = find_order_block(ctx.candles_5m, direction)
+    if ob is not None and (ob["low"] - tolerance) <= price <= (ob["high"] + tolerance):
+        return True
+    clusters = equal_level_clusters(
+        ctx.candles_5m,
+        tolerance_pct=settings.scalper_eqhl_tolerance_pct,
+    )
+    levels = clusters["eql"] if direction == Direction.LONG else clusters["eqh"]
+    return nearest_level(price, levels, tolerance) is not None
 
 
 def passes_equilibrium(ctx: StrategyContext, direction: Direction, enabled: bool) -> bool:
@@ -337,17 +484,36 @@ class StrategyC(StrategyProtocol):
 
         last = candles_5m[-1]
 
-        if (rsi_last < self._RSI_LONG_MAX
+        # Eşikler settings'ten (varsayılanlar sınıf sabitleriyle birebir) —
+        # aktivite ayarı backtest kanıtıyla env'den yapılır.
+        rsi_long_max = float(
+            getattr(settings, "scalper_c_rsi_long_max", self._RSI_LONG_MAX)
+        )
+        rsi_short_min = float(
+            getattr(settings, "scalper_c_rsi_short_min", self._RSI_SHORT_MIN)
+        )
+        require_div = bool(getattr(settings, "scalper_c_require_divergence", True))
+
+        if (rsi_last < rsi_long_max
                 and last.close < lower
-                and bullish_divergence(candles_5m, rsi_values, self._DIVERGENCE_LOOKBACK)):
+                and (not require_div
+                     or bullish_divergence(candles_5m, rsi_values, self._DIVERGENCE_LOOKBACK))):
             lookback_window = candles_5m[-self._STOP_LOOKBACK:]
             stop_price = min(c.low for c in lookback_window) * (1.0 - self._STOP_BUFFER)
             if stop_price >= ctx.current_price:
                 return None
             if not passes_equilibrium(ctx, Direction.LONG, settings.scalper_use_equilibrium_filter):
                 return None
+            if not passes_flow_confirm(
+                ctx, Direction.LONG, settings.scalper_c_require_flow_confirm
+            ):
+                return None
+            if not passes_reversal_zone(
+                ctx, Direction.LONG, settings.scalper_c_require_reversal_zone
+            ):
+                return None
 
-            score = (self._RSI_LONG_MAX - rsi_last) + max(0.0, lower - last.close) / atr_5m
+            score = (rsi_long_max - rsi_last) + max(0.0, lower - last.close) / atr_5m
             return ScalpSignal(
                 strategy=self.name,
                 symbol=ctx.symbol,
@@ -361,17 +527,26 @@ class StrategyC(StrategyProtocol):
                 risk_multiplier=self._RISK_MULTIPLIER,
             )
 
-        if (rsi_last > self._RSI_SHORT_MIN
+        if (rsi_last > rsi_short_min
                 and last.close > upper
-                and bearish_divergence(candles_5m, rsi_values, self._DIVERGENCE_LOOKBACK)):
+                and (not require_div
+                     or bearish_divergence(candles_5m, rsi_values, self._DIVERGENCE_LOOKBACK))):
             lookback_window = candles_5m[-self._STOP_LOOKBACK:]
             stop_price = max(c.high for c in lookback_window) * (1.0 + self._STOP_BUFFER)
             if stop_price <= ctx.current_price:
                 return None
             if not passes_equilibrium(ctx, Direction.SHORT, settings.scalper_use_equilibrium_filter):
                 return None
+            if not passes_flow_confirm(
+                ctx, Direction.SHORT, settings.scalper_c_require_flow_confirm
+            ):
+                return None
+            if not passes_reversal_zone(
+                ctx, Direction.SHORT, settings.scalper_c_require_reversal_zone
+            ):
+                return None
 
-            score = (rsi_last - self._RSI_SHORT_MIN) + max(0.0, last.close - upper) / atr_5m
+            score = (rsi_last - rsi_short_min) + max(0.0, last.close - upper) / atr_5m
             return ScalpSignal(
                 strategy=self.name,
                 symbol=ctx.symbol,
@@ -597,7 +772,158 @@ class StrategyD(StrategyProtocol):
         )
 
 
-ALL_STRATEGIES: list[StrategyProtocol] = [StrategyA(), StrategyB(), StrategyC(), StrategyD()]
+class StrategyE(StrategyProtocol):
+    """E — S/R seviyesinde osilatör kesişimi (dönüş avcısı).
+
+    Fikir: bir destek/direnç seviyesi TEK BAŞINA giriş sebebi değildir;
+    osilatör kesişimi de tek başına değildir. İkisi AYNI ANDA oluştuğunda
+    (fiyat çok test edilmiş bir seviyeye değmişken momentum dönüyorsa)
+    dönüş işlemi açılır.
+
+    Neden bu tasarım: backtest'te tek pozitif strateji B'ydi ve B, en çok
+    teyit katmanı isteyen stratejiydi (RSI ucu + BB bandı + swing yapısı +
+    dönüş mumu + 15m bağlam). Diğerleri tek/iki koşulla giriyor ve zarar
+    ediyor. E, aynı "çoklu teyit" disiplinini S/R + kesişim ekseninde kurar.
+
+    Bileşenler:
+      1. Seviye: equal_level_clusters() — EQL destek, EQH direnç. Seviyenin
+         `count` alanı kaç pivotun üst üste bindiğini, yani seviyenin ne
+         kadar çok test edildiğini verir; minimum dokunuş sayısı aranır.
+      2. Yakınlık: fiyat seviyeye ATR cinsinden yakın olmalı (sabit yüzde
+         değil) — volatil sembolde tolerans kendiliğinden genişler.
+      3. Kesişim: Stochastic RSI %K, %D'yi aşağıdan yukarı keser (LONG) ve
+         kesişim aşırı satım bölgesinde gerçekleşir. SHORT aynası.
+      4. Momentum teyidi: MACD histogramı kesişim yönünde toparlıyor olmalı.
+      5. Mum teyidi: son mum dönüş yönünde kapanmalı.
+
+    Stop YAPISALDIR: seviyenin hemen ötesi. Seviye kırılırsa tez geçersizdir,
+    bu yüzden stop tam oraya konur — keyfi bir yüzde değil.
+
+    Rejim kapısı settings.scalper_e_allowed_regimes ile daraltılabilir
+    (varsayılan "UP,DOWN,RANGE"). UNKNOWN her zaman engellidir.
+    """
+
+    name = "E"
+
+    _RSI_PERIOD = 14
+    _STOCH_PERIOD = 14
+    _K_SMOOTH = 3
+    _D_SMOOTH = 3
+    _K_OVERSOLD = 30.0
+    _K_OVERBOUGHT = 70.0
+    _LEVEL_LOOKBACK = 80
+    _MIN_TOUCHES = 2
+    _MAX_LEVEL_DISTANCE_ATR = 0.75
+    _ATR_PERIOD = 14
+    _STOP_BUFFER = 0.0015
+    _MIN_CANDLES = 60
+
+    def _allowed(self, ctx: StrategyContext) -> bool:
+        raw = getattr(settings, "scalper_e_allowed_regimes", "UP,DOWN,RANGE")
+        allowed = {name.strip().upper() for name in str(raw).split(",") if name.strip()}
+        if ctx.regime == Regime.UNKNOWN:
+            return False
+        return ctx.regime.value in allowed
+
+    def evaluate(self, ctx: StrategyContext) -> ScalpSignal | None:
+        if not self._allowed(ctx):
+            return None
+
+        candles_5m = ctx.candles_5m
+        if len(candles_5m) < self._MIN_CANDLES:
+            return None
+
+        atr_5m = ctx.atr_5m
+        if atr_5m <= 0.0:
+            return None
+
+        price = ctx.current_price
+        if price <= 0.0:
+            return None
+
+        closes = [c.close for c in candles_5m]
+        k_series, d_series = stoch_rsi_series(
+            closes, self._RSI_PERIOD, self._STOCH_PERIOD,
+            self._K_SMOOTH, self._D_SMOOTH,
+        )
+        if len(k_series) < 2:
+            return None
+
+        _macd_line, _signal_line, hist = macd(closes)
+        if len(hist) < 2:
+            return None
+
+        tolerance = float(getattr(settings, "scalper_eqhl_tolerance_pct", 0.05))
+        clusters = equal_level_clusters(
+            candles_5m, tolerance_pct=tolerance, lookback=self._LEVEL_LOOKBACK
+        )
+        max_distance = atr_5m * self._MAX_LEVEL_DISTANCE_ATR
+        last = candles_5m[-1]
+
+        # --- LONG: destekte yukarı kesişim ---
+        if crossover(k_series, d_series) and k_series[-2] <= self._K_OVERSOLD:
+            supports = [lv for lv in clusters["eql"]
+                        if lv.get("count", 0) >= self._MIN_TOUCHES]
+            level = nearest_level(price, supports, max_distance)
+            if (
+                level is not None
+                and hist[-1] > hist[-2]
+                and last.close > last.open
+            ):
+                stop_price = float(level["price"]) * (1.0 - self._STOP_BUFFER)
+                if stop_price < price and passes_equilibrium(
+                    ctx, Direction.LONG, settings.scalper_use_equilibrium_filter
+                ):
+                    return ScalpSignal(
+                        strategy=self.name,
+                        symbol=ctx.symbol,
+                        direction=Direction.LONG,
+                        entry_price=price,
+                        stop_price=stop_price,
+                        reason=(
+                            f"Destek {level['price']:.6g} ({level['count']} dokunuş) + "
+                            f"StochRSI yukarı kesişim (K {k_series[-1]:.0f}) + MACD teyidi"
+                        ),
+                        regime=ctx.regime,
+                        atr_5m=atr_5m,
+                        score=float(level["count"]) + max(0.0, self._K_OVERSOLD - k_series[-2]) / 10.0,
+                    )
+
+        # --- SHORT: dirençte aşağı kesişim ---
+        if crossunder(k_series, d_series) and k_series[-2] >= self._K_OVERBOUGHT:
+            resistances = [lv for lv in clusters["eqh"]
+                           if lv.get("count", 0) >= self._MIN_TOUCHES]
+            level = nearest_level(price, resistances, max_distance)
+            if (
+                level is not None
+                and hist[-1] < hist[-2]
+                and last.close < last.open
+            ):
+                stop_price = float(level["price"]) * (1.0 + self._STOP_BUFFER)
+                if stop_price > price and passes_equilibrium(
+                    ctx, Direction.SHORT, settings.scalper_use_equilibrium_filter
+                ):
+                    return ScalpSignal(
+                        strategy=self.name,
+                        symbol=ctx.symbol,
+                        direction=Direction.SHORT,
+                        entry_price=price,
+                        stop_price=stop_price,
+                        reason=(
+                            f"Direnç {level['price']:.6g} ({level['count']} dokunuş) + "
+                            f"StochRSI aşağı kesişim (K {k_series[-1]:.0f}) + MACD teyidi"
+                        ),
+                        regime=ctx.regime,
+                        atr_5m=atr_5m,
+                        score=float(level["count"]) + max(0.0, k_series[-2] - self._K_OVERBOUGHT) / 10.0,
+                    )
+
+        return None
+
+
+ALL_STRATEGIES: list[StrategyProtocol] = [
+    StrategyA(), StrategyB(), StrategyC(), StrategyD(), StrategyE(),
+]
 
 _STRATEGY_BY_NAME: dict[str, StrategyProtocol] = {s.name: s for s in ALL_STRATEGIES}
 

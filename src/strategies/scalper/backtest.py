@@ -30,12 +30,14 @@ import argparse
 import asyncio
 import bisect
 import json
+import math
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from src.core.config import settings
 from src.core.logger import app_logger
@@ -43,7 +45,7 @@ from src.strategies.scalper.data import KlineFetcher
 from src.strategies.scalper.indicators import atr, chandelier_stop
 from src.strategies.scalper.regime import detect_regime
 from src.strategies.scalper.scanner import UniverseScanner
-from src.strategies.scalper.setups import get_enabled
+from src.strategies.scalper.setups import apply_stop_policy, get_enabled
 from src.strategies.scalper.types import (
     Candle,
     Direction,
@@ -58,7 +60,9 @@ from src.strategies.scalper.types import (
 # --------------------------------------------------------------------------
 
 # Kline çekme: aralığa göre günlük mum sayısı ve sayfalama arası bekleme.
-_CANDLES_PER_DAY: Dict[str, int] = {"5m": 288, "15m": 96, "4h": 6}
+_CANDLES_PER_DAY: Dict[str, int] = {
+    "1m": 1440, "3m": 480, "5m": 288, "15m": 96, "30m": 48, "1h": 24, "4h": 6,
+}
 _REQUEST_DELAY_SECONDS = 0.3
 _MAX_PAGE_LIMIT = 1500  # Binance futures klines tek istekte azami mum sayısı
 
@@ -66,6 +70,17 @@ _MAX_PAGE_LIMIT = 1500  # Binance futures klines tek istekte azami mum sayısı
 _CTX_5M_WINDOW = 150
 _CTX_15M_WINDOW = 100
 _CTX_4H_WINDOW = 250
+
+# Sonuç penceresinden ÖNCE çekilen sabit bağlam. Bu mumlar yalnız indikatör
+# ve rejim seed'i içindir; test metriğine/sinyal üretim penceresine girmez.
+# Değerler canlı motorun her turda istediği bağlamla birebirdir.
+BACKTEST_WARMUP_CANDLES: Dict[str, int] = {
+    "5m": _CTX_5M_WINDOW,
+    "15m": _CTX_15M_WINDOW,
+    "4h": _CTX_4H_WINDOW,
+}
+
+_MILLISECONDS_PER_DAY = 86_400_000
 
 # Maliyet modeli.
 # NOT: komisyon oranları artık settings'ten okunur (scalper_taker_fee_pct /
@@ -136,9 +151,22 @@ async def fetch_paginated(
         remaining = total_needed - len(collected)
         limit = min(page_limit, max(remaining, 1))
 
-        batch = await fetch(symbol, interval, limit, cursor_end)
-        if not batch:
+        raw_batch = await fetch(symbol, interval, limit, cursor_end)
+        if not raw_batch:
             break  # Borsa bu sembol/aralık için daha eski veri döndürmedi.
+
+        # Binance `endTime` seçiminde kline open_time'ını kullanabilir; tam
+        # tarihsel sınırda açılan ama sınırdan SONRA kapanan mum bu nedenle
+        # yanıta girebilir. Backtest yalnız o anda kapanmış mumları görmeli.
+        batch = [candle for candle in raw_batch if candle.close_time <= cursor_end]
+        if not batch:
+            # Yalnız sınır-sonrası mum geldiyse bir önceki open_time'ın
+            # gerisine ilerle; aksi halde aynı sayfayı sonsuza dek isteme.
+            next_cursor = min(candle.open_time for candle in raw_batch) - 1
+            if next_cursor >= cursor_end:
+                break
+            cursor_end = next_cursor
+            continue
 
         collected = batch + collected
         cursor_end = batch[0].open_time - 1
@@ -149,14 +177,47 @@ async def fetch_paginated(
     return collected
 
 
+def resolve_timeframes(cfg: Any) -> Tuple[str, str, str]:
+    """(entry, context, regime) zaman dilimi üçlüsünü cfg'den çöz.
+
+    Varsayılan 5m/15m/4h tarihsel davranışla birebir; canlı motor da aynı
+    ayarları okur (engine._evaluate_symbol) — parite korunur.
+    """
+    return (
+        str(getattr(cfg, "scalper_tf_entry", "5m") or "5m"),
+        str(getattr(cfg, "scalper_tf_context", "15m") or "15m"),
+        str(getattr(cfg, "scalper_tf_regime", "4h") or "4h"),
+    )
+
+
+# Rol → warm-up penceresi (entry/context/regime, canlı bağlam boylarıyla aynı).
+_WARMUP_BY_ROLE: Tuple[int, int, int] = (
+    _CTX_5M_WINDOW, _CTX_15M_WINDOW, _CTX_4H_WINDOW
+)
+
+
 async def gather_symbol_data(
-    fetch: FetchFn, symbol: str, days: int, end_time: Optional[int] = None
+    fetch: FetchFn, symbol: str, days: int, end_time: Optional[int] = None,
+    timeframes: Tuple[str, str, str] = ("5m", "15m", "4h"),
 ) -> Dict[str, List[Candle]]:
-    """Bir sembol için 5m/15m/4h tarihsel mum verisini `days` günlük derinlikte
-    toplar."""
+    """Bir sembol için test penceresi + sabit warm-up mumlarını toplar.
+
+    Warm-up mumları yalnız bağlam/indikatör seed'i içindir. `run_backtest`,
+    `simulate_symbol(..., test_start_time_ms=...)` ile sinyal üretimini istenen
+    `days` penceresine sınırlar; böylece ilk günler eksik EMA/RSI ile ölçülmez.
+
+    `timeframes` = (entry, context, regime); desteklenmeyen aralıkta açık
+    ValueError (sessiz yanlış veri yerine).
+    """
     out: Dict[str, List[Candle]] = {}
-    for interval, per_day in _CANDLES_PER_DAY.items():
-        needed = days * per_day
+    for interval, warmup in zip(timeframes, _WARMUP_BY_ROLE):
+        per_day = _CANDLES_PER_DAY.get(interval)
+        if per_day is None:
+            raise ValueError(
+                f"Desteklenmeyen zaman dilimi: {interval!r} "
+                f"(bilinenler: {sorted(_CANDLES_PER_DAY)})"
+            )
+        needed = days * per_day + warmup
         out[interval] = await fetch_paginated(fetch, symbol, interval, needed, end_time=end_time)
     return out
 
@@ -353,6 +414,29 @@ def open_position(
     if not (cfg.scalper_min_stop_pct <= stop_distance_pct <= cfg.scalper_max_stop_pct):
         return None
 
+    # Canlı executor ile aynı minimum R:R kapısı. Beklenen runner getirisi
+    # muhafazakâr biçimde TP1'e eşit varsayılır; eşik <= 0 ise kapı kapalıdır.
+    min_rr = float(getattr(cfg, "scalper_min_rr", 0.0) or 0.0)
+    if min_rr > 0.0:
+        tp1_frac = cfg.scalper_tp1_fraction
+        tp2_frac = cfg.scalper_tp2_fraction
+        runner_frac = max(0.0, 1.0 - tp1_frac - tp2_frac)
+        expected_roi = (
+            cfg.scalper_tp1_roi * tp1_frac
+            + cfg.scalper_tp2_roi * tp2_frac
+            + cfg.scalper_tp1_roi * runner_frac
+        )
+        sl_risk_roi = stop_distance_pct * (
+            int(getattr(signal, "leverage", None) or 0) or cfg.scalper_leverage
+        )
+        rr = expected_roi / sl_risk_roi if sl_risk_roi > 0.0 else 0.0
+        if rr < min_rr:
+            if missed_counter is not None:
+                missed_counter["min_rr_rejected"] = (
+                    missed_counter.get("min_rr_rejected", 0) + 1
+                )
+            return None
+
     price_distance = abs(entry_hint - stop_price)
     if price_distance <= 0:
         return None
@@ -383,7 +467,8 @@ def open_position(
     risk_amount = balance * (cfg.scalper_risk_percentage / 100.0) * signal.risk_multiplier
     qty = risk_amount / price_distance
 
-    leverage = cfg.scalper_leverage
+    # Canlı parite: sinyalin coin-bazlı dinamik kaldıracı öncelikli.
+    leverage = int(getattr(signal, "leverage", None) or 0) or cfg.scalper_leverage
     margin_pct = getattr(cfg, "scalper_max_margin_pct", 50.0) / 100.0
     nominal_cap = balance * leverage * margin_pct
     nominal = qty * entry_hint
@@ -621,10 +706,16 @@ def simulate_symbol(
     cfg: Any,
     initial_balance: float = _DEFAULT_VIRTUAL_BALANCE,
     missed_counter: Optional[Dict[str, int]] = None,
+    test_start_time_ms: Optional[int] = None,
 ) -> List[BacktestTrade]:
     """Bir sembol için TEK eşzamanlı pozisyonla tam backtest simülasyonu.
     AĞ YOK — yalnız zaten çekilmiş mum listeleri üzerinde çalışır (saf,
-    test edilebilir)."""
+    test edilebilir).
+
+    `test_start_time_ms` verilirse daha eski mumlar yalnız warm-up bağlamı
+    olarak kullanılır; o zamandan önce sinyal/işlem üretilmez ve dolayısıyla
+    sonuç metriklerine dahil edilmez.
+    """
     trades: List[BacktestTrade] = []
     n5 = len(candles_5m)
     if n5 < 2:
@@ -635,10 +726,24 @@ def simulate_symbol(
     close_times_4h = [c.close_time for c in candles_4h]
 
     leverage = cfg.scalper_leverage
-    i = 0
+    # Canlı parite: ortak stop politikası + kayıp sonrası sembol cooldown'u
+    # (engine.apply_stop_policy + executor.start_loss_cooldown karşılığı).
+    loss_cooldown_ms = int(
+        float(getattr(cfg, "scalper_loss_cooldown_minutes", 0) or 0) * 60_000
+    )
+    cooldown_until_ms = 0
+    i = (
+        bisect.bisect_left(close_times_5m, test_start_time_ms)
+        if test_start_time_ms is not None
+        else 0
+    )
     while i < n5:
         if i + 1 >= n5:
             break  # dolum yapılacak sonraki mum yok
+
+        if loss_cooldown_ms > 0 and close_times_5m[i] < cooldown_until_ms:
+            i += 1
+            continue
 
         ctx = build_context(
             symbol, candles_5m, candles_15m, candles_4h, i, leverage,
@@ -649,7 +754,7 @@ def simulate_symbol(
         for strat in strategies:
             sig = strat.evaluate(ctx)
             if sig is not None:
-                signal = sig
+                signal = apply_stop_policy(sig, cfg)
                 break
 
         if signal is None:
@@ -663,6 +768,8 @@ def simulate_symbol(
 
         trade = manage_position(pos, candles_5m, cfg)
         trades.append(trade)
+        if loss_cooldown_ms > 0 and (trade.exit_reason == "SL" or trade.pnl < 0.0):
+            cooldown_until_ms = trade.exit_time + loss_cooldown_ms
         i = trade.exit_idx + 1
 
     return trades
@@ -789,7 +896,7 @@ def print_report(
 
     if missed_counter is not None:
         missed_total = sum(missed_counter.values())
-        print(f"Kaçan sinyal (maker limit timeout içinde dolmadı): {missed_total}")
+        print(f"Kapılarda reddedilen/kaçan sinyal: {missed_total} {dict(missed_counter)}")
 
     print()
     _print_regime_breakdown(all_trades)
@@ -826,12 +933,101 @@ def _print_regime_breakdown(all_trades: List[BacktestTrade]) -> None:
     print("=" * len(header) + "\n")
 
 
+def _utc_iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _ms_to_utc_iso(timestamp_ms: int) -> str:
+    return (
+        datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _git_provenance() -> Dict[str, Any]:
+    """Raporun üretildiği checkout'un commit ve dirty durumunu döndürür.
+
+    Git bulunamazsa rapor yine yazılır; bilinmeyen alanlar None olur. Shell
+    kullanılmaz ve komutlar repo köküne sabitlenir.
+    """
+    repo_root = Path(__file__).resolve().parents[3]
+    try:
+        sha_result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=True,
+        )
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=True,
+        )
+        return {
+            "git_sha": sha_result.stdout.strip() or None,
+            "git_dirty": bool(status_result.stdout.strip()),
+        }
+    except (OSError, subprocess.SubprocessError):
+        return {"git_sha": None, "git_dirty": None}
+
+
+def scalper_config_snapshot(cfg: Any) -> Dict[str, Any]:
+    """`cfg` içindeki tüm `scalper_` ayarlarının JSON-uyumlu görüntüsü.
+
+    Pydantic Settings ve testlerdeki dataclass/sade nesneler desteklenir.
+    Prefix filtresi sayesinde API anahtarı gibi alakasız/gizli ayarlar rapora
+    yanlışlıkla girmez.
+    """
+    if hasattr(cfg, "model_dump"):
+        raw = cfg.model_dump()
+    else:
+        raw = vars(cfg)
+    return {
+        name: raw[name]
+        for name in sorted(raw)
+        if name.startswith("scalper_")
+    }
+
+
+def _candle_window_snapshot(
+    candles: List[Candle], test_start_time_ms: int,
+) -> Dict[str, Any]:
+    if not candles:
+        return {
+            "candles_fetched": 0,
+            "candles_in_test_window": 0,
+            "fetched_start_ms": None,
+            "fetched_start_utc": None,
+            "fetched_end_ms": None,
+            "fetched_end_utc": None,
+        }
+    return {
+        "candles_fetched": len(candles),
+        "candles_in_test_window": sum(
+            1 for candle in candles if candle.close_time >= test_start_time_ms
+        ),
+        "fetched_start_ms": candles[0].open_time,
+        "fetched_start_utc": _ms_to_utc_iso(candles[0].open_time),
+        "fetched_end_ms": candles[-1].close_time,
+        "fetched_end_utc": _ms_to_utc_iso(candles[-1].close_time),
+    }
+
+
 def write_json_report(
     all_trades: List[BacktestTrade],
     days: int,
     symbols: List[str],
     strategy_names: str,
     missed_counter: Optional[Dict[str, int]] = None,
+    cfg: Any = settings,
+    run_metadata: Optional[Dict[str, Any]] = None,
+    output_dir: str | Path = "logs",
 ) -> str:
     by_strategy = _group_by_strategy(all_trades)
     by_strategy_regime = _group_by_strategy_regime(all_trades)
@@ -842,9 +1038,32 @@ def write_json_report(
         for strategy_name, regimes in by_strategy_regime.items()
     }
 
+    metadata = run_metadata or {}
+    git_state = _git_provenance()
+    provenance = {
+        "git_sha": metadata.get("git_sha", git_state["git_sha"]),
+        "git_dirty": metadata.get("git_dirty", git_state["git_dirty"]),
+        "scalper_config": metadata.get(
+            "scalper_config", scalper_config_snapshot(cfg)
+        ),
+        "test_window": metadata.get(
+            "test_window", {"requested_days": days, "start_ms": None, "end_ms": None}
+        ),
+        "warmup_candles": metadata.get(
+            "warmup_candles", dict(BACKTEST_WARMUP_CANDLES)
+        ),
+        "universe_snapshot": metadata.get(
+            "universe_snapshot",
+            {"selection_mode": "provided", "symbols": list(symbols)},
+        ),
+        "data_windows": metadata.get("data_windows", {}),
+        "data_source_base_url": metadata.get("data_source_base_url"),
+    }
+
     payload = {
-        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "generated_at": _utc_iso_now(),
         "params": {"days": days, "symbols": symbols, "strategies": strategy_names},
+        "provenance": provenance,
         "overall": compute_stats(all_trades),
         "by_strategy": {name: compute_stats(ts) for name, ts in by_strategy.items()},
         "regime_breakdown": regime_breakdown,
@@ -852,15 +1071,34 @@ def write_json_report(
         "trades": [t.to_dict() for t in all_trades],
     }
 
-    logs_dir = Path("logs")
-    logs_dir.mkdir(exist_ok=True)
-    filename = f"backtest_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+    logs_dir = Path(output_dir)
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"backtest_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
     path = logs_dir / filename
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+        json.dump(
+            _strict_json_value(payload),
+            f,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+            allow_nan=False,
+        )
 
     app_logger.info(f"📄 Backtest raporu yazıldı: {path}")
     return str(path)
+
+
+def _strict_json_value(value: Any) -> Any:
+    """Replace non-finite floats so reports remain standards-compliant JSON."""
+
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _strict_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_strict_json_value(item) for item in value]
+    return value
 
 
 # ==========================================================================
@@ -875,31 +1113,79 @@ async def run_backtest(
     base_url: str = "https://fapi.binance.com",
     cfg: Any = settings,
     missed_counter: Optional[Dict[str, int]] = None,
+    run_metadata: Optional[Dict[str, Any]] = None,
+    end_time_ms: Optional[int] = None,
 ) -> List[BacktestTrade]:
     """Verilen semboller için tarihsel veriyi çeker ve tüm stratejileri
     simüle eder; tüm işlemleri (tüm semboller birleşik) döndürür.
 
-    `missed_counter` verilirse (mutasyonla) maker modda timeout içinde
-    dolmayan sinyallerin sayısı buraya birikir (tüm semboller toplamı)."""
+    `missed_counter` verilirse (mutasyonla) kapılarda reddedilen/timeout olan
+    sinyallerin sayısı buraya birikir (tüm semboller toplamı).
+
+    `end_time_ms` tüm sembol ve aralıklara aynı sabit test bitişini uygular.
+    `run_metadata` verilirse gerçek veri pencereleri ve yeniden üretilebilirlik
+    bilgileri bu sözlüğe yazılır.
+    """
+    if days <= 0:
+        raise ValueError("Backtest gün sayısı pozitif olmalı")
+
     strategies = get_enabled(strategy_names)
     if not strategies:
         raise ValueError(f"Geçerli scalper stratejisi bulunamadı: '{strategy_names}'")
+
+    test_end_time_ms = end_time_ms if end_time_ms is not None else int(time.time() * 1000)
+    test_start_time_ms = test_end_time_ms - days * _MILLISECONDS_PER_DAY
+    metadata = {
+        **_git_provenance(),
+        "scalper_config": scalper_config_snapshot(cfg),
+        "test_window": {
+            "requested_days": days,
+            "start_ms": test_start_time_ms,
+            "start_utc": _ms_to_utc_iso(test_start_time_ms),
+            "end_ms": test_end_time_ms,
+            "end_utc": _ms_to_utc_iso(test_end_time_ms),
+        },
+        "warmup_candles": dict(BACKTEST_WARMUP_CANDLES),
+        "universe_snapshot": {
+            "captured_at": _utc_iso_now(),
+            "selection_mode": "provided",
+            "symbols": list(symbols),
+        },
+        "data_windows": {},
+        "data_source_base_url": base_url,
+    }
+    if run_metadata is not None:
+        run_metadata.clear()
+        run_metadata.update(metadata)
 
     fetcher = KlineFetcher(base_url=base_url)
     throttled = _ThrottledFetch(fetcher.get_klines)
 
     all_trades: List[BacktestTrade] = []
     try:
+        timeframes = resolve_timeframes(cfg)
+        tf_entry, tf_context, tf_regime = timeframes
         for symbol in symbols:
             app_logger.info(f"📥 {symbol}: tarihsel veri çekiliyor ({days} gün)...")
-            data = await gather_symbol_data(throttled, symbol, days)
-            candles_5m, candles_15m, candles_4h = data["5m"], data["15m"], data["4h"]
+            data = await gather_symbol_data(
+                throttled, symbol, days, end_time=test_end_time_ms,
+                timeframes=timeframes,
+            )
+            candles_5m = data[tf_entry]
+            candles_15m = data[tf_context]
+            candles_4h = data[tf_regime]
+            metadata["data_windows"][symbol] = {
+                interval: _candle_window_snapshot(candles, test_start_time_ms)
+                for interval, candles in data.items()
+            }
             app_logger.info(
-                f"📊 {symbol}: 5m={len(candles_5m)} 15m={len(candles_15m)} 4h={len(candles_4h)} mum toplandı"
+                f"📊 {symbol}: {tf_entry}={len(candles_5m)} {tf_context}={len(candles_15m)} "
+                f"{tf_regime}={len(candles_4h)} mum toplandı"
             )
             trades = simulate_symbol(
                 symbol, candles_5m, candles_15m, candles_4h, strategies, cfg,
                 missed_counter=missed_counter,
+                test_start_time_ms=test_start_time_ms,
             )
             app_logger.info(f"✅ {symbol}: {len(trades)} işlem simüle edildi")
             all_trades.extend(trades)
@@ -944,9 +1230,22 @@ async def main_async(args: argparse.Namespace) -> None:
     )
 
     missed_counter: Dict[str, int] = {}
+    run_metadata: Dict[str, Any] = {}
     all_trades = await run_backtest(
-        days=args.days, symbols=symbols, strategy_names=args.strategies, missed_counter=missed_counter,
+        days=args.days,
+        symbols=symbols,
+        strategy_names=args.strategies,
+        missed_counter=missed_counter,
+        run_metadata=run_metadata,
     )
+
+    universe_snapshot = run_metadata["universe_snapshot"]
+    universe_snapshot["selection_mode"] = (
+        "auto_current_24h_volume"
+        if args.symbols.strip().lower() == "auto"
+        else "explicit_symbols"
+    )
+    universe_snapshot["requested_arg"] = args.symbols
 
     print_report(all_trades, missed_counter=missed_counter)
     # NOT: src/core/logger.py loguru için sys.stdout.buffer'ı SARAN ayrı bir
@@ -955,7 +1254,15 @@ async def main_async(args: argparse.Namespace) -> None:
     # açabiliyor. logger.py'ye dokunmadan, kendi çıktımızı garantiye almak
     # için burada açıkça flush ediyoruz.
     sys.stdout.flush()
-    write_json_report(all_trades, args.days, symbols, args.strategies, missed_counter=missed_counter)
+    write_json_report(
+        all_trades,
+        args.days,
+        symbols,
+        args.strategies,
+        missed_counter=missed_counter,
+        cfg=settings,
+        run_metadata=run_metadata,
+    )
 
 
 def main() -> None:

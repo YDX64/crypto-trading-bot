@@ -12,21 +12,30 @@ deterministik ve karmaşık gerçek strateji koşullarına bağımlı değildir.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional
 
 import pytest
 
+import src.strategies.scalper.backtest as backtest_module
 from src.strategies.scalper.backtest import (
+    BACKTEST_WARMUP_CANDLES,
     BacktestTrade,
     OpenPosition,
     build_context,
     compute_stats,
     fetch_paginated,
+    gather_symbol_data,
     manage_position,
     open_position,
+    run_backtest,
+    scalper_config_snapshot,
     simulate_symbol,
+    write_json_report,
 )
+from src.strategies.scalper.regime import detect_regime
 from src.strategies.scalper.types import (
     Candle,
     Direction,
@@ -79,6 +88,7 @@ class _Cfg:
     scalper_taker_fee_pct: float = 0.05
     scalper_maker_fee_pct: float = 0.02
     scalper_maker_fill_timeout_candles: int = 3
+    scalper_min_rr: float = 1.2
 
 
 def _mk_signal(entry_price: float, stop_price: float,
@@ -147,6 +157,37 @@ class TestBuildContextLookAhead:
         ctx = build_context("BTCUSDT", candles_5m, [], [], index=399, leverage=20)
         assert len(ctx.candles_5m) == 150
         assert ctx.candles_5m[-1].close_time == candles_5m[399].close_time
+
+    def test_regime_requires_fixed_ema200_and_excludes_future_4h_candle(self):
+        interval_4h = 14_400_000
+        past_4h = [
+            _mk_candle(
+                i,
+                100.0 + i,
+                100.5 + i,
+                99.5 + i,
+                100.0 + i,
+                interval_ms=interval_4h,
+            )
+            for i in range(200)
+        ]
+        assert detect_regime(past_4h[:199]) == Regime.UNKNOWN
+        assert detect_regime(past_4h) == Regime.UP
+
+        # 200 kapanmış 4h mumunun hemen ardından uç bir GELECEK mumu ekle.
+        # 5m cutoff tam 200. 4h mumun kapanışına denk gelir; gelecek mum
+        # bağlama/rejime sızmamalı.
+        future_4h = _mk_candle(
+            200, 1.0, 1.0, 1.0, 1.0, interval_ms=interval_4h,
+        )
+        current_5m = _mk_candle(200 * 48 - 1, 299.0, 299.0, 299.0, 299.0)
+        ctx = build_context(
+            "BTCUSDT", [current_5m], [], past_4h + [future_4h], index=0, leverage=20,
+        )
+
+        assert len(ctx.candles_4h) == 200
+        assert future_4h not in ctx.candles_4h
+        assert ctx.regime == Regime.UP
 
 
 # --------------------------------------------------------------------------
@@ -324,6 +365,33 @@ class TestOpenPositionGates:
         nominal_cap = 10_000.0 * cfg.scalper_leverage * 0.5
         assert pos.qty_total * 100.0 == pytest.approx(nominal_cap)
 
+    def test_min_rr_gate_matches_live_formula(self):
+        # Beklenen harman ROI = 29; SL riski = %3 * 20x = 60;
+        # R:R = 0.483 < 1.2 -> canlı executor gibi reddedilmeli.
+        cfg = _Cfg(scalper_max_stop_pct=5.0, scalper_min_rr=1.2)
+        signal = _mk_signal(entry_price=100.0, stop_price=97.0)
+        candles_5m = [
+            _mk_candle(0, 100.0, 100.0, 100.0, 100.0),
+            _mk_candle(1, 100.0, 100.0, 100.0, 100.0),
+        ]
+        missed_counter: dict = {}
+
+        assert open_position(
+            signal, candles_5m, 0, cfg, balance=10_000.0,
+            missed_counter=missed_counter,
+        ) is None
+        assert missed_counter == {"min_rr_rejected": 1}
+
+    def test_min_rr_gate_can_be_disabled_like_live(self):
+        cfg = _Cfg(scalper_max_stop_pct=5.0, scalper_min_rr=0.0)
+        signal = _mk_signal(entry_price=100.0, stop_price=97.0)
+        candles_5m = [
+            _mk_candle(0, 100.0, 100.0, 100.0, 100.0),
+            _mk_candle(1, 100.0, 100.0, 100.0, 100.0),
+        ]
+
+        assert open_position(signal, candles_5m, 0, cfg, balance=10_000.0) is not None
+
 
 # --------------------------------------------------------------------------
 # simulate_symbol — tek eşzamanlı pozisyon + tarama/yönetim döngüsü
@@ -356,6 +424,29 @@ class TestSimulateSymbol:
         trades = simulate_symbol("TESTUSDT", [_mk_candle(0, 100, 100, 100, 100)], [], [],
                                   [_AlwaysLongStrategy()], cfg)
         assert trades == []
+
+    def test_warmup_candles_do_not_enter_requested_window_metrics(self):
+        cfg = _Cfg()
+        candles_5m: List[Candle] = []
+        for i in range(8):
+            if i % 2 == 0:
+                candles_5m.append(_mk_candle(i, 100.0, 100.1, 99.9, 100.0))
+            else:
+                candles_5m.append(_mk_candle(i, 100.0, 100.5, 90.0, 95.0))
+
+        test_start = candles_5m[4].close_time
+        trades = simulate_symbol(
+            "TESTUSDT",
+            candles_5m,
+            [],
+            [],
+            [_AlwaysLongStrategy()],
+            cfg,
+            test_start_time_ms=test_start,
+        )
+
+        assert [trade.exit_idx for trade in trades] == [5, 7]
+        assert all(trade.entry_time >= test_start for trade in trades)
 
 
 # --------------------------------------------------------------------------
@@ -441,6 +532,170 @@ class TestFetchPaginated:
         )
         assert result == all_candles
         assert len(result) == 30
+
+    @pytest.mark.asyncio
+    async def test_historical_end_time_excludes_candle_that_closes_after_boundary(self):
+        candles = [
+            _mk_candle(i, 100.0, 100.0, 100.0, 100.0)
+            for i in range(3)
+        ]
+        boundary = candles[2].open_time
+
+        async def open_time_filtered_exchange(
+            symbol, interval, limit, end_time=None,
+        ):
+            # Binance-benzeri davranış: endTime'a open_time ile dahil eder;
+            # son mum boundary'de açılır ama daha sonra kapanır.
+            eligible = [
+                candle for candle in candles
+                if end_time is None or candle.open_time <= end_time
+            ]
+            return eligible[-limit:]
+
+        result = await fetch_paginated(
+            open_time_filtered_exchange,
+            "BTCUSDT",
+            "5m",
+            total_needed=2,
+            end_time=boundary,
+            page_limit=2,
+        )
+
+        assert result == candles[:2]
+        assert all(candle.close_time <= boundary for candle in result)
+
+
+class TestBacktestWarmupAndProvenance:
+    @pytest.mark.asyncio
+    async def test_gather_fetches_fixed_live_context_warmup(self):
+        interval_ms = {"5m": 300_000, "15m": 900_000, "4h": 14_400_000}
+        expected = {
+            "5m": 288 + BACKTEST_WARMUP_CANDLES["5m"],
+            "15m": 96 + BACKTEST_WARMUP_CANDLES["15m"],
+            "4h": 6 + BACKTEST_WARMUP_CANDLES["4h"],
+        }
+        available = {
+            interval: [
+                _mk_candle(i, 100.0, 100.0, 100.0, 100.0, interval_ms=interval_ms[interval])
+                for i in range(count)
+            ]
+            for interval, count in expected.items()
+        }
+
+        async def fake_fetch(symbol, interval, limit, end_time=None):
+            candles = available[interval]
+            eligible = [c for c in candles if end_time is None or c.open_time <= end_time]
+            return eligible[-limit:]
+
+        data = await gather_symbol_data(
+            fake_fetch, "BTCUSDT", days=1, end_time=10**15,
+        )
+
+        assert {interval: len(candles) for interval, candles in data.items()} == expected
+
+    @pytest.mark.asyncio
+    async def test_run_backtest_wires_warmup_boundary_and_metadata(self, monkeypatch):
+        interval_ms = {"5m": 300_000, "15m": 900_000, "4h": 14_400_000}
+
+        class FakeKlineFetcher:
+            def __init__(self, base_url):
+                self.base_url = base_url
+
+            async def get_klines(self, symbol, interval, limit, end_time=None):
+                span = interval_ms[interval]
+                cutoff = end_time if end_time is not None else 1_000_000_000_000
+                last_open = ((cutoff - span) // span) * span
+                first_open = last_open - (limit - 1) * span
+                return [
+                    Candle(
+                        open_time=first_open + i * span,
+                        open=100.0,
+                        high=100.1,
+                        low=99.9,
+                        close=100.0,
+                        volume=100.0,
+                        close_time=first_open + (i + 1) * span - 1,
+                    )
+                    for i in range(limit)
+                ]
+
+            async def close(self):
+                return None
+
+        monkeypatch.setattr(backtest_module, "KlineFetcher", FakeKlineFetcher)
+        monkeypatch.setattr(
+            backtest_module, "_ThrottledFetch", lambda fetch: fetch,
+        )
+        monkeypatch.setattr(
+            backtest_module, "get_enabled", lambda _names: [_AlwaysLongStrategy()],
+        )
+
+        end_time_ms = 1_000_000_000_000
+        metadata: dict = {}
+        trades = await run_backtest(
+            days=1,
+            symbols=["BTCUSDT"],
+            strategy_names="X",
+            cfg=_Cfg(),
+            run_metadata=metadata,
+            end_time_ms=end_time_ms,
+        )
+
+        assert trades
+        assert all(
+            trade.entry_time >= metadata["test_window"]["start_ms"]
+            for trade in trades
+        )
+        assert metadata["test_window"]["end_ms"] == end_time_ms
+        assert metadata["universe_snapshot"]["symbols"] == ["BTCUSDT"]
+        assert {
+            interval: window["candles_fetched"]
+            for interval, window in metadata["data_windows"]["BTCUSDT"].items()
+        } == {
+            "5m": 288 + BACKTEST_WARMUP_CANDLES["5m"],
+            "15m": 96 + BACKTEST_WARMUP_CANDLES["15m"],
+            "4h": 6 + BACKTEST_WARMUP_CANDLES["4h"],
+        }
+
+    def test_json_report_records_config_code_window_and_universe(self, tmp_path):
+        cfg = _Cfg(scalper_entry_mode="maker", scalper_min_rr=1.5)
+        cfg_snapshot = scalper_config_snapshot(cfg)
+        metadata = {
+            "git_sha": "abc123",
+            "git_dirty": True,
+            "scalper_config": cfg_snapshot,
+            "test_window": {"requested_days": 7, "start_ms": 100, "end_ms": 200},
+            "warmup_candles": dict(BACKTEST_WARMUP_CANDLES),
+            "universe_snapshot": {
+                "selection_mode": "explicit_symbols",
+                "symbols": ["BTCUSDT"],
+            },
+            "data_windows": {"BTCUSDT": {"5m": {"candles_fetched": 2166}}},
+            "data_source_base_url": "https://fapi.binance.com",
+        }
+
+        path = write_json_report(
+            [],
+            days=7,
+            symbols=["BTCUSDT"],
+            strategy_names="C",
+            cfg=cfg,
+            run_metadata=metadata,
+            output_dir=tmp_path,
+        )
+        with open(path, encoding="utf-8") as report_file:
+            payload = json.load(report_file)
+
+        provenance = payload["provenance"]
+        assert provenance["git_sha"] == "abc123"
+        assert provenance["git_dirty"] is True
+        assert provenance["scalper_config"] == cfg_snapshot
+        assert set(cfg_snapshot) == {
+            name for name in vars(cfg) if name.startswith("scalper_")
+        }
+        assert provenance["test_window"] == metadata["test_window"]
+        assert provenance["universe_snapshot"] == metadata["universe_snapshot"]
+        assert provenance["data_windows"] == metadata["data_windows"]
 
 
 # --------------------------------------------------------------------------
@@ -570,3 +825,18 @@ class TestRegimeTagging:
         assert len(trades) == 1
         # build_context([]) 4h verisi yokken detect_regime -> UNKNOWN döner (regime.py sözleşmesi)
         assert trades[0].regime == "UNKNOWN"
+
+
+def test_json_report_uses_null_for_infinite_values(tmp_path):
+    report_path = backtest_module.write_json_report(
+        [],
+        days=1,
+        symbols=["BTCUSDT"],
+        strategy_names="C",
+        run_metadata={"data_windows": {"sentinel": float("inf")}},
+        output_dir=tmp_path,
+    )
+
+    raw = Path(report_path).read_text(encoding="utf-8")
+    assert "Infinity" not in raw
+    assert json.loads(raw)["provenance"]["data_windows"]["sentinel"] is None
