@@ -90,6 +90,9 @@ class ImprovedBinanceClient:
 
     # Borsa filtreleri nadiren değişir; süreç ömrü boyunca önbellek yeterli
     _FILTER_CACHE_TTL = 3600.0
+    # Binance X-MBX-USED-WEIGHT-1M başlığından son ölçülen dakikalık ağırlık
+    # (sınıf düzeyi: tüm istemci örnekleri aynı IP bütçesini paylaşır)
+    _last_used_weight_1m: int = 0
     # /commissionRate IP weight=20; işlem başına çağrılmamalıdır.
     _COMMISSION_CACHE_TTL = 3600.0
     _CLIENT_ALGO_ID_RE = re.compile(r"^[.A-Za-z0-9_:/-]{1,36}$")
@@ -284,6 +287,22 @@ class ImprovedBinanceClient:
                     response = await self.client.delete(request_url, headers=headers)
                 else:
                     raise ValueError(f"Desteklenmeyen HTTP metodu: {method}")
+
+                # Binance'in bildirdiği gerçek dakikalık ağırlık — tahmin değil
+                # ölçüm. Testnet'in weight bütçesi mainnet'ten düşük ve resmi
+                # olarak belgelenmemiş; 418 teşhisi bu log olmadan kör kalır.
+                uw_raw = response.headers.get("X-MBX-USED-WEIGHT-1M")
+                if uw_raw is not None:
+                    try:
+                        uw = int(uw_raw)
+                    except (TypeError, ValueError):
+                        uw = None
+                    if uw is not None:
+                        type(self)._last_used_weight_1m = uw
+                        if uw >= 300:
+                            self.logger.warning(
+                                f"⚖️ Binance 1dk kullanılan ağırlık: {uw} ({endpoint})"
+                            )
 
                 if response.status_code >= 400:
                     code, msg = self._parse_error(response)
