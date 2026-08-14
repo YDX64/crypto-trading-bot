@@ -299,7 +299,11 @@ class ImprovedBinanceClient:
                         uw = None
                     if uw is not None:
                         type(self)._last_used_weight_1m = uw
-                        if uw >= 300:
+                        # Testnet'te başlık edge-bazlı ve tutarsız (aynı dakika
+                        # içinde 1912→375 gözlendi); mutlak değer değil trend
+                        # sinyali. Eşik gerçek 2400 sınırına yakın tutulur ki
+                        # log gürültüsü olmasın ama gerçek riske yaklaşım görünsün.
+                        if uw >= 1800:
                             self.logger.warning(
                                 f"⚖️ Binance 1dk kullanılan ağırlık: {uw} ({endpoint})"
                             )
