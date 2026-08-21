@@ -68,8 +68,15 @@ fi
 # ── Restart + sağlık ───────────────────────────────────────────────────────
 if [ "${DEPLOY_NO_RESTART:-0}" = "1" ]; then log "restart atlandı (DEPLOY_NO_RESTART=1)"; exit 0; fi
 supervisorctl restart "$PROGRAM" | tee -a "$LOG"
-sleep 30
-if ! supervisorctl status "$PROGRAM" | grep -q RUNNING; then rollback; fi
-if ! curl -fsS -m 10 "$HEALTH_URL" | grep -q '"status"'; then log "sağlık uç noktası cevap vermedi: $HEALTH_URL"; rollback; fi
+# Açılış (Binance init + pozisyon devralma) 1-3 dk sürebilir: süreç RUNNING kaldığı sürece
+# portu sabırla yokla; süreç düşerse ya da HEALTH_TIMEOUT dolarsa geri al.
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-240}"
+waited=0; healthy=0
+while [ "$waited" -lt "$HEALTH_TIMEOUT" ]; do
+  if ! supervisorctl status "$PROGRAM" | grep -q RUNNING; then log "süreç RUNNING değil ($(supervisorctl status "$PROGRAM" | awk '{print $2}'))"; rollback; fi
+  if curl -fsS -m 5 "$HEALTH_URL" 2>/dev/null | grep -q '"status"'; then healthy=1; break; fi
+  sleep 5; waited=$((waited+5))
+done
+if [ "$healthy" != "1" ]; then log "sağlık uç noktası ${HEALTH_TIMEOUT}s içinde cevap vermedi: $HEALTH_URL"; rollback; fi
 PID="$(supervisorctl pid "$PROGRAM")"
-log "TAMAM: $PROGRAM RUNNING pid=$PID commit=$NEW"
+log "TAMAM: $PROGRAM RUNNING pid=$PID commit=$NEW (sağlık ${waited}s sonra)"
