@@ -108,3 +108,23 @@ golden test ona hiç dokunmuyor (fixture zaten kapanmış mumlar).
 
 ## Eski (kapı ÖNCESİ harness — yalnız yön bilgisi için; mutlak sayılar geçersiz)
 2026-08-19/21 sweep'leri: chandelier 2.5→3.5 (+), TP1 15 (−), TP2 40 (nötr), runner %40 (+), strateji D (−), 50x (−−).
+
+## 2026-08-21 — Autoresearch (scripts/autoresearch.py)
+Kaynak: `python3 scripts/autoresearch.py` — otomatik uretildi, elle duzenlemeyin.
+| Varyant | Pencere | Islem | WR% | PnL | PF | maxDD | Karar |
+|---|---|---|---|---|---|---|---|
+| E4a | AYI | 345 | 83.2 | -5960.31 | 0.79 | 8752.80 | - |
+| E4a | YATAY | 237 | 86.1 | +2009.74 | 1.13 | 2584.77 | - |
+| E4a | BOGA | 119 | 90.8 | +4523.75 | 1.85 | 1448.26 | - |
+| E4a | KARAR | - | - | -6888.98 | - | - | REDDEDILDI (AYI PF 0.79<1.1 ve AYI/YATAY birlikte iyilesmedi) |
+| E4a | hipotez | Gevsek RSI esigi (35/65) daha fazla ve daha erken sinyal yakalar; asiri filtrelemeyi hafifletir. | | | | | |
+| E4b | AYI | 216 | 85.6 | +1134.34 | 1.07 | 3604.81 | - |
+| E4b | YATAY | 154 | 87.0 | +2891.65 | 1.35 | 3169.06 | - |
+| E4b | BOGA | 95 | 92.6 | +3867.42 | 2.20 | 724.00 | - |
+| E4b | KARAR | - | - | +431.26 | - | - | ADAY (AYI&YATAY PnL birlikte iyilesti) |
+| E4b | hipotez | Chandelier carpanini 3.0'a daraltmak stop'u sikilastirir, trail kazancini erken kilitler. | | | | | |
+| E4c | AYI | 216 | 85.6 | +640.40 | 1.04 | 3743.00 | - |
+| E4c | YATAY | 150 | 86.7 | +2811.15 | 1.34 | 3105.95 | - |
+| E4c | BOGA | 95 | 92.6 | +4317.10 | 2.33 | 720.97 | - |
+| E4c | KARAR | - | - | +306.49 | - | - | REDDEDILDI (AYI PF 1.04<1.1 ve AYI/YATAY birlikte iyilesmedi) |
+| E4c | hipotez | Chandelier carpanini 4.0'a genisletmek trail'e daha fazla alan birakir, erken cikislari azaltir. | | | | | |
