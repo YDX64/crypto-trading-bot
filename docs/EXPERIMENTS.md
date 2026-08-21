@@ -128,3 +128,43 @@ Kaynak: `python3 scripts/autoresearch.py` — otomatik uretildi, elle duzenlemey
 | E4c | BOGA | 95 | 92.6 | +4317.10 | 2.33 | 720.97 | - |
 | E4c | KARAR | - | - | +306.49 | - | - | REDDEDILDI (AYI PF 1.04<1.1 ve AYI/YATAY birlikte iyilesmedi) |
 | E4c | hipotez | Chandelier carpanini 4.0'a genisletmek trail'e daha fazla alan birakir, erken cikislari azaltir. | | | | | |
+| E4d | AYI | 216 | 85.6 | +951.37 | 1.06 | 3728.66 | - |
+| E4d | YATAY | 150 | 86.7 | +2717.42 | 1.33 | 3165.33 | - |
+| E4d | BOGA | 96 | 92.7 | +3830.44 | 2.18 | 734.59 | - |
+| E4d | KARAR | - | - | +37.08 | - | - | REDDEDILDI (AYI PF 1.06<1.1 ve AYI/YATAY birlikte iyilesmedi) |
+| E4d | hipotez | TP2 hedefini 20'ye dusurmek runner payini daha sik gerceklestirir. | | | | | |
+| E4e | AYI | 216 | 85.6 | +884.75 | 1.06 | 3549.39 | - |
+| E4e | YATAY | 150 | 86.7 | +2776.61 | 1.33 | 3171.59 | - |
+| E4e | BOGA | 96 | 92.7 | +3845.53 | 2.19 | 734.59 | - |
+| E4e | KARAR | - | - | +44.74 | - | - | REDDEDILDI (AYI PF 1.06<1.1 ve AYI/YATAY birlikte iyilesmedi) |
+| E4e | hipotez | TP2 hedefini 30'a yukseltmek runner'a daha fazla alan birakir. | | | | | |
+| E4f | AYI | 229 | 89.1 | +1572.66 | 1.13 | 2604.45 | - |
+| E4f | YATAY | 162 | 89.5 | +2744.44 | 1.40 | 2153.57 | - |
+| E4f | BOGA | 104 | 95.2 | +4203.43 | 2.90 | 514.25 | - |
+| E4f | KARAR | - | - | +1058.37 | - | - | ADAY (AYI PF=1.13) |
+| E4f | hipotez | TP1 hedefini 8'e dusurmek break-even'e daha erken gecer, whipsaw'da SL'den korur. | | | | | |
+| E4g | AYI | 212 | 84.0 | +1909.73 | 1.11 | 4106.57 | - |
+| E4g | YATAY | 140 | 85.0 | +3578.56 | 1.39 | 2468.54 | - |
+| E4g | BOGA | 85 | 88.2 | +3687.24 | 1.77 | 1247.03 | - |
+| E4g | KARAR | - | - | +1713.37 | - | - | ADAY (AYI PF=1.11) |
+| E4g | hipotez | TP1 hedefini 12'ye yukseltmek erken kismi kar alimini geciktirir, runner payini buyutur. | | | | | |
+| E4h | AYI | 216 | 85.6 | +885.60 | 1.06 | 3574.40 | - |
+| E4h | YATAY | 150 | 86.7 | +2745.14 | 1.33 | 3180.54 | - |
+| E4h | BOGA | 96 | 92.7 | +3831.41 | 2.18 | 734.59 | - |
+| E4h | KARAR | - | - | +0.00 | - | - | REDDEDILDI (AYI PF 1.06<1.1 ve AYI/YATAY birlikte iyilesmedi) |
+| E4h | hipotez | Maksimum pozisyon sayisini 3'e sabitlemek (sunucu farkliysa) slot rekabetini azaltir. | | | | | |
+| E4i | AYI | 160 | 88.8 | +5624.12 | 1.68 | 3002.71 | - |
+| E4i | YATAY | 84 | 83.3 | +1073.09 | 1.20 | 1421.00 | - |
+| E4i | BOGA | 55 | 92.7 | +3552.58 | 3.22 | 590.14 | - |
+| E4i | KARAR | - | - | +0.00 | - | - | REDDEDILDI (asiri filtreleme (islem<60: ['BOGA'])) |
+| E4i | hipotez | Dinamik kaldirac tavanini 20'den 10'a dusurmek stop mesafesini buyutup gurultu stop'unu azaltir. | | | | | |
+| E4j | AYI | 201 | 87.1 | +3292.72 | 1.27 | 3953.33 | - |
+| E4j | YATAY | 124 | 84.7 | +1185.88 | 1.14 | 1883.94 | - |
+| E4j | BOGA | 68 | 89.7 | +2353.05 | 1.74 | 1057.14 | - |
+| E4j | KARAR | - | - | -630.52 | - | - | REDDEDILDI (BOGA PnL kaybi >%20) |
+| E4j | hipotez | Dinamik kaldirac tavanini 20'den 15'e dusurmek orta yol olarak stop mesafesini biraz buyutur. | | | | | |
+| E4k | AYI | 190 | 85.8 | +855.43 | 1.07 | 3696.49 | - |
+| E4k | YATAY | 137 | 85.4 | +1600.60 | 1.19 | 3482.42 | - |
+| E4k | BOGA | 87 | 93.1 | +3430.98 | 2.11 | 734.59 | - |
+| E4k | KARAR | - | - | -1575.14 | - | - | REDDEDILDI (AYI PF 1.07<1.1 ve AYI/YATAY birlikte iyilesmedi) |
+| E4k | hipotez | Baglam TF'sini 15m'de sabitlemek (sunucu farkliysa) sinyal baglamini rejim TF'sinden ayristirir. | | | | | |
