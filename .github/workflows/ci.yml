@@ -1,0 +1,42 @@
+name: CI
+
+# Her push/PR'da: sözdizimi + tanımsız isim kontrolü (ruff) ve tam test paketi.
+# Sunucu venv'i Python 3.12 — CI aynı sürümü kullanır (parite).
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Bağımlılıklar
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff
+
+      - name: Ruff (yalnız gerçek hatalar: sözdizimi, tanımsız isim, yanlış f-string)
+        run: ruff check --select E9,F63,F7,F82 src tests scripts
+
+      - name: Testler
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m pytest tests -q -p no:cacheprovider --durations=5
+
+      - name: Deploy script sözdizimi
+        run: bash -n scripts/deploy.sh && bash -n scripts/server_deploy.sh
