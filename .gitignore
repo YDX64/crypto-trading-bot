@@ -84,3 +84,4 @@ backups/
 .test-logs/
 # Backtest kline onbellegi (harness; fixture dosyalari tests/fixtures altinda)
 data/klines_cache/
+scripts/.scalper_env_snapshot.txt
