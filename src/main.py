@@ -9,6 +9,7 @@ yapılandırılmamışsa endpoint AÇIK KALMAZ, kapatılır (fail-closed).
 import asyncio
 import hmac
 import json
+import logging
 import math
 import os
 import re
@@ -34,6 +35,59 @@ from src.services.telegram_bot import TelegramBotService
 from src.services.orchestrator import TradingOrchestrator
 from src.strategies.scalper.engine import ScalperEngine
 from src.strategies.scalper.tracker import ScalpTracker
+
+
+# ---------------------------------------------------------------------------
+# GÜVENLİK: erişim logu secret sızıntısı (2026-08-21)
+# ---------------------------------------------------------------------------
+# uvicorn'un `uvicorn.access` logger'ı tam istek satırını (?secret=... dahil)
+# düz metin yazar (bkz. logs/supervisor.log — CLAUDE.md "secret içerir, dökme").
+# `python -m uvicorn src.main:app` ile başlatıldığında bu modül import
+# edilirken uvicorn kendi logging yapılandırmasını Config.__init__'te (import
+# öncesinde ya da sonrasında olabilir) kurar; filtre LOGGER nesnesine
+# eklendiği için handler'ların ne zaman bağlandığından bağımsız her zaman
+# devreye girer. Modül kapsamında + idempotent: reload'da tekrar eklenmez.
+_SECRET_QS_RE = re.compile(r"(secret=)[^&\s\"']+", re.IGNORECASE)
+
+
+def _redact_secret_value(value):
+    """Bir log alanındaki (msg ya da tek bir arg) `secret=...` değerini maskele."""
+    if isinstance(value, str) and _SECRET_QS_RE.search(value):
+        return _SECRET_QS_RE.sub(r"\1***", value)
+    return value
+
+
+class _SecretRedactionLogFilter(logging.Filter):
+    """`secret=<değer>`i `secret=***` yapan logging.Filter.
+
+    LogRecord formatlanmadan ÖNCE (yani %-interpolasyonundan önce) hem
+    `record.msg` hem `record.args` üzerinde çalışır — uvicorn erişim logu
+    `'%s - "%s %s HTTP/%s" %d'` gibi bir şablonu ayrı args ile doldurur,
+    secret query string'de olduğu için genelde args içindeki path elemanında
+    bulunur.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = _redact_secret_value(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(_redact_secret_value(a) for a in record.args)
+        elif isinstance(record.args, dict):
+            record.args = {k: _redact_secret_value(v) for k, v in record.args.items()}
+        elif record.args is not None:
+            record.args = _redact_secret_value(record.args)
+        return True
+
+
+def _install_access_log_secret_redaction() -> None:
+    for _name in ("uvicorn.access", "uvicorn.error"):
+        _target = logging.getLogger(_name)
+        if not any(
+            isinstance(_f, _SecretRedactionLogFilter) for _f in _target.filters
+        ):
+            _target.addFilter(_SecretRedactionLogFilter())
+
+
+_install_access_log_secret_redaction()
 
 
 # Global instances — tek orchestrator, Telegram servisiyle PAYLAŞILIR
@@ -541,6 +595,37 @@ _TV_LONG_WORDS = ("buy", "long", "bull")
 _TV_SHORT_WORDS = ("sell", "short", "bear")
 
 
+def _tv_source_allowlist() -> set:
+    """?src= için izinli kaynak kümesi (küçük harf, boşluksuz)."""
+    raw = getattr(settings, "tv_source_allowlist", "") or ""
+    return {s.strip().lower() for s in raw.split(",") if s.strip()}
+
+
+def resolve_tv_source(raw_src_param: Optional[str], raw_body: str):
+    """`?src=` sorgu parametresini normalize et ve allowlist'e karşı doğrula.
+
+    ?src= serbest metindir — bir yazım hatası (ör. "algpro") sessizce
+    hayalet bir kaynak yaratır ve TvConfluence'ta hiçbir zaman farklı kaynak
+    sayısını dolduramaz (bkz. config.py `tv_source_allowlist` yorumu).
+    Bilinmeyen değer REDDEDİLMEZ (erişilebilirlik > katılık) — "tv" jenerik
+    kaynağına eşlenir; çağıran taraf `source_raw_rejected=True` olduğunda
+    WARNING loglar.
+
+    `raw_src_param` boşsa (parametre hiç verilmemişse), AlgoPro'nun
+    varsayılan mesaj biçimi ("... | TF: ... | Price: ...") parmak iziyle
+    tanınır; aksi halde jenerik "tv".
+
+    Dönüş: (source, source_raw_rejected).
+    """
+    source = str(raw_src_param or "").strip().lower()
+    if not source:
+        fallback = "algopro" if ("| TF:" in raw_body or "| Price:" in raw_body) else "tv"
+        return fallback, False
+    if source not in _tv_source_allowlist():
+        return "tv", True
+    return source, False
+
+
 def resolve_tv_signal(raw: str, configured_secret: str, url_secret: str = ""):
     """TradingView alert gövdesini (JSON veya düz metin) çöz ve doğrula.
 
@@ -637,10 +722,20 @@ async def tradingview_webhook(request: Request):
 
     # Kaynak etiketi: alarm URL'sindeki ?src=... öncelikli; yoksa AlgoPro'nun
     # varsayılan mesaj biçimi ("BUY on X | TF: 1 | Price: ...") parmak iziyle
-    # tanınır; kalan her şey "tv". Sağlama FARKLI kaynak sayar.
-    source = str(request.query_params.get("src") or "").strip().lower()
-    if not source:
-        source = "algopro" if ("| TF:" in raw or "| Price:" in raw) else "tv"
+    # tanınır; kalan her şey "tv". Sağlama FARKLI kaynak sayar. Bilinmeyen
+    # ?src= REDDEDİLMEZ, "tv"ye eşlenir ve WARNING loglanır (bkz.
+    # resolve_tv_source / config.py tv_source_allowlist yorumu).
+    raw_src_param = request.query_params.get("src")
+    source, source_raw_rejected = resolve_tv_source(raw_src_param, raw)
+    if source_raw_rejected:
+        app_logger.warning(
+            f"TV webhook: allowlist dışı ?src='{str(raw_src_param)[:32]}' — "
+            f"'tv' olarak eşleştirildi (yazım hatası ya da tanınmayan entegrasyon olabilir)"
+        )
+
+    source_fields = {"source": source}
+    if source_raw_rejected:
+        source_fields["source_raw_rejected"] = True
 
     required = max(1, int(getattr(settings, "tv_confluence_required", 1) or 1))
     if required > 1:
@@ -651,6 +746,7 @@ async def tradingview_webhook(request: Request):
                 "direction": direction.value,
                 "accepted": False,
                 "confluence": verdict,
+                **source_fields,
             }
         result = await scalper_engine.external_signal(symbol, direction)
         return {
@@ -658,10 +754,11 @@ async def tradingview_webhook(request: Request):
             "direction": direction.value,
             **result,
             "confluence": verdict,
+            **source_fields,
         }
 
     result = await scalper_engine.external_signal(symbol, direction)
-    return {"symbol": symbol, "direction": direction.value, "source": source, **result}
+    return {"symbol": symbol, "direction": direction.value, **source_fields, **result}
 
 
 @app.post("/signal", dependencies=[Depends(require_api_key)])

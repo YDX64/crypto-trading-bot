@@ -44,6 +44,24 @@ negatif, BNB/ADA/DOGE karışık. Yedek `env.bak-20260821-tvallow`.
 ### D8 — Stop modu fixed_roi %50, dinamik kaldıraç 3-20x, ATR tabanı 0.5, kayıp cooldown 60 dk · 2026-08-11 · AKTİF
 BEAT çöküşü (7 dk'da 4 SL): yapısal stop dibe yapışıyordu + yeniden giriş engeli yoktu.
 
+### D9 — Webhook sertleştirme: `?src=` allowlist + erişim logu secret redaksiyonu · 2026-08-21 · AKTİF
+Ne: (1) `TV_SOURCE_ALLOWLIST` (varsayılan `luxosc,luxso,algopro,botv3,tv`) — `/tv-signal`
+`?src=` artık normalize edilip (küçük harf/trim) bu kümeye karşı doğrulanır; bilinmeyen
+değer REDDEDİLMEZ, "tv" jenerik kaynağına eşlenir ve WARNING loglanır, yanıt
+`source_raw_rejected: true` taşır. (2) `uvicorn.access`/`uvicorn.error` logger'larına
+modül import anında (`src/main.py`, idempotent) bir `logging.Filter` eklendi —
+`secret=<değer>` kalıbını msg VE args içinde `secret=***`'e çevirir.
+Neden: `?src=` serbest metin olduğu için bir yazım hatası (ör. "algpro") sessizce
+hayalet bir kaynak yaratıyordu — TvConfluence'ta asla farklı kaynak sayısını
+dolduramayan, hiç fark edilmeyen bir sinyal kaybı (bkz. D5/TV notu). Ayrıca webhook
+secret'ı `?secret=...` query'sinde taşınabiliyor (LuxAlgo "Any alert" modu, bkz.
+`resolve_tv_signal`) ve uvicorn'un erişim logu tam istek satırını düz metin yazıyordu
+(Güvenlik borçları #1 — RUNBOOK.md). Kanıt: `tests/test_tv_signal_bridge.py`
+(`TestTvSourceAllowlist`, `TestTvWebhookSourceLogging`) ve
+`tests/test_access_log_redaction.py` — `python3 -m pytest tests -q` → 487 passed, 1 skipped.
+Geri alma: `src/main.py`/`src/core/config.py`'deki bu değişiklikleri revert et; davranışsal
+risk yok (kabul mantığı gevşetildi, hiçbir sinyal reddedilmiyor).
+
 ## Reddedilen kararlar (kanıtla)
 
 | Fikir | Tarih | Sonuç | Neden reddedildi |

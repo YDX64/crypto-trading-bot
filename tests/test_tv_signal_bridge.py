@@ -12,7 +12,8 @@ import json
 import pytest
 from fastapi import HTTPException
 
-from src.main import resolve_tv_signal
+import src.main as main_module
+from src.main import resolve_tv_signal, resolve_tv_source
 from src.strategies.scalper.types import Direction
 
 SECRET = "sup3r-gizli-t0ken"
@@ -112,3 +113,110 @@ class TestDirectionResolution:
         raw = f"Bullish ETHUSDT secret={tricky}"
         symbol, direction = resolve_tv_signal(raw, tricky)
         assert (symbol, direction) == ("ETHUSDT", Direction.LONG)
+
+
+class TestTvSourceAllowlist:
+    """?src= allowlist (2026-08-21): typo → hayalet kaynak sessizce
+    sağlamayı asla dolduramazdı. Bilinmeyen değer reddedilmez, 'tv'ye
+    eşlenir ve çağıran (webhook endpoint) WARNING loglar."""
+
+    def test_unknown_src_maps_to_tv_and_flags_rejected(self):
+        source, rejected = resolve_tv_source("algpro", "")  # yazım hatası
+        assert source == "tv"
+        assert rejected is True
+
+    def test_known_src_passes_through_unrejected(self):
+        source, rejected = resolve_tv_source("algopro", "")
+        assert source == "algopro"
+        assert rejected is False
+
+    def test_case_and_whitespace_normalized(self):
+        source, rejected = resolve_tv_source("  LuxOSC  ", "")
+        assert source == "luxosc"
+        assert rejected is False
+
+    def test_missing_src_falls_back_to_algopro_fingerprint(self):
+        raw_body = "BUY on BTCUSDT | TF: 5 | Price: 65000"
+        source, rejected = resolve_tv_source(None, raw_body)
+        assert source == "algopro"
+        assert rejected is False
+
+    def test_missing_src_falls_back_to_generic_tv(self):
+        source, rejected = resolve_tv_source("", "Bullish Confirmation BTCUSDT.P")
+        assert source == "tv"
+        assert rejected is False
+
+    def test_all_default_allowlist_entries_pass_through(self):
+        for name in ("luxosc", "luxso", "algopro", "botv3", "tv"):
+            source, rejected = resolve_tv_source(name, "")
+            assert (source, rejected) == (name, False)
+
+    def test_custom_allowlist_setting_is_respected(self, monkeypatch):
+        # tv_source_allowlist ayarı gerçekten okunuyor mu (yalnız varsayılan
+        # değerle değil) — dar bir allowlist ile "algopro" bile reddedilmeli.
+        monkeypatch.setattr(main_module.settings, "tv_source_allowlist", "luxosc,tv")
+        source, rejected = resolve_tv_source("algopro", "")
+        assert (source, rejected) == ("tv", True)
+
+
+class _FakeRequest:
+    """`Request`'in webhook'ta kullanılan iki yüzeyini taklit eden test çifti."""
+
+    def __init__(self, body: bytes, query: dict):
+        self._body = body
+        self.query_params = query  # dict .get() ile QueryParams'a yeter
+
+    async def body(self) -> bytes:
+        return self._body
+
+
+@pytest.fixture
+def _tv_webhook_ready(monkeypatch):
+    """Endpoint'in erken-dönüş koşullarını (secret/scalper hazır) aşacak
+    minimum global durum. external_signal AsyncMock — gerçek işlem açmaz."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setattr(main_module.settings, "tv_webhook_secret", SECRET)
+    monkeypatch.setattr(main_module.settings, "tv_confluence_required", 1)
+    fake_engine = MagicMock()
+    fake_engine.external_signal = AsyncMock(return_value={"accepted": True})
+    monkeypatch.setattr(main_module, "scalper_engine", fake_engine)
+    return fake_engine
+
+
+class TestTvWebhookSourceLogging:
+    """Endpoint'in GERÇEK kod yolu: allowlist dışı ?src= WARNING loglar ve
+    yanıt source_raw_rejected=True taşır; bilinen ?src= sessiz geçer."""
+
+    async def test_unknown_src_logs_warning_and_flags_response(
+        self, monkeypatch, _tv_webhook_ready
+    ):
+        warnings = []
+        monkeypatch.setattr(
+            main_module.app_logger, "warning", lambda msg: warnings.append(msg)
+        )
+        body = json.dumps({"secret": SECRET, "symbol": "BTCUSDT", "side": "buy"})
+        request = _FakeRequest(body.encode(), {"src": "algpro"})  # yazım hatası
+
+        result = await main_module.tradingview_webhook(request)
+
+        assert result["source"] == "tv"
+        assert result["source_raw_rejected"] is True
+        assert len(warnings) == 1
+        assert "algpro" in warnings[0]
+
+    async def test_known_src_passes_through_without_warning(
+        self, monkeypatch, _tv_webhook_ready
+    ):
+        warnings = []
+        monkeypatch.setattr(
+            main_module.app_logger, "warning", lambda msg: warnings.append(msg)
+        )
+        body = json.dumps({"secret": SECRET, "symbol": "BTCUSDT", "side": "buy"})
+        request = _FakeRequest(body.encode(), {"src": "LuxOSC"})
+
+        result = await main_module.tradingview_webhook(request)
+
+        assert result["source"] == "luxosc"
+        assert "source_raw_rejected" not in result
+        assert warnings == []

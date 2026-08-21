@@ -65,11 +65,14 @@ Daima `supervisorctl`.
 ## Sinyal hattı (TradingView)
 49 alarm → `POST /tv-signal?secret=…&src=<kaynak>` (luxosc / luxso / botv3; AlgoPro gövde
 parmak iziyle) → `TvConfluence.vote` (2 farklı kaynak, 420 sn, ters oy sıfırlar) →
-`engine.external_signal` → aynı risk/çıkış kuralları. `?src` serbest metindir: yazım hatası yeni
-bir "kaynak" yaratır ve sağlamaya hiç ulaşmaz (sertleştirme adayı: allowlist).
+`engine.external_signal` → aynı risk/çıkış kuralları. `?src` serbest metindir; 2026-08-21'den
+(D9) beri `TV_SOURCE_ALLOWLIST`'e karşı doğrulanır — bilinmeyen değer "tv"ye eşlenir ve
+WARNING loglanır (sessiz hayalet kaynak artık yok, ama sinyal yine de reddedilmez).
 TV Desktop MCP ile ölçüm reçetesi: awa-brain `ops-gotchas/tradingview-desktop-mcp-luxalgo.md`.
 
 ## Güvenlik borçları
-1. Webhook düz HTTP + IP, secret sorgu dizesinde, uvicorn erişim logunda düz metin.
+1. Webhook düz HTTP + IP, secret sorgu dizesinde. Erişim logu kısmı ÇÖZÜLDÜ (D9,
+   2026-08-21): `uvicorn.access`/`uvicorn.error` logger'larına `secret=...`'ü `secret=***`
+   yapan bir filtre eklendi (`src/main.py`). Açık kalan: TLS + log rotasyonu.
 2. Futbol botu kodunda gömülü RapidAPI anahtarı (`/root/bots/LIVE1/main.py`) — ayrı proje, bilgi.
 3. Sunucu venv'i `requirements.txt`'in gerisinde (dependabot bump'ları kurulu değil) — test ederek güncelle.

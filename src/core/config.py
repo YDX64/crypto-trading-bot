@@ -265,6 +265,13 @@ class Settings(BaseSettings):
     # Ters yön oyu tüm oyları sıfırlar (çelişkide sinyal temiz değildir).
     tv_confluence_required: int = 1
     tv_confluence_window_seconds: int = 180
+    # ?src= allowlist (2026-08-21): TradingView alarm URL'sindeki ?src=...
+    # serbest metindir — yazım hatası (ör. "algpro") sessizce hayalet bir
+    # kaynak yaratır ve hiçbir zaman sağlamaya (confluence) ulaşmaz çünkü
+    # farklı kaynak sayısı asla dolmaz. Bilinmeyen değer REDDEDİLMEZ
+    # (erişilebilirlik > katılık) — "tv" jenerik kaynağına eşlenir ve
+    # WARNING loglanır ki typo fark edilsin.
+    tv_source_allowlist: str = "luxosc,luxso,algopro,botv3,tv"
     # --- Coin-bazlı dinamik kaldıraç (2026-08-13, kullanıcı isteği) ---
     # fixed_roi stop modunda kaldıraç volatiliteye göre coin başına çözülür:
     # hedef stop FİYAT mesafesi = ATR × dyn_lev_stop_atr_mult olacak şekilde
