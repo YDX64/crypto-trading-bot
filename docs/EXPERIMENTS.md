@@ -44,5 +44,67 @@ FLAT 11 gün LONG 40 %52 +90 / SHORT 42 %50 +179 (+268'i tek günden); DOWN 0 g�
 - 13 LUCID script'i (Discord + LuxAlgo AI): en iyi D6-BNB 2.26, S3-ETH 1.73, D1-ETH 1.53 — hiçbiri yalın toolkit'i geçmedi. Dosyalar: `lucid_bench_results.md`, `discord_bench_results.md`.
 - AlgoPro V1.6: repaint yok; panel TP1 kazanma ort %40.5 (RR 1). `algopro_v16_audit.md`.
 
+## 2026-08-21 — Altın (golden) backtest regresyonu (offline, deterministik)
+
+Amaç: `src/strategies/scalper/backtest.py` motorunu (simulate_symbol →
+open_position → manage_position) AĞSIZ ve sabit bir sonuca kilitlemek —
+`tests/test_golden_backtest.py`, davranış değişince (kasıtlı ya da kaza)
+kırılır. Kod: `src/strategies/scalper/kline_cache.py` (yeni, `--cache-dir`/
+`--refresh` CLI bayrakları backtest.py'ye eklendi) + `tests/fixtures/klines/`
+(6 dosya, ~104 KB, gzip JSON, BTCUSDT+ETHUSDT × 5m/15m).
+
+Fixture penceresi: 2026-08-07→2026-08-10 UTC (3 gün, `[start,end)`).
+Yalnız 5m (giriş) ve 15m (bağlam VE rejim) serileri gerekir — golden
+config `SCALPER_TF_REGIME=15m` kullandığından rejim serisi de "15m"
+anahtarını paylaşır (bkz. `gather_symbol_data`'nın aralık-adıyla
+anahtarlanan sözlüğü); 1m HİÇ kullanılmaz (dolum `candles_5m[idx].open`
+ile yapılır, tik-bazlı değil).
+
+Sabit ayarlar (`tests/test_golden_backtest.py::_GoldenCfg` — .env OKUNMAZ,
+`src.core.config.settings` tekil nesnesi monkeypatch ile ayrıca sabitlenir
+çünkü StrategyC bunu cfg'den değil doğrudan global'den okur):
+strategies=C · `SCALPER_STOP_MODE=fixed_roi` · `SCALPER_FIXED_STOP_ROI_PCT=50`
+· `SCALPER_DYNAMIC_LEVERAGE=true` (3-20) · `SCALPER_CHANDELIER_ATR_MULT=3.5`
+· `SCALPER_TP1_ROI=10` `SCALPER_TP2_ROI=25` `SCALPER_TP2_FRACTION=0.20`
+· `SCALPER_REGIME_FILTER=true` · `SCALPER_TF_REGIME=15m` ·
+`SCALPER_C_RSI_LONG_MAX=30` `SCALPER_C_RSI_SHORT_MIN=70` ·
+`SCALPER_C_REQUIRE_DIVERGENCE=true` · `SCALPER_LOSS_COOLDOWN_MINUTES=60` ·
+`SCALPER_STOP_ATR_FLOOR_MULT=0.5` (yalnız kayıt — fixed_roi modunda inert)
+· `SCALPER_MAX_HOLD_HOURS=8` (yalnız kayıt — backtest harness'i max-hold
+hiç UYGULAMAZ, yalnız canlı engine.py'de var) · sembol BTCUSDT,ETHUSDT.
+
+**Bulgu (raporlanmalı, gerçek `.env` ile doğrulanmalı):** `SCALPER_MIN_RR`
+sınıf varsayılanı (1.2) bu kombinasyonla (tp1=10/tp2=25/tp2_frac=0.20,
+fixed_roi=50) KULLANILAMAZ — `open_position()`'ın RR kapısı `fixed_roi`
+modunda `sl_risk_roi`'yi HER ZAMAN tam `SCALPER_FIXED_STOP_ROI_PCT`'e
+sadeler (kaldıraç iptal olur), yani `rr = (10×0.8+25×0.20) / 50 = 13/50 =
+0.26` — piyasa verisinden bağımsız SABİT bir değer. 1.2 eşiğiyle HİÇBİR
+C sinyali (ne backtest'te ne canlıda) asla geçemez; bu CLAUDE.md'nin
+belgelediği canlı işlem geçmişiyle (başabaş WR ≈%85) çelişir. Golden test
+`SCALPER_MIN_RR=0.0` (kapı kapalı) varsayımıyla yazıldı — gerçek sunucu
+`.env`'i kontrol edilip ya bu not güncellenmeli ya da `docs/DECISIONS.md`'ye
+girilmeli.
+
+**Altın değerler** (ETHUSDT bu dar 3 günlük pencerede hiç ham sinyal
+üretmedi — RSI 30/70 + BB taşması + zorunlu diverjans üçlüsü hiç üst üste
+binmedi; hata DEĞİL, gerçek piyasa verisi):
+
+| Metrik | Değer |
+|---|---|
+| Toplam işlem | 2 (ikisi de BTCUSDT) |
+| Net PnL | +26.77 |
+| Yön | LONG 2 |
+| Çıkış nedeni | TRAIL 2 |
+| Kapı reddi | `regime_gate` 4 (rejime ters C sinyali) |
+| Koşum süresi | ~2 sn (3 test, AĞSIZ) |
+
+Doğrulama: `python3 -m pytest tests/test_golden_backtest.py -q` iki ayrı
+süreçte birebir aynı sonucu verdi (determinism testi ayrıca fingerprint
+karşılaştırır). Harness'te bulunan/gerekli nondeterminizm düzeltmesi:
+YOK — `simulate_symbol` zincirinde (`build_context`, `indicators.py`,
+`regime.py`) `time.time()`/`datetime.now()`/rastgelelik/sıralamaya-duyarlı
+set yok; tek zaman kaynağı `data.py`'nin `KlineFetcher._drop_unclosed`'ı,
+golden test ona hiç dokunmuyor (fixture zaten kapanmış mumlar).
+
 ## Eski (kapı ÖNCESİ harness — yalnız yön bilgisi için; mutlak sayılar geçersiz)
 2026-08-19/21 sweep'leri: chandelier 2.5→3.5 (+), TP1 15 (−), TP2 40 (nötr), runner %40 (+), strateji D (−), 50x (−−).

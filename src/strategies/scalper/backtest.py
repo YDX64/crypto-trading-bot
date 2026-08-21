@@ -26,6 +26,11 @@ CLI:
     # rejim bazlı (BEAR/BULL/FLAT) karşılaştırma için:
     python -m src.strategies.scalper.backtest \\
         --start 2026-01-23 --end 2026-02-13 --symbols BTCUSDT --strategies C
+    # Kline önbelleği (varsayılan açık, data/klines_cache/): aynı
+    # (sembol, aralık, pencere) için sonraki koşular Binance'e gitmez.
+    # --refresh önbelleği yok sayıp TAZE çeker ve üzerine yazar.
+    python -m src.strategies.scalper.backtest --days 7 --symbols BTCUSDT \\
+        --cache-dir data/klines_cache --refresh
 """
 
 from __future__ import annotations
@@ -45,6 +50,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from src.core.config import settings
 from src.core.logger import app_logger
+from src.strategies.scalper import kline_cache
 from src.strategies.scalper.data import KlineFetcher
 from src.strategies.scalper.indicators import atr, chandelier_stop
 from src.strategies.scalper.regime import detect_regime
@@ -204,6 +210,8 @@ _WARMUP_BY_ROLE: Tuple[int, int, int] = (
 async def gather_symbol_data(
     fetch: FetchFn, symbol: str, days: int, end_time: Optional[int] = None,
     timeframes: Tuple[str, str, str] = ("5m", "15m", "4h"),
+    cache_dir: Optional[Path] = None,
+    refresh: bool = False,
 ) -> Dict[str, List[Candle]]:
     """Bir sembol için test penceresi + sabit warm-up mumlarını toplar.
 
@@ -213,6 +221,14 @@ async def gather_symbol_data(
 
     `timeframes` = (entry, context, regime); desteklenmeyen aralıkta açık
     ValueError (sessiz yanlış veri yerine).
+
+    `cache_dir` verilirse (ve `end_time` biliniyorsa) her (sembol, aralık,
+    pencere) serisi `kline_cache` ile diskte gzip JSON olarak saklanır:
+    aynı anahtar için sonraki çağrı Binance'e gitmez, doğrudan diskten okur
+    (bkz. kline_cache.window_start_ms — anahtar `needed` mum sayısından
+    türer, warm-up sabitleri değişirse anahtar da değişir). `refresh=True`
+    önbelleği yok sayar, taze çeker ve üzerine yazar. `cache_dir=None`
+    (varsayılan) eski davranışla birebir aynıdır — her çağrı Binance'e gider.
     """
     out: Dict[str, List[Candle]] = {}
     for interval, warmup in zip(timeframes, _WARMUP_BY_ROLE):
@@ -223,7 +239,33 @@ async def gather_symbol_data(
                 f"(bilinenler: {sorted(_CANDLES_PER_DAY)})"
             )
         needed = days * per_day + warmup
-        out[interval] = await fetch_paginated(fetch, symbol, interval, needed, end_time=end_time)
+
+        candles: Optional[List[Candle]] = None
+        cache_start_ms: Optional[int] = None
+        if cache_dir is not None and end_time is not None:
+            cache_start_ms = kline_cache.window_start_ms(interval, needed, end_time)
+            if not refresh:
+                candles = kline_cache.load(cache_dir, symbol, interval, cache_start_ms, end_time)
+                if candles is not None and len(candles) != needed:
+                    # Boyut uyuşmazlığı: eski/kısmi bir önbellek (aynı anahtarla
+                    # ama farklı içerikle) — güvenilmez say, taze çek.
+                    app_logger.warning(
+                        f"⚠️ {symbol} {interval}: önbellek boyutu uyuşmuyor "
+                        f"({len(candles)} != {needed}) — yeniden çekiliyor"
+                    )
+                    candles = None
+                elif candles is not None:
+                    app_logger.info(
+                        f"💾 {symbol} {interval}: önbellekten yüklendi ({len(candles)} mum)"
+                    )
+
+        if candles is None:
+            app_logger.info(f"📥 {symbol} {interval}: Binance'ten çekiliyor...")
+            candles = await fetch_paginated(fetch, symbol, interval, needed, end_time=end_time)
+            if cache_dir is not None and end_time is not None:
+                kline_cache.save(cache_dir, symbol, interval, cache_start_ms, end_time, candles)
+
+        out[interval] = candles
     return out
 
 
@@ -1200,6 +1242,8 @@ async def run_backtest(
     run_metadata: Optional[Dict[str, Any]] = None,
     end_time_ms: Optional[int] = None,
     start_time_ms: Optional[int] = None,
+    cache_dir: Optional[str | Path] = None,
+    refresh: bool = False,
 ) -> List[BacktestTrade]:
     """Verilen semboller için tarihsel veriyi çeker ve tüm stratejileri
     simüle eder; tüm işlemleri (tüm semboller birleşik) döndürür.
@@ -1215,6 +1259,12 @@ async def run_backtest(
     doğru hesaplayıp geçirir, burada tekrar türetilmez.
     `run_metadata` verilirse gerçek veri pencereleri ve yeniden üretilebilirlik
     bilgileri bu sözlüğe yazılır.
+
+    `cache_dir` verilirse `gather_symbol_data`'ya aynen iletilir — her sembol/
+    aralık serisi diskte gzip JSON olarak saklanır ve sonraki aynı-pencereli
+    koşular Binance'e gitmez (bkz. kline_cache modülü). `refresh=True`
+    önbelleği yok sayıp taze çeker ve üzerine yazar. Varsayılan `cache_dir=None`
+    ile davranış eskisiyle birebir aynıdır (her koşu Binance'e gider).
     """
     if start_time_ms is None and days <= 0:
         raise ValueError("Backtest gün sayısı pozitif olmalı")
@@ -1255,6 +1305,7 @@ async def run_backtest(
 
     fetcher = KlineFetcher(base_url=base_url)
     throttled = _ThrottledFetch(fetcher.get_klines)
+    cache_dir_path = Path(cache_dir) if cache_dir is not None else None
 
     all_trades: List[BacktestTrade] = []
     try:
@@ -1265,6 +1316,7 @@ async def run_backtest(
             data = await gather_symbol_data(
                 throttled, symbol, days, end_time=test_end_time_ms,
                 timeframes=timeframes,
+                cache_dir=cache_dir_path, refresh=refresh,
             )
             candles_5m = data[tf_entry]
             candles_15m = data[tf_context]
@@ -1366,6 +1418,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--strategies", type=str, default="A,B,C",
         help="Virgülle ayrılmış strateji adları (setups.get_enabled ile dinamik yüklenir)",
     )
+    parser.add_argument(
+        "--cache-dir", type=str, default="data/klines_cache",
+        help=(
+            "Kline önbellek dizini (yoksa oluşturulur). Aynı (sembol, aralık, "
+            "pencere) için sonraki koşular Binance'e gitmez, buradan okur "
+            "(varsayılan: data/klines_cache)"
+        ),
+    )
+    parser.add_argument(
+        "--refresh", action="store_true",
+        help="Önbelleği yok say, Binance'ten TAZE çek ve üzerine yaz",
+    )
     return parser
 
 
@@ -1387,6 +1451,8 @@ async def main_async(args: argparse.Namespace) -> None:
         run_metadata=run_metadata,
         start_time_ms=start_ms,
         end_time_ms=end_ms,
+        cache_dir=args.cache_dir,
+        refresh=args.refresh,
     )
 
     universe_snapshot = run_metadata["universe_snapshot"]
