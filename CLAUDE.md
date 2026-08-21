@@ -10,6 +10,8 @@ Sinyal kaynakları: botun kendi taraması + TradingView webhook'ları (LuxAlgo O
 AlgoPro) → `src/services/tv_confluence.py` sağlaması (2 farklı kaynak / 420 sn).
 Ayrıntı: `docs/ARCHITECTURE.md`. Kararlar ve kanıtları: `docs/DECISIONS.md`.
 İşletme: `docs/RUNBOOK.md`. Deney defteri: `docs/EXPERIMENTS.md`.
+Yeni sinyal kaynağı (haber botu vb.) eklemek: `docs/INTEGRATIONS.md`. Otomatik deney döngüsü:
+`docs/AUTORESEARCH.md`. Mainnet'e geçiş şartları ve mimarisi: `docs/MAINNET_PLAN.md`.
 
 ## Nerede çalışır? (gerçeğin kaynağı)
 - **Kod:** GitHub `YDX64/crypto-trading-bot` `main` — tek gerçek. Sunucu repo'su
