@@ -121,4 +121,7 @@ sayılır (dosyayı silmek = resume; sil-öncesi neden loga bakılmalı).
    2026-08-21): `uvicorn.access`/`uvicorn.error` logger'larına `secret=...`'ü `secret=***`
    yapan bir filtre eklendi (`src/main.py`). Açık kalan: TLS + log rotasyonu.
 2. Futbol botu kodunda gömülü RapidAPI anahtarı (`/root/bots/LIVE1/main.py`) — ayrı proje, bilgi.
-3. Sunucu venv'i `requirements.txt`'in gerisinde (dependabot bump'ları kurulu değil) — test ederek güncelle.
+3. ~~Sunucu venv'i requirements.txt'in gerisinde~~ ÇÖZÜLDÜ (2026-08-21 17:46): yeni venv yanına kuruldu,
+   541 testle doğrulandı, `mv` ile değiştirildi (cryptography 50, python-multipart 0.0.31, pytest 9).
+   Geri alma: `mv .venv .venv-failed && mv .venv-old .venv && supervisorctl restart tradingbot_v2`.
+   `.venv-old` 1 hafta sonra silinebilir. Reçete: yeni venv → test → swap → restart → sağlık yokla.
