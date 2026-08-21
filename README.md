@@ -1,3 +1,9 @@
+> **GÜNCEL DURUM (2026-08-21):** Bu README Ekim 2025'ten kalmadır ve kısmen eskidir.
+> Sistemi anlamak için önce [`CLAUDE.md`](CLAUDE.md) (çalışma sözleşmesi), sonra
+> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/DECISIONS.md`](docs/DECISIONS.md),
+> [`docs/RUNBOOK.md`](docs/RUNBOOK.md), [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md) okunur.
+> Eski araştırma/n8n dosyaları `archive/2025-10-legacy/` altındadır.
+
 # 🤖 AI-Powered Crypto Trading Bot
 
 Otomatik kripto para trading botu - Telegram sinyallerini AI analizi ile işler ve Binance'de pozisyon açar.
