@@ -168,3 +168,23 @@ Kaynak: `python3 scripts/autoresearch.py` — otomatik uretildi, elle duzenlemey
 | E4k | BOGA | 87 | 93.1 | +3430.98 | 2.11 | 734.59 | - |
 | E4k | KARAR | - | - | -1575.14 | - | - | REDDEDILDI (AYI PF 1.07<1.1 ve AYI/YATAY birlikte iyilesmedi) |
 | E4k | hipotez | Baglam TF'sini 15m'de sabitlemek (sunucu farkliysa) sinyal baglamini rejim TF'sinden ayristirir. | | | | | |
+| E5a | AYI | 186 | 89.8 | +2937.02 | 1.33 | 3094.20 | - |
+| E5a | YATAY | 117 | 87.2 | +1409.71 | 1.24 | 959.67 | - |
+| E5a | BOGA | 67 | 89.6 | +1218.40 | 1.39 | 1160.12 | - |
+| E5a | KARAR | - | - | -1897.02 | - | - | REDDEDILDI (BOGA PnL kaybi >%20) |
+| E5a | hipotez | TP1 %8 + kaldirac tavani 12: erken BE + genis stop — ayi dayanikliligi, boga islem sayisi korunur mu? | | | | | |
+| E5b | AYI | 204 | 88.7 | +1406.30 | 1.13 | 4522.34 | - |
+| E5b | YATAY | 141 | 88.7 | +2312.85 | 1.36 | 2047.77 | - |
+| E5b | BOGA | 87 | 92.0 | +2100.32 | 1.66 | 737.55 | - |
+| E5b | KARAR | - | - | -1642.69 | - | - | REDDEDILDI (BOGA PnL kaybi >%20) |
+| E5b | hipotez | TP1 %8 + kaldirac tavani 15: E5a'nin daha az kisitli hali. | | | | | |
+| E5c | AYI | 177 | 87.6 | +3725.78 | 1.35 | 3582.47 | - |
+| E5c | YATAY | 108 | 85.2 | +1771.05 | 1.28 | 1227.05 | - |
+| E5c | BOGA | 60 | 86.7 | +1617.87 | 1.44 | 1276.94 | - |
+| E5c | KARAR | - | - | -347.45 | - | - | REDDEDILDI (BOGA PnL kaybi >%20) |
+| E5c | hipotez | Kaldirac tavani 12 tek basina: E4i (10) ile E4j (15) arasi — boga islem sayisi >=60 kalir mi? | | | | | |
+| E5d | AYI | 229 | 89.1 | +1488.87 | 1.12 | 2549.93 | - |
+| E5d | YATAY | 163 | 89.6 | +2719.06 | 1.40 | 2127.93 | - |
+| E5d | BOGA | 103 | 95.1 | +4239.47 | 2.92 | 514.25 | - |
+| E5d | KARAR | - | - | +985.23 | - | - | ADAY (AYI PF=1.12) |
+| E5d | hipotez | TP1 %8 + chandelier 3.0: iki bagimsiz adayin birlesimi toplamsal mi? | | | | | |
