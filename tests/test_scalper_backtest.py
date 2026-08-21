@@ -30,6 +30,7 @@ from src.strategies.scalper.backtest import (
     gather_symbol_data,
     manage_position,
     open_position,
+    resolve_backtest_window,
     run_backtest,
     scalper_config_snapshot,
     simulate_symbol,
@@ -89,6 +90,7 @@ class _Cfg:
     scalper_maker_fee_pct: float = 0.02
     scalper_maker_fill_timeout_candles: int = 3
     scalper_min_rr: float = 1.2
+    scalper_regime_filter: bool = True
 
 
 def _mk_signal(entry_price: float, stop_price: float,
@@ -840,3 +842,117 @@ def test_json_report_uses_null_for_infinite_values(tmp_path):
     raw = Path(report_path).read_text(encoding="utf-8")
     assert "Infinity" not in raw
     assert json.loads(raw)["provenance"]["data_windows"]["sentinel"] is None
+
+
+# --------------------------------------------------------------------------
+# --start/--end pencere çözümü (resolve_backtest_window) — AĞ YOK, saf
+# --------------------------------------------------------------------------
+
+class TestResolveBacktestWindow:
+    def test_days_only_keeps_legacy_behavior(self):
+        # --start/--end verilmezse eski --days davranışı birebir korunmalı:
+        # start_ms/end_ms None döner, run_backtest kendi "şu andan N gün
+        # geriye" mantığını uygular.
+        effective_days, start_ms, end_ms = resolve_backtest_window(30, None, None)
+        assert effective_days == 30
+        assert start_ms is None
+        assert end_ms is None
+
+    def test_start_end_overrides_days_and_computes_span(self):
+        # 2026-01-23 -> 2026-02-13 = 21 gün tam; --days (30) görmezden gelinmeli.
+        effective_days, start_ms, end_ms = resolve_backtest_window(
+            30, "2026-01-23", "2026-02-13",
+        )
+        assert start_ms == 1769126400000  # 2026-01-23T00:00:00Z
+        assert end_ms == 1770940800000    # 2026-02-13T00:00:00Z
+        assert end_ms - start_ms == 21 * 86_400_000
+        assert effective_days == 21
+
+    def test_end_exclusive_window_is_utc_midnight_to_midnight(self):
+        _, start_ms, end_ms = resolve_backtest_window(1, "2026-08-07", "2026-08-08")
+        assert (end_ms - start_ms) == 86_400_000  # tam 1 gün, [start, end)
+
+    def test_single_day_window_still_fetches_at_least_one_day(self):
+        # --start/--end yalnız tarih (saat yok) aldığından fark her zaman tam
+        # gün sayısıdır; en küçük geçerli pencere (1 gün) bile en az 1 günlük
+        # veri istemeli (aşağı taşma yok).
+        effective_days, start_ms, end_ms = resolve_backtest_window(
+            30, "2026-08-07", "2026-08-08",
+        )
+        assert effective_days == 1
+        assert end_ms - start_ms == 86_400_000
+
+    def test_only_start_without_end_raises(self):
+        with pytest.raises(ValueError):
+            resolve_backtest_window(30, "2026-01-23", None)
+
+    def test_only_end_without_start_raises(self):
+        with pytest.raises(ValueError):
+            resolve_backtest_window(30, None, "2026-02-13")
+
+    def test_end_not_after_start_raises(self):
+        with pytest.raises(ValueError):
+            resolve_backtest_window(30, "2026-02-13", "2026-01-23")
+        with pytest.raises(ValueError):
+            resolve_backtest_window(30, "2026-02-13", "2026-02-13")  # eşit de reddedilir
+
+    def test_bad_date_format_raises(self):
+        with pytest.raises(ValueError):
+            resolve_backtest_window(30, "23-01-2026", "2026-02-13")
+
+
+# --------------------------------------------------------------------------
+# Rejim kapısı paritesi (simulate_symbol) — canlı engine.py ile birebir:
+# DOWN rejimde LONG / UP rejimde SHORT engellenir. Bu kapı 2026-08-21'e
+# kadar yalnız canlı motordaydı; backtest'te YOKTU.
+# --------------------------------------------------------------------------
+
+class TestSimulateSymbolRegimeGate:
+    _INTERVAL_4H = 1_000  # ms — sentetik, gerçek 4h süresi ÖNEMSİZ (yalnız sıralama)
+
+    def _down_regime_4h_candles(self) -> List[Candle]:
+        # Azalan kapanış dizisi -> EMA50 < EMA200 ve son kapanış < EMA50 => DOWN
+        # (test_regime_requires_fixed_ema200... testindeki artan UP dizisinin aynası).
+        return [
+            _mk_candle(i, 300.0 - i, 300.5 - i, 299.5 - i, 300.0 - i,
+                       interval_ms=self._INTERVAL_4H)
+            for i in range(200)
+        ]
+
+    def _entry_5m_candles(self) -> List[Candle]:
+        # 4h bağlamın son close_time'ından (199_999) çok sonrasında iki mum:
+        # 0=sinyal, 1=giriş + anında SL (LONG stopu %1 altı, low=90 deler).
+        big_offset = 500_000
+        return [
+            Candle(open_time=big_offset, open=100.0, high=100.1, low=99.9,
+                   close=100.0, volume=100.0, close_time=big_offset + 299_999),
+            Candle(open_time=big_offset + 300_000, open=100.0, high=100.5,
+                   low=90.0, close=95.0, volume=100.0,
+                   close_time=big_offset + 599_999),
+        ]
+
+    def test_down_regime_blocks_long_by_default(self):
+        cfg = _Cfg()
+        candles_4h = self._down_regime_4h_candles()
+        assert detect_regime(candles_4h) == Regime.DOWN  # ön koşulu doğrula
+
+        missed: dict = {}
+        trades = simulate_symbol(
+            "TESTUSDT", self._entry_5m_candles(), [], candles_4h,
+            [_AlwaysLongStrategy()], cfg, missed_counter=missed,
+        )
+
+        assert trades == []
+        assert missed.get("regime_gate") == 1
+
+    def test_down_regime_allows_long_when_gate_disabled(self):
+        cfg = _Cfg(scalper_regime_filter=False)
+        candles_4h = self._down_regime_4h_candles()
+
+        trades = simulate_symbol(
+            "TESTUSDT", self._entry_5m_candles(), [], candles_4h,
+            [_AlwaysLongStrategy()], cfg,
+        )
+
+        assert len(trades) == 1
+        assert trades[0].exit_reason == "SL"

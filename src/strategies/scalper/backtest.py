@@ -22,6 +22,10 @@ CLI:
     python -m src.strategies.scalper.backtest --days 30 \\
         --symbols BTCUSDT,ETHUSDT,SOLUSDT --strategies A,B,C
     python -m src.strategies.scalper.backtest --days 7 --symbols auto
+    # Sabit tarih penceresi (UTC, [start,end)) — --days'i geçersiz kılar,
+    # rejim bazlı (BEAR/BULL/FLAT) karşılaştırma için:
+    python -m src.strategies.scalper.backtest \\
+        --start 2026-01-23 --end 2026-02-13 --symbols BTCUSDT --strategies C
 """
 
 from __future__ import annotations
@@ -53,6 +57,7 @@ from src.strategies.scalper.types import (
     StrategyContext,
     StrategyProtocol,
     price_at_roi,
+    resolve_trail_mult,
 )
 
 # --------------------------------------------------------------------------
@@ -596,7 +601,8 @@ def _update_trailing(pos: OpenPosition, candles_5m: List[Candle], idx: int, cfg:
     raw_stop = chandelier_stop(
         window,
         pos.direction,
-        atr_mult=cfg.scalper_chandelier_atr_mult,
+        # Canlı exits._update_trailing ile parite: tepe ROI kademesi.
+        atr_mult=resolve_trail_mult(cfg, pos.mfe_pct),
         atr_period=cfg.scalper_chandelier_atr_period,
         since_index=pos.entry_idx,
     )
@@ -715,6 +721,10 @@ def simulate_symbol(
     `test_start_time_ms` verilirse daha eski mumlar yalnız warm-up bağlamı
     olarak kullanılır; o zamandan önce sinyal/işlem üretilmez ve dolayısıyla
     sonuç metriklerine dahil edilmez.
+
+    cfg.scalper_regime_filter (varsayılan True) rejime ters sinyalleri
+    engeller (DOWN'da LONG, UP'ta SHORT) — canlı motorla (engine.py) birebir
+    parite. Engellenenler `missed_counter["regime_gate"]` altında sayılır.
     """
     trades: List[BacktestTrade] = []
     n5 = len(candles_5m)
@@ -750,16 +760,34 @@ def simulate_symbol(
             close_times_5m, close_times_15m, close_times_4h,
         )
 
-        signal: Optional[ScalpSignal] = None
+        raw_signal: Optional[ScalpSignal] = None
         for strat in strategies:
             sig = strat.evaluate(ctx)
             if sig is not None:
-                signal = apply_stop_policy(sig, cfg)
+                raw_signal = sig
                 break
 
-        if signal is None:
+        if raw_signal is None:
             i += 1
             continue
+
+        # Canlı parite: rejim kapısı (engine._evaluate_symbol ile birebir) —
+        # DOWN rejimde LONG / UP rejimde SHORT engellenir. Bu kapı daha önce
+        # yalnız CANLI motordaydı; backtest'te YOKTU (2026-08-21 tespiti) —
+        # yani geçmiş backtest sonuçları rejime-ters işlemleri de içeriyordu.
+        # TV dış sinyali backtest'te simüle edilmediği için
+        # scalper_tv_regime_filter ayrımı burada anlamsız — tüm sinyaller
+        # "iç" (scalper_regime_filter tek başına yeterli).
+        if bool(getattr(cfg, "scalper_regime_filter", True)):
+            rejim = getattr(ctx.regime, "value", str(ctx.regime))
+            yon = getattr(raw_signal.direction, "value", str(raw_signal.direction))
+            if (rejim == "DOWN" and yon == "LONG") or (rejim == "UP" and yon == "SHORT"):
+                if missed_counter is not None:
+                    missed_counter["regime_gate"] = missed_counter.get("regime_gate", 0) + 1
+                i += 1
+                continue
+
+        signal = apply_stop_policy(raw_signal, cfg)
 
         pos = open_position(signal, candles_5m, i, cfg, initial_balance, missed_counter=missed_counter)
         if pos is None:
@@ -849,6 +877,24 @@ def _group_by_strategy_regime(trades: List[BacktestTrade]) -> Dict[str, Dict[str
     return out
 
 
+def _group_by_strategy_direction(trades: List[BacktestTrade]) -> Dict[str, Dict[str, List[BacktestTrade]]]:
+    """(strateji, yön[LONG/SHORT]) -> işlem listesi — rejim kırılımıyla aynı
+    şekil, rejim penceresi analizinde (BEAR/BULL/FLAT) yön dağılımını görmek
+    için."""
+    out: Dict[str, Dict[str, List[BacktestTrade]]] = {}
+    for t in trades:
+        out.setdefault(t.strategy, {}).setdefault(t.direction, []).append(t)
+    return out
+
+
+def _group_by_strategy_exit(trades: List[BacktestTrade]) -> Dict[str, Dict[str, List[BacktestTrade]]]:
+    """(strateji, çıkış nedeni[SL/TP_LADDER/TRAIL/...]) -> işlem listesi."""
+    out: Dict[str, Dict[str, List[BacktestTrade]]] = {}
+    for t in trades:
+        out.setdefault(t.strategy, {}).setdefault(t.exit_reason, []).append(t)
+    return out
+
+
 def _fmt_pf(pf: float) -> str:
     return "inf" if pf == float("inf") else f"{pf:.2f}"
 
@@ -900,6 +946,12 @@ def print_report(
 
     print()
     _print_regime_breakdown(all_trades)
+    _print_grouped_breakdown(
+        "YÖN KIRILIMI (LONG/SHORT)", "Yön", _group_by_strategy_direction(all_trades),
+    )
+    _print_grouped_breakdown(
+        "ÇIKIŞ NEDENİ KIRILIMI", "Çıkış", _group_by_strategy_exit(all_trades),
+    )
 
 
 def _print_regime_breakdown(all_trades: List[BacktestTrade]) -> None:
@@ -926,6 +978,38 @@ def _print_regime_breakdown(all_trades: List[BacktestTrade]) -> None:
                 s = compute_stats(grouped[strategy_name][regime_name])
                 values = [
                     strategy_name, regime_name, str(s["trades"]),
+                    f"{s['winrate']:.1f}", f"{s['total_pnl']:.2f}", _fmt_pf(s["profit_factor"]),
+                ]
+                print(" | ".join(v.ljust(w) for v, (_, w) in zip(values, cols)))
+
+    print("=" * len(header) + "\n")
+
+
+def _print_grouped_breakdown(
+    title: str, group_col_label: str, grouped: Dict[str, Dict[str, List[BacktestTrade]]],
+) -> None:
+    """`_print_regime_breakdown` ile aynı biçimde, genel amaçlı kırılım
+    tablosu — yön (LONG/SHORT) ve çıkış nedeni (SL/TP_LADDER/TRAIL/...)
+    raporları bunu paylaşır (rejim penceresi analizinde işe yarar)."""
+    cols = [
+        ("Strateji", 8), (group_col_label, 12), ("İşlem", 6), ("Kazanma%", 9),
+        ("Toplam PnL", 12), ("P.Faktör", 9),
+    ]
+    header = " | ".join(name.ljust(w) for name, w in cols)
+    print("=" * len(header))
+    print(title)
+    print("=" * len(header))
+    print(header)
+    print("-" * len(header))
+
+    if not grouped:
+        print("(işlem yok)")
+    else:
+        for strategy_name in sorted(grouped.keys()):
+            for group_name in sorted(str(k) for k in grouped[strategy_name].keys()):
+                s = compute_stats(grouped[strategy_name][group_name])
+                values = [
+                    strategy_name, group_name, str(s["trades"]),
                     f"{s['winrate']:.1f}", f"{s['total_pnl']:.2f}", _fmt_pf(s["profit_factor"]),
                 ]
                 print(" | ".join(v.ljust(w) for v, (_, w) in zip(values, cols)))
@@ -1115,6 +1199,7 @@ async def run_backtest(
     missed_counter: Optional[Dict[str, int]] = None,
     run_metadata: Optional[Dict[str, Any]] = None,
     end_time_ms: Optional[int] = None,
+    start_time_ms: Optional[int] = None,
 ) -> List[BacktestTrade]:
     """Verilen semboller için tarihsel veriyi çeker ve tüm stratejileri
     simüle eder; tüm işlemleri (tüm semboller birleşik) döndürür.
@@ -1123,10 +1208,15 @@ async def run_backtest(
     sinyallerin sayısı buraya birikir (tüm semboller toplamı).
 
     `end_time_ms` tüm sembol ve aralıklara aynı sabit test bitişini uygular.
+    `start_time_ms` verilirse (CLI --start/--end) test penceresi `days`
+    yerine [start_time_ms, test_end_time_ms) olarak sabitlenir; `days`
+    yalnız İÇSEL veri çekme boyutlandırması (kaç mum istenecek) için taban
+    değer olur — `resolve_backtest_window` bunu pencere süresinden zaten
+    doğru hesaplayıp geçirir, burada tekrar türetilmez.
     `run_metadata` verilirse gerçek veri pencereleri ve yeniden üretilebilirlik
     bilgileri bu sözlüğe yazılır.
     """
-    if days <= 0:
+    if start_time_ms is None and days <= 0:
         raise ValueError("Backtest gün sayısı pozitif olmalı")
 
     strategies = get_enabled(strategy_names)
@@ -1134,7 +1224,12 @@ async def run_backtest(
         raise ValueError(f"Geçerli scalper stratejisi bulunamadı: '{strategy_names}'")
 
     test_end_time_ms = end_time_ms if end_time_ms is not None else int(time.time() * 1000)
-    test_start_time_ms = test_end_time_ms - days * _MILLISECONDS_PER_DAY
+    if start_time_ms is not None:
+        if start_time_ms >= test_end_time_ms:
+            raise ValueError("start_time_ms, end_time_ms'den (test penceresi bitişi) önce olmalı")
+        test_start_time_ms = start_time_ms
+    else:
+        test_start_time_ms = test_end_time_ms - days * _MILLISECONDS_PER_DAY
     metadata = {
         **_git_provenance(),
         "scalper_config": scalper_config_snapshot(cfg),
@@ -1207,11 +1302,62 @@ async def _resolve_symbols(symbols_arg: str) -> List[str]:
     return [s.strip().upper() for s in symbols_arg.split(",") if s.strip()]
 
 
+def _parse_utc_date(date_str: str) -> int:
+    """'YYYY-MM-DD' -> o günün 00:00:00 UTC'sinin epoch ms değeri.
+
+    Hatalı biçimde ValueError fırlatır (argparse/main_async bunu yakalayıp
+    kullanıcıya okunur biçimde gösterir).
+    """
+    dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def resolve_backtest_window(
+    days: int, start: Optional[str], end: Optional[str],
+) -> Tuple[int, Optional[int], Optional[int]]:
+    """CLI --days / --start / --end argümanlarını çözer (AĞ YOK, saf —
+    testler için).
+
+    --start/--end İKİSİ BİRDEN verilirse --days'i geçersiz kılar: pencere
+    [start, end) UTC olur (end DAHİL DEĞİL). Yalnız biri verilirse hata.
+    Hiçbiri verilmezse eski davranış (days, None, None) — `--days N` ile
+    şu andan N gün geriye.
+
+    Döner: (effective_days, start_ms, end_ms).
+    `effective_days`, pencere modunda `gather_symbol_data`'nın kaç günlük
+    mum isteyeceğini belirler (pencere süresinin YUKARI yuvarlanmışı) —
+    warm-up zaten `gather_symbol_data` içinde ayrıca eklenir, burada tekrar
+    hesaba katılmaz.
+    """
+    if (start is None) != (end is None):
+        raise ValueError("--start ve --end birlikte verilmeli (yalnız biri verildi)")
+
+    if start is None:
+        return days, None, None
+
+    start_ms = _parse_utc_date(start)
+    end_ms = _parse_utc_date(end)
+    if end_ms <= start_ms:
+        raise ValueError(f"--end ({end}) --start'tan ({start}) sonra olmalı")
+
+    span_days = (end_ms - start_ms) / _MILLISECONDS_PER_DAY
+    effective_days = max(1, math.ceil(span_days))
+    return effective_days, start_ms, end_ms
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Scalper (A/B/C/...) stratejileri için tarihsel backtest ve karşılaştırma raporu."
     )
     parser.add_argument("--days", type=int, default=30, help="Kaç günlük tarihsel veri (varsayılan 30)")
+    parser.add_argument(
+        "--start", type=str, default=None,
+        help="Pencere başlangıcı UTC YYYY-MM-DD (--end ile birlikte verilmeli; verilirse --days'i geçersiz kılar)",
+    )
+    parser.add_argument(
+        "--end", type=str, default=None,
+        help="Pencere bitişi UTC YYYY-MM-DD, DAHİL DEĞİL — [start, end) (--start ile birlikte verilmeli)",
+    )
     parser.add_argument(
         "--symbols", type=str, default="BTCUSDT,ETHUSDT,SOLUSDT",
         help="Virgülle ayrılmış sembol listesi, veya 'auto' (UniverseScanner mainnet ilk 8)",
@@ -1225,18 +1371,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 async def main_async(args: argparse.Namespace) -> None:
     symbols = await _resolve_symbols(args.symbols)
+    effective_days, start_ms, end_ms = resolve_backtest_window(args.days, args.start, args.end)
+    window_desc = f"{args.start}→{args.end} (UTC, [start,end))" if start_ms is not None else f"{args.days} gün"
     app_logger.info(
-        f"🚀 Scalper backtest başlıyor: gün={args.days} sembol={symbols} strateji={args.strategies}"
+        f"🚀 Scalper backtest başlıyor: pencere={window_desc} sembol={symbols} strateji={args.strategies}"
     )
 
     missed_counter: Dict[str, int] = {}
     run_metadata: Dict[str, Any] = {}
     all_trades = await run_backtest(
-        days=args.days,
+        days=effective_days,
         symbols=symbols,
         strategy_names=args.strategies,
         missed_counter=missed_counter,
         run_metadata=run_metadata,
+        start_time_ms=start_ms,
+        end_time_ms=end_ms,
     )
 
     universe_snapshot = run_metadata["universe_snapshot"]
@@ -1256,7 +1406,7 @@ async def main_async(args: argparse.Namespace) -> None:
     sys.stdout.flush()
     write_json_report(
         all_trades,
-        args.days,
+        effective_days,
         symbols,
         args.strategies,
         missed_counter=missed_counter,
