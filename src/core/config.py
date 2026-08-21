@@ -272,6 +272,17 @@ class Settings(BaseSettings):
     # (erişilebilirlik > katılık) — "tv" jenerik kaynağına eşlenir ve
     # WARNING loglanır ki typo fark edilsin.
     tv_source_allowlist: str = "luxosc,luxso,algopro,botv3,tv"
+    # Risk-olayı kanalı (2026-08-21, D10): haber/olay botlarının POST
+    # /risk-event ile giriş durdur/devam et/her-şeyi-düzleştir diyebildiği
+    # AYRI kanal — TV webhook'undan (yön önerisi) tamamen farklı amaç, o
+    # yüzden AYRI secret. Boş = endpoint kapalı (fail-closed, TV webhook ile
+    # aynı desen). docs/INTEGRATIONS.md §3.
+    risk_event_secret: str = ""
+    # Risk-olayı halt'ı scalper_entry_halt_path'ten AYRI bir dosyadır — bkz.
+    # engine.py _risk_event_halt_snapshot yorumu: SCALPER_ENTRY_HALT_ENABLED
+    # yalnız koruma-hatası otomatik latch'ini gater; risk-olayı halt'ı bu
+    # bayraktan bağımsız HER ZAMAN uygulanır.
+    risk_event_halt_path: str = "state/risk_event_halt.json"
     # --- Coin-bazlı dinamik kaldıraç (2026-08-13, kullanıcı isteği) ---
     # fixed_roi stop modunda kaldıraç volatiliteye göre coin başına çözülür:
     # hedef stop FİYAT mesafesi = ATR × dyn_lev_stop_atr_mult olacak şekilde

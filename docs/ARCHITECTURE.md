@@ -82,11 +82,11 @@ satır 56-63). `?src=` yoksa kaynak, AlgoPro'nun varsayılan mesaj biçiminden
 
 | Dosya | Sorumluluk | Anahtar semboller |
 |---|---|---|
-| `src/main.py` | FastAPI app, lifespan, tüm HTTP endpoint'leri | `lifespan:128`, `resolve_tv_signal:544`, `tradingview_webhook:613`, `health_check:264`, `api_status:332`, `scalper_stats:798` |
+| `src/main.py` | FastAPI app, lifespan, tüm HTTP endpoint'leri | `lifespan:128`, `resolve_tv_signal:544`, `tradingview_webhook:613`, `risk_event` (POST `/risk-event`, D10, hemen `tradingview_webhook` sonrası), `health_check:264`, `api_status:332`, `scalper_stats:798` |
 | `src/core/config.py` | Tüm ayarlar (pydantic `Settings`), testnet/mainnet fail-safe | `Settings:28`, `is_testnet:313`, `_validate_binance_environment:392` (mainnet+halt_enabled+prod uyarı zinciri) |
 | `src/core/database.py` | Async SQLAlchemy engine/session, SQLite WAL, idempotent migration | `init_db:88`, `_ensure_schema_migrations:76` (entry_order_id kolonu sonradan eklendi) |
 | `src/core/rate_limiter.py` | Küresel Binance/OpenAI hız sınırlayıcı | `RateLimiter.wait_for_binance:49` (asyncio.Lock ile atomik slot rezervi) |
-| `src/strategies/scalper/engine.py` | Orkestrasyon: scan/safety/exchange döngüleri, kapılar, kill switch | `ScalperEngine:100`, `_scan_tick:699`, `_evaluate_symbol:769`, rejim kapısı `815-834`, `_reap_aged_positions:602`, `_update_kill_switch:1343`, `external_signal:968`, `health_snapshot:1241` |
+| `src/strategies/scalper/engine.py` | Orkestrasyon: scan/safety/exchange döngüleri, kapılar, kill switch, risk-olayı kanalı | `ScalperEngine:100`, `_scan_tick:699`, `_evaluate_symbol:769`, rejim kapısı `815-834`, `_reap_aged_positions:602`, `_update_kill_switch:1343`, `external_signal:968`, `health_snapshot:1241`, `_risk_event_halt_snapshot`/`risk_event_halt`/`risk_event_resume`/`risk_event_flatten`/`risk_event_status` (risk-olayı bölümü, `_persist_entry_halt` sonrası) |
 | `src/strategies/scalper/setups.py` | Saf strateji mantığı (A/B/C/D/E), stop politikası, ortak kapılar | `StrategyC:431` (`evaluate:459`), `apply_stop_policy:87`, `passes_equilibrium:194`, `get_enabled:931` |
 | `src/strategies/scalper/regime.py` | 4h/tf_regime rejim tespiti (EMA50/200) | `detect_regime:19` |
 | `src/strategies/scalper/executor.py` | Giriş boyutlama, risk kapıları, maker/taker giriş, SL/TP algo emirleri, cooldown | `try_open:678`, `_finalize_position:1263`, `_open_maker_entry_locked:1430`, `_set_cooldown:548`, `start_loss_cooldown:586` |
@@ -208,7 +208,24 @@ için `_step_one` çağırır (`exits.py:133-181`):
   `executor.py:520-546`), `scalper_entry_halt_path` (varsayılan
   `state/scalper_entry_halt.json`, fail-closed kalıcı giriş kilidi —
   `engine.py:298-371`), `scalper_pending_journal_path` (maker LIMIT
-  niyetlerinin restart-güvenli journal'ı, `executor.py:198-287`).
+  niyetlerinin restart-güvenli journal'ı, `executor.py:198-287`),
+  `risk_event_halt_path` (varsayılan `state/risk_event_halt.json`, TTL'li
+  fail-closed risk-olayı kilidi — bkz. altta ve `docs/INTEGRATIONS.md` §3).
+
+**Risk-olayı kanalı** (`POST /risk-event`, D10, `docs/DECISIONS.md`): haber/olay
+botlarının giriş kapılarını durdurup/devam ettirebildiği veya tüm izlenen pozisyonları
+acilen düzleştirebildiği yol, motor mantığına DOKUNMADAN eklendi. `risk_event_halt_path`,
+`scalper_entry_halt_path`'ten BİLİNÇLİ olarak AYRI bir dosyadır ve `scalper_entry_halt_enabled`
+bayrağından (yalnız `UnprotectedPositionError` otomatik latch'ini gater; canlı sunucuda
+`false`) TAMAMEN BAĞIMSIZ, her zaman uygulanır — `_entries_ready()` (`engine.py:483-501`,
+scanner + `external_signal`'in TEK ortak kapısı) `_risk_event_halt_snapshot()`'ı (~1sn TTL
+önbellekli, dosya bozuksa/parse edilemezse fail-closed HALT AKTİF) sorar. `flatten`
+aksiyonu, reaper'ın (`_reap_aged_positions`) kullandığı reduce-only MARKET emrini
+(`_submit_reduce_only_market_close`) yeniden kullanır — yeni bir emir yolu yoktur — ve her
+sembolün kapanışını borsa üzerinde doğruladıktan SONRA `exits._handle_closed`'ı
+`forced_exit_reason="RISK_EVENT"` ile çağırır; doğrulanamayan sembol izlemede kalır
+(SL/TP asla doğrulanmadan iptal edilmez). Backtest harness'ına BİLİNÇLİ olarak
+dokunulmadı — risk-olayları yalnız canlı motoru etkiler.
 - **logs/**: `logs/` dizini repoda mevcut (115 girdi görüldü); loguru
   yapılandırması `src/core/logger.py`'dedir — içerik bu görevde satır bazlı
   incelenmedi (kapsam dışı, ana odak scalper akışı).

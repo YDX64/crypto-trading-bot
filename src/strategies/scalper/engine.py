@@ -113,6 +113,11 @@ class ScalperEngine:
     _VIRTUAL_EQUITY_CACHE_TTL = 30.0
     _EXCHANGE_PROBE_INTERVAL = 30.0
     _RESERVATION_OWNER = "scalper"
+    # Risk-olayı halt dosyası _evaluate_symbol'ün sembol döngüsünde her
+    # sinyal denemesinde okunabilir — kısa TTL disk I/O'yu boğmadan ~1sn
+    # içinde halt/resume'u yansıtır (POST /risk-event canlı etkisi için
+    # yeterince taze).
+    _RISK_EVENT_HALT_CACHE_TTL = 1.0
 
     def __init__(self) -> None:
         self.cfg = settings
@@ -181,6 +186,22 @@ class ScalperEngine:
             Path(configured_halt_path).expanduser() if configured_halt_path else None
         )
         self._load_entry_halt()
+        # Risk-olayı kanalı (D10): scalper_entry_halt_path'ten AYRI durum
+        # dosyası — bkz. _risk_event_halt_snapshot. TTL'li olduğu için
+        # (scalper_entry_halt gibi) başlangıçta RAM'e yüklenip tutulmaz;
+        # her okumada dosyadan (kısa TTL önbellekli) taze değerlendirilir.
+        configured_risk_event_halt_path = getattr(
+            self.cfg, "risk_event_halt_path", None
+        )
+        self._risk_event_halt_path: Optional[Path] = (
+            Path(configured_risk_event_halt_path).expanduser()
+            if configured_risk_event_halt_path
+            else None
+        )
+        self._risk_event_halt_cache: Optional[Tuple[float, Dict[str, Any]]] = None
+        # RAM latch (D): dosya yazımı BAŞARISIZ olsa bile halt RAM'de
+        # otoriter kalır — bkz. _persist_risk_event_halt / risk_event_halt.
+        self._risk_event_halt_ram: Optional[Dict[str, Any]] = None
         self._exchange_ready: bool = False
         self._recovery_ready: bool = False
         self._exchange_last_success_at: Optional[str] = None
@@ -370,6 +391,301 @@ class ScalperEngine:
                 except OSError:
                     pass
 
+    # ------------------------------------------------------------------
+    # Risk-olayı kanalı (D10, POST /risk-event) — bkz. docs/INTEGRATIONS.md §3
+    # ------------------------------------------------------------------
+    # `state/risk_event_halt.json`, `state/scalper_entry_halt.json`'dan
+    # BİLİNÇLİ olarak AYRI bir dosyadır:
+    #   * scalper_entry_halt → yalnız KORUMA HATASINDA (UnprotectedPositionError)
+    #     otomatik tetiklenir, `scalper_entry_halt_enabled=false` iken hem
+    #     yüklenmesi hem yeni latch'lenmesi ATLANIR (bkz. _load_entry_halt,
+    #     _latch_entry_halt) — canlı sunucu bu bayrağı false tutuyor.
+    #   * risk_event_halt → yalnız bu API ile (haber/olay botu) YAZILIR,
+    #     `scalper_entry_halt_enabled` bayrağından TAMAMEN bağımsız her zaman
+    #     `_entries_ready()` tarafından uygulanır (yukarıdaki yorum), TTL ile
+    #     kendiliğinden süresi dolar, fail-closed: dosya bozuksa/parse
+    #     edilemezse HALT AKTİF sayılır (aksi "sessizce fail-open" olurdu).
+    # Açık pozisyonların SL/TP/trailing yönetimi bu kanaldan HİÇ etkilenmez —
+    # yalnız YENİ giriş kapılarını (_entries_ready) etkiler.
+
+    def _risk_event_halt_snapshot(self, *, force: bool = False) -> Dict[str, Any]:
+        """`risk_event_halt_path`'i oku (kısa TTL önbellekli), fail-closed.
+
+        Dönüş: {"active": bool, "reason": str|None, "source": str|None,
+        "until_ts": float|None}. `force=True` önbelleği atlar (halt/resume/
+        flatten API çağrılarından hemen sonra taze durum döndürmek için).
+        """
+        path = getattr(self, "_risk_event_halt_path", None)
+        now_mono = time.monotonic()
+        cached = getattr(self, "_risk_event_halt_cache", None)
+        if (
+            not force
+            and cached is not None
+            and (now_mono - cached[0]) < self._RISK_EVENT_HALT_CACHE_TTL
+        ):
+            return cached[1]
+
+        if path is None or not path.exists():
+            snapshot: Dict[str, Any] = {
+                "active": False, "reason": None, "source": None, "until_ts": None,
+            }
+        else:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("risk_event_halt şeması geçersiz (dict değil)")
+                until_ts = float(payload["until_ts"])
+                reason = str(payload.get("reason") or "risk olayı")
+                raw_source = payload.get("source")
+                source = str(raw_source) if raw_source not in (None, "") else None
+            except Exception as e:
+                # Fail-closed: bozuk/okunamayan risk-event halt dosyası
+                # "resume" gibi davranamaz — _load_entry_halt ile aynı ilke.
+                snapshot = {
+                    "active": True,
+                    "reason": f"risk_event_halt dosyası okunamadı: {type(e).__name__}: {e}",
+                    "source": None,
+                    "until_ts": None,
+                }
+            else:
+                if until_ts <= time.time():
+                    snapshot = {
+                        "active": False, "reason": None, "source": None,
+                        "until_ts": until_ts,
+                    }
+                else:
+                    snapshot = {
+                        "active": True, "reason": reason, "source": source,
+                        "until_ts": until_ts,
+                    }
+
+        # RAM latch (D): dosya yazımı başarısız olsa/olmasa da halt RAM'de
+        # otoriter kalır — persist edilemeyen bir halt "aktif değil" gibi
+        # davranamaz (fail-open olurdu). TTL kendiliğinden süresi dolar;
+        # dosyanın süresi RAM'den daha ileri gösteriyorsa (ör. resume dosyayı
+        # sildi ama RAM temizlenmeden önce okundu — pratikte olmaz, ama
+        # savunmacı) dosya kazanır.
+        ram = getattr(self, "_risk_event_halt_ram", None)
+        if ram is not None:
+            ram_until = float(ram.get("until_ts") or 0.0)
+            if ram_until <= time.time():
+                self._risk_event_halt_ram = None
+            else:
+                ram_snapshot = {
+                    "active": True,
+                    "reason": ram.get("reason"),
+                    "source": ram.get("source"),
+                    "until_ts": ram_until,
+                }
+                if not snapshot.get("active"):
+                    snapshot = ram_snapshot
+                elif (
+                    snapshot.get("until_ts") is not None
+                    and float(snapshot["until_ts"]) < ram_until
+                ):
+                    snapshot = ram_snapshot
+
+        self._risk_event_halt_cache = (now_mono, snapshot)
+        return snapshot
+
+    def _persist_risk_event_halt(
+        self, *, reason: str, source: Optional[str], until_ts: float
+    ) -> bool:
+        """Halt durumunu diske yaz. Dönüş: kalıcılaştırma başarılı mı.
+
+        BAŞARISIZ olursa (veya yol yapılandırılmamışsa) `False` döner ama
+        istisna FIRLATMAZ — çağıran `risk_event_halt`, RAM latch'ini (bkz.
+        `_risk_event_halt_ram`) ÖNCEDEN kurmuş olduğu için halt yine de
+        etkilidir; yalnız restart'ta kaybolur.
+        """
+        path = getattr(self, "_risk_event_halt_path", None)
+        if path is None:
+            return False
+        tmp_path: Optional[Path] = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_name(
+                f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+            )
+            payload = {
+                "version": 1,
+                "reason": reason,
+                "source": source,
+                "until_ts": until_ts,
+                "created_at": _utcnow_iso(),
+            }
+            with tmp_path.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, path)
+            try:
+                directory_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                pass
+            return True
+        except Exception as e:
+            self.logger.critical(
+                f"🚨 risk-event halt RAM'de aktif ancak kalıcılaştırılamadı — "
+                f"halt yalnız RAM'de ({path}): {e}",
+                extra={"trade": True},
+            )
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            return False
+        finally:
+            self._risk_event_halt_cache = None
+
+    async def _cancel_pending_for_risk_event(self, *, source_label: str) -> None:
+        """Halt/flatten anında bekleyen maker girişlerini hemen iptal et.
+
+        `_latch_entry_halt`/`_safety_tick` ile aynı desen: entry_lock altında
+        cancel_all_pending, dolan varsa _track_opened_positions ile izlemeye
+        al. İptal başarısız olsa bile halt/flatten API çağrısı BAŞARISIZ
+        sayılmaz — safety döngüsü zaten her turda aynı iptali dener.
+        """
+        async with self._entry_lock:
+            if not self.executor.pending_symbols():
+                return
+            try:
+                opened_during_cancel = await self.executor.cancel_all_pending()
+                self._track_opened_positions(
+                    opened_during_cancel, source=source_label
+                )
+            except Exception as cancel_error:
+                self.logger.error(
+                    f"⚠️ risk-event: bekleyen girişler iptal edilemedi: {cancel_error}",
+                    exc_info=True,
+                )
+
+    async def risk_event_halt(
+        self, *, reason: str, source: Optional[str], ttl_minutes: int
+    ) -> Dict[str, Any]:
+        """POST /risk-event action=halt|flatten tarafından çağrılır."""
+        ttl_minutes = max(1, min(int(ttl_minutes), 1440))
+        until_ts = time.time() + ttl_minutes * 60.0
+        # RAM latch ÖNCE kurulur (D): _persist_risk_event_halt diske
+        # yazamasa bile halt _risk_event_halt_snapshot üzerinden hemen
+        # otoriter olur — _entries_ready() dosya olmadan da False döner.
+        self._risk_event_halt_ram = {
+            "reason": reason, "source": source, "until_ts": until_ts,
+        }
+        self._risk_event_halt_cache = None
+        persisted = self._persist_risk_event_halt(
+            reason=reason, source=source, until_ts=until_ts
+        )
+        # .bind(trade=True) ile loguru'ya kwarg GEÇİLMEZ → mesaj üzerinde
+        # .format() ÇAĞRILMAZ (F): reason/source çağıran-kontrollü metindir,
+        # "{...}" içerirse extra=... kwarg'lı critical() KeyError/IndexError
+        # fırlatıp halt'ı 500'e düşürürdü — persist YİNE de yukarıda oldu.
+        self.logger.bind(trade=True).critical(
+            f"🚨 RİSK-OLAYI HALT: yeni scalper girişleri durduruldu — "
+            f"neden='{reason}' kaynak={source or '-'} ttl={ttl_minutes}dk "
+            f"kalıcı={persisted}"
+        )
+        await self._cancel_pending_for_risk_event(source_label="risk-event halt iptal yarışı")
+        snap = dict(self._risk_event_halt_snapshot(force=True))
+        snap["persisted"] = persisted
+        return snap
+
+    def risk_event_resume(self) -> Dict[str, Any]:
+        """POST /risk-event action=resume tarafından çağrılır.
+
+        YALNIZ risk_event_halt_path'i temizler — koruma-hatası
+        scalper_entry_halt dosyasına DOKUNMAZ (ayrı kilit, ayrı kurtarma).
+        """
+        path = getattr(self, "_risk_event_halt_path", None)
+        if path is not None:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as e:
+                self.logger.error(
+                    f"⚠️ risk-event halt dosyası silinemedi ({path}): {e}"
+                )
+        self._risk_event_halt_ram = None
+        self._risk_event_halt_cache = None
+        self.logger.warning(
+            "✅ RİSK-OLAYI RESUME: giriş kilidi kaldırıldı", extra={"trade": True}
+        )
+        return self._risk_event_halt_snapshot(force=True)
+
+    def risk_event_status(self) -> Dict[str, Any]:
+        """POST /risk-event action=status tarafından çağrılır."""
+        snapshot = self._risk_event_halt_snapshot()
+        snapshot = dict(snapshot)
+        snapshot["open_positions"] = len(self.exits.tracked_symbols())
+        return snapshot
+
+    async def risk_event_flatten(
+        self, *, reason: str, source: Optional[str], ttl_minutes: int
+    ) -> Dict[str, Any]:
+        """POST /risk-event action=flatten: TÜM izlenen pozisyonları kapat.
+
+        Reaper'ın (`_reap_aged_positions`) kullandığı AYNI reduce-only
+        MARKET emir çağrısını (`_submit_reduce_only_market_close`) yeniden
+        kullanır — YENİ bir emir yolu yazılmadı. Kapanış her sembol için
+        borsa üzerinde doğrulanır (`_close_position_market`); doğrulanamayan
+        sembol `errors`'a düşer ve izlemede KALIR (fail-closed — SL/TP asla
+        doğrulanmadan iptal edilmez).
+
+        Halt ÖNCE kurulur, kapatma turundan ÖNCE: kapanış turu sembol başına
+        ~4 sn + ledger REST'i sürebilir; tarama döngüsü BAĞIMSIZ bir task'tır
+        (`_loop`, `start()`), halt sonradan kurulursa `_entries_ready()` bu
+        pencere boyunca AÇIK kalır ve scan/TV kanalının turun ORTASINDA açtığı
+        pozisyon tek-atımlık `tracked_symbols()` anlık görüntüsüne girmediği
+        için ASLA kapanmaz (yanıt yine de "flat" der). `risk_event_halt`
+        bekleyen maker'ları da HALT ALTINDA iptal eder — ayrı bir
+        `_cancel_pending_for_risk_event` çağrısına gerek kalmaz. Turdan sonra
+        `tracked_symbols()` İKİNCİ kez taranır: halt kurulmasıyla eşzamanlı
+        dolan (ör. WS fill yarışı) bir pozisyon varsa o da düzleştirilir.
+        """
+        halt_snapshot = await self.risk_event_halt(
+            reason=reason, source=source, ttl_minutes=ttl_minutes
+        )
+
+        flattened: List[str] = []
+        errors: List[str] = []
+        seen: Set[str] = set()
+        for _ in range(2):  # 2. tur: halt ile eşzamanlı dolan girişleri yakalar
+            remaining = sorted(self.exits.tracked_symbols() - seen)
+            if not remaining:
+                break
+            for symbol in remaining:
+                seen.add(symbol)
+                sp = self.exits._positions.get(symbol)
+                if sp is None:
+                    continue
+                try:
+                    closed = await self._close_position_market(symbol, sp)
+                except Exception as e:
+                    msg = f"{symbol}: {type(e).__name__}: {e}"
+                    errors.append(msg)
+                    self.logger.error(f"❌ risk-event flatten: {msg}", exc_info=True)
+                    continue
+                if closed:
+                    flattened.append(symbol)
+                    self.logger.critical(
+                        f"🚨 risk-event flatten: {symbol} reduce-only kapatıldı",
+                        extra={"trade": True},
+                    )
+                else:
+                    msg = f"{symbol}: kapanış borsa üzerinde doğrulanamadı"
+                    errors.append(msg)
+                    self.logger.error(f"❌ risk-event flatten: {msg}")
+
+        return {
+            "flattened": flattened,
+            "errors": errors,
+            "halt": self._risk_event_halt_snapshot(force=True),
+        }
+
     async def _probe_exchange(self) -> bool:
         """Prove signed Binance Futures account access; never fake readiness."""
 
@@ -468,6 +784,11 @@ class ScalperEngine:
             if self._exchange_last_success_monotonic is not None
             else float("inf")
         )
+        # Risk-olayı halt'ı scalper_entry_halt_enabled'tan BAĞIMSIZ uygulanır
+        # (bkz. _risk_event_halt_snapshot) — canlı sunucu bu bayrağı false
+        # tutsa bile (yalnız koruma-hatası otomatik latch'ini gater) haber
+        # botunun halt'ı yeni girişleri durdurur.
+        risk_event_active = bool(self._risk_event_halt_snapshot().get("active"))
         return bool(
             self._exchange_ready
             and exchange_age <= self._EXCHANGE_PROBE_INTERVAL * 3.0
@@ -475,6 +796,7 @@ class ScalperEngine:
             and self._risk_ready
             and not self._entry_halted
             and not self._kill_switch
+            and not risk_event_active
         )
 
     def _sync_scalper_reservations(self) -> None:
@@ -638,18 +960,7 @@ class ScalperEngine:
             qty = abs(float(sp.position.quantity))
             try:
                 qty = await self.client.quantize_quantity(symbol, qty)
-                await self.client._request_with_retry(
-                    "POST", "/fapi/v1/order",
-                    params={
-                        "symbol": symbol,
-                        "side": close_side,
-                        "type": "MARKET",
-                        "quantity": qty,
-                        "reduceOnly": "true",
-                        "newOrderRespType": "RESULT",
-                    },
-                    signed=True,
-                )
+                await self._submit_reduce_only_market_close(symbol, close_side, qty)
                 self.logger.info(
                     f"⏳ Reaper: {symbol} {age_h:.1f}sa yaşında (limit {limit_h:.0f}sa) — "
                     f"reduce-only kapanış gönderildi; ledger doğrulaması safety turunda",
@@ -660,6 +971,77 @@ class ScalperEngine:
                     f"⏳ Reaper: {symbol} kapanışı gönderilemedi ({e}); sonraki turda denenecek"
                 )
             return  # tur başına en fazla bir kapanış
+
+    async def _submit_reduce_only_market_close(
+        self, symbol: str, close_side: str, qty: float
+    ) -> None:
+        """Reduce-only MARKET kapanış emri — TEK emir yolu.
+
+        Reaper (`_reap_aged_positions`) VE risk-olayı `flatten` aksiyonu
+        (`risk_event_flatten`/`_close_position_market`) AYNI çağrıyı kullanır;
+        risk-olayı kanalı için YENİ bir emir yolu YAZILMADI (bkz. görev
+        sözleşmesi).
+        """
+        await self.client._request_with_retry(
+            "POST", "/fapi/v1/order",
+            params={
+                "symbol": symbol,
+                "side": close_side,
+                "type": "MARKET",
+                "quantity": qty,
+                "reduceOnly": "true",
+                "newOrderRespType": "RESULT",
+            },
+            signed=True,
+        )
+
+    async def _close_position_market(self, symbol: str, sp: Any) -> bool:
+        """Bir pozisyonu reduce-only MARKET ile kapat ve borsada DOĞRULA.
+
+        Reaper'dan farkı: reaper "gönder ve bir sonraki safety turunda
+        exits.step() algılasın" der (tur başına tek kapanış disiplini).
+        Risk-olayı flatten'ı SENKRON, tüm pozisyonlar için ve HTTP yanıtında
+        `flattened=[...]` listesi gerektirir — o yüzden burada kapanışı
+        birkaç kısa deneme ile borsa üzerinde (positionAmt==0) doğrulayıp
+        exits._handle_closed'u DOĞRUDAN çağırıyoruz. Doğrulanamazsa
+        _handle_closed ASLA çağrılmaz — aksi halde SL/TP emirleri iptal
+        edilip pozisyon KORUMASIZ kalabilirdi (fail-closed).
+
+        Boyut ve doğrulama borsadan CANLI okunur (force_fresh=True):
+        `sp.position.quantity` GİRİŞ dolumudur ve kısmi TP'lerden sonra ASLA
+        güncellenmez (exits.py onu `filled` referansı olarak kullanır) —
+        trailing_active bir koşucuda bunu göndermek canlının 1.6-3.3 katı
+        reduce-only MARKET demektir (-2022 NON_RETRYABLE riski, pozisyon
+        korumasız kalır). position_manager._emergency_close ile aynı yol.
+        force_fresh=True her iki okuma için de zorunludur: geri alınamaz
+        kararlar (kapanış boyutu, kapanış doğrulaması) önbellek değil taze
+        veri ister — force_fresh olmadan doğrulama denemeleri 5 sn'lik
+        pozisyon snapshot önbelleğinden aynı bayat kaydı döndürebilir ve
+        retry döngüsü fiilen ölü kalır.
+        """
+        pos_info = await self.client.get_position_risk(symbol, force_fresh=True)
+        amt = float(pos_info.get("positionAmt", 0) or 0) if pos_info else 0.0
+        if amt == 0:
+            # Zaten flat: emir gönderme, yalnız SL/TP temizliği + ledger.
+            await self.exits._handle_closed(
+                symbol, sp, forced_exit_reason="RISK_EVENT"
+            )
+            return True
+        close_side = "SELL" if amt > 0 else "BUY"
+        qty = await self.client.quantize_quantity(symbol, abs(amt))
+        await self._submit_reduce_only_market_close(symbol, close_side, qty)
+
+        for delay in (0.0, 0.3, 0.6, 1.0, 2.0):
+            if delay:
+                await asyncio.sleep(delay)
+            pos_info = await self.client.get_position_risk(symbol, force_fresh=True)
+            amt2 = abs(float(pos_info.get("positionAmt", 0))) if pos_info else 0.0
+            if amt2 == 0:
+                await self.exits._handle_closed(
+                    symbol, sp, forced_exit_reason="RISK_EVENT"
+                )
+                return True
+        return False
 
     def _track_opened_positions(self, positions: list, *, source: str) -> None:
         """Pending uzlaştırmasında gerçekleşmiş dolumları izlemeye al."""
@@ -846,10 +1228,13 @@ class ScalperEngine:
                 tracked = self.exits.tracked_symbols()
                 pending = self.executor.pending_symbols()
                 if not self._entries_ready():
+                    risk_event_snap = self._risk_event_halt_snapshot()
                     if self._entry_halted:
                         reason = "entry safety latch"
                     elif self._kill_switch:
                         reason = "kill switch"
+                    elif risk_event_snap.get("active"):
+                        reason = f"risk-event halt ({risk_event_snap.get('reason')})"
                     else:
                         reason = "exchange/recovery readiness"
                     self.logger.info(f"⏭️ {symbol}: {reason} aktif, hazır sinyal açılmadı")
@@ -986,11 +1371,15 @@ class ScalperEngine:
                 )
                 return {"accepted": False, "reason": "TV sembol allowlist'i dışında"}
         if not self._entries_ready():
-            reason = (
-                self._entry_halt_reason
-                if self._entry_halted
-                else ("kill switch" if self._kill_switch else "girişler hazır değil")
-            )
+            risk_event_snap = self._risk_event_halt_snapshot()
+            if self._entry_halted:
+                reason = self._entry_halt_reason
+            elif self._kill_switch:
+                reason = "kill switch"
+            elif risk_event_snap.get("active"):
+                reason = f"risk-event halt ({risk_event_snap.get('reason')})"
+            else:
+                reason = "girişler hazır değil"
             # 2026-08-14: Sessiz retler teşhisi köreltiyordu (sağlama tamam →
             # iz yok). Ret nedeni HTTP yanıtına ek olarak log'a da yazılır.
             self.logger.info(f"🚫 TV sinyali reddedildi: {symbol} — {reason}")
@@ -1321,6 +1710,8 @@ class ScalperEngine:
             "entry_halted": self._entry_halted,
             "entry_halt_reason": self._entry_halt_reason,
             "entry_halted_at": self._entry_halted_at,
+            "risk_event_halted": bool(self._risk_event_halt_snapshot().get("active")),
+            "risk_event_halt_reason": self._risk_event_halt_snapshot().get("reason"),
             "scan": scan,
             "safety": safety,
             "exchange": exchange,
@@ -1576,6 +1967,7 @@ class ScalperEngine:
             "entry_halted": self._entry_halted,
             "entry_halt_reason": self._entry_halt_reason,
             "entry_halted_at": self._entry_halted_at,
+            "risk_event": self.risk_event_status(),
             "signals_today": self._signals_today,
             "last_scan_at": self._last_scan_at,
             "tracked": tracked,

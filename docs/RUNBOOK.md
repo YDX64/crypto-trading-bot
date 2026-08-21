@@ -49,6 +49,9 @@ gerçek 429 yoksa gürültü). Bekle; ban bitince önce `wait_for_binance` logla
 **Entry-halt (`state/scalper_entry_halt.json`):** güvenlik kilidi, fail-closed. Açmak = nedeni
 anla → dosyayı `.cleared-<tarih>` diye yeniden adlandır → restart. Recover sonrası kapanış
 kayıtları (`exit_reason=UNKNOWN`) güvenilmezdir; PnL'i `binance_income_net` ile doğrula.
+⚠️ Bununla KARIŞTIRMA: `state/risk_event_halt.json` AYRI bir dosyadır (haber/olay botu kanalı,
+D10, bkz. "Risk-olayı kanalı" bölümü) — restart GEREKMEZ, `POST /risk-event action=resume`
+veya dosyayı silmek yeterlidir.
 
 **Degraded ama hata yok + tarama bayat:** dashboard açıkken /api/status force-fresh çağrısı
 limiter'ı doyuruyordu (düzeltildi). Belirti imzası aynıysa önce dashboard'u kapat.
@@ -72,6 +75,46 @@ parmak iziyle) → `TvConfluence.vote` (2 farklı kaynak, 420 sn, ters oy sıfı
 (D9) beri `TV_SOURCE_ALLOWLIST`'e karşı doğrulanır — bilinmeyen değer "tv"ye eşlenir ve
 WARNING loglanır (sessiz hayalet kaynak artık yok, ama sinyal yine de reddedilmez).
 TV Desktop MCP ile ölçüm reçetesi: awa-brain `ops-gotchas/tradingview-desktop-mcp-luxalgo.md`.
+
+## Risk-olayı kanalı (haber/olay botları, D10)
+`POST /risk-event` — TV webhook'undan AYRI amaç (yön DEĞİL, giriş durdur/devam et/her-şeyi-
+kapat). Ayrı secret: `.env`'de `RISK_EVENT_SECRET` (boş = 503 ile kapalı). Durum dosyası
+`state/risk_event_halt.json` — `state/scalper_entry_halt.json`'dan AYRI, `SCALPER_ENTRY_HALT_ENABLED`
+bayrağından bağımsız her zaman uygulanır (ayrıntı: `docs/INTEGRATIONS.md` §3).
+
+**Durumu gör:**
+```bash
+curl -sS -X POST "http://127.0.0.1:9091/risk-event?secret=$RISK_EVENT_SECRET" \
+  -H 'Content-Type: application/json' -d '{"action": "status"}' | python3 -m json.tool
+```
+
+**Girişleri durdur (manuel/haber botu — 60 dk, sebep zorunlu):**
+```bash
+curl -sS -X POST "http://127.0.0.1:9091/risk-event?secret=$RISK_EVENT_SECRET" \
+  -H 'Content-Type: application/json' \
+  -d '{"action": "halt", "reason": "manuel bakım", "source": "ops", "ttl_minutes": 60}'
+```
+
+**Durdurmayı kaldır (halt dosyası süresinden ÖNCE kalksın):**
+```bash
+curl -sS -X POST "http://127.0.0.1:9091/risk-event?secret=$RISK_EVENT_SECRET" \
+  -H 'Content-Type: application/json' -d '{"action": "resume"}'
+```
+
+**Acil: tüm açık scalper pozisyonlarını kapat + girişleri durdur:**
+```bash
+curl -sS -X POST "http://127.0.0.1:9091/risk-event?secret=$RISK_EVENT_SECRET" \
+  -H 'Content-Type: application/json' \
+  -d '{"action": "flatten", "reason": "borsa arızası", "source": "ops", "ttl_minutes": 240}'
+```
+`flatten` yanıtındaki `flattened`/`errors` listelerini kontrol et — `errors`'a düşen sembol
+borsa üzerinde kapanışı DOĞRULANAMADI demektir (SL/TP dokunulmadan izlemede kalır), elle
+`get_position_risk`/dashboard ile bak. Halt her durumda (pozisyon olsun olmasın) kurulur.
+
+**Elle kurtarma (API'ye erişilemiyorsa):** `state/risk_event_halt.json`'ı sil (veya
+`.cleared-<tarih>` diye yeniden adlandır) — restart GEREKMEZ, motor dosyayı ~1sn TTL
+önbellekle her okuduğunda taze değerlendirir. Bozuk/parse edilemeyen dosya fail-closed HALT
+sayılır (dosyayı silmek = resume; sil-öncesi neden loga bakılmalı).
 
 ## Güvenlik borçları
 1. Webhook düz HTTP + IP, secret sorgu dizesinde. Erişim logu kısmı ÇÖZÜLDÜ (D9,

@@ -79,6 +79,10 @@ class ExitManager:
         self.kline_fetch = kline_fetch
         self.logger = app_logger
         self._positions: Dict[str, ScalpPosition] = {}
+        # Aynı sembol için _handle_closed'a İKİ YOLDAN (safety turu ve
+        # risk-olayı flatten'ı) eşzamanlı girişi engelleyen uçuş-halinde
+        # kümesi. Tek event-loop'ta check+add arasında await yoktur.
+        self._closing: Set[str] = set()
         # SL/negatif kapanışta executor'ın sembol cooldown'unu başlatır.
         # Opsiyonel: verilmezse (eski kurulum/testler) davranış değişmez.
         self._loss_cooldown_cb = loss_cooldown_cb
@@ -150,6 +154,17 @@ class ExitManager:
         except Exception as e:
             self.logger.error(
                 f"⚠️ {symbol}: pozisyon durumu sorgusunda beklenmeyen hata ({e}). İzleme sürüyor."
+            )
+            return
+
+        # Eşzamanlı finalize kontrolü: yukarıdaki await sırasında başka bir yol
+        # (risk-olayı flatten → _handle_closed) bu pozisyonu bitirip listeden
+        # çıkarmış ya da değiştirmiş olabilir. Bayat `sp` nesnesiyle devam etmek
+        # ikinci bir finalize/cancel_all demektir — tek-finalizer kilidinin
+        # (`_closing`) tamamlayıcısı: izlenen nesne artık bu değilse adımı bırak.
+        if self._positions.get(symbol) is not sp:
+            self.logger.debug(
+                f"{symbol}: pozisyon bu adım sırasında başka yolca sonlandırıldı — adım atlandı"
             )
             return
 
@@ -425,7 +440,52 @@ class ExitManager:
             return max(breakeven, runner_floor)
         return min(breakeven, runner_floor)
 
-    async def _handle_closed(self, symbol: str, sp: ScalpPosition) -> None:
+    async def _handle_closed(
+        self,
+        symbol: str,
+        sp: ScalpPosition,
+        *,
+        forced_exit_reason: Optional[str] = None,
+    ) -> None:
+        """Pozisyon kapanışını kaydet.
+
+        `forced_exit_reason`: normal (SL/TP/trailing) kapanışlarda kullanılmaz
+        (None); risk-olayı `flatten` gibi harici tetikleyicilerin kapanış
+        NEDENİNİ (örn. "RISK_EVENT") zorlaması için — fiyat/PnL doğrulaması
+        (`_verified_close_ledger`/`_fetch_net_income`) DEĞİŞMEDEN aynen
+        çalışır, yalnız etiketlenen `exit_reason` üzerine yazılır.
+        """
+        # SimpleNamespace/object.__new__ fixture'larında alan bulunmayabilir
+        # (repo konvansiyonu: hasattr yerine getattr(..., None)).
+        closing = getattr(self, "_closing", None)
+        if closing is None:
+            closing = set()
+            self._closing = closing
+        if symbol in closing:
+            # Zaten başka bir yol (safety turu / flatten) bu pozisyonu
+            # finalize ediyor: ikinci kez cancel_all + userTrades + income
+            # çekmek REST weight'i ikiye katlar ve record_close'u ÜZERİNE
+            # yazar (exit_reason kaybı, close_seq çift artışı).
+            self.logger.debug(
+                f"{symbol}: kapanış zaten işleniyor, mükerrer finalize atlandı"
+            )
+            return
+        closing.add(symbol)
+        try:
+            await self._finalize_close(
+                symbol, sp, forced_exit_reason=forced_exit_reason
+            )
+        finally:
+            closing.discard(symbol)
+            self._positions.pop(symbol, None)
+
+    async def _finalize_close(
+        self,
+        symbol: str,
+        sp: ScalpPosition,
+        *,
+        forced_exit_reason: Optional[str] = None,
+    ) -> None:
         try:
             await self.client.cancel_all_open_orders(symbol)
         except Exception as e:
@@ -486,9 +546,13 @@ class ExitManager:
             verification_notes.append("close_verification=unverified")
 
         exit_reason = (
-            ledger.exit_reason
-            if ledger is not None
-            else self._infer_exit_reason(sp, exit_price, realized_pnl=realized_pnl)
+            forced_exit_reason
+            if forced_exit_reason is not None
+            else (
+                ledger.exit_reason
+                if ledger is not None
+                else self._infer_exit_reason(sp, exit_price, realized_pnl=realized_pnl)
+            )
         )
         notes = ";".join(verification_notes) or None
 
@@ -520,7 +584,6 @@ class ExitManager:
             f"kaynak={pnl_source} neden={exit_reason}",
             extra={"trade": True},
         )
-        self._positions.pop(symbol, None)
 
     async def _verified_close_ledger(
         self,

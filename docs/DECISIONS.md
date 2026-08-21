@@ -62,6 +62,93 @@ secret'ı `?secret=...` query'sinde taşınabiliyor (LuxAlgo "Any alert" modu, b
 Geri alma: `src/main.py`/`src/core/config.py`'deki bu değişiklikleri revert et; davranışsal
 risk yok (kabul mantığı gevşetildi, hiçbir sinyal reddedilmiyor).
 
+### D10 — Risk-olayı kanalı: `POST /risk-event` (halt/resume/flatten/status) · 2026-08-21 · AKTİF
+**Ne:** `docs/INTEGRATIONS.md` §3'te planlanan risk-olayı kanalı uygulandı. Haber/olay
+botlarının strateji mantığına DOKUNMADAN scalper girişlerini durdurup/devam ettirebildiği
+veya tüm açık pozisyonları acilen düzleştirebildiği ayrı bir uç nokta:
+- `RISK_EVENT_SECRET` — TV webhook secret'ından AYRI, boş = 503 ile kapalı (aynı desen).
+- `state/risk_event_halt.json` — `state/scalper_entry_halt.json`'dan (koruma-hatası
+  otomatik latch'i) BİLİNÇLİ olarak AYRI dosya; `SCALPER_ENTRY_HALT_ENABLED`
+  bayrağından TAMAMEN BAĞIMSIZ her zaman uygulanır (o bayrak yalnız
+  `UnprotectedPositionError` latch'ini gater — canlı sunucu bunu `false` tutuyor).
+  Motor'un TEK giriş kapısı `_entries_ready()`'ye eklendi; bu yüzden hem scanner'ın C
+  stratejisi (`_evaluate_symbol`) hem TV dış sinyali (`external_signal`) aynı anda kapanır.
+  Fail-closed: dosya bozuk/parse edilemezse HALT AKTİF sayılır (`_load_entry_halt` ile
+  aynı ilke). TTL ile kendiliğinden süresi dolar (varsayılan 120dk, azami 1440dk).
+- `flatten`: reaper'ın (`_reap_aged_positions`) kullandığı AYNI reduce-only MARKET emir
+  çağrısını (`_submit_reduce_only_market_close`) yeniden kullanır — YENİ bir emir yolu
+  YAZILMADI. Halt, kapatma turundan **ÖNCE** kurulur (bkz. aşağıdaki "Düşmanca inceleme
+  düzeltmeleri" — ilk sürümde SONRA kuruluyordu, bu bir kusurdu). Her sembolün kapanışı
+  borsa üzerinde (`positionAmt==0`, `force_fresh=True` ile) doğrulanmadan
+  `exits._handle_closed` ÇAĞRILMAZ (fail-closed — aksi halde SL/TP iptal edilip pozisyon
+  korumasız kalabilirdi). Doğrulanan kapanışlar `exit_reason="RISK_EVENT"` ile kaydedilir
+  (`exits._handle_closed`'a yeni `forced_exit_reason` parametresi eklendi — PnL/fiyat
+  doğrulaması AYNI, yalnız etiket zorlanıyor). Kapatma turu bittikten sonra `tracked_symbols()`
+  **İKİNCİ kez** taranır — halt kurulmasıyla eşzamanlı (ör. WS fill yarışı) dolan bir pozisyon
+  varsa o da düzleştirilir.
+- Açık pozisyonların SL/TP/trailing yönetimi bu kanaldan HİÇ etkilenmez.
+
+**Düşmanca inceleme düzeltmeleri (aynı gün, commit'e girmeden önce):** 3 mercekli (21 ajan)
+düşmanca bir inceleme 6 gerçek kusur buldu; hepsi AYNI gün düzeltildi ve `docs/DECISIONS.md`
+committen ÖNCE güncellendi (bu commit hiçbir zaman kusurlu haliyle canlıya çıkmadı):
+1. **Halt sırası (yukarıda anlatıldı):** `risk_event_flatten` halt'ı kapatma turundan SONRA
+   kuruyordu — tur onlarca saniye sürebildiğinden (`scalper_max_positions` kadar sembol ×
+   ~4sn + ledger REST'i) tarama döngüsü bu pencerede YENİ pozisyon açabilirdi ve o pozisyon
+   tur başındaki tek-atımlık `tracked_symbols()` anlık görüntüsüne girmediği için asla
+   kapanmazdı. Düzeltme: `risk_event_halt` (bekleyen maker'ları da halt ALTINDA iptal eder)
+   turdan ÖNCE çağrılır; tur sonrası ikinci bir tarama eşzamanlı dolumu yakalar.
+2. **Ölü retry döngüsü:** kapanış doğrulaması `get_position_risk`'i `force_fresh=True` OLMADAN
+   çağırıyordu — 5sn'lik pozisyon snapshot önbelleği ilk okumadan sonraki 4 denemeyi aynı
+   bayat (sıfır olmayan) kayda düşürüyor, flatten fiilen kapanmış pozisyonları "doğrulanamadı"
+   diye `errors`'a yazıyordu. Düzeltme: boyutlama VE doğrulama okumaları `force_fresh=True`.
+3. **Bayat miktar:** reduce-only MARKET, `sp.position.quantity` (giriş dolumu, kısmi TP
+   sonrası ASLA güncellenmez) ile boyutlanıyordu — TP1/TP2 dolmuş bir koşucuda canlının
+   1.6-3.3 katı miktar göndermek -2022 (NON_RETRYABLE) reddi riskiydi. Düzeltme: miktar CANLI
+   `positionAmt`'tan (`force_fresh=True`) alınır; `position_manager._emergency_close` ile aynı
+   desen.
+4. **Çift finalize:** flatten'ın doğrudan çağırdığı `exits._handle_closed` ile safety
+   döngüsünün (`exits.step()`) AYNI sembolü eşzamanlı finalize edebilmesi — `cancel_all_open_
+   orders`/ledger/income REST'i iki katına çıkarıyor, `record_close`'u üzerine yazıp
+   `RISK_EVENT` etiketini kaybettirebiliyordu. Düzeltme: `ExitManager._closing: Set[str]`
+   tek-finalizer kapısı (check+add arasında await yok, tek event-loop'ta atomik).
+5. **Sessiz fail-open:** `state/risk_event_halt.json` yazılamazsa (disk dolu/salt-okunur)
+   halt hiç RAM'de tutulmuyordu — `_entries_ready()` True kalıyor, endpoint yine de
+   `ok:true` dönüyordu. Düzeltme: `_risk_event_halt_ram` latch'i persist'ten ÖNCE kurulur ve
+   `_risk_event_halt_snapshot`'a max(RAM, dosya) olarak katılır; yanıt artık `persisted: bool`
+   alanı taşır, `ok` gerçeği yansıtır (halt: `active`; flatten: `not errors`; resume:
+   `not active`).
+6. **Loguru/hmac ikincil kusurlar:** `reason`/`source` içindeki `{...}` loguru'nun
+   `.format()`'unu (kwarg'lı `critical(..., extra=...)` çağrısı yüzünden) tetikleyip
+   KeyError/IndexError ile 500'e düşürüyordu (`.bind(trade=True).critical(...)`'a geçildi);
+   `hmac.compare_digest(str, str)` ASCII-dışı secret'ta TypeError ile 500 veriyordu
+   (`_constant_time_equals`'a geçildi, UTF-8 encode eder); `ttl_minutes: Infinity` →
+   `int(float('inf'))` `OverflowError` fırlatıyordu, `except (TypeError, ValueError)`
+   yakalamıyordu (tuple'a eklendi).
+
+**Neden:** `docs/INTEGRATIONS.md` §2.4 — "savaş çıktı, her şeyi kapat" tipi olaylar yön
+sinyali DEĞİL, ayrı bir risk-olayı kanalı gerektiriyordu; TV webhook'u yalnız yön önerir
+ve sağlamadan (tv_confluence) geçer, tek bir haber botu tek başına giriş açtıramaz — ama
+"her şeyi durdur" kararı sağlamaya TABİ OLMAMALI (bir kaynağın acil müdahalesi yeterli
+olmalı). `SCALPER_ENTRY_HALT_ENABLED=false` canlı sunucuda aktif olduğu için mevcut
+`scalper_entry_halt` latch'i bu amaca uygun değildi (bkz. `engine.py` `_load_entry_halt`/
+`_latch_entry_halt` — bayrak kapalıyken hem yükleme hem yeni latch ATLANIYOR); o yüzden
+YENİ ve bağımsız bir dosya/bayrak gerekti.
+
+**Kanıt:** `tests/test_risk_event.py` — 50 test (29 orijinal auth/doğrulama/dispatch +
+motor-seviyesi halt/resume/ttl-expiry/fail-closed/flatten, + yukarıdaki 6 düşmanca-inceleme
+düzeltmesi için 21 regresyon testi, aynı gün commit'e girmeden eklendi).
+`python3 -m pytest tests -q` → 540 passed, 1 skipped (önceki: 490 passed). Backtest'e
+DOKUNULMADI — risk-olayları yalnız canlı motoru etkiler (bkz. `docs/INTEGRATIONS.md` §3
+"Backtest paritesi").
+
+**Geri alma:** `RISK_EVENT_SECRET`'i `.env`'den kaldır/boş bırak → endpoint 503 ile
+kendiliğinden kapanır (kod geri alınmasına gerek yok). Tam geri alma gerekirse: bu
+commit'teki `src/main.py` (`/risk-event`), `src/strategies/scalper/engine.py`
+(risk-olayı bölümü + `_entries_ready`/`_evaluate_symbol`/`external_signal` içindeki
+risk-event dalları + `_reap_aged_positions` refactor'u), `src/strategies/scalper/exits.py`
+(`_handle_closed` `forced_exit_reason` parametresi), `src/core/config.py`
+(`risk_event_secret`/`risk_event_halt_path`) değişikliklerini revert et.
+
 ## Reddedilen kararlar (kanıtla)
 
 | Fikir | Tarih | Sonuç | Neden reddedildi |

@@ -7,7 +7,6 @@ yapılandırılmamışsa endpoint AÇIK KALMAZ, kapatılır (fail-closed).
 """
 
 import asyncio
-import hmac
 import json
 import logging
 import math
@@ -656,7 +655,7 @@ def resolve_tv_signal(raw: str, configured_secret: str, url_secret: str = ""):
         provided_secret = match.group(1) if match else ""
     if not provided_secret:
         provided_secret = str(url_secret or "")
-    if not hmac.compare_digest(provided_secret, configured_secret):
+    if not _constant_time_equals(provided_secret, configured_secret):
         raise HTTPException(status_code=403, detail="Geçersiz webhook secret")
 
     symbol = str(payload.get("symbol") or "").upper().strip()
@@ -759,6 +758,191 @@ async def tradingview_webhook(request: Request):
 
     result = await scalper_engine.external_signal(symbol, direction)
     return {"symbol": symbol, "direction": direction.value, **source_fields, **result}
+
+
+# ---------------------------------------------------------------------------
+# Risk-olayı kanalı (D10) — haber/olay botları giriş durdur/devam et/
+# her-şeyi-düzleştir diyebilir. YÖN sinyali GÖNDERMEZ, tv_confluence
+# sağlamasından GEÇMEZ — bilinçli olarak AYRI secret (docs/INTEGRATIONS.md §3).
+# ---------------------------------------------------------------------------
+
+_RISK_EVENT_ACTIONS = frozenset({"halt", "resume", "flatten", "status"})
+_RISK_EVENT_MAX_BODY_BYTES = 4096
+_RISK_EVENT_DEFAULT_TTL_MINUTES = 120
+_RISK_EVENT_MAX_TTL_MINUTES = 1440
+_RISK_EVENT_MAX_REASON_CHARS = 200
+_RISK_EVENT_MAX_SOURCE_CHARS = 32
+
+
+@app.post("/risk-event")
+async def risk_event(request: Request):
+    """Haber/olay botu köprüsü: giriş kapılarını durdur/devam ettir veya
+    tüm açık scalper pozisyonlarını reduce-only kapat.
+
+    TV webhook'undan (`/tv-signal`) FARKLI amaç: bu kanal YÖN önermez, yalnız
+    giriş izni verir/kapatır ya da acil kapanış tetikler. Bu yüzden AYRI
+    secret (`RISK_EVENT_SECRET`) ister ve sağlamadan (tv_confluence) hiç
+    geçmez — tek başına bir "olay" tüm sistemi durdurabilmeli.
+
+    Halt durumu `state/risk_event_halt.json`'da tutulur — mevcut
+    `state/scalper_entry_halt.json` (koruma hatası latch'i) dosyasından
+    BİLİNÇLİ olarak AYRI ve `SCALPER_ENTRY_HALT_ENABLED` bayrağından
+    BAĞIMSIZDIR (bkz. engine.py `_risk_event_halt_snapshot` yorumu).
+    Açık pozisyonların SL/TP/trailing yönetimi bu kanaldan etkilenmez.
+    """
+    configured = (settings.risk_event_secret or "").strip()
+    if not configured:
+        raise HTTPException(
+            status_code=503,
+            detail="Risk-event kanalı devre dışı — .env'e RISK_EVENT_SECRET ekleyin",
+        )
+
+    raw = await request.body()
+    if len(raw) > _RISK_EVENT_MAX_BODY_BYTES:
+        raise HTTPException(status_code=422, detail="Gövde çok büyük (>4KB)")
+
+    # Tolerans: resolve_tv_signal ile aynı desen — geçersiz/boş JSON secret
+    # kontrolüne kadar sessizce boş sözlüğe düşer, bilgi sızdırmaz (secret
+    # doğrulaması her zaman ayrıştırma hatasından SONRA, 403 olarak döner).
+    payload: dict = {}
+    if raw:
+        try:
+            parsed = json.loads(raw.decode("utf-8", errors="replace"))
+            if isinstance(parsed, dict):
+                payload = parsed
+        except ValueError:
+            pass
+
+    # Gövde secret'ı VARSA o karar verir (URL'ye sessizce düşülmez) —
+    # resolve_tv_signal'daki "body secret wins" kuralıyla aynı.
+    provided_secret = str(payload.get("secret") or "")
+    if not provided_secret:
+        provided_secret = str(request.query_params.get("secret") or "")
+    if not _constant_time_equals(provided_secret, configured):
+        raise HTTPException(status_code=403, detail="Geçersiz risk-event secret")
+
+    action = str(payload.get("action") or "").strip().lower()
+    if action not in _RISK_EVENT_ACTIONS:
+        raise HTTPException(
+            status_code=422,
+            detail="Geçersiz 'action' — halt|resume|flatten|status olmalı",
+        )
+
+    reason = str(payload.get("reason") or "").strip()
+    if len(reason) > _RISK_EVENT_MAX_REASON_CHARS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"'reason' {_RISK_EVENT_MAX_REASON_CHARS} karakteri aşamaz",
+        )
+
+    raw_source = payload.get("source")
+    source: Optional[str] = (
+        str(raw_source).strip() if raw_source not in (None, "") else None
+    )
+    if source and len(source) > _RISK_EVENT_MAX_SOURCE_CHARS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"'source' {_RISK_EVENT_MAX_SOURCE_CHARS} karakteri aşamaz",
+        )
+    if source == "":
+        source = None
+
+    ttl_raw = payload.get("ttl_minutes", _RISK_EVENT_DEFAULT_TTL_MINUTES)
+    try:
+        # json.loads standart-dışı Infinity/-Infinity/NaN kabul eder;
+        # int(float('inf')) OverflowError fırlatır (ArithmeticError'dır,
+        # ValueError/TypeError DEĞİL) — yakalanmazsa halt hiç çalışmadan
+        # 500'e düşer.
+        ttl_minutes = int(ttl_raw)
+    except (TypeError, ValueError, OverflowError):
+        raise HTTPException(status_code=422, detail="'ttl_minutes' tamsayı olmalı")
+    if ttl_minutes <= 0 or ttl_minutes > _RISK_EVENT_MAX_TTL_MINUTES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"'ttl_minutes' 1..{_RISK_EVENT_MAX_TTL_MINUTES} aralığında olmalı",
+        )
+
+    if not scalper_engine:
+        raise HTTPException(status_code=503, detail="Scalper hazır değil")
+
+    if action in ("halt", "flatten") and not reason:
+        raise HTTPException(
+            status_code=422, detail=f"'reason' zorunlu (action={action})"
+        )
+
+    # .bind(trade=True) ile loguru'ya kwarg GEÇİLMEZ → mesaj üzerinde
+    # .format() ÇAĞRILMAZ (F): reason/source çağıran-kontrollü metindir,
+    # "{...}" içerirse extra=... kwarg'lı critical() KeyError/IndexError
+    # fırlatıp halt/flatten'ı hiç çalışmadan 500'e düşürürdü.
+    app_logger.bind(trade=True).critical(
+        f"🚨 /risk-event: action={action} reason='{reason}' kaynak={source or '-'} "
+        f"ttl={ttl_minutes}dk"
+    )
+
+    if action == "status":
+        snap = scalper_engine.risk_event_status()
+        return {
+            "ok": True,
+            "action": action,
+            "halted_until": snap.get("until_ts"),
+            "reason": snap.get("reason"),
+            "flattened": [],
+            "errors": [],
+            "active": snap.get("active"),
+            "open_positions": snap.get("open_positions"),
+        }
+
+    if action == "resume":
+        snap = scalper_engine.risk_event_resume()
+        # ok=False: dosya silinemediyse (OSError) halt file-derived olarak
+        # AKTİF kalır (bkz. risk_event_resume) — yanıt bunu "başarılı resume"
+        # gibi göstermemeli (I).
+        return {
+            "ok": not snap.get("active"),
+            "action": action,
+            "halted_until": snap.get("until_ts"),
+            "reason": snap.get("reason"),
+            "flattened": [],
+            "errors": [],
+        }
+
+    if action == "halt":
+        snap = await scalper_engine.risk_event_halt(
+            reason=reason, source=source, ttl_minutes=ttl_minutes
+        )
+        # ok=snapshot.active: RAM latch sayesinde persist başarısız olsa
+        # bile halt gerçekten etkilidir (D) — ok=False YALNIZ latch de
+        # kurulamamışsa (ör. TTL<=0 gibi imkansız bir durum) döner.
+        # persisted=False ile ok=True birlikte görülebilir: halt etkili
+        # ama restart'ta kaybolur — çağıran `persisted` alanını kontrol
+        # etmeli.
+        return {
+            "ok": bool(snap.get("active")),
+            "action": action,
+            "halted_until": snap.get("until_ts"),
+            "reason": snap.get("reason"),
+            "flattened": [],
+            "errors": [],
+            "persisted": bool(snap.get("persisted", True)),
+        }
+
+    # action == "flatten"
+    result = await scalper_engine.risk_event_flatten(
+        reason=reason, source=source, ttl_minutes=ttl_minutes
+    )
+    halt_snap = result.get("halt") or {}
+    # ok=False: bir veya daha fazla sembol borsa üzerinde doğrulanamadıysa
+    # (fail-closed — SL/TP iptal edilmedi, izlemede kaldı) yanıt "flat"
+    # OKUNAMAZ (I).
+    return {
+        "ok": not result.get("errors"),
+        "action": action,
+        "halted_until": halt_snap.get("until_ts"),
+        "reason": halt_snap.get("reason"),
+        "flattened": result.get("flattened", []),
+        "errors": result.get("errors", []),
+        "persisted": bool(halt_snap.get("persisted", True)),
+    }
 
 
 @app.post("/signal", dependencies=[Depends(require_api_key)])
