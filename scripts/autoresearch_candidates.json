@@ -1,0 +1,80 @@
+[
+  {
+    "id": "E4a",
+    "hypothesis": "Gevsek RSI esigi (35/65) daha fazla ve daha erken sinyal yakalar; asiri filtrelemeyi hafifletir.",
+    "overrides": {
+      "SCALPER_C_RSI_LONG_MAX": "35",
+      "SCALPER_C_RSI_SHORT_MIN": "65"
+    }
+  },
+  {
+    "id": "E4b",
+    "hypothesis": "Chandelier carpanini 3.0'a daraltmak stop'u sikilastirir, trail kazancini erken kilitler.",
+    "overrides": {
+      "SCALPER_CHANDELIER_ATR_MULT": "3.0"
+    }
+  },
+  {
+    "id": "E4c",
+    "hypothesis": "Chandelier carpanini 4.0'a genisletmek trail'e daha fazla alan birakir, erken cikislari azaltir.",
+    "overrides": {
+      "SCALPER_CHANDELIER_ATR_MULT": "4.0"
+    }
+  },
+  {
+    "id": "E4d",
+    "hypothesis": "TP2 hedefini 20'ye dusurmek runner payini daha sik gerceklestirir.",
+    "overrides": {
+      "SCALPER_TP2_ROI": "20"
+    }
+  },
+  {
+    "id": "E4e",
+    "hypothesis": "TP2 hedefini 30'a yukseltmek runner'a daha fazla alan birakir.",
+    "overrides": {
+      "SCALPER_TP2_ROI": "30"
+    }
+  },
+  {
+    "id": "E4f",
+    "hypothesis": "TP1 hedefini 8'e dusurmek break-even'e daha erken gecer, whipsaw'da SL'den korur.",
+    "overrides": {
+      "SCALPER_TP1_ROI": "8"
+    }
+  },
+  {
+    "id": "E4g",
+    "hypothesis": "TP1 hedefini 12'ye yukseltmek erken kismi kar alimini geciktirir, runner payini buyutur.",
+    "overrides": {
+      "SCALPER_TP1_ROI": "12"
+    }
+  },
+  {
+    "id": "E4h",
+    "hypothesis": "Maksimum pozisyon sayisini 3'e sabitlemek (sunucu farkliysa) slot rekabetini azaltir.",
+    "overrides": {
+      "SCALPER_MAX_POSITIONS": "3"
+    }
+  },
+  {
+    "id": "E4i",
+    "hypothesis": "Dinamik kaldirac tavanini 20'den 10'a dusurmek stop mesafesini buyutup gurultu stop'unu azaltir.",
+    "overrides": {
+      "SCALPER_DYN_LEV_MAX": "10"
+    }
+  },
+  {
+    "id": "E4j",
+    "hypothesis": "Dinamik kaldirac tavanini 20'den 15'e dusurmek orta yol olarak stop mesafesini biraz buyutur.",
+    "overrides": {
+      "SCALPER_DYN_LEV_MAX": "15"
+    }
+  },
+  {
+    "id": "E4k",
+    "hypothesis": "Baglam TF'sini 15m'de sabitlemek (sunucu farkliysa) sinyal baglamini rejim TF'sinden ayristirir.",
+    "overrides": {
+      "SCALPER_TF_CONTEXT": "15m"
+    }
+  }
+]

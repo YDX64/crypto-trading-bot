@@ -70,6 +70,8 @@ docker-compose.override.yml
 
 # N8N Workflows (optional backup files)
 *.json
+# autoresearch aday listesi kod ile birlikte commit'lenir (uretim ciktisi degil)
+!scripts/autoresearch_candidates.json
 
 # .env yedekleri (anahtar icerir)
 .env.bak*
