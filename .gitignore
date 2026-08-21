@@ -80,3 +80,5 @@ backups/
 
 # pytest log yonlendirmesi (conftest.py)
 .test-logs/
+# Backtest kline onbellegi (harness; fixture dosyalari tests/fixtures altinda)
+data/klines_cache/
