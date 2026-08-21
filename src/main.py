@@ -346,7 +346,12 @@ async def api_status():
         except Exception as e:
             errors.append(f"price: {e}")
         try:
-            account["open_positions"] = len(await client.get_all_positions())
+            # Gösterim amaçlı sayaç: force_fresh=False şart. Panel 5 sn'de bir
+            # bu endpoint'i çağırıyor; taze zorlamak rate-limiter kuyruğunu
+            # doyurup scan döngüsünü bayatlatıyordu (2026-08-18 degraded olayı).
+            account["open_positions"] = len(
+                await client.get_all_positions(force_fresh=False)
+            )
         except Exception as e:
             errors.append(f"positions: {e}")
     else:

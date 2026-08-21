@@ -3,10 +3,11 @@ Konfigürasyon yönetimi modülü.
 Tüm environment variables ve uygulama ayarları burada yönetilir.
 """
 
+import ipaddress
 import sys
 import warnings
 from typing import Optional
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -46,6 +47,14 @@ class Settings(BaseSettings):
     # geçişlerinde Binance farklı WS hostu yayımlayabildiği için env ile açık
     # override desteklenir (BINANCE_WS_BASE_URL).
     binance_ws_base_url: Optional[str] = None
+    # 2026-08-15: Boş değilse Binance REST soketleri bu yerel IP'ye bind edilir
+    # (BINANCE_BIND_IP). Neden: sunucudaki NordVPN policy routing'i tüm çıkışı
+    # tünele sokuyor; X-MBX-USED-WEIGHT-1M IP bazlı sayıldığından paylaşılan
+    # tünel çıkış IP'sinde YABANCI trafik bizim 2400/dk bütçemizi yiyip 418
+    # ban'ı yedirtiyordu (bot 10 istek/dk atarken başlık 5864 gösterdi).
+    # `from <ana-IP> lookup 100` kuralı sayesinde bind edilen soket tüneli
+    # atlar ve temiz, yalnız bize ait weight bütçesinden harcar.
+    binance_bind_ip: str = ""
     # Gerçek parayla (mainnet) işlem yapmak için açık onay. Varsayılan False.
     # binance_base_url mainnet'i gösteriyorsa ve bu False ise Settings() hata verir.
     allow_mainnet: bool = False
@@ -138,6 +147,23 @@ class Settings(BaseSettings):
     # girişin korumasız kalma penceresini tarama süresine bağlı olmaktan
     # çıkarır; ortam değişkeni: SCALPER_SAFETY_INTERVAL_SECONDS.
     scalper_safety_interval_seconds: float = 2.0
+    # Pozisyon bu saatten yaşlıysa reaper reduce-only MARKET ile kapatır
+    # (0 = kapalı). Scalp ufkunu aşan pozisyon slot+sermaye israfıdır.
+    scalper_max_hold_hours: float = 0.0
+    # Rejime ters C girislerini engelle (LONG yasak DOWN'da, SHORT yasak
+    # UP'ta; RANGE/UNKNOWN serbest).
+    scalper_regime_filter: bool = True
+    # TV dış sinyallerine sembol allowlist'i (virgüllü; boş = tümü serbest).
+    # 2026-08-21 kanıtı: LuxAlgo OSC Backtester 8 sembolde tarandı (TV MCP) —
+    # BTC/ETH/XRP PF 1.9-2.5, DOGE/ADA/LTC PF<1; canlı defter de aynı yönde
+    # (TV kayıpları SOL −30.65 ve DOGE'dan geldi). luxosc sinyali her coinde
+    # aynı değil; kanıtı olan sembollere sınırla.
+    scalper_tv_symbol_allowlist: str = ""
+    # TV dış sinyalleri de rejim kapısına tabi mi? 2026-08-18: True yapıldı —
+    # 2 kaynaklı sağlamaya rağmen TV 2 günde −41 USDT (7 işlem, iki gün de
+    # negatif); en kötüsü rejime ters 8 saatlik SHORT (SOL #92, −30.65).
+    # False = eski davranış (TV muaf).
+    scalper_tv_regime_filter: bool = True
     scalper_leverage: int = 20
     scalper_risk_percentage: float = 2.0       # işlem başına bakiye riski (C yarısını kullanır)
     scalper_max_positions: int = 3
@@ -150,6 +176,14 @@ class Settings(BaseSettings):
     scalper_breakeven_buffer_pct: float = 0.05
     scalper_chandelier_atr_mult: float = 2.5
     scalper_chandelier_atr_period: int = 14
+    # --- Kademeli gevşeyen iz (2026-08-21, kullanıcı kararı: koşucuyu yalnız
+    # SL durdurur, %1000'e bile binebilmeli). TEPE ROI şu eşiği geçince
+    # chandelier çarpanı bir üst kademeye çıkar ve (high-water mark) bir daha
+    # sıkılaşmaz. roi1<=0 = özellik kapalı. Bkz. types.resolve_trail_mult.
+    scalper_trail_relax_roi1_pct: float = 0.0
+    scalper_trail_relax_mult1: float = 5.0
+    scalper_trail_relax_roi2_pct: float = 150.0
+    scalper_trail_relax_mult2: float = 7.0
     scalper_daily_loss_limit_pct: float = 15.0 # 0 = kesici kapalı
     scalper_use_equilibrium_filter: bool = True  # LONG yalnız discount, SHORT yalnız premium
     scalper_min_rr: float = 1.2                # beklenen harman TP getirisi / SL riski alt sınırı; 0 = kapalı
@@ -256,6 +290,13 @@ class Settings(BaseSettings):
     # temizlenmemeli. Bu atomik durum dosyası yalnız doğrulanmış manuel
     # müdahaleyle kaldırılır.
     scalper_entry_halt_path: str = "state/scalper_entry_halt.json"
+    # Fail-closed giriş latch'i. LIVE'da daima True kalmalı; testnet'te hızlı
+    # test turları için False yapılabilir (UnprotectedPositionError yine acil
+    # kapatma + CRITICAL log üretir, yalnız yeni girişler durdurulmaz).
+    # Mainnet'te False, _validate_binance_environment tarafından startup'ta
+    # ValueError ile reddedilir — testnet .env'i canlıya kopyalanınca güvenlik
+    # kilidi sessizce devre dışı kalamaz.
+    scalper_entry_halt_enabled: bool = True
     scalper_c_allowed_regimes: str = "UP,DOWN,RANGE"  # deney: "RANGE" ile sınırla
     scalper_d_use_eqhl: bool = True              # D süpürmesi EQH/EQL kümelerine bağlı
     scalper_eqhl_tolerance_pct: float = 0.05     # pivot eşitlik eşiği (%)
@@ -280,6 +321,23 @@ class Settings(BaseSettings):
         """
         base_url_lower = self.binance_base_url.lower()
         return any(host in base_url_lower for host in TESTNET_HOSTS)
+
+    @field_validator("binance_bind_ip")
+    @classmethod
+    def _validate_bind_ip(cls, value: str) -> str:
+        """Geçersiz IP startup'ta patlasın: httpx.AsyncHTTPTransport hatalı
+        local_address'i hatasız kabul eder ve sorun ancak İLK istekte jenerik
+        ConnectError olarak (3 retry ardından) yüzeylenir — operatör bunu
+        geçici ağ sorunu sanır."""
+        value = (value or "").strip()
+        if value:
+            try:
+                ipaddress.ip_address(value)
+            except ValueError as e:
+                raise ValueError(
+                    f"BINANCE_BIND_IP geçersiz IP adresi: {value!r}"
+                ) from e
+        return value
 
     @model_validator(mode="after")
     def _validate_fixed_roi_stop_consistency(self) -> "Settings":
@@ -357,6 +415,17 @@ class Settings(BaseSettings):
                     "olarak onaylanmadı. Gerçek parayla işlem için ALLOW_MAINNET=true "
                     "ayarlayın. Testnet kullanmak istiyorsanız BINANCE_BASE_URL="
                     "https://testnet.binancefuture.com olarak ayarlayın."
+                )
+
+            if not self.scalper_entry_halt_enabled:
+                # Testnet .env'inden kalan SCALPER_ENTRY_HALT_ENABLED=false,
+                # canlıda fail-closed giriş kilidini (UnprotectedPositionError
+                # latch'i + kalıcı halt dosyası) sessizce devre dışı bırakır.
+                raise ValueError(
+                    "GÜVENLİK HATASI: SCALPER_ENTRY_HALT_ENABLED=false yalnız "
+                    "testnet'te kullanılabilir. Mainnet'te fail-closed giriş "
+                    "kilidi devre dışı bırakılamaz — ayarı .env'den kaldırın "
+                    "veya true yapın."
                 )
 
             if not self.is_production:

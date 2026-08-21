@@ -1394,6 +1394,7 @@ class ScalpExecutor:
                 sl_algo_id=sl_algo_id,
                 tp1_algo_id=tp1_algo_id,
                 tp2_algo_id=tp2_algo_id,
+                entry_order_id=entry_order_id,
             )
         except Exception as e:
             self.logger.critical(

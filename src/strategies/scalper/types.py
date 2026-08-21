@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from enum import Enum
-from typing import List, Optional
+from typing import Any, List, Optional
 
 
 class Regime(str, Enum):
@@ -147,6 +147,30 @@ def price_at_roi(entry: float, roi_pct: float, leverage: int,
     """Girişten itibaren hedef ROI'ye denk gelen fiyat."""
     delta = entry * roi_to_price_delta_pct(roi_pct, leverage) / 100.0
     return entry + delta if direction == Direction.LONG else entry - delta
+
+
+def resolve_trail_mult(cfg: Any, peak_roi_pct: float) -> float:
+    """Kademeli gevşeyen iz: TEPE ROI (high-water mark) büyüdükçe chandelier
+    çarpanı büyür — küçük kârda sıkı koru, dev trendde geniş bırak.
+
+    Anlık ROI değil tepe ROI kullanılır: geri çekilme sırasında iz yeniden
+    sıkılaşsaydı koşucu tam korumak istediğimiz anda ölürdü; kademe tek
+    yönlüdür. scalper_trail_relax_roi1_pct<=0 özelliği kapatır (temel çarpan).
+    Canlı (exits._update_trailing) ve backtest (_update_trailing) İKİSİ DE
+    bunu çağırır — parite bozulmamalı.
+    """
+    base = float(getattr(cfg, "scalper_chandelier_atr_mult", 2.5) or 2.5)
+    roi1 = float(getattr(cfg, "scalper_trail_relax_roi1_pct", 0.0) or 0.0)
+    if roi1 <= 0:
+        return base
+    mult1 = float(getattr(cfg, "scalper_trail_relax_mult1", base) or base)
+    roi2 = float(getattr(cfg, "scalper_trail_relax_roi2_pct", 0.0) or 0.0)
+    mult2 = float(getattr(cfg, "scalper_trail_relax_mult2", mult1) or mult1)
+    if roi2 > roi1 and peak_roi_pct >= roi2:
+        return mult2
+    if peak_roi_pct >= roi1:
+        return mult1
+    return base
 
 
 def fee_aware_breakeven_price(

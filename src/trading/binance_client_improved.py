@@ -104,6 +104,78 @@ class ImprovedBinanceClient:
     _breaker_last_log: float = 0.0
     _BAN_UNTIL_RE = re.compile(r"banned until (\d{10,16})")
 
+    # --- REST ağırlık diyeti: süreç-geneli okuma önbellekleri -----------
+    # 2026-08-15: positionRisk/account polling'i 2400 weight/dk sınırını
+    # düzenli aşıp 418 ban döngüsü yaratıyordu; ban körlüğünde 5 pozisyon
+    # günlerce "hayalet" kaldı ve restart'ta toplu UNKNOWN kapanışıyla
+    # (−89 USDT) deftere indi. Sembolsüz positionRisk TÜM pozisyonları tek
+    # weight-5 çağrıyla verir; account yanıtı da tüm bakiyeleri taşır.
+    # Okumalar bu paylaşılan anlık görüntülerden beslenir. SINIF düzeyinde
+    # paylaşım AYNI SÜREÇ içinde geçerlidir: src/main.py'nin engine +
+    # orchestrator + in-process FastAPI app'i aynı görüntüyü kullanır. DİKKAT:
+    # start_system.sh'nin ayrı süreç olarak başlattığı (deprecated)
+    # src/api_server.py bu paylaşımın DIŞINDADIR — sınıf-düzeyi önbellek
+    # süreç sınırını geçmez, o süreç kendi bağımsız önbelleğini yaşlandırır.
+    _POS_SNAPSHOT_TTL = 5.0    # sn — safety turu 2 sn (config varsayılanı):
+    #                            snapshot ~2-3 tur yaşar, tur başına ≤1 çağrı
+    _POS_SNAPSHOT_FRESH_S = 1.0  # sn — bu yaştan taze TAM snapshot, sıfır/eksik
+    #                              kayıt için de "taze doğrulama" sayılır
+    #                              (yazma olmadıysa — bkz. _write_generation)
+    _ACCOUNT_CACHE_TTL = 15.0  # sn — dashboard 5 sn'de bir bakiye soruyor
+    _PRICE_CACHE_TTL = 2.5     # sn — MAE/MFE ve tahmini çıkış için yeterli
+    _PRICE_CACHE_MAX = 256     # girdi tavanı — aşılınca süresi geçenler atılır
+    # Her POST/DELETE'te artar. İki görevi var: (1) yazma sırasında havada
+    # olan bir GET'in emir-ÖNCESİ yanıtı önbelleğe "taze" damgalamasını önler
+    # (fetch başlarken alınan jenerasyon değiştiyse damga basılmaz);
+    # (2) kilit içi 1 sn kısayolu yalnız son yazmadan SONRA alınmış snapshot'a
+    # güvenir. Zaman damgası sıfırlamak tek başına bu yarışı kapatamıyordu.
+    _write_generation: int = 0
+    _pos_snapshot: Optional[Dict[str, Dict[str, Any]]] = None
+    _pos_snapshot_ts: float = 0.0
+    _pos_snapshot_gen: int = -1
+    _pos_snapshot_lock: Optional[asyncio.Lock] = None
+    _account_cache: Optional[Dict[str, Any]] = None
+    _account_cache_ts: float = 0.0
+    _account_cache_lock: Optional[asyncio.Lock] = None
+    # Piyasa fiyatı bilinçli olarak invalidasyon/kilit dışında: kendi
+    # yazmalarımız piyasa fiyatını değiştirmez, kaçırılan yarışın bedeli en
+    # fazla bir yinelenen GET'tir. Bu sadeliği kopyalamadan önce dikkat:
+    # HESAP verisi önbellekleyen her yeni endpoint kilitli+invalidasyonlu
+    # desene (_pos_snapshot/_account_cache) uymalıdır.
+    _price_cache: Dict[str, Tuple[float, float]] = {}
+    # Ağırlık uyarısına iliştirilen teşhis: son uyarıdan bu yana endpoint
+    # başına GERÇEK ağa çıkan istek sayısı. "Bütçeyi kim yiyor" sorusu
+    # tahminle değil bu sayaçla cevaplanır (2026-08-15).
+    _endpoint_counts: Dict[str, int] = {}
+
+    @classmethod
+    def _read_lock(cls, name: str) -> asyncio.Lock:
+        """Sınıf-düzeyi kilidi tembel oluştur (import anında loop olmayabilir)."""
+        lock = getattr(cls, name)
+        if lock is None:
+            lock = asyncio.Lock()
+            setattr(cls, name, lock)
+        return lock
+
+    @classmethod
+    def _invalidate_read_caches(cls, symbol: Optional[str] = None) -> None:
+        """Her yazma isteğinde (POST/DELETE) çağrılır: kendi emirlerimizin
+        etkisi asla bayat anlık görüntüden okunmasın.
+
+        Sembollü yazmada pozisyon snapshot'ından YALNIZ o sembol düşer:
+        pozisyon verisi sembol bazlıdır, A'ya atılan stop replace'i aynı
+        exits.step turundaki B/C okumalarına weight-5 taze fetch ödetmemeli
+        (aksi hâlde volatil anda diyet, diyetsiz baseline'a geriliyordu).
+        Account yanıtı ise global (emir marjı her yazmayla değişebilir) —
+        daima komple düşer. Jenerasyon her durumda artar; sıfır-servisi ve
+        taze-damga bekçileri buna bakar."""
+        cls._write_generation += 1
+        if symbol and cls._pos_snapshot is not None:
+            cls._pos_snapshot.pop(str(symbol).strip().upper(), None)
+        else:
+            cls._pos_snapshot_ts = 0.0
+        cls._account_cache_ts = 0.0
+
     def _ensure_rest_allowed(self, endpoint: str) -> None:
         """Küresel ban devre kesicisi: -1003/418 sonrası ban bitene kadar
         HİÇBİR istek ağa çıkmaz. Ban sırasında atılan her istek yasağı uzatır
@@ -151,11 +223,25 @@ class ImprovedBinanceClient:
         self.base_url = settings.binance_base_url
         self.logger = app_logger
 
-        self.client = httpx.AsyncClient(
-            timeout=httpx.Timeout(60.0, connect=10.0),
-            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
-            follow_redirects=True,
-        )
+        # Boş değilse soketler bu yerel IP'ye bind edilir: NordVPN policy
+        # routing'inde `from <ana-IP> lookup 100` kuralı bind'li soketi tünel
+        # DIŞINA çıkarır → paylaşılan tünel IP'sinin weight bütçesi yerine
+        # yalnız bize ait temiz bütçe (418 kök nedeni, 2026-08-15).
+        bind_ip = str(getattr(settings, "binance_bind_ip", "") or "").strip()
+        limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
+        client_kwargs: Dict[str, Any] = {
+            "timeout": httpx.Timeout(60.0, connect=10.0),
+            "follow_redirects": True,
+        }
+        if bind_ip:
+            # transport verildiğinde limits client'ta değil transport'ta geçerli
+            client_kwargs["transport"] = httpx.AsyncHTTPTransport(
+                local_address=bind_ip, limits=limits
+            )
+            self.logger.info(f"🔌 Binance REST soketleri {bind_ip} IP'sine bind edildi")
+        else:
+            client_kwargs["limits"] = limits
+        self.client = httpx.AsyncClient(**client_kwargs)
 
         self.max_retries = 3
         self.retry_delay = 2.0
@@ -246,21 +332,36 @@ class ImprovedBinanceClient:
         endpoint: str,
         params: Optional[Dict[str, Any]] = None,
         signed: bool = False,
+        invalidate_symbol: Optional[str] = None,
     ) -> Any:
         """API isteği yap — her deneme parametreleri sıfırdan kurar.
 
         KRİTİK: base_params asla mutasyona uğramaz. Retry sırasında önceki
         denemenin 'signature' alanı yeniden imzalanırsa Binance -1022 döndürür.
+
+        invalidate_symbol: API'ye GÖNDERİLMEZ — yalnız önbellek invalidasyonu
+        için. Sembolsüz yazma endpoint'leri (örn. algoId'li DELETE) etkilenen
+        sembolü bununla bildirir ki invalidasyon global yerine hedefli olsun.
         """
         base_params = dict(params or {})
+        cache_symbol = base_params.get("symbol") or invalidate_symbol
         url = f"{self.base_url}{endpoint}"
         last_error: Optional[Exception] = None
 
         self._ensure_rest_allowed(endpoint)
 
+        # Yazma denemesi başlarken VE başarıyla bitince okuma önbellekleri
+        # düşer: belirsiz sonuçlu (timeout) bir POST bile bayat okuma bırakmaz.
+        if method != "GET":
+            type(self)._invalidate_read_caches(cache_symbol)
+
         for attempt in range(self.max_retries):
             try:
                 await rate_limiter.wait_for_binance()
+
+                type(self)._endpoint_counts[endpoint] = (
+                    type(self)._endpoint_counts.get(endpoint, 0) + 1
+                )
 
                 # Her denemede TAZE kopya — mutasyon yok
                 attempt_params = dict(base_params)
@@ -304,8 +405,15 @@ class ImprovedBinanceClient:
                         # sinyali. Eşik gerçek 2400 sınırına yakın tutulur ki
                         # log gürültüsü olmasın ama gerçek riske yaklaşım görünsün.
                         if uw >= 1800:
+                            counts = type(self)._endpoint_counts
+                            top = sorted(
+                                counts.items(), key=lambda kv: kv[1], reverse=True
+                            )[:6]
+                            detail = ", ".join(f"{ep}×{n}" for ep, n in top)
+                            type(self)._endpoint_counts = {}
                             self.logger.warning(
-                                f"⚖️ Binance 1dk kullanılan ağırlık: {uw} ({endpoint})"
+                                f"⚖️ Binance 1dk kullanılan ağırlık: {uw} ({endpoint}) "
+                                f"| son uyarıdan beri istekler: {detail}"
                             )
 
                 if response.status_code >= 400:
@@ -356,6 +464,8 @@ class ImprovedBinanceClient:
                         self.logger.error(str(err))
                     raise err
 
+                if method != "GET":
+                    type(self)._invalidate_read_caches(cache_symbol)
                 return response.json()
 
             except BinanceAPIError:
@@ -598,6 +708,32 @@ class ImprovedBinanceClient:
             self.logger.error(f"❌ Bağlantı testi başarısız: {e}")
             return False
 
+    async def _get_account(self, *, force_fresh: bool = False) -> Dict[str, Any]:
+        """/fapi/v2/account yanıtı — süreç-geneli önbellek (TTL 15 sn).
+
+        Bakiye/cüzdan okumaları ve dashboard polling'i tek weight-5 çağrıyı
+        paylaşır. Yazma istekleri önbelleği düşürür; kurtarma akışları
+        force_fresh=True ile her zaman taze okur.
+        """
+        cls = type(self)
+        if (not force_fresh and cls._account_cache is not None
+                and time.monotonic() - cls._account_cache_ts < cls._ACCOUNT_CACHE_TTL):
+            return cls._account_cache
+        async with self._read_lock("_account_cache_lock"):
+            if (not force_fresh and cls._account_cache is not None
+                    and time.monotonic() - cls._account_cache_ts < cls._ACCOUNT_CACHE_TTL):
+                return cls._account_cache
+            gen = cls._write_generation
+            response = await self._request_with_retry(
+                "GET", "/fapi/v2/account", signed=True
+            )
+            # Fetch sırasında yazma olduysa yanıt emir-öncesi olabilir:
+            # çağırana döner ama "taze" diye damgalanmaz.
+            if cls._write_generation == gen:
+                cls._account_cache = response
+                cls._account_cache_ts = time.monotonic()
+            return response
+
     async def get_account_balance(self) -> Optional[float]:
         """Kullanılabilir USDT bakiyesi.
 
@@ -606,7 +742,7 @@ class ImprovedBinanceClient:
         0.0 dönüyordu ve bu, config'deki sahte bakiyeye düşülmesine yol açıyordu.
         """
         try:
-            response = await self._request_with_retry("GET", "/fapi/v2/account", signed=True)
+            response = await self._get_account()
             for asset in response.get("assets", []):
                 if asset["asset"] == "USDT":
                     balance = float(asset["availableBalance"])
@@ -622,9 +758,7 @@ class ImprovedBinanceClient:
         """USDT wallet equity before open-order/position margin deductions."""
 
         try:
-            response = await self._request_with_retry(
-                "GET", "/fapi/v2/account", signed=True
-            )
+            response = await self._get_account()
             total = response.get("totalWalletBalance")
             if total not in (None, ""):
                 return float(total)
@@ -1123,11 +1257,18 @@ class ImprovedBinanceClient:
         )
         return response if isinstance(response, list) else []
 
-    async def cancel_algo_order(self, algo_id: int) -> Dict[str, Any]:
-        """Koşullu emri iptal et."""
+    async def cancel_algo_order(
+        self, algo_id: int, *, symbol: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Koşullu emri iptal et.
+
+        symbol API'ye gönderilmez; verilirse önbellek invalidasyonu global
+        yerine yalnız o sembole uygulanır (bkz. _invalidate_read_caches).
+        """
         try:
             response = await self._request_with_retry(
-                "DELETE", "/fapi/v1/algoOrder", params={"algoId": algo_id}, signed=True
+                "DELETE", "/fapi/v1/algoOrder", params={"algoId": algo_id},
+                signed=True, invalidate_symbol=symbol,
             )
             self.logger.info(f"❌ Koşullu emir iptal edildi: algoId={algo_id}")
             return response
@@ -1205,7 +1346,7 @@ class ImprovedBinanceClient:
         cancelled = 0
         try:
             for algo in await self.get_open_algo_orders(symbol):
-                await self.cancel_algo_order(int(algo["algoId"]))
+                await self.cancel_algo_order(int(algo["algoId"]), symbol=symbol)
                 cancelled += 1
         except Exception as e:
             self.logger.warning(f"{symbol}: koşullu emirler iptal edilemedi: {e}")
@@ -1216,23 +1357,84 @@ class ImprovedBinanceClient:
     # Pozisyon / piyasa
     # ------------------------------------------------------------------
 
-    async def get_position_risk(self, symbol: str) -> Optional[Dict[str, Any]]:
+    async def get_position_risk(
+        self, symbol: str, *, force_fresh: bool = False
+    ) -> Optional[Dict[str, Any]]:
         """Pozisyon bilgisi. Hata durumunda istisna fırlatır (None DEĞİL).
 
         None yalnızca "borsa bu sembol için kayıt döndürmedi" anlamına gelir.
         Ağ hatasını 'pozisyon kapandı' sanmak, izlemenin sessizce durmasına
         yol açıyordu.
-        """
-        response = await self._request_with_retry(
-            "GET", "/fapi/v2/positionRisk", params={"symbol": symbol}, signed=True
-        )
-        if isinstance(response, list) and response:
-            return response[0]
-        return None
 
-    async def get_all_positions(self) -> List[Dict[str, Any]]:
-        """Borsadaki TÜM açık pozisyonlar — restart sonrası kurtarma için."""
-        account = await self._request_with_retry("GET", "/fapi/v2/account", signed=True)
+        Ağırlık diyeti (2026-08-15): sembolsüz /fapi/v2/positionRisk tüm
+        sembolleri TEK weight-5 çağrıyla döndürür; okumalar 5 sn'lik süreç-
+        geneli anlık görüntüden beslenir. GÜVENLİK KURALI: önbellek "pozisyon
+        sıfır / kayıt yok" diyorsa taze doğrulama ZORUNLU — bayat görüntüyle
+        asla 'kapandı' kararı verilmez (14 Ağu toplu UNKNOWN kapanışı dersi).
+        Tek istisna: _POS_SNAPSHOT_FRESH_S'ten (1 sn) taze VE son yazmadan
+        sonra alınmış TAM snapshot taze doğrulama sayılır — aynı safety turu
+        içindeki mükerrer weight-5 çağrıları bastırmak için. force_fresh=True
+        bu istisnayı da atlar; geri alınamaz kararlar onu kullanmalı.
+        Not: tek-yön (one-way) mod varsayılır; hedge modda sembol başına iki
+        kayıt gelir ve sözlükte son gelen kazanır.
+        """
+        cls = type(self)
+        sym = str(symbol).strip().upper()
+
+        if not force_fresh and cls._pos_snapshot is not None:
+            if time.monotonic() - cls._pos_snapshot_ts < cls._POS_SNAPSHOT_TTL:
+                entry = cls._pos_snapshot.get(sym)
+                if entry is not None and abs(float(entry.get("positionAmt", 0) or 0)) > 0:
+                    return entry
+                # sıfır/eksik → aşağıda taze doğrulama
+
+        async with self._read_lock("_pos_snapshot_lock"):
+            # Kilit beklerken başka bir coroutine tazelemiş olabilir;
+            # _POS_SNAPSHOT_FRESH_S'ten taze ve yazma-sonrası bir görüntü
+            # "taze doğrulama" sayılır (aynı safety turu). Jenerasyon şartı,
+            # az önce emir atılmış bir sembol için emir-öncesi sıfırın
+            # servis edilmesini engeller.
+            if not force_fresh and cls._pos_snapshot is not None:
+                if (
+                    time.monotonic() - cls._pos_snapshot_ts < cls._POS_SNAPSHOT_FRESH_S
+                    and cls._write_generation == cls._pos_snapshot_gen
+                ):
+                    return cls._pos_snapshot.get(sym)
+            gen = cls._write_generation
+            response = await self._request_with_retry(
+                "GET", "/fapi/v2/positionRisk", signed=True
+            )
+            if not isinstance(response, list):
+                raise BinanceAPIError(
+                    502, None, "positionRisk yanıtı liste değil", "/fapi/v2/positionRisk"
+                )
+            snapshot = {
+                str(p.get("symbol", "")).upper(): p
+                for p in response
+                if isinstance(p, dict)
+            }
+            # Fetch sırasında yazma olduysa yanıt emir-öncesi olabilir:
+            # çağırana döner ama önbelleğe "taze" diye damgalanmaz.
+            if cls._write_generation == gen:
+                cls._pos_snapshot = snapshot
+                cls._pos_snapshot_ts = time.monotonic()
+                cls._pos_snapshot_gen = gen
+            return snapshot.get(sym)
+
+    async def get_all_positions(
+        self, *, force_fresh: bool = True
+    ) -> List[Dict[str, Any]]:
+        """Borsadaki TÜM açık pozisyonlar — restart sonrası kurtarma için.
+
+        Kurtarma kararı geri alınamaz; önbellek DEĞİL, her zaman taze okunur
+        (varsayılan). force_fresh=False YALNIZ gösterim amaçlı çağrılar
+        içindir (dashboard /api/status): 5 sn'lik panel polling'i her tikte
+        weight-5 taze çağrı yapınca 2.5 sn'lik rate-limiter kuyruğunu tek
+        başına doyurup scan döngüsünü açlığa itiyordu (2026-08-18 watchdog
+        restart'ının kök nedeni) — 15 sn'lik account önbelleği panel için
+        fazlasıyla taze.
+        """
+        account = await self._get_account(force_fresh=force_fresh)
         return [
             p for p in account.get("positions", [])
             if float(p.get("positionAmt", 0)) != 0
@@ -1324,11 +1526,25 @@ class ImprovedBinanceClient:
         return response
 
     async def get_current_price(self, symbol: str) -> Optional[float]:
+        cls = type(self)
+        sym = str(symbol).strip().upper()
+        cached = cls._price_cache.get(sym)
+        if cached is not None and time.monotonic() - cached[0] < cls._PRICE_CACHE_TTL:
+            return cached[1]
         try:
             response = await self._request_with_retry(
-                "GET", "/fapi/v1/ticker/price", params={"symbol": symbol}
+                "GET", "/fapi/v1/ticker/price", params={"symbol": sym}
             )
-            return float(response["price"])
+            price = float(response["price"])
+            cls._price_cache[sym] = (time.monotonic(), price)
+            if len(cls._price_cache) > cls._PRICE_CACHE_MAX:
+                # waiting-mode/TV kaynaklı rastgele semboller haftalar içinde
+                # birikmesin: tavan aşılınca süresi geçen girdiler atılır.
+                cutoff = time.monotonic() - cls._PRICE_CACHE_TTL
+                cls._price_cache = {
+                    k: v for k, v in cls._price_cache.items() if v[0] >= cutoff
+                }
+            return price
         except Exception as e:
             self.logger.error(f"Fiyat sorgusu hatası: {e}")
             return None

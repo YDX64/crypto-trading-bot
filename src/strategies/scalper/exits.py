@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import math
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from src.core.logger import app_logger
 from src.models.position import PositionModel, PositionStatus, PositionSide
@@ -29,6 +30,7 @@ from src.strategies.scalper.types import (
     ScalpSignal,
     fee_aware_breakeven_price,
     price_at_roi,
+    resolve_trail_mult,
 )
 from src.trading.binance_client_improved import (
     ImprovedBinanceClient,
@@ -37,6 +39,16 @@ from src.trading.binance_client_improved import (
 from src.trading.position_manager import PositionManager, UnprotectedPositionError
 
 KlineFetch = Callable[[str, str, int], Awaitable[List[Candle]]]
+
+
+@dataclass(frozen=True)
+class _CloseLedger:
+    """Borsa userTrades satırlarıyla kanıtlanmış kapanış özeti."""
+    exit_price: float        # pozisyonu sıfırlayan emrin fill VWAP'ı
+    exit_reason: str         # "SL" | "TRAIL" | "TP_LADDER"
+    net_pnl_estimate: float  # Σ(realizedPnl − commission) − tahmini giriş komisyonu
+    close_fills: int
+    flatten_kind: str        # "SL" | "TP1" | "TP2"
 
 
 class ExitManager:
@@ -367,7 +379,9 @@ class ExitManager:
             raw_stop = chandelier_stop(
                 candles,
                 direction=direction,
-                atr_mult=self.cfg.scalper_chandelier_atr_mult,
+                # Kademeli gevşeyen iz: tepe ROI büyüdükçe çarpan büyür
+                # (bkz. types.resolve_trail_mult — backtest ile paritedir).
+                atr_mult=resolve_trail_mult(self.cfg, sp.mfe_pct),
                 atr_period=self.cfg.scalper_chandelier_atr_period,
                 since_index=since_index,
             )
@@ -417,31 +431,66 @@ class ExitManager:
         except Exception as e:
             self.logger.warning(f"⚠️ {symbol}: artık emirler temizlenemedi ({e})")
 
-        exit_price: Optional[float] = None
-        try:
-            exit_price = await self.client.get_current_price(symbol)
-        except Exception:
-            pass
-        if not exit_price:
-            exit_price = sp.position.current_price or sp.position.entry_price
-
         direction = sp.signal.direction
         entry = sp.position.entry_price
         qty = sp.position.quantity
+
+        # SimpleNamespace fixture'larında (testler) bu alanlar hiç bulunmayabilir
+        # — hasattr yerine getattr(..., None) kullanılır, fail-closed davranış
+        # bu alanların yokluğunda da ledger'ı sessizce None'a düşürür.
+        ledger = await self._verified_close_ledger(
+            symbol=symbol,
+            direction=direction,
+            quantity=qty,
+            entry_price=entry,
+            opened_at=sp.position.opened_at,
+            sl_order_id=getattr(sp.position, "sl_order_id", None),
+            tp1_algo_id=getattr(sp.plan, "tp1_algo_id", None),
+            tp2_algo_id=getattr(sp.plan, "tp2_algo_id", None),
+            trailing_active=sp.trailing_active,
+            entry_fee_rate=float(getattr(sp.plan, "entry_fee_rate", 0.0) or 0.0),
+        )
+
+        if ledger is not None:
+            exit_price = ledger.exit_price
+        else:
+            exit_price = None
+            try:
+                exit_price = await self.client.get_current_price(symbol)
+            except Exception:
+                pass
+            if not exit_price:
+                exit_price = sp.position.current_price or sp.position.entry_price
+
         estimated_gross = self._estimate_gross_pnl(direction, entry, exit_price, qty)
         income_net = await self._fetch_net_income(
             symbol=symbol,
             opened_at=sp.position.opened_at,
             entry_order_id=sp.position.entry_order_id,
         )
-        if income_net is None:
-            realized_pnl = estimated_gross
-            pnl_source = "estimated_gross"
-        else:
+
+        verification_notes: List[str] = []
+        if ledger is None:
+            verification_notes.append("exit_fill=unverified")
+
+        if income_net is not None:
             realized_pnl = income_net
             pnl_source = "binance_income_net"
+        elif ledger is not None:
+            realized_pnl = ledger.net_pnl_estimate
+            pnl_source = "binance_trades_close_net"
+            verification_notes.append("pnl=close_fills_net_entry_fee_estimated")
+        else:
+            realized_pnl = estimated_gross
+            pnl_source = "estimated_gross"
+            verification_notes.append("close_verification=unverified")
 
-        exit_reason = self._infer_exit_reason(sp, exit_price)
+        exit_reason = (
+            ledger.exit_reason
+            if ledger is not None
+            else self._infer_exit_reason(sp, exit_price, realized_pnl=realized_pnl)
+        )
+        notes = ";".join(verification_notes) or None
 
         try:
             await self.tracker.record_close(
@@ -452,6 +501,7 @@ class ExitManager:
                 mae_pct=sp.mae_pct,
                 mfe_pct=sp.mfe_pct,
                 pnl_source=pnl_source,
+                notes=notes,
             )
         except Exception as e:
             self.logger.error(f"❌ {symbol}: kapanış kaydı yazılamadı (#{sp.trade_id}): {e}")
@@ -471,6 +521,190 @@ class ExitManager:
             extra={"trade": True},
         )
         self._positions.pop(symbol, None)
+
+    async def _verified_close_ledger(
+        self,
+        *,
+        symbol: str,
+        direction: Direction,
+        quantity: float,
+        entry_price: float,
+        opened_at: Optional[datetime],
+        sl_order_id: Optional[str],
+        tp1_algo_id: Optional[str],
+        tp2_algo_id: Optional[str],
+        trailing_active: bool,
+        entry_fee_rate: float,
+    ) -> Optional[_CloseLedger]:
+        """Kapanışı borsa userTrades satırlarıyla doğrula.
+
+        GÜVENLİK İLKESİ: herhangi bir aday emrin fill satırı beklenmedik
+        görünüyorsa (miktar, yön, komisyon varlığı, zaman penceresi, ...)
+        TÜM sonuç atılır — "kısmen doğrulanmış" diye bir şey yoktur, belirsiz
+        veri asla doğrulanmış sayılmaz. Bu durumda None döner ve çağıran
+        income/tahmini kaynağa düşer.
+        """
+        algo_getter = getattr(self.client, "get_algo_order", None)
+        trades_getter = getattr(self.client, "get_account_trades", None)
+        if algo_getter is None or trades_getter is None:
+            return None
+        if opened_at is None:
+            return None
+
+        opened_utc = opened_at
+        if opened_utc.tzinfo is None:
+            opened_utc = opened_utc.replace(tzinfo=timezone.utc)
+        else:
+            opened_utc = opened_utc.astimezone(timezone.utc)
+        opened_ms = int(opened_utc.timestamp() * 1000)
+        window_start_ms = opened_ms - self.INCOME_ENTRY_LOOKBACK_SECONDS * 1000
+
+        # LONG pozisyon SELL ile kapanır (buyer=False); SHORT BUY ile (buyer=True).
+        expected_buyer = direction != Direction.LONG
+
+        candidates: List[Tuple[str, int]] = []
+        seen_ids: Set[int] = set()
+        for kind, raw_id in (("SL", sl_order_id), ("TP1", tp1_algo_id), ("TP2", tp2_algo_id)):
+            if not raw_id:
+                continue
+            try:
+                numeric_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if numeric_id in seen_ids:
+                continue
+            seen_ids.add(numeric_id)
+            candidates.append((kind, numeric_id))
+
+        fills: List[Tuple[str, Dict[str, Any]]] = []
+        for kind, algo_id in candidates:
+            try:
+                algo = await algo_getter(algo_id=algo_id)
+            except Exception as exc:
+                self.logger.debug(f"{symbol}: {kind} algo emri sorgulanamadı ({exc}), aday atlandı")
+                continue
+            actual = (algo or {}).get("actualOrderId")
+            if actual in (None, "", 0, "0"):
+                continue
+            try:
+                numeric_actual = int(actual)
+            except (TypeError, ValueError):
+                continue
+            try:
+                rows = await trades_getter(symbol, order_id=numeric_actual, limit=500)
+            except Exception as exc:
+                self.logger.debug(f"{symbol}: {kind} fill sorgusu başarısız ({exc}), aday atlandı")
+                continue
+            if not isinstance(rows, list):
+                return None
+
+            for row in rows:
+                if not isinstance(row, dict):
+                    return None
+                try:
+                    if int(row.get("orderId")) != numeric_actual:
+                        return None
+                except (TypeError, ValueError):
+                    return None
+                buyer = row.get("buyer")
+                if buyer is None or bool(buyer) != expected_buyer:
+                    return None
+                try:
+                    raw_qty = row.get("qty")
+                    if raw_qty is None:
+                        raw_qty = row.get("quantity")
+                    qty_value = float(raw_qty)
+                    price_value = float(row.get("price"))
+                except (TypeError, ValueError):
+                    return None
+                if not math.isfinite(qty_value) or qty_value <= 0:
+                    return None
+                if not math.isfinite(price_value) or price_value <= 0:
+                    return None
+                try:
+                    row_time_ms = int(row.get("time"))
+                except (TypeError, ValueError):
+                    return None
+                if row_time_ms < window_start_ms:
+                    return None
+                try:
+                    realized_value = float(row.get("realizedPnl"))
+                    commission_value = float(row.get("commission"))
+                except (TypeError, ValueError):
+                    return None
+                if not math.isfinite(realized_value) or not math.isfinite(commission_value):
+                    return None
+                if commission_value < 0:
+                    return None
+                fills.append((kind, row))
+
+        if not fills:
+            return None
+
+        commission_assets = {str(row.get("commissionAsset") or "") for _, row in fills}
+        commission_assets.discard("")
+        if commission_assets != {"USDT"}:
+            return None
+
+        def _row_qty(row: Dict[str, Any]) -> float:
+            raw = row.get("qty")
+            if raw is None:
+                raw = row.get("quantity")
+            return float(raw)
+
+        total_qty = sum(_row_qty(row) for _, row in fills)
+        tolerance = max(1e-12, quantity * 1e-6)
+        if abs(total_qty - quantity) > tolerance:
+            return None
+
+        gross = sum(float(row.get("realizedPnl")) for _, row in fills)
+        fees = sum(float(row.get("commission")) for _, row in fills)
+
+        if entry_fee_rate and entry_fee_rate > 0:
+            rate = entry_fee_rate
+        else:
+            try:
+                rate = max(
+                    float(getattr(self.cfg, "scalper_taker_fee_pct", 0.05) or 0.05),
+                    float(getattr(self.cfg, "scalper_maker_fee_pct", 0.02) or 0.02),
+                ) / 100.0
+            except (TypeError, ValueError):
+                rate = 0.0005
+
+        entry_fee_est = entry_price * quantity * rate
+        net_pnl_estimate = gross - fees - entry_fee_est
+
+        def _fill_sort_key(item: Tuple[str, Dict[str, Any]]) -> Tuple[int, int]:
+            _, row = item
+            try:
+                row_time = int(row.get("time"))
+            except (TypeError, ValueError):
+                row_time = 0
+            try:
+                row_id = int(row.get("id") or 0)
+            except (TypeError, ValueError):
+                row_id = 0
+            return row_time, row_id
+
+        closing_kind, closing_row = max(fills, key=_fill_sort_key)
+        if closing_kind in ("TP1", "TP2"):
+            exit_reason = "TP_LADDER"
+        else:
+            exit_reason = "TRAIL" if trailing_active else "SL"
+
+        closing_order_id = int(closing_row.get("orderId"))
+        closing_fills = [row for _, row in fills if int(row.get("orderId")) == closing_order_id]
+        closing_notional = sum(float(row.get("price")) * _row_qty(row) for row in closing_fills)
+        closing_qty = sum(_row_qty(row) for row in closing_fills)
+        exit_price = closing_notional / closing_qty if closing_qty > 0 else entry_price
+
+        return _CloseLedger(
+            exit_price=exit_price,
+            exit_reason=exit_reason,
+            net_pnl_estimate=net_pnl_estimate,
+            close_fills=len(closing_fills),
+            flatten_kind=closing_kind,
+        )
 
     @staticmethod
     def _estimate_gross_pnl(
@@ -684,8 +918,15 @@ class ExitManager:
         return order_time_ms - self.INCOME_ENTRY_LOOKBACK_SECONDS * 1000
 
     @staticmethod
-    def _infer_exit_reason(sp: ScalpPosition, exit_price: float) -> str:
-        """Kaba çıkarım: son fiyat SL'ye mi TP tarafına mı yakındı + tp1_done bilgisi."""
+    def _infer_exit_reason(sp: ScalpPosition, exit_price: float, realized_pnl: float) -> str:
+        """Kaba çıkarım (ledger doğrulaması yoksa son çare): son fiyat SL'ye mi TP
+        tarafına mı yakındı + tp1_done bilgisi — TAHMİNİ bir etikettir.
+
+        Mantık kapısı: negatif net PnL asla TP_LADDER olarak etiketlenemez —
+        mesafe kıyası fiyat sıçraması/kayma nedeniyle yanılabilir, ama kayıplı
+        bir kapanışın "kâr merdiveni" olarak görünmesi asıl bulguyu (2026-08-13
+        ADAUSDT vakası) tekrarlar.
+        """
         if sp.trailing_active:
             # TP1 sonrası trailing aktifken kapanmışsa TRAIL veya son SL — TRAIL say
             return "TRAIL"
@@ -693,7 +934,10 @@ class ExitManager:
         tp_price = sp.plan.tp1_price
         dist_to_sl = abs(exit_price - sl_price)
         dist_to_tp = abs(exit_price - tp_price)
-        return "TP_LADDER" if dist_to_tp < dist_to_sl else "SL"
+        label = "TP_LADDER" if dist_to_tp < dist_to_sl else "SL"
+        if label == "TP_LADDER" and realized_pnl < 0:
+            return "SL"
+        return label
 
     def _update_mae_mfe(self, sp: ScalpPosition, current_price: float) -> None:
         entry = sp.position.entry_price
@@ -708,11 +952,16 @@ class ExitManager:
         sp.mae_pct = min(sp.mae_pct, roi_pct)
 
     @staticmethod
-    def _live_stop_trigger(
+    def _live_stop_order(
         algo_orders: List[Dict[str, Any]],
         direction: Direction,
-    ) -> Optional[float]:
-        """Açık algo emirlerinden pozisyon yönünü gerçekten koruyan STOP'u bul."""
+    ) -> Optional[Tuple[Optional[str], float]]:
+        """Açık algo emirlerinden pozisyon yönünü gerçekten koruyan STOP'u bul.
+
+        ``(algo_id, tetik_fiyatı)`` döner; algo_id (veya orderId alias'ı)
+        yanıtta yoksa ``None`` olur — çağıran bu durumda DB'deki son bilinen
+        kimliğe düşer.
+        """
         expected_side = "SELL" if direction == Direction.LONG else "BUY"
         for order in algo_orders or []:
             order_type = order.get("orderType") or order.get("type")
@@ -727,41 +976,113 @@ class ExitManager:
             except (TypeError, ValueError):
                 continue
             if trigger_value > 0:
-                return trigger_value
+                algo_id = order.get("algoId")
+                if algo_id in (None, ""):
+                    algo_id = order.get("orderId")
+                algo_id_str = str(algo_id) if algo_id not in (None, "") else None
+                return algo_id_str, trigger_value
         return None
 
+    @staticmethod
+    def _live_stop_trigger(
+        algo_orders: List[Dict[str, Any]],
+        direction: Direction,
+    ) -> Optional[float]:
+        """Açık algo emirlerinden pozisyon yönünü gerçekten koruyan STOP'u bul.
+
+        Geriye dönük uyumluluk için ince sarmalayıcı — davranışı değişmez,
+        yalnız algo_id'yi düşürür. ``_recover_one`` doğrudan ``_live_stop_order``
+        kullanır.
+        """
+        found = ExitManager._live_stop_order(algo_orders, direction)
+        return found[1] if found is not None else None
+
     async def _record_recovery_estimate(self, trade: Any, notes: str) -> bool:
-        """Belirsiz restart kapanışını açıkça tahmini brüt olarak kaydet."""
-        try:
-            exit_price = await self.client.get_current_price(trade.symbol)
-        except Exception:
-            exit_price = None
-        exit_price = float(exit_price or trade.entry_price)
+        """Belirsiz restart kapanışını borsa income/ledger doğrulamasıyla kaydet.
+
+        Restart sırasında borsada zaten kapanmış bulunan pozisyonlar (recover'da
+        canlı miktar<=0) için de canlı kapanışla AYNI doğrulama merdiveni
+        uygulanır: önce income, sonra userTrades ledger, ancak ikisi de
+        doğrulanamazsa tahmini brüte düşülür. ``notes`` içindeki mevcut
+        ``recovery=...`` etiketi her zaman korunur; doğrulama etiketleri
+        ``;`` ile eklenir.
+        """
+        income_net = await self._fetch_net_income(
+            symbol=trade.symbol,
+            opened_at=getattr(trade, "opened_at", None),
+            entry_order_id=getattr(trade, "entry_order_id", None),
+        )
+        ledger = await self._verified_close_ledger(
+            symbol=trade.symbol,
+            direction=Direction(trade.direction),
+            quantity=float(trade.quantity),
+            entry_price=float(trade.entry_price),
+            opened_at=getattr(trade, "opened_at", None),
+            sl_order_id=getattr(trade, "sl_algo_id", None),
+            tp1_algo_id=getattr(trade, "tp1_algo_id", None),
+            tp2_algo_id=getattr(trade, "tp2_algo_id", None),
+            trailing_active=False,
+            entry_fee_rate=0.0,
+        )
+
+        if ledger is not None:
+            exit_price = ledger.exit_price
+        else:
+            try:
+                exit_price = await self.client.get_current_price(trade.symbol)
+            except Exception:
+                exit_price = None
+            exit_price = float(exit_price or trade.entry_price)
+
         estimated_gross = self._estimate_gross_pnl(
             Direction(trade.direction),
             float(trade.entry_price),
             exit_price,
             float(trade.quantity),
         )
+
+        verification_notes: List[str] = []
+        if ledger is None:
+            verification_notes.append("exit_fill=unverified")
+
+        if income_net is not None:
+            realized_pnl = income_net
+            pnl_source = "binance_income_net"
+        elif ledger is not None:
+            realized_pnl = ledger.net_pnl_estimate
+            pnl_source = "binance_trades_close_net"
+            verification_notes.append("pnl=close_fills_net_entry_fee_estimated")
+        else:
+            realized_pnl = estimated_gross
+            pnl_source = "estimated_gross"
+            verification_notes.append("close_verification=unverified")
+
+        exit_reason = ledger.exit_reason if ledger is not None else "UNKNOWN"
+        merged_notes = ";".join(
+            part for part in (notes, ";".join(verification_notes)) if part
+        )
+
         try:
             await self.tracker.record_close(
                 trade_id=trade.id,
                 exit_price=exit_price,
-                realized_pnl=estimated_gross,
-                exit_reason="UNKNOWN",
-                pnl_source="estimated_gross",
-                notes=notes,
+                realized_pnl=realized_pnl,
+                exit_reason=exit_reason,
+                pnl_source=pnl_source,
+                notes=merged_notes,
             )
         except Exception as e:
             self.logger.error(
-                f"❌ recover(): {trade.symbol} #{trade.id} UNKNOWN kapanışı yazılamadı ({e})"
+                f"❌ recover(): {trade.symbol} #{trade.id} {exit_reason} kapanışı yazılamadı ({e})"
             )
             return False
         self._maybe_start_loss_cooldown(
             trade.symbol,
-            "UNKNOWN",
-            estimated_gross,
-            self._estimated_roundtrip_fee(
+            exit_reason,
+            realized_pnl,
+            0.0
+            if pnl_source == "binance_income_net"
+            else self._estimated_roundtrip_fee(
                 float(trade.entry_price), exit_price, float(trade.quantity)
             ),
         )
@@ -809,7 +1130,8 @@ class ExitManager:
     async def _recover_one(self, trade) -> bool:
         symbol = trade.symbol
         try:
-            pos_info = await self.client.get_position_risk(symbol)
+            # UNKNOWN kapatma kararı geri alınamaz — önbellek değil taze veri.
+            pos_info = await self.client.get_position_risk(symbol, force_fresh=True)
         except Exception as e:
             self.logger.error(
                 f"⚠️ recover(): {symbol} pozisyon durumu sorgulanamadı ({e}), "
@@ -841,7 +1163,9 @@ class ExitManager:
             )
             return False
 
-        current_stop = self._live_stop_trigger(algo_orders, direction)
+        live_stop = self._live_stop_order(algo_orders, direction)
+        live_sl_algo_id = live_stop[0] if live_stop is not None else None
+        current_stop = live_stop[1] if live_stop is not None else None
         if current_stop is None:
             self.logger.critical(
                 f"🚨 recover(): {symbol} borsada açık ama canlı STOP yok. "
@@ -927,8 +1251,12 @@ class ExitManager:
             first_tp_quantity=trade.quantity * tp1_fraction,
             targets=str([tp1_price, tp2_price]),
             status=PositionStatus.OPEN,
-            entry_order_id="",
-            sl_order_id=trade.sl_algo_id,
+            # Kapanışta ledger doğrulaması için borsaca doğrulanmış giriş
+            # order id'si — DB'ye kalıcı yazılmış olan trade.entry_order_id.
+            entry_order_id=str(getattr(trade, "entry_order_id", "") or ""),
+            # Canlı algo_id varsa DB'dekinden daha güncel — trailing SL
+            # değişince DB güncellenmiyor, bu yüzden canlı yanıt öncelikli.
+            sl_order_id=live_sl_algo_id or trade.sl_algo_id,
             tp_order_id=trade.tp1_algo_id,
             highest_price=trade.entry_price,
             lowest_price=trade.entry_price,

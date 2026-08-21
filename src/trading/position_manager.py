@@ -623,7 +623,7 @@ class PositionManager:
         #    closePosition=true olduğu için ilki tetiklendiğinde diğeri zararsızdır.
         if old_sl_id and str(old_sl_id) != str(new_id):
             try:
-                await self.binance.cancel_algo_order(int(old_sl_id))
+                await self.binance.cancel_algo_order(int(old_sl_id), symbol=symbol)
             except Exception as e:
                 self.logger.warning(
                     f"⚠️ {symbol}: eski SL #{old_sl_id} iptal edilemedi ({e}). "
@@ -655,7 +655,9 @@ class PositionManager:
             if order.get("orderType") in ("STOP_MARKET", "STOP") and \
                     str(order.get("algoId")) != str(keep_order_id):
                 try:
-                    await self.binance.cancel_algo_order(int(order["algoId"]))
+                    await self.binance.cancel_algo_order(
+                        int(order["algoId"]), symbol=symbol
+                    )
                 except Exception as e:
                     self.logger.warning(
                         f"Eski stop iptal edilemedi algoId={order.get('algoId')}: {e}"

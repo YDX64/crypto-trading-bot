@@ -102,7 +102,15 @@ class ScalperEngine:
 
     _REGIME_CACHE_TTL = 300.0    # saniye — sembol başına rejim önbelleği
     _BALANCE_CACHE_TTL = 300.0   # saniye — kill switch için bakiye önbelleği
-    _INCOME_CACHE_TTL = 30.0
+    # 2026-08-14: 30→120 sn. /fapi/v1/income weight=30; 30 sn TTL tek başına
+    # 60 weight/dk yiyordu — testnet'in düşük IP bütçesinde 418'e katkı.
+    # Kill switch tepkisi bu TTL'e MAHKUM DEĞİL: her tracker.record_close
+    # önbelleği düşürür (close_seq karşılaştırması), yani limiti aşan kapanış
+    # bir sonraki kill-switch turunda sıfır ek REST maliyetiyle görülür.
+    _INCOME_CACHE_TTL = 120.0
+    # Sanal sermaye çözümü income endpoint'ine değil sizing/bakiye okumalarına
+    # dayanır — income diyeti gerekçesi onu kapsamaz, eski 30 sn'de kalır.
+    _VIRTUAL_EQUITY_CACHE_TTL = 30.0
     _EXCHANGE_PROBE_INTERVAL = 30.0
     _RESERVATION_OWNER = "scalper"
 
@@ -155,6 +163,9 @@ class ScalperEngine:
             0.0,
             None,
         )
+        # Önbellek dolduğunda tracker.close_seq'in değeri: sonradan bir
+        # kapanış kaydedilirse (seq artar) TTL dolmadan taze okunur.
+        self._income_cache_close_seq: int = -1
         self._risk_ready: bool = False
         self._kill_switch: bool = False
         self._kill_switch_day: Optional[str] = None
@@ -286,6 +297,13 @@ class ScalperEngine:
 
     def _load_entry_halt(self) -> None:
         path = self._entry_halt_path
+        if not getattr(self.cfg, "scalper_entry_halt_enabled", True):
+            if path is not None and path.exists():
+                self.logger.warning(
+                    "⚠️ Entry halt devre dışı (scalper_entry_halt_enabled=false); "
+                    f"mevcut halt dosyası yok sayılıyor: {path}"
+                )
+            return
         if path is None or not path.exists():
             return
         try:
@@ -565,6 +583,7 @@ class ScalperEngine:
         # Artık tüm yeni dolumlar korumalı ve izleniyor: açık pozisyon çıkış
         # yönetimi ile gerçek günlük risk kapısı bundan sonra çalışabilir.
         await self.exits.step()
+        await self._reap_aged_positions()
         self._sync_scalper_reservations()
         was_blocked = self._kill_switch or self._entry_halted
         await self._update_kill_switch()
@@ -580,21 +599,95 @@ class ScalperEngine:
                         opened_during_cancel, source="risk kapısı iptal yarışı"
                     )
 
+    async def _reap_aged_positions(self) -> None:
+        """Yaş limitini aşan KORUMASIZ pozisyonları kapat (ölü-sermaye reaper'ı).
+
+        2026-08-15: 8 slot 10-15 saatlik pozisyonlarla kilitlenince tüm yeni
+        confluence sinyalleri reddedildi. Kapanış reduce-only MARKET'tir ve
+        exits._handle_closed'un normal dış-kapanış yolundan (ledger + emir
+        temizliği) doğrulanır. Tur başına EN FAZLA BİR kapanış: 2026-08-14'te
+        5 eşzamanlı kapanış safety turunu şişirip watchdog restart'ı
+        tetiklemişti.
+
+        2026-08-21 (kullanıcı kararı): trailing_active pozisyonlar MUAF —
+        TP1 dolmuş, SL girişte/üstünde, chandelier iz sürüyor. Bugün kesilen
+        trend yarın devam edebilir; koşucuyu yalnız stop/trailing durdurur,
+        saat DEĞİL. Beklemenin en kötü sonucu ~breakeven. Reaper yalnız TP1'i
+        hiç görememiş (BE koruması olmayan) yaşlı pozisyonları keser.
+        """
+        limit_h = float(getattr(self.cfg, "scalper_max_hold_hours", 0.0) or 0.0)
+        if limit_h <= 0:
+            return
+        now = datetime.now(timezone.utc)
+        for symbol in list(self.exits.tracked_symbols()):
+            sp = self.exits._positions.get(symbol)
+            if sp is None:
+                continue
+            if getattr(sp, "trailing_active", False):
+                continue  # BE korumalı koşucu: tek çıkış stop/trailing
+            opened = getattr(sp.position, "opened_at", None)
+            if opened is None:
+                continue
+            if opened.tzinfo is None:
+                opened = opened.replace(tzinfo=timezone.utc)
+            age_h = (now - opened).total_seconds() / 3600.0
+            if age_h < limit_h:
+                continue
+            side_val = getattr(sp.position.side, "value", str(sp.position.side))
+            close_side = "SELL" if str(side_val).endswith("LONG") else "BUY"
+            qty = abs(float(sp.position.quantity))
+            try:
+                qty = await self.client.quantize_quantity(symbol, qty)
+                await self.client._request_with_retry(
+                    "POST", "/fapi/v1/order",
+                    params={
+                        "symbol": symbol,
+                        "side": close_side,
+                        "type": "MARKET",
+                        "quantity": qty,
+                        "reduceOnly": "true",
+                        "newOrderRespType": "RESULT",
+                    },
+                    signed=True,
+                )
+                self.logger.info(
+                    f"⏳ Reaper: {symbol} {age_h:.1f}sa yaşında (limit {limit_h:.0f}sa) — "
+                    f"reduce-only kapanış gönderildi; ledger doğrulaması safety turunda",
+                    extra={"trade": True},
+                )
+            except Exception as e:
+                self.logger.warning(
+                    f"⏳ Reaper: {symbol} kapanışı gönderilemedi ({e}); sonraki turda denenecek"
+                )
+            return  # tur başına en fazla bir kapanış
+
     def _track_opened_positions(self, positions: list, *, source: str) -> None:
         """Pending uzlaştırmasında gerçekleşmiş dolumları izlemeye al."""
         for sp in positions:
             symbol = sp.position.symbol
             if not symbol_reservations.reserve(symbol, self._RESERVATION_OWNER):
-                self._entry_halted = True
-                self._entry_halt_reason = (
+                reason = (
                     f"{symbol}: korunmuş fill başka bir motorun sembol sahipliğiyle çakıştı"
                 )
-                self._entry_halted_at = _utcnow_iso()
-                self._persist_entry_halt()
-                self.logger.critical(
-                    f"🚨 {self._entry_halt_reason}; tüm yeni scalper girişleri durduruldu",
-                    extra={"trade": True},
-                )
+                # _load_entry_halt ve _latch_entry_halt ile aynı kapı: flag
+                # kapalıyken latch'lemek hem sözleşmeyi bozar hem de load
+                # tarafının yok sayacağı bir halt dosyası persist ederdi.
+                if not getattr(self.cfg, "scalper_entry_halt_enabled", True):
+                    self.logger.critical(
+                        f"🚨 {reason}. Entry halt DEVRE DIŞI "
+                        "(scalper_entry_halt_enabled=false) — yeni girişler "
+                        "durdurulmadı, yalnız loglandı.",
+                        extra={"trade": True},
+                    )
+                else:
+                    self._entry_halted = True
+                    self._entry_halt_reason = reason
+                    self._entry_halted_at = _utcnow_iso()
+                    self._persist_entry_halt()
+                    self.logger.critical(
+                        f"🚨 {reason}; tüm yeni scalper girişleri durduruldu",
+                        extra={"trade": True},
+                    )
             self.exits.track(sp)
             self._signals_today += 1
             self.logger.info(
@@ -719,6 +812,28 @@ class ScalperEngine:
             sig = strat.evaluate(ctx)
             if sig is None:
                 continue
+            # 2026-08-16 rejim kapisi: C, DOWN rejimde LONG / UP rejimde SHORT
+            # acamaz (30 saatlik RANGE/DOWN penceresinde rejime ters girisler
+            # -35 USDT kanatti). 2026-08-18: TV muafiyeti KALDIRILDI (ayrı
+            # bayrakla): 2 kaynaklı sağlamaya rağmen TV 2 günde −41 USDT
+            # kaybetti; en kötüsü 8 saat yükselen piyasada taşınan SHORT
+            # (SOL #92, −30.65). Rejime ters dış sinyal de artık bloklanır.
+            is_external = strat.__class__.__name__ == "_ExternalSignalStrategy"
+            gate_on = bool(getattr(self.cfg, "scalper_regime_filter", True)) and (
+                not is_external
+                or bool(getattr(self.cfg, "scalper_tv_regime_filter", True))
+            )
+            if gate_on:
+                rejim = getattr(regime, "value", str(regime))
+                yon = getattr(sig.direction, "value", str(sig.direction))
+                if (rejim == "DOWN" and yon == "LONG") or (
+                        rejim == "UP" and yon == "SHORT"):
+                    kaynak = "TV sinyali" if is_external else "girişi"
+                    self.logger.info(
+                        f"⛔ {symbol}: rejim kapısı — {rejim} rejiminde {yon} "
+                        f"{kaynak} engellendi (SCALPER_REGIME_FILTER)"
+                    )
+                    continue
             # Ortak stop politikası: structural modda ATR tabanı, fixed_roi
             # modda marj-yüzdesi stopu. Backtest'te simulate_symbol aynı
             # dönüşümü uygular — canlı/backtest paritesi bozulmamalı.
@@ -859,16 +974,33 @@ class ScalperEngine:
         symbol = str(symbol).upper()
         if not self.running:
             return {"accepted": False, "reason": "scalper çalışmıyor"}
+        tv_allow = str(
+            getattr(self.cfg, "scalper_tv_symbol_allowlist", "") or ""
+        ).strip()
+        if tv_allow:
+            allowed = {s.strip().upper() for s in tv_allow.split(",") if s.strip()}
+            if symbol not in allowed:
+                self.logger.info(
+                    f"🚫 TV sinyali reddedildi: {symbol} — TV sembol allowlist'i "
+                    f"dışında (OSC kanıtı yok; bkz. scalper_tv_symbol_allowlist)"
+                )
+                return {"accepted": False, "reason": "TV sembol allowlist'i dışında"}
         if not self._entries_ready():
             reason = (
                 self._entry_halt_reason
                 if self._entry_halted
                 else ("kill switch" if self._kill_switch else "girişler hazır değil")
             )
+            # 2026-08-14: Sessiz retler teşhisi köreltiyordu (sağlama tamam →
+            # iz yok). Ret nedeni HTTP yanıtına ek olarak log'a da yazılır.
+            self.logger.info(f"🚫 TV sinyali reddedildi: {symbol} — {reason}")
             return {"accepted": False, "reason": reason}
 
         before = self.exits.tracked_symbols() | self.executor.pending_symbols()
         if symbol in before:
+            self.logger.info(
+                f"🚫 TV sinyali reddedildi: {symbol} — sembolde zaten pozisyon/pending var"
+            )
             return {"accepted": False, "reason": "sembolde zaten pozisyon/pending var"}
 
         self.logger.info(
@@ -975,7 +1107,7 @@ class ScalperEngine:
         now_monotonic = time.monotonic()
         if (
             cached_equity is not None
-            and now_monotonic - cached_at < self._INCOME_CACHE_TTL
+            and now_monotonic - cached_at < self._VIRTUAL_EQUITY_CACHE_TTL
         ):
             return cached_equity
 
@@ -1013,6 +1145,14 @@ class ScalperEngine:
         self, error: UnprotectedPositionError, *, source: str
     ) -> None:
         """Korunamayan pozisyon sinyalini process-restart'e kadar kilitle."""
+        if not getattr(self.cfg, "scalper_entry_halt_enabled", True):
+            self.logger.critical(
+                f"🚨 UnprotectedPositionError ({source}): {error}. Entry halt "
+                "DEVRE DIŞI (scalper_entry_halt_enabled=false) — yeni girişler "
+                "durdurulmadı, yalnız loglandı.",
+                extra={"trade": True},
+            )
+            return
         if not self._entry_halted:
             self._entry_halted = True
             self._entry_halt_reason = f"{type(error).__name__}: {error}"
@@ -1285,6 +1425,9 @@ class ScalperEngine:
             cached_value is not None
             and cached_day == today
             and now_monotonic - cached_at < self._INCOME_CACHE_TTL
+            # Son okumadan beri kapanış kaydedildiyse önbellek bayattır:
+            # limit aşımı 120 sn TTL'i beklemeden bir sonraki turda görülür.
+            and self._income_cache_close_seq == getattr(self.tracker, "close_seq", 0)
         ):
             return cached_value
 
@@ -1314,6 +1457,7 @@ class ScalperEngine:
                 raise RuntimeError(f"Geçersiz Binance income satırı: {row!r}")
 
         self._daily_income_cache = (net, now_monotonic, today)
+        self._income_cache_close_seq = getattr(self.tracker, "close_seq", 0)
         return net
 
     async def _get_cached_balance(self) -> Optional[float]:

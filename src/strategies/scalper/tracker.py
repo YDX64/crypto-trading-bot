@@ -24,6 +24,10 @@ class ScalpTracker:
 
     def __init__(self):
         self.logger = app_logger
+        # Her başarılı record_close'ta artar. Engine'in günlük income
+        # önbelleği bunu karşılaştırarak kapanış sonrası TTL beklemeden
+        # taze okur (kill switch tepkisi kapanışa kilitli, TTL'e değil).
+        self.close_seq: int = 0
 
     async def record_open(
         self,
@@ -35,6 +39,7 @@ class ScalpTracker:
         sl_algo_id: Optional[str],
         tp1_algo_id: Optional[str],
         tp2_algo_id: Optional[str],
+        entry_order_id: Optional[str] = None,
     ) -> int:
         """Yeni scalp işlemini OPEN durumunda kaydet; satır id'sini döner."""
         async with AsyncSessionLocal() as session:
@@ -52,6 +57,7 @@ class ScalpTracker:
                 sl_algo_id=sl_algo_id,
                 tp1_algo_id=tp1_algo_id,
                 tp2_algo_id=tp2_algo_id,
+                entry_order_id=entry_order_id or None,
             )
             session.add(trade)
             await session.commit()
@@ -100,6 +106,7 @@ class ScalpTracker:
             trade.status = "CLOSED"
             trade.closed_at = datetime.utcnow()
             await session.commit()
+            self.close_seq += 1
 
             self.logger.info(
                 f"📝 Scalp işlem kaydı kapandı: #{trade_id} PNL={realized_pnl:.2f} "
@@ -195,7 +202,11 @@ class ScalpTracker:
                 value = part.split("=", 1)[1]
                 if value in ("binance_income_net", "binance_account_trades_net"):
                     return "verified"
-                if value == "estimated_gross":
+                # "binance_trades_close_net": kapanış bacağı borsa satırlarıyla
+                # kanıtlı ama giriş komisyonu tahmini + funding hariç — pozitif
+                # sonucu sermayeye eklemek için yeterince kesin değil; kayıp
+                # zaten fallback yolundan dahil olur (kayıp saklanmaz kuralı).
+                if value in ("estimated_gross", "binance_trades_close_net"):
                     return "fallback"
         return "legacy"
 

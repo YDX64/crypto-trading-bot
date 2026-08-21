@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from typing import Any, Dict, List
 from unittest.mock import AsyncMock
 
 import pytest
@@ -38,7 +39,19 @@ def _manager(client, tracker=None, pm=None):
     return manager
 
 
-def _scalp_position(*, entry_price=100.0, quantity=2.0, order_id="123"):
+def _scalp_position(
+    *,
+    entry_price=100.0,
+    quantity=2.0,
+    order_id="123",
+    sl_order_id=None,
+    tp1_algo_id=None,
+    tp2_algo_id=None,
+    entry_fee_rate=0.0004,
+    initial_stop=95.0,
+    tp1_price=110.0,
+    trailing_active=False,
+):
     return SimpleNamespace(
         trade_id=7,
         signal=SimpleNamespace(direction=Direction.LONG),
@@ -48,9 +61,16 @@ def _scalp_position(*, entry_price=100.0, quantity=2.0, order_id="123"):
             current_price=entry_price,
             opened_at=datetime.now(timezone.utc),
             entry_order_id=order_id,
+            sl_order_id=sl_order_id,
         ),
-        plan=SimpleNamespace(initial_stop=95.0, tp1_price=110.0),
-        trailing_active=False,
+        plan=SimpleNamespace(
+            initial_stop=initial_stop,
+            tp1_price=tp1_price,
+            tp1_algo_id=tp1_algo_id,
+            tp2_algo_id=tp2_algo_id,
+            entry_fee_rate=entry_fee_rate,
+        ),
+        trailing_active=trailing_active,
         mae_pct=-2.0,
         mfe_pct=4.0,
     )
@@ -214,7 +234,12 @@ async def test_recovery_missing_stop_flattens_and_records_unknown_estimate():
     assert close["exit_reason"] == "UNKNOWN"
     assert close["realized_pnl"] == pytest.approx(-5.0)
     assert close["pnl_source"] == "estimated_gross"
-    assert close["notes"] == "recovery=missing_stop_emergency_close"
+    # income/ledger doğrulanamadı — recovery etiketi korunur, doğrulama
+    # etiketleri ; ile eklenir (5g).
+    assert close["notes"] == (
+        "recovery=missing_stop_emergency_close;"
+        "exit_fill=unverified;close_verification=unverified"
+    )
 
 
 @pytest.mark.asyncio
@@ -239,6 +264,9 @@ async def test_recovery_with_live_directional_stop_resumes_tracking():
     assert await manager.recover() is True
     assert manager.tracked_symbols() == {"BTCUSDT"}
     pm.emergency_close.assert_not_awaited()
+    # algo_orders yanıtında algoId YOK -> DB'deki son bilinen sl_algo_id'ye düşer.
+    sp = manager._positions["BTCUSDT"]
+    assert sp.position.sl_order_id == "55"
 
 
 @pytest.mark.asyncio
@@ -315,3 +343,238 @@ async def test_tracker_stats_exposes_verified_fallback_and_legacy_counts(monkeyp
     assert stats["C"]["fallback_trades"] == 1
     assert stats["C"]["legacy_trades"] == 1
     assert stats["C"]["pnl_basis"] == "mixed"
+
+
+# --------------------------------------------------------------------------
+# Kapanış ledger doğrulaması (2026-08-13 ADAUSDT vakası: gerçek SL kaybı
+# yanlışlıkla TP_LADDER olarak kaydedilmişti)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_handle_closed_uses_verified_sl_fill_for_price_reason_and_net_when_income_missing():
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    client = SimpleNamespace(
+        cancel_all_open_orders=AsyncMock(),
+        get_current_price=AsyncMock(return_value=103.0),
+        get_order=AsyncMock(side_effect=RuntimeError("giriş emri bulunamadı")),
+        get_income_history=AsyncMock(return_value=[]),
+        get_algo_order=AsyncMock(return_value={"algoId": 55, "actualOrderId": 9001}),
+        get_account_trades=AsyncMock(
+            return_value=[
+                {
+                    "orderId": 9001,
+                    "buyer": False,
+                    "qty": "2",
+                    "price": "94.0",
+                    "realizedPnl": "-12.0",
+                    "commission": "0.05",
+                    "commissionAsset": "USDT",
+                    "time": now_ms,
+                    "id": 1,
+                }
+            ]
+        ),
+    )
+    tracker = SimpleNamespace(record_close=AsyncMock())
+    calls: List[str] = []
+    manager = _manager(client, tracker=tracker)
+    manager._loss_cooldown_cb = calls.append
+
+    sp = _scalp_position(entry_price=100.0, quantity=2.0, sl_order_id="55")
+    await manager._handle_closed("BTCUSDT", sp)
+
+    close = tracker.record_close.await_args.kwargs
+    # SL vurdu ve fiyat 103'e toparlandı — kayıt SL fill'inin gerçek fiyatı
+    # olan 94.0'ı kullanmalı, dedektörün gördüğü güncel fiyatı DEĞİL.
+    assert close["exit_price"] == pytest.approx(94.0)
+    assert close["exit_reason"] == "SL"
+    assert close["pnl_source"] == "binance_trades_close_net"
+    assert close["realized_pnl"] == pytest.approx(-12.0 - 0.05 - 100 * 2 * 0.0004)
+    assert "pnl=close_fills_net_entry_fee_estimated" in close["notes"]
+    assert calls == ["BTCUSDT"]
+
+
+@pytest.mark.asyncio
+async def test_handle_closed_negative_estimate_cannot_be_labeled_tp_ladder():
+    client = SimpleNamespace(
+        cancel_all_open_orders=AsyncMock(),
+        get_current_price=AsyncMock(return_value=99.0),
+        get_order=AsyncMock(return_value=None),
+        get_income_history=AsyncMock(return_value=[]),
+    )
+    tracker = SimpleNamespace(record_close=AsyncMock())
+    manager = _manager(client, tracker=tracker)
+
+    sp = _scalp_position(
+        entry_price=100.0,
+        quantity=2.0,
+        initial_stop=90.0,
+        tp1_price=101.0,
+    )
+    await manager._handle_closed("BTCUSDT", sp)
+
+    close = tracker.record_close.await_args.kwargs
+    # dist_to_tp(2) < dist_to_sl(9) -> kaba mesafe kıyası TP_LADDER derdi,
+    # ama net tahmin negatif -> mantık kapısı SL'ye zorlar.
+    assert close["exit_reason"] == "SL"
+    assert close["pnl_source"] == "estimated_gross"
+    assert "close_verification=unverified" in close["notes"]
+    assert "exit_fill=unverified" in close["notes"]
+
+
+@pytest.mark.asyncio
+async def test_handle_closed_positive_estimate_keeps_tp_ladder_label():
+    client = SimpleNamespace(
+        cancel_all_open_orders=AsyncMock(),
+        get_current_price=AsyncMock(return_value=100.8),
+        get_order=AsyncMock(return_value=None),
+        get_income_history=AsyncMock(return_value=[]),
+    )
+    tracker = SimpleNamespace(record_close=AsyncMock())
+    manager = _manager(client, tracker=tracker)
+
+    sp = _scalp_position(
+        entry_price=100.0,
+        quantity=2.0,
+        initial_stop=90.0,
+        tp1_price=101.0,
+    )
+    await manager._handle_closed("BTCUSDT", sp)
+
+    close = tracker.record_close.await_args.kwargs
+    assert close["exit_reason"] == "TP_LADDER"
+    assert close["pnl_source"] == "estimated_gross"
+    assert close["realized_pnl"] == pytest.approx(1.6)
+
+
+@pytest.mark.asyncio
+async def test_recover_restores_entry_order_id_and_live_stop_algo_id():
+    trade = _trade(entry_order_id="4242")
+    client = SimpleNamespace(
+        get_position_risk=AsyncMock(return_value={"positionAmt": "1"}),
+        get_open_algo_orders=AsyncMock(
+            return_value=[
+                {
+                    "orderType": "STOP_MARKET",
+                    "side": "SELL",
+                    "triggerPrice": "94.5",
+                    "algoId": "777",
+                }
+            ]
+        ),
+    )
+    tracker = SimpleNamespace(open_trades=AsyncMock(return_value=[trade]))
+    pm = SimpleNamespace(emergency_close=AsyncMock())
+    manager = _manager(client, tracker=tracker, pm=pm)
+
+    assert await manager.recover() is True
+    sp = manager._positions["BTCUSDT"]
+    assert sp.position.entry_order_id == "4242"
+    assert sp.position.sl_order_id == "777"
+
+
+@pytest.mark.asyncio
+async def test_recovery_no_live_position_verifies_close_via_trades_ledger():
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    trade = _trade()  # sl_algo_id="55", tp1_algo_id="56", tp2_algo_id="57", quantity=1.0
+
+    async def _get_algo_order(*, algo_id):
+        if int(algo_id) == 55:
+            return {"algoId": 55, "actualOrderId": 9101}
+        # TP1/TP2 hiç tetiklenmedi — cancel_all_open_orders sonrası "not exist".
+        raise RuntimeError("algo emri bulunamadı")
+
+    client = SimpleNamespace(
+        get_position_risk=AsyncMock(return_value={"positionAmt": "0"}),
+        get_current_price=AsyncMock(return_value=97.0),
+        get_algo_order=AsyncMock(side_effect=_get_algo_order),
+        get_account_trades=AsyncMock(
+            return_value=[
+                {
+                    "orderId": 9101,
+                    "buyer": False,
+                    "qty": "1",
+                    "price": "93.0",
+                    "realizedPnl": "-7.0",
+                    "commission": "0.03",
+                    "commissionAsset": "USDT",
+                    "time": now_ms,
+                    "id": 1,
+                }
+            ]
+        ),
+    )
+    tracker = SimpleNamespace(
+        open_trades=AsyncMock(return_value=[trade]),
+        record_close=AsyncMock(),
+    )
+    pm = SimpleNamespace(emergency_close=AsyncMock())
+    manager = _manager(client, tracker=tracker, pm=pm)
+
+    assert await manager.recover() is True
+
+    close = tracker.record_close.await_args.kwargs
+    assert close["exit_reason"] == "SL"
+    assert close["pnl_source"] == "binance_trades_close_net"
+    assert "recovery=no_live_position" in close["notes"]
+    assert "pnl=close_fills_net_entry_fee_estimated" in close["notes"]
+
+
+def test_tracker_pnl_source_maps_trades_close_net_to_fallback():
+    tracker = ScalpTracker()
+    assert tracker._pnl_source("pnl_source=binance_trades_close_net") == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_record_open_persists_entry_order_id(monkeypatch):
+    added: Dict[str, Any] = {}
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def add(self, obj):
+            obj.id = 1
+            added["trade"] = obj
+
+        async def commit(self):
+            return None
+
+    monkeypatch.setattr(tracker_module, "AsyncSessionLocal", lambda: _Session())
+
+    signal = SimpleNamespace(
+        strategy="C", symbol="BTCUSDT", direction=Direction.LONG, reason="test",
+    )
+    trade_id = await ScalpTracker().record_open(
+        signal=signal,
+        entry_price=100.0,
+        quantity=1.0,
+        leverage=10,
+        margin_usdt=10.0,
+        sl_algo_id="55",
+        tp1_algo_id="56",
+        tp2_algo_id="57",
+        entry_order_id="4242",
+    )
+
+    assert trade_id == 1
+    assert added["trade"].entry_order_id == "4242"
+
+
+def test_init_db_migration_adds_entry_order_id_column():
+    from sqlalchemy import create_engine, text, inspect as sa_inspect
+
+    from src.core.database import _ensure_schema_migrations
+
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE scalp_trades (id INTEGER PRIMARY KEY)"))
+        _ensure_schema_migrations(conn)
+        columns = {col["name"] for col in sa_inspect(conn).get_columns("scalp_trades")}
+        assert "entry_order_id" in columns
+        # İkinci çağrı idempotent olmalı, hata üretmemeli.
+        _ensure_schema_migrations(conn)

@@ -73,6 +73,18 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
             await session.close()
 
 
+def _ensure_schema_migrations(sync_conn) -> None:
+    """create_all mevcut tabloya yeni sütun EKLEMEZ; eksik sütunları tamamla."""
+    from sqlalchemy import inspect as sa_inspect, text
+    inspector = sa_inspect(sync_conn)
+    if "scalp_trades" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("scalp_trades")}
+    if "entry_order_id" not in columns:
+        sync_conn.execute(text("ALTER TABLE scalp_trades ADD COLUMN entry_order_id VARCHAR"))
+        app_logger.info("🔧 scalp_trades.entry_order_id sütunu eklendi (migration)")
+
+
 async def init_db():
     """Veritabanını başlat ve tabloları oluştur"""
     # Import all models to ensure they're registered with Base
@@ -83,6 +95,9 @@ async def init_db():
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # create_all zaten var olan tabloya yeni sütun eklemez; eski DB'lerde
+        # eksik kalan sütunları burada tamamlıyoruz (idempotent).
+        await conn.run_sync(_ensure_schema_migrations)
     app_logger.info("Veritabanı tabloları oluşturuldu")
 
 

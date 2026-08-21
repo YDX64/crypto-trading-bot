@@ -51,4 +51,8 @@ class ScalpTradeModel(Base):
     tp1_algo_id = Column(String, nullable=True)
     tp2_algo_id = Column(String, nullable=True)
 
+    # Giriş emri kimliği — kapanışta Binance income/userTrades doğrulaması
+    # restart sonrası da çalışabilsin diye kalıcıdır.
+    entry_order_id = Column(String, nullable=True)
+
     notes = Column(String, nullable=True)
