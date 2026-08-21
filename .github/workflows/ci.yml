@@ -30,7 +30,7 @@ jobs:
           pip install -r requirements.txt
           pip install ruff
 
-      - name: Ruff (yalnız gerçek hatalar: sözdizimi, tanımsız isim, yanlış f-string)
+      - name: "Ruff (yalnız gerçek hatalar: sözdizimi, tanımsız isim, yanlış f-string)"
         run: ruff check --select E9,F63,F7,F82 src tests scripts
 
       - name: Testler
