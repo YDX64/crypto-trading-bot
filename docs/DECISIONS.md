@@ -71,7 +71,8 @@ risk yok (kabul mantığı gevşetildi, hiçbir sinyal reddedilmiyor).
 | Stop ROI 50→30 | 08-21 | AYI −6108 (baz −2042), SL 120→224 | dar stop trail'e ulaşacak işlemleri kesiyor |
 | Rejim TF 15m→4h | 08-21 | BOĞA +2798→−63, YATAY −9090 | yavaş rejim boğayı yok ediyor |
 | RANGE'de C kapalı | 08-21 | YATAY −7170 | yatay pencere RANGE'den ibaret değil |
-| Flow-confirm filtresi | 08-21 | AYI 1.19 ✓, YATAY 0.81 ✗ | tek pencerede iyi; E2a ile birleşimi denenmedi (açık) |
+| Flow-confirm filtresi | 08-21 | AYI 1.19 ✓, YATAY 0.81 ✗ | tek pencerede iyi |
+| Divergence + flow_confirm birlikte (E2ab) | 08-21 | AYI 3.35/+1498 ama 31 işlem; BOĞA 0.85/−243; YATAY 0.78/−692 | aşırı filtreleme — tek başına divergence (D6) doğru kalibrasyon |
 | Reversal-zone filtresi | 08-21 | AYI 0.68 | — |
 | RSI 25/75 (sıkı eşik) | 08-21 | nötr | — |
 | Strateji D, C+D | 08-21 | −660 / −4353 | C'yi zehirliyor |
