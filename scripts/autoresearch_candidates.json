@@ -76,5 +76,36 @@
     "overrides": {
       "SCALPER_TF_CONTEXT": "15m"
     }
+  },
+  {
+    "id": "E5a",
+    "hypothesis": "TP1 %8 + kaldirac tavani 12: erken BE + genis stop — ayi dayanikliligi, boga islem sayisi korunur mu?",
+    "overrides": {
+      "SCALPER_TP1_ROI": "8",
+      "SCALPER_DYN_LEV_MAX": "12"
+    }
+  },
+  {
+    "id": "E5b",
+    "hypothesis": "TP1 %8 + kaldirac tavani 15: E5a'nin daha az kisitli hali.",
+    "overrides": {
+      "SCALPER_TP1_ROI": "8",
+      "SCALPER_DYN_LEV_MAX": "15"
+    }
+  },
+  {
+    "id": "E5c",
+    "hypothesis": "Kaldirac tavani 12 tek basina: E4i (10) ile E4j (15) arasi — boga islem sayisi >=60 kalir mi?",
+    "overrides": {
+      "SCALPER_DYN_LEV_MAX": "12"
+    }
+  },
+  {
+    "id": "E5d",
+    "hypothesis": "TP1 %8 + chandelier 3.0: iki bagimsiz adayin birlesimi toplamsal mi?",
+    "overrides": {
+      "SCALPER_TP1_ROI": "8",
+      "SCALPER_CHANDELIER_ATR_MULT": "3.0"
+    }
   }
 ]
