@@ -104,3 +104,43 @@ kanalın kapsamı dışındadır (bkz. D10, `docs/DECISIONS.md`).
 `engine.py` kapıları, `exits.py`, `executor.py`, `config.py` varsayılanları, `tv_confluence.py`
 oy kuralı. Bunlardan birini değiştirmek "yeni bot" değil "motor değişikliği"dir: backtest +
 DECISIONS + parite testi ister.
+
+## 6. Örnek istemci (`examples/`)
+
+Yeni bir haber/olay botu yazarken sıfırdan başlama — `examples/` altındaki iki dosyayı
+kendi bot deponuza kopyalayın (bu dosyalar motora import EDİLMEZ, motordan bağımsız
+yaşarlar, gerçek bir dış bot gibi):
+
+- `examples/news_bot_client.py` — bağımlılıksız (yalnız stdlib `urllib`) istemci:
+  `TradingBotClient(base_url, tv_secret, risk_secret=None, source="news_macro")`.
+  `signal()` secret'ı QUERY string'de taşır (`?secret=...`, LuxAlgo alarmlarının aynı
+  yolu kullanmasıyla aynı sebep — dosyanın docstring'inde ayrıntı), `halt()`/`resume()`/
+  `flatten()`/`status()` secret'ı GÖVDEDE taşır. 4xx asla retry edilmez (yanlış secret
+  kendi kendine düzelmez); 5xx/bağlantı hatası 2 kez exponential backoff ile retry edilir.
+  `dry_run=True` hiç ağa çıkmadan (secret'ı redakte ederek) ne gönderileceğini basar.
+  CLI:
+  ```bash
+  python examples/news_bot_client.py --base http://127.0.0.1:9091 signal BTCUSDT sell --dry-run
+  python examples/news_bot_client.py --base http://127.0.0.1:9091 --tv-secret <TV_WEBHOOK_SECRET> signal BTCUSDT sell
+  python examples/news_bot_client.py --base http://127.0.0.1:9091 --risk-secret <RISK_EVENT_SECRET> halt "savaş çıktı" --ttl-minutes 60
+  ```
+- `examples/news_bot_skeleton.py` — `ingest(headline) → classify(headline) → de-dup →
+  rate-limit → send` akışının iskeleti. `classify()` bilinçli olarak bir STUB'tır
+  (`# TODO: LLM/kural tabanlı sınıflandırma buraya`) — de-dup, rate-limit (sembol başına
+  10 dakikada azami N sinyal, `NEWS_BOT_MAX_SIGNALS_PER_10MIN`), allowlist zorlaması
+  (`NEWS_BOT_SYMBOL_ALLOWLIST`) ve `TradingBotClient` üzerinden teslimat GERÇEK ve
+  çalışır durumdadır — kopyalayan yalnız `classify()`'ı doldurur.
+
+Testler: `tests/test_news_bot_client.py` (yerel sahte `http.server` ile — gerçek ağ yok):
+secret'ın doğru kanalda taşındığını, 4xx'te retry olmadığını, 5xx'te retry olduğunu,
+`dry_run`'ın ağa çıkmadığını ve secret'ın hiçbir çıktıda (dry-run/CLI) görünmediğini
+doğrular.
+
+**Yeni bot kontrol listesi** (bkz. §4 terfi hattı):
+1. `src` adı seç (tek isim, `news_macro` gibi — bir modelin iki varyantı iki `src`
+   SAYILMAZ, bkz. §2.2).
+2. Gölge: `src`'yi `TV_SOURCE_ALLOWLIST`'e EKLEME, 3-5 gün yalnız logla (fiilen "tv"ye
+   eşlenir, sağlamaya oy vermez) — kaç sinyal, hangi yön, mevcut kaynaklarla örtüşme.
+3. Testnet: allowlist'e ekle → ≥5 gün → canlı defterde kaynak bazlı PF.
+4. Mainnet: yalnız etiketli sürümle (CLAUDE.md terfi kuralı) — ayıda PF ≥ 1.1 **ve**
+   boğada PnL kaybı ≤ %20 kanıtı olmadan yok.
