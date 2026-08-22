@@ -67,6 +67,45 @@ class ScalpTracker:
             )
             return trade.id
 
+    async def record_shadow(
+        self,
+        signal: ScalpSignal,
+        entry_price: float,
+        quantity: float,
+        leverage: int,
+        margin_usdt: float,
+    ) -> int:
+        """Gölge modunda emir GÖNDERİLMEDEN sinyali SHADOW olarak kaydet.
+
+        entry_price sinyal fiyatıdır (gerçek dolum yok, borsaya hiç emir
+        gitmedi). status="SHADOW" — stats()/open_trades() yalnız
+        "CLOSED"/"OPEN" sorguladığı için bu satırlar istatistiklerden,
+        kapasite sayımından ve restart kurtarmasından KENDİLİĞİNDEN dışlanır
+        (bkz. docs/MAINNET_PLAN.md §3, D14). Cooldown/loss-cooldown burada
+        HİÇ tetiklenmez — hiçbir risk alınmadı.
+        """
+        async with AsyncSessionLocal() as session:
+            trade = ScalpTradeModel(
+                strategy=signal.strategy,
+                symbol=signal.symbol,
+                direction=signal.direction.value,
+                entry_price=entry_price,
+                quantity=quantity,
+                leverage=leverage,
+                margin_usdt=margin_usdt,
+                signal_reason=signal.reason,
+                status="SHADOW",
+                opened_at=datetime.utcnow(),
+                notes="shadow_mode",
+            )
+            session.add(trade)
+            await session.commit()
+            self.logger.info(
+                f"👻 GÖLGE: {signal.symbol} {signal.direction.value} @{entry_price} "
+                f"({signal.reason})"
+            )
+            return trade.id
+
     async def record_close(
         self,
         trade_id: int,

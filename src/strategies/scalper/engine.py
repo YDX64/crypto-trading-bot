@@ -250,6 +250,7 @@ class ScalperEngine:
             return
 
         self.logger.info("⚡ Scalper motoru başlatılıyor...")
+        self._maybe_log_shadow_mode_banner()
         self.logger.info(
             f"🎯 Evren={self.cfg.scalper_top_n} sembol, tarama={self.cfg.scalper_scan_interval_seconds}sn, "
             f"safety={self._safety_interval_seconds():g}sn, "
@@ -1335,6 +1336,15 @@ class ScalperEngine:
         """Hatalı/negatif ayarı yoğun bir busy-loop'a çevirmeden sınırla."""
         return max(0.5, float(getattr(self.cfg, "scalper_safety_interval_seconds", 2.0)))
 
+    def _maybe_log_shadow_mode_banner(self) -> None:
+        """Gölge modu (D14) açıksa başlangıçta YÜKSEK SESLE uyar.
+
+        Operatör bir supervisorctl restart sonrası bot.log'a bakınca kaçırmasın
+        diye WARNING seviyesinde ve ayrı satırda — kapalıyken hiçbir şey basmaz.
+        """
+        if bool(getattr(self.cfg, "scalper_shadow_mode", False)):
+            self.logger.warning("⚠️ GÖLGE MODU AÇIK — emir gönderilmez")
+
     def _executor_entry_blocked(self, symbol: str) -> bool:
         """Executor'ın sembol cooldown kapısını güvenli/geriye uyumlu oku."""
         checker = getattr(self.executor, "is_entry_blocked", None)
@@ -1951,6 +1961,7 @@ class ScalperEngine:
         return {
             "enabled": self.cfg.scalper_enabled,
             "running": self.running,
+            "shadow_mode": bool(getattr(self.cfg, "scalper_shadow_mode", False)),
             "scan_interval": self.cfg.scalper_scan_interval_seconds,
             "safety_interval": self._safety_interval_seconds(),
             "health": self.health_snapshot(),

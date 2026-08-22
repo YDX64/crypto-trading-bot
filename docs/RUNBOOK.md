@@ -116,6 +116,31 @@ borsa üzerinde kapanışı DOĞRULANAMADI demektir (SL/TP dokunulmadan izlemede
 önbellekle her okuduğunda taze değerlendirir. Bozuk/parse edilemeyen dosya fail-closed HALT
 sayılır (dosyayı silmek = resume; sil-öncesi neden loga bakılmalı).
 
+## Gölge modu (`SCALPER_SHADOW_MODE`, D14)
+Yeni bir parametreyi veya (ileride) mainnet'in kendisini gerçek parayla riske girmeden
+gözlemlemek için: sinyaller BUGÜNKÜ GİBİ tüm kapılardan (cooldown/rejim/kapasite/confluence/
+stop-R:R/boyutlama) geçer ama `ScalpExecutor.try_open` margin/leverage ayarından ve emir
+göndermeden ÖNCE döner — borsaya HİÇBİR istek gitmez.
+
+**Açmak:**
+```bash
+ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date +%Y%m%d)-shadow && sed -i "s/^SCALPER_SHADOW_MODE=.*/SCALPER_SHADOW_MODE=true/" .env || echo "SCALPER_SHADOW_MODE=true" >> .env && supervisorctl restart tradingbot_v2'
+```
+**Ne görürsün:**
+- Restart loglarında `⚠️ GÖLGE MODU AÇIK — emir gönderilmez` (yüksek sesle, WARNING).
+- Her gölge sinyalinde `logs/bot.log`'da `👻 GÖLGE: <SEMBOL> <YÖN> @<fiyat> (<gerekçe>)`.
+- `GET /scalper/status` → `shadow_mode: true`.
+- `sqlite3 tradingbot.db "SELECT symbol,direction,entry_price FROM scalp_trades WHERE status='SHADOW' ORDER BY id DESC LIMIT 20"` — gerçek emir YOK, yalnız kayıt.
+- `GET /scalper/stats` ve `GET /scalper/trades` (varsayılan) SHADOW satırlarını GÖSTERMEZ
+  (istatistik/PnL anlamı yok — hiç emir gitmedi); görmek için `GET /scalper/trades?include_shadow=1`.
+- Kapasite/cooldown ETKİLENMEZ: gölge sinyaller `tracked`/`pending`'e hiç girmez, yeni
+  cooldown BAŞLATMAZ (mevcut bir cooldown varsa onu yine de bugünkü gibi RESPECT eder).
+
+**Kapatmak:** `SCALPER_SHADOW_MODE=false` (veya satırı sil) + restart — varsayılan zaten
+kapalı. ⚠️ Mainnet'te (testnet DEĞİLKEN) gölge KAPALIYSA `RISK_EVENT_SECRET`,
+`TV_WEBHOOK_SECRET` ve `SCALPER_SYMBOL_ALLOWLIST` boş olamaz — `_validate_binance_environment`
+startup'ta reddeder (docs/MAINNET_PLAN.md §5.3); doldurmadan kapatamazsın.
+
 ## Güvenlik borçları
 1. Webhook düz HTTP + IP, secret sorgu dizesinde. Erişim logu kısmı ÇÖZÜLDÜ (D9,
    2026-08-21): `uvicorn.access`/`uvicorn.error` logger'larına `secret=...`'ü `secret=***`

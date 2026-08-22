@@ -315,6 +315,15 @@ class Settings(BaseSettings):
     # ValueError ile reddedilir — testnet .env'i canlıya kopyalanınca güvenlik
     # kilidi sessizce devre dışı kalamaz.
     scalper_entry_halt_enabled: bool = True
+    # Gölge modu (docs/MAINNET_PLAN.md §3, D14): True iken engine sinyalleri
+    # BUGÜNKÜ GİBİ tüm kapılardan (rejim/kapasite/cooldown/confluence) geçirir
+    # ve executor risk boyutlamasını hesaplar, ama emri BORSAYA GÖNDERMEZ —
+    # scalp_trades'e status="SHADOW" olarak kaydeder. Yeni parametreleri
+    # mainnet'te riske girmeden 3 gün gözlemlemek için. Testnet'te varsayılan
+    # kapalı (mevcut davranış aynen sürer); mainnet'te açık DEĞİLSE
+    # _validate_binance_environment risk/webhook secret'larını ve allowlist'i
+    # zorunlu kılar (aşağıda).
+    scalper_shadow_mode: bool = False
     scalper_c_allowed_regimes: str = "UP,DOWN,RANGE"  # deney: "RANGE" ile sınırla
     scalper_d_use_eqhl: bool = True              # D süpürmesi EQH/EQL kümelerine bağlı
     scalper_eqhl_tolerance_pct: float = 0.05     # pivot eşitlik eşiği (%)
@@ -445,6 +454,29 @@ class Settings(BaseSettings):
                     "kilidi devre dışı bırakılamaz — ayarı .env'den kaldırın "
                     "veya true yapın."
                 )
+
+            if not self.scalper_shadow_mode:
+                # Gölge modu (D14) mainnet'e AÇIK olarak girmenin tek istisnası:
+                # emir gönderilmediği için kill-switch/webhook/allowlist'in
+                # HENÜZ kurulu olmaması riske girmez. Gölge KAPALIYSA (gerçek
+                # emir gönderilecek demektir) bu üç koruma ZORUNLUDUR —
+                # docs/MAINNET_PLAN.md §5.3.
+                missing_mainnet_protections = []
+                if not self.risk_event_secret:
+                    missing_mainnet_protections.append("RISK_EVENT_SECRET")
+                if not self.tv_webhook_secret:
+                    missing_mainnet_protections.append("TV_WEBHOOK_SECRET")
+                if not self.scalper_symbol_allowlist:
+                    missing_mainnet_protections.append("SCALPER_SYMBOL_ALLOWLIST")
+                if missing_mainnet_protections:
+                    raise ValueError(
+                        "GÜVENLİK HATASI: Mainnet'te (SCALPER_SHADOW_MODE=false iken) şu "
+                        f"ayarlar boş bırakılamaz: {', '.join(missing_mainnet_protections)}. "
+                        "Kill-switch (RISK_EVENT_SECRET), TV webhook doğrulaması "
+                        "(TV_WEBHOOK_SECRET) ve sembol allowlist'i (SCALPER_SYMBOL_ALLOWLIST) "
+                        "mainnet'te ZORUNLUDUR — doldurun ya da önce SCALPER_SHADOW_MODE=true "
+                        "ile 3 gün gölge modda çalıştırın (docs/MAINNET_PLAN.md §5.3)."
+                    )
 
             if not self.is_production:
                 warning_message = (

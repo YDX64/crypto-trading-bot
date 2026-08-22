@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import settings
@@ -1037,6 +1037,7 @@ async def get_waiting_history(db: AsyncSession = Depends(get_db)):
 _EMPTY_SCALPER_STATUS = {
     "enabled": False,
     "running": False,
+    "shadow_mode": settings.scalper_shadow_mode,
     "scan_interval": settings.scalper_scan_interval_seconds,
     "safety_interval": settings.scalper_safety_interval_seconds,
     "health": {"healthy": False, "running": False, "reason": "engine_not_created"},
@@ -1132,12 +1133,22 @@ async def scalper_stats(db: AsyncSession = Depends(get_db)):
 
 
 @app.get("/scalper/trades")
-async def scalper_trades(limit: int = 50, db: AsyncSession = Depends(get_db)):
-    """Kapanmış scalp işlemleri, en yeni önce."""
+async def scalper_trades(
+    limit: int = 50, include_shadow: bool = False, db: AsyncSession = Depends(get_db)
+):
+    """Kapanmış scalp işlemleri, en yeni önce.
+
+    Varsayılan: yalnız gerçek (CLOSED) işlemler — gölge modu (D14) satırları
+    ("SHADOW") hiç emir göndermediği için istatistik/PnL anlamı taşımaz ve
+    dışarıda bırakılır. ?include_shadow=1 ile SHADOW satırları da (opened_at'e
+    göre sıralanarak, closed_at'leri olmadığından) listeye eklenir.
+    """
+    statuses = ["CLOSED", "SHADOW"] if include_shadow else ["CLOSED"]
+    order_col = func.coalesce(ScalpTradeModel.closed_at, ScalpTradeModel.opened_at)
     result = await db.execute(
         select(ScalpTradeModel)
-        .where(ScalpTradeModel.status == "CLOSED")
-        .order_by(ScalpTradeModel.closed_at.desc())
+        .where(ScalpTradeModel.status.in_(statuses))
+        .order_by(order_col.desc())
         .limit(limit)
     )
     return [
@@ -1146,6 +1157,7 @@ async def scalper_trades(limit: int = 50, db: AsyncSession = Depends(get_db)):
             "strategy": t.strategy,
             "symbol": t.symbol,
             "direction": t.direction,
+            "status": t.status,
             "entry_price": t.entry_price,
             "exit_price": t.exit_price,
             "realized_pnl": t.realized_pnl,
@@ -1154,7 +1166,7 @@ async def scalper_trades(limit: int = 50, db: AsyncSession = Depends(get_db)):
             "opened_at": t.opened_at.isoformat() if t.opened_at else None,
             "closed_at": t.closed_at.isoformat() if t.closed_at else None,
             "signal_reason": t.signal_reason,
-            "pnl_source": ScalpTracker._pnl_source(t.notes),
+            "pnl_source": None if t.status == "SHADOW" else ScalpTracker._pnl_source(t.notes),
         }
         for t in result.scalars().all()
     ]

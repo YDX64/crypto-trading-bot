@@ -28,6 +28,13 @@ Akış (try_open, "taker" modu — varsayılan):
   adımları (SL → TP merdiveni → kayıt) GERÇEK dolum fiyatından çalışır —
   bu adımlar _finalize_position() içinde iki giriş yolunun ORTAK kod yolu
   olarak paylaşılır (taker davranışı BİREBİR korunur).
+
+Gölge modu (settings.scalper_shadow_mode == True, D14, docs/MAINNET_PLAN.md §3):
+  1-5 adımları AYNEN çalışır (cooldown, bakiye, stop/R:R kapıları, boyutlama,
+  borsa filtresi doğrulaması — leverage/margin bu GERÇEK hesaplamadan gelir).
+  Adım 6'dan (margin/leverage ayarı) ÖNCE sinyal scalp_trades'e status="SHADOW"
+  olarak kaydedilir ve try_open None döner — borsaya HİÇBİR istek gitmez (margin/
+  leverage ayarı YAPILMAZ, emir GÖNDERİLMEZ, SL/TP YOKTUR, pozisyon izlenmez).
 """
 
 from __future__ import annotations
@@ -789,6 +796,23 @@ class ScalpExecutor:
             return None
         except Exception as e:
             self.logger.error(f"❌ {symbol}: boyutlama/doğrulama sırasında beklenmeyen hata ({e})")
+            return None
+
+        # --- Gölge modu (D14, docs/MAINNET_PLAN.md §3): buraya kadar TÜM
+        #     kapılar (cooldown/stop-mesafesi/R:R/boyutlama/borsa filtresi)
+        #     bugünkü gibi çalıştı — leverage/margin bu GERÇEK hesaplamadan
+        #     gelir. Bundan sonrası (margin/leverage AYARI dahil) borsa
+        #     hesabını değiştirir veya emir gönderir; gölge modda HİÇBİRİ
+        #     ÇALIŞMAZ — sinyal SHADOW olarak deftere yazılır ve dönülür. ---
+        if getattr(self.cfg, "scalper_shadow_mode", False):
+            margin_usdt = (qty * entry_hint) / leverage if leverage else qty * entry_hint
+            await self.tracker.record_shadow(
+                signal=signal,
+                entry_price=entry_hint,
+                quantity=qty,
+                leverage=leverage,
+                margin_usdt=margin_usdt,
+            )
             return None
 
         # --- 6. Margin type + leverage (emirden ÖNCE — burada hata zararsız) ---

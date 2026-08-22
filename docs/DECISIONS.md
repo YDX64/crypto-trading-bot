@@ -166,6 +166,55 @@ DYN_LEV_MAX 20→10: AYI PF 1.68 / +5624 (taban +886), BOĞA 55 işlem (örnekle
 Geniş stop (düşük kaldıraç) ayıda SL'leri keskin azaltıyor. Tur-3 adayı: DYN_LEV_MAX 12-15 + TP1 8 birleşimi.
 Not (P1): harness SCALPER_MAX_POSITIONS kapasitesini modellemiyor (E4h taban ile birebir aynı) — parite boşluğu.
 
+### D14 — Gölge modu (`SCALPER_SHADOW_MODE`) · 2026-08-22 · AKTİF
+**Ne:** `SCALPER_SHADOW_MODE=true` iken `ScalperEngine`/`ScalpExecutor.try_open` sinyali
+BUGÜNKÜ GİBİ tüm kapılardan geçirir (cooldown, bakiye, stop-mesafesi/R:R, boyutlama, borsa
+filtresi doğrulaması — leverage/margin bu GERÇEK hesaplamadan gelir) ama adım 6'dan (margin
+type + leverage ayarı) itibaren HİÇBİR borsa isteği göndermez: margin/leverage AYARLANMAZ,
+emir GÖNDERİLMEZ, SL/TP YOKTUR, pozisyon izlenmez. Bunun yerine sinyal `scalp_trades`'e
+`status="SHADOW"`, `entry_price=sinyal fiyatı` (gerçek dolum değil), `notes="shadow_mode"`
+olarak yazılır ve `try_open` `None` döner — engine bunu normal bir "sinyal reddedildi"
+sonucu gibi ele alır (rezervasyon serbest kalır, `tracked`/`pending`'e hiç girmez).
+`tracker.stats()`/`open_trades()` yalnız `CLOSED`/`OPEN` sorguladığı için SHADOW satırları
+istatistiklerden, kapasite sayımından ve restart kurtarmasından KENDİLİĞİNDEN dışlanır — ayrı
+bir filtre eklemeye gerek kalmadı. `/scalper/trades` varsayılanı da aynı nedenle SHADOW'u
+gösterMEZ; `?include_shadow=1` ile görülebilir. Cooldown/loss-cooldown gölge girişiyle
+TETİKLENMEZ (hiçbir risk alınmadı) ama MEVCUT cooldown gölge sinyalini de engellemeye devam
+eder (kapı bugünküyle AYNI). Başlangıçta `⚠️ GÖLGE MODU AÇIK — emir gönderilmez` YÜKSEK
+SESLE loglanır (`ScalperEngine._maybe_log_shadow_mode_banner`); `/scalper/status`
+`shadow_mode` alanını dışa verir.
+
+**Neden:** docs/MAINNET_PLAN.md §3/§5.2 — mainnet'e geçişte yeni bir parametreyi veya
+mainnet'in kendisini gerçek parayla riske girmeden 3 gün gözlemlemek için. Ayrıca
+`_validate_binance_environment` (config.py) artık mainnet'te (testnet DEĞİLKEN) gölge
+KAPALIYSA `RISK_EVENT_SECRET`, `TV_WEBHOOK_SECRET` ve `SCALPER_SYMBOL_ALLOWLIST`'in dolu
+olmasını ZORUNLU kılıyor (docs/MAINNET_PLAN.md §5.3) — gölge modu bu üç korumayı BYPASS
+edebilen TEK istisna, çünkü emir zaten gitmiyor. `SCALPER_ENTRY_HALT_ENABLED=false` kontrolü
+gölge modundan bağımsız her zaman uygulanır (bypass edilmez).
+
+**Kapsam dışı bırakılan tasarım kararı:** margin/leverage ayarı (adım 6, `set_margin_type`/
+`set_leverage`) da gölge modda ATLANIR — bunlar borsa hesabının GERÇEK leverage/margin type
+ayarını değiştiren mutasyon çağrılarıdır; bir gölge sinyalin canlı hesabı sessizce
+değiştirmesi (paralel çalışan gerçek executor'la çakışma riski) kabul edilemezdi. Yalnız
+adım 1-5 (bakiye okuma + yerel/önbellekli borsa filtresi doğrulaması) çalışır — bunlar
+mutasyon değildir ve gerçekçi leverage/margin sayıları için gereklidir.
+
+**Kanıt:** `tests/test_shadow_mode.py` — 19 test: executor'da emir/margin/leverage çağrısı
+gitmediği + SHADOW kaydı yazıldığı + kapasite/cooldown etkilenmediği (gölge açık), bugünkü
+yolun değişmediği (gölge kapalı), gerçek (geçici) SQLite üzerinde stats/open_trades'in SHADOW
+satırını dışladığı, mainnet doğrulamasının (bypass + eksik secret reddi) ve başlangıç
+bannerının davranışı. `python3 -m pytest tests -q` → 592 passed, 1 skipped (önceki: 573).
+Backtest harness'e DOKUNULMADI — gölge modu yalnız canlı `try_open`'ı etkiler, harness zaten
+borsaya hiç çıkmaz (bkz. docs/MAINNET_PLAN.md §5 madde 2 "canlı-only").
+
+**Geri alma:** `.env`'den `SCALPER_SHADOW_MODE`'u kaldır/`false` yap (varsayılan zaten
+`false` — davranış değişmez). Tam geri alma gerekirse bu commit'teki `src/core/config.py`
+(`scalper_shadow_mode` alanı + `_validate_binance_environment` mainnet bloğu),
+`src/strategies/scalper/executor.py` (`try_open` gölge dalı), `src/strategies/scalper/
+tracker.py` (`record_shadow`), `src/strategies/scalper/engine.py`
+(`_maybe_log_shadow_mode_banner` + `snapshot()` `shadow_mode` alanı), `src/main.py`
+(`_EMPTY_SCALPER_STATUS`/`scalper/trades` `include_shadow`) değişikliklerini revert et.
+
 ## Reddedilen kararlar (kanıtla)
 
 | Fikir | Tarih | Sonuç | Neden reddedildi |

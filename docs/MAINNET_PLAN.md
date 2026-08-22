@@ -28,8 +28,9 @@ Aynı kod, farklı env. Halka C asla `origin/main`'in ucunu almaz; yalnız B'de 
 - **Kill-switch:** `POST /risk-event {action: flatten}` (D10) — ayrı secret, süreli halt. Mainnet'te
   `RISK_EVENT_SECRET` ZORUNLU (boş bırakılamaz; başlangıç doğrulamasına eklenecek).
 - **Entry-halt otomatiği:** `SCALPER_ENTRY_HALT_ENABLED=true` (mainnet doğrulaması zaten `false`'u reddeder).
-- **Gölge modu (yazılacak):** `SCALPER_SHADOW_MODE=true` → sinyaller üretilir, loglanır, defterde
+- **Gölge modu (D14, YAZILDI):** `SCALPER_SHADOW_MODE=true` → sinyaller üretilir, loglanır, defterde
   "SHADOW" olarak kaydedilir, emir GÖNDERİLMEZ. Yeni parametre mainnet'te önce 3 gün gölge.
+  Ayrıntı: `docs/DECISIONS.md` D14, `docs/RUNBOOK.md` "Gölge modu".
 - **Mutabakat:** her gün `scalp_trades` ↔ Binance income (close ledger var) farkı > %1 ise Telegram uyarı + halt.
 - **Ağırlık/ban:** mainnet'te gerçek X-MBX-USED-WEIGHT; eşik 1800 → gerçek değere göre kalibre; ban = halt.
 - **Ayrı IP bağlama:** `BINANCE_BIND_IP` mainnet için ayrı (testnet ile aynı IP'den ban riskini ayırmak
@@ -43,9 +44,14 @@ ve mainnet defteri 2 hafta sonra aynı rejim-bölünmüş tabloyla testnet'le ka
 
 ## 5. Yapılacaklar (sıra)
 1. `scripts/deploy.sh --ring mainnet` + `server_deploy.sh` parametreleri (dizin/program/port/secret).
-2. Gölge modu (`SCALPER_SHADOW_MODE`) + testleri + harness paritesi gerektirmez (canlı-only).
-3. Mainnet başlangıç doğrulaması: `RISK_EVENT_SECRET` zorunlu, `TV_WEBHOOK_SECRET` zorunlu,
-   allowlist boş olamaz, `SCALPER_ENTRY_HALT_ENABLED=true`.
+2. ~~Gölge modu (`SCALPER_SHADOW_MODE`) + testleri + harness paritesi gerektirmez (canlı-only).~~
+   ✅ YAPILDI (D14, 2026-08-22): `docs/DECISIONS.md` D14, `tests/test_shadow_mode.py` (19 test).
+3. ~~Mainnet başlangıç doğrulaması: `RISK_EVENT_SECRET` zorunlu, `TV_WEBHOOK_SECRET` zorunlu,
+   allowlist boş olamaz, `SCALPER_ENTRY_HALT_ENABLED=true`.~~ ✅ YAPILDI (D14,
+   `Settings._validate_binance_environment`) — `SCALPER_ENTRY_HALT_ENABLED` kontrolü zaten
+   vardı; `RISK_EVENT_SECRET`/`TV_WEBHOOK_SECRET`/allowlist zorunluluğu bu turda eklendi,
+   TEK istisna `SCALPER_SHADOW_MODE=true` (emir gitmediği için bu üçü henüz kurulu olmasa da
+   riske girmez).
 4. Ayrı supervisord programı + ayrı port (9092) + ayrı tünel + ayrı Telegram kanalı.
 5. TV alarmları: mainnet için ayrı webhook URL'si (`?ring=main` DEĞİL — ayrı secret ve yol `/tv-signal` aynı,
    host/port farklı; 14 Eylül yenilemesiyle birlikte kurulur) + alan adı + TLS.
