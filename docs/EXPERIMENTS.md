@@ -188,3 +188,28 @@ Kaynak: `python3 scripts/autoresearch.py` — otomatik uretildi, elle duzenlemey
 | E5d | BOGA | 103 | 95.1 | +4239.47 | 2.92 | 514.25 | - |
 | E5d | KARAR | - | - | +985.23 | - | - | ADAY (AYI PF=1.12) |
 | E5d | hipotez | TP1 %8 + chandelier 3.0: iki bagimsiz adayin birlesimi toplamsal mi? | | | | | |
+
+## 2026-08-22 — Autoresearch (scripts/autoresearch.py)
+Kaynak: `python3 scripts/autoresearch.py` — otomatik uretildi, elle duzenlemeyin.
+| Varyant | Pencere | Islem | WR% | PnL | PF | maxDD | Karar |
+|---|---|---|---|---|---|---|---|
+| E4b | AYI | 213 | 85.4 | +823.15 | 1.05 | 3717.82 | - |
+| E4b | YATAY | 149 | 87.2 | +2519.27 | 1.30 | 3223.76 | - |
+| E4b | BOGA | 90 | 93.3 | +3984.39 | 2.46 | 724.00 | - |
+| E4b | KARAR | - | - | +448.48 | - | - | ADAY (AYI&YATAY PnL birlikte iyilesti) |
+| E4b | hipotez | Chandelier carpanini 3.0'a daraltmak stop'u sikilastirir, trail kazancini erken kilitler. | | | | | |
+| E4f | AYI | 226 | 88.9 | +1415.12 | 1.12 | 2604.45 | - |
+| E4f | YATAY | 159 | 89.9 | +2603.52 | 1.38 | 2153.57 | - |
+| E4f | BOGA | 101 | 96.0 | +4597.63 | 3.71 | 514.25 | - |
+| E4f | KARAR | - | - | +1737.94 | - | - | ADAY (AYI PF=1.12) |
+| E4f | hipotez | TP1 hedefini 8'e dusurmek break-even'e daha erken gecer, whipsaw'da SL'den korur. | | | | | |
+| E4g | AYI | 205 | 83.4 | +1175.76 | 1.07 | 4106.57 | - |
+| E4g | YATAY | 134 | 85.1 | +3014.92 | 1.33 | 2555.06 | - |
+| E4g | BOGA | 78 | 91.0 | +4891.83 | 2.51 | 755.33 | - |
+| E4g | KARAR | - | - | +2204.18 | - | - | ADAY (AYI&YATAY PnL birlikte iyilesti) |
+| E4g | hipotez | TP1 hedefini 12'ye yukseltmek erken kismi kar alimini geciktirir, runner payini buyutur. | | | | | |
+| E5c | AYI | 157 | 86.6 | +2646.69 | 1.26 | 3073.82 | - |
+| E5c | YATAY | 96 | 84.4 | +710.47 | 1.11 | 1408.39 | - |
+| E5c | BOGA | 52 | 86.5 | +1578.66 | 1.50 | 1510.41 | - |
+| E5c | KARAR | - | - | +0.00 | - | - | REDDEDILDI (asiri filtreleme (islem<60: ['BOGA'])) |
+| E5c | hipotez | Kaldirac tavani 12 tek basina: E4i (10) ile E4j (15) arasi — boga islem sayisi >=60 kalir mi? | | | | | |
