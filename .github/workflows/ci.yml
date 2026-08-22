@@ -42,4 +42,4 @@ jobs:
         run: python -m pytest tests -q -p no:cacheprovider --durations=5
 
       - name: Deploy script sözdizimi
-        run: bash -n scripts/deploy.sh && bash -n scripts/server_deploy.sh
+        run: bash -n scripts/deploy.sh && bash -n scripts/server_deploy.sh && bash -n scripts/ring_env_diff.sh

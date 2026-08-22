@@ -40,6 +40,58 @@ Restart'ı kanıtla: `ps -o etimes= -p $(supervisorctl pid tradingbot_v2)` küç
 script'i bu yüzden 240 sn'ye kadar yoklar (`HEALTH_TIMEOUT`). 2026-08-21'de 30 sn'lik sabit bekleme
 yanlış alarmla otomatik geri alma tetikledi — mekanizma doğru çalıştı, eşik düzeltildi.
 
+### Mainnet halkası
+Durum: pipeline hazır, dizin/program HENÜZ YOK (`/opt/tradingbot-main` bir insan tarafından
+kurulmadan mainnet deploy'u çalışmaz — bkz. `docs/MAINNET_PLAN.md` §1, §5). `scripts/deploy.sh`
+`--ring mainnet` ile çağrıldığında testnet'ten AYRI dizin/program/port/sağlık uç noktasını
+kullanır ve yalnız etiketli (`vX.Y.Z`) sürümleri kabul eder:
+```bash
+scripts/deploy.sh awa v1.2.0 --ring mainnet
+# ── MAİNNET DEPLOY ONAYI ──────────────────────────────
+#   halka  : mainnet
+#   host   : awa
+#   hedef  : v1.2.0
+#   repo   : /opt/tradingbot-main
+#   program: tradingbot_main
+# Onaylamak için 'MAINNET' yazın: MAINNET
+```
+Otomasyon (ör. CI) için onay istemini atla: `DEPLOY_CONFIRM=MAINNET scripts/deploy.sh awa v1.2.0 --ring mainnet`.
+Reddedilen durumlar: hedef `origin/main` veya `vX.Y.Z` biçiminde olmayan çıplak bir commit ise,
+ya da etiket origin'e push edilmemişse — script deploy'u başlatmadan iptal eder.
+
+`scripts/server_deploy.sh` tarafında `RING=mainnet` iki şey yapar: log satırlarına `[ring=mainnet]`
+ekler (rollback mantığı iki halka için ORTAK, değişmez) ve ekstra bir ön kontrol çalıştırır — `.env`
+içinde `RISK_EVENT_SECRET` ve `TV_WEBHOOK_SECRET` dolu, `SCALPER_ENTRY_HALT_ENABLED=true` değilse
+deploy Türkçe bir hata mesajıyla reddedilir (bkz. `docs/MAINNET_PLAN.md` §3).
+
+İki halkanın `.env`'i arasındaki `SCALPER_*`/`TV_*`/`RISK_*` farkını (secret DEĞERLERİ maskelenerek)
+görmek için salt okunur yardımcı:
+```bash
+scripts/ring_env_diff.sh awa
+```
+
+**Mainnet dizini/programı kurulduğunda** (insan tarafından, bkz. `docs/MAINNET_PLAN.md` §5 madde 4),
+supervisord'a eklenecek program tanımı (testnet'in `tradingbot_v2` programının eşleniği — port 9092,
+ayrı log yolu):
+```ini
+[program:tradingbot_main]
+directory=/opt/tradingbot-main
+command=/opt/tradingbot-main/.venv/bin/python -m uvicorn src.main:app --host 127.0.0.1 --port 9092
+autostart=false        ; ilk kurulumda kapalı — go/no-go sonrası elle açılır
+autorestart=true
+stopsignal=TERM
+stopasgroup=true
+killasgroup=true
+user=<sunucu-kullanıcısı>
+environment=PYTHONUNBUFFERED="1"
+stdout_logfile=/opt/tradingbot-main/logs/supervisor.log
+stdout_logfile_maxbytes=10MB
+stdout_logfile_backups=5
+redirect_stderr=true
+```
+Uygulamanın kendi log dosyası (`logs/bot.log`, testnet'teki gibi) çalışma dizini `/opt/tradingbot-main`
+olduğu için otomatik olarak ayrı olur — testnet'in `logs/`'ıyla KARIŞMAZ.
+
 ## Arızalar
 **Binance 418 / ban:** `logs/bot.log`'da `HTTP 418|banned|devre kesici`. Ban aktifken restart
 **YASAK** (ban süresini uzatır). Kök nedenler ve çözümler: rate limiter kilidi (mevcut), dashboard
