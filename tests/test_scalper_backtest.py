@@ -24,6 +24,7 @@ from src.strategies.scalper.backtest import (
     BACKTEST_WARMUP_CANDLES,
     BacktestTrade,
     OpenPosition,
+    _apply_capacity_gate,
     build_context,
     compute_stats,
     fetch_paginated,
@@ -91,6 +92,7 @@ class _Cfg:
     scalper_maker_fill_timeout_candles: int = 3
     scalper_min_rr: float = 1.2
     scalper_regime_filter: bool = True
+    scalper_max_positions: int = 3
 
 
 def _mk_signal(entry_price: float, stop_price: float,
@@ -956,3 +958,178 @@ class TestSimulateSymbolRegimeGate:
 
         assert len(trades) == 1
         assert trades[0].exit_reason == "SL"
+
+
+# --------------------------------------------------------------------------
+# Kapasite kapısı paritesi (_apply_capacity_gate / run_backtest) — canlı
+# engine.py ile birebir: `len(tracked | pending) >= scalper_max_positions`
+# iken yeni giriş açılmaz. simulate_symbol her sembolü BAĞIMSIZ simüle
+# ettiğinden (küresel saat YOK) bu kapı semboller birleştirildikten SONRA,
+# run_backtest() içinde kronolojik bir geçişle uygulanır (2026-08-21,
+# görev: "parite boşluğu — capacity"). Bu kapı 2026-08-21'e kadar YOKTU;
+# SCALPER_MAX_POSITIONS=3 varyantının sunucunun 5'iyle birebir aynı sonucu
+# vermesi bunu kanıtladı (autoresearch E4h, docs/EXPERIMENTS.md).
+# --------------------------------------------------------------------------
+
+def _mk_trade(symbol: str, entry_time: int, exit_time: int,
+              strategy: str = "X", direction: str = "LONG") -> BacktestTrade:
+    return BacktestTrade(
+        strategy=strategy, symbol=symbol, direction=direction,
+        entry_price=100.0, entry_time=entry_time,
+        exit_price=101.0, exit_time=exit_time,
+        quantity=1.0, leverage=20, margin_usdt=5.0, pnl=1.0, roi_pct=1.0,
+        exit_reason="EOD", mae_pct=0.0, mfe_pct=0.0,
+        duration_minutes=max(0.0, (exit_time - entry_time) / 60_000.0),
+        exit_idx=0, regime="RANGE",
+    )
+
+
+class TestApplyCapacityGate:
+    """`_apply_capacity_gate` doğrudan (run_backtest'in ağ/veri katmanı
+    olmadan) — üst düzeyde kapasite mantığının kendisini test eder."""
+
+    def test_max_positions_1_only_earlier_trade_survives(self):
+        # AAA t=0'da girer, t=1000'de kapanır. BBB t=100'de girer (AAA hâlâ
+        # açık) — max_positions=1 iken yalnız ERKEN (AAA) hayatta kalır.
+        aaa = _mk_trade("AAAUSDT", entry_time=0, exit_time=1000)
+        bbb = _mk_trade("BBBUSDT", entry_time=100, exit_time=900)
+        cfg = _Cfg(scalper_max_positions=1)
+        missed: dict = {}
+
+        accepted = _apply_capacity_gate(
+            [aaa, bbb], symbols=["AAAUSDT", "BBBUSDT"], cfg=cfg, missed_counter=missed,
+        )
+
+        assert [t.symbol for t in accepted] == ["AAAUSDT"]
+        assert missed == {"capacity": 1}
+
+    def test_max_positions_2_both_overlapping_trades_survive(self):
+        aaa = _mk_trade("AAAUSDT", entry_time=0, exit_time=1000)
+        bbb = _mk_trade("BBBUSDT", entry_time=100, exit_time=900)
+        cfg = _Cfg(scalper_max_positions=2)
+        missed: dict = {}
+
+        accepted = _apply_capacity_gate(
+            [aaa, bbb], symbols=["AAAUSDT", "BBBUSDT"], cfg=cfg, missed_counter=missed,
+        )
+
+        assert {t.symbol for t in accepted} == {"AAAUSDT", "BBBUSDT"}
+        assert missed == {}
+
+    def test_non_overlapping_trades_never_rejected_even_at_max_positions_1(self):
+        # BBB, AAA tam kapandıktan (exit_time=1000) SONRA açılıyor (t=1000) ->
+        # slot aynı anda boşalmış sayılır, kapasite dolu DEĞİLDİR.
+        aaa = _mk_trade("AAAUSDT", entry_time=0, exit_time=1000)
+        bbb = _mk_trade("BBBUSDT", entry_time=1000, exit_time=2000)
+        cfg = _Cfg(scalper_max_positions=1)
+        missed: dict = {}
+
+        accepted = _apply_capacity_gate(
+            [aaa, bbb], symbols=["AAAUSDT", "BBBUSDT"], cfg=cfg, missed_counter=missed,
+        )
+
+        assert {t.symbol for t in accepted} == {"AAAUSDT", "BBBUSDT"}
+        assert missed == {}
+
+    def test_same_entry_time_tie_break_uses_symbols_list_order(self):
+        # Aynı 5m mumunda iki sembol de sinyal verirse (entry_time eşit),
+        # canlı taramanın `self._universe` sırasına karşılık gelen
+        # `symbols` argüman sırası kazanır.
+        aaa = _mk_trade("AAAUSDT", entry_time=0, exit_time=1000)
+        bbb = _mk_trade("BBBUSDT", entry_time=0, exit_time=1000)
+        cfg = _Cfg(scalper_max_positions=1)
+
+        accepted_aaa_first = _apply_capacity_gate(
+            [bbb, aaa], symbols=["AAAUSDT", "BBBUSDT"], cfg=cfg,
+        )
+        assert [t.symbol for t in accepted_aaa_first] == ["AAAUSDT"]
+
+        accepted_bbb_first = _apply_capacity_gate(
+            [aaa, bbb], symbols=["BBBUSDT", "AAAUSDT"], cfg=cfg,
+        )
+        assert [t.symbol for t in accepted_bbb_first] == ["BBBUSDT"]
+
+    def test_missing_scalper_max_positions_defaults_to_3(self):
+        # cfg'de alan hiç yoksa (ör. eski bir sahte cfg) canlı Settings
+        # varsayılanıyla (3) aynı taban kullanılır — patlamaz.
+        @dataclass
+        class _NoCapacityCfg:
+            pass
+
+        trades = [
+            _mk_trade("A1USDT", 0, 1000), _mk_trade("A2USDT", 0, 1000),
+            _mk_trade("A3USDT", 0, 1000), _mk_trade("A4USDT", 0, 1000),
+        ]
+        missed: dict = {}
+
+        accepted = _apply_capacity_gate(
+            trades, symbols=["A1USDT", "A2USDT", "A3USDT", "A4USDT"],
+            cfg=_NoCapacityCfg(), missed_counter=missed,
+        )
+
+        assert len(accepted) == 3
+        assert missed == {"capacity": 1}
+
+
+class TestRunBacktestCapacityGateWiring:
+    """run_backtest()'in _apply_capacity_gate'i gerçekten uyguladığını,
+    simulate_symbol'ü sahte adaylarla değiştirip (ağ/gösterge hesaplaması
+    devre dışı) uçtan uca doğrular."""
+
+    @pytest.mark.asyncio
+    async def test_run_backtest_drops_overlapping_trade_over_capacity(self, monkeypatch):
+        trades_by_symbol = {
+            "AAAUSDT": [_mk_trade("AAAUSDT", entry_time=0, exit_time=1000)],
+            "BBBUSDT": [_mk_trade("BBBUSDT", entry_time=100, exit_time=900)],
+        }
+
+        async def fake_gather_symbol_data(*args, **kwargs):
+            return {"5m": [], "15m": [], "4h": []}
+
+        def fake_simulate_symbol(symbol, *args, **kwargs):
+            return list(trades_by_symbol[symbol])
+
+        monkeypatch.setattr(backtest_module, "gather_symbol_data", fake_gather_symbol_data)
+        monkeypatch.setattr(backtest_module, "simulate_symbol", fake_simulate_symbol)
+
+        missed_counter: dict = {}
+        trades = await run_backtest(
+            days=1,
+            symbols=["AAAUSDT", "BBBUSDT"],
+            strategy_names="C",
+            cfg=_Cfg(scalper_max_positions=1),
+            missed_counter=missed_counter,
+            end_time_ms=10_000_000,
+        )
+
+        assert [t.symbol for t in trades] == ["AAAUSDT"]
+        assert missed_counter.get("capacity") == 1
+
+    @pytest.mark.asyncio
+    async def test_run_backtest_keeps_both_when_capacity_allows(self, monkeypatch):
+        trades_by_symbol = {
+            "AAAUSDT": [_mk_trade("AAAUSDT", entry_time=0, exit_time=1000)],
+            "BBBUSDT": [_mk_trade("BBBUSDT", entry_time=100, exit_time=900)],
+        }
+
+        async def fake_gather_symbol_data(*args, **kwargs):
+            return {"5m": [], "15m": [], "4h": []}
+
+        def fake_simulate_symbol(symbol, *args, **kwargs):
+            return list(trades_by_symbol[symbol])
+
+        monkeypatch.setattr(backtest_module, "gather_symbol_data", fake_gather_symbol_data)
+        monkeypatch.setattr(backtest_module, "simulate_symbol", fake_simulate_symbol)
+
+        missed_counter: dict = {}
+        trades = await run_backtest(
+            days=1,
+            symbols=["AAAUSDT", "BBBUSDT"],
+            strategy_names="C",
+            cfg=_Cfg(scalper_max_positions=2),
+            missed_counter=missed_counter,
+            end_time_ms=10_000_000,
+        )
+
+        assert {t.symbol for t in trades} == {"AAAUSDT", "BBBUSDT"}
+        assert missed_counter.get("capacity") is None

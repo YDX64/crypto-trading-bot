@@ -197,6 +197,12 @@ Not (P1): harness SCALPER_MAX_POSITIONS kapasitesini modellemiyor (E4h taban ile
 Harness rejim kapısını uygulamıyordu; tüm eski sayılar geçersiz sayıldı. `simulate_symbol`
 artık `cfg.scalper_regime_filter` ile canlıyla aynı kuralı uygular; testler
 `tests/test_scalper_backtest.py`. Motorda kapı/filtre değişirse harness da değişir.
+Parite listesi: rejim kapısı (`simulate_symbol`) + **kapasite kapısı**
+(`scalper_max_positions`, `run_backtest._apply_capacity_gate` — semboller
+bağımsız simüle edildiği için post-hoc kronolojik geçiş, sembol-içi değil;
+kanıt: E4h/E5 varyantlarının AYNI sonucu vermesi — `docs/EXPERIMENTS.md`
+"Autoresearch" bölümü, `SCALPER_MAX_POSITIONS=3` sunucunun 5'ine karşı hiç
+fark yaratmamıştı). Bilinen sapmalar `_apply_capacity_gate` docstring'inde.
 
 ### P2 — Karar kuralı · 2026-08-21
 Aday = AYI PF ≥ 1.1 (veya AYI ve YATAY PnL birlikte iyileşir) VE BOĞA PnL kaybı ≤ %20.

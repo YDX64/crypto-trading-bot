@@ -15,8 +15,15 @@ YASAKTIR. build_context() bunu her çağrıda assert ile de doğrular.
 
 Simülasyon sembol başına TEK eşzamanlı pozisyon kullanır: bir sinyal
 pozisyon açtığında, o pozisyon kapanana kadar aynı sembolde yeni sinyal
-aranmaz (backtest tarafı — canlı motorun scalper_max_positions kapısı
-farklı bir kavramdır, burada YOK).
+aranmaz. Her sembol simulate_symbol() içinde BAĞIMSIZ (küresel saat YOK)
+simüle edilir; canlı motorun `scalper_max_positions` KAPASİTE kapısı
+(engine._evaluate_symbol, `len(tracked | pending) >= max`) bu yüzden
+sembol-içi değil, semboller-ARASI bir kısıt olduğundan run_backtest()
+seviyesinde, tüm sembollerin aday işlemleri birleştirildikten SONRA,
+giriş zamanına göre kronolojik tek bir POST-HOC geçişle uygulanır (bkz.
+`_apply_capacity_gate`, 2026-08-21 "parite: kapasite kapısı"). Kapasite
+yüzünden reddedilen adaylar `missed_counter["capacity"]`'de sayılır ve
+işleme dahil edilmez. Bilinen sapmalar `_apply_capacity_gate` docstring'inde.
 
 CLI:
     python -m src.strategies.scalper.backtest --days 30 \\
@@ -38,6 +45,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import bisect
+import heapq
 import json
 import math
 import subprocess
@@ -1232,6 +1240,68 @@ def _strict_json_value(value: Any) -> Any:
 # ==========================================================================
 
 
+def _apply_capacity_gate(
+    trades: List[BacktestTrade],
+    symbols: List[str],
+    cfg: Any,
+    missed_counter: Optional[Dict[str, int]] = None,
+) -> List[BacktestTrade]:
+    """Canlı motorun kapasite kapısıyla PARİTE (2026-08-21).
+
+    `engine._evaluate_symbol` yeni girişi yalnız `len(tracked | pending) <
+    scalper_max_positions` iken açar (kural tur başında VE try_open'dan
+    hemen önce iki kez doğrulanır — engine.py `_scan_tick`/`_evaluate_symbol`,
+    satır ~1135 ve ~1252). `simulate_symbol` her sembolü BAĞIMSIZ simüle
+    ettiğinden (küresel saat YOK — modül docstring'i) bu kapıyı sembol-içi
+    döngüde uygulamak mümkün değil; en az müdahaleci yol tüm sembollerin
+    aday işlemleri birleştirildikten SONRA, giriş zamanına göre KRONOLOJİK
+    tek bir geçiş yapmaktır: açık aday sayısı `scalper_max_positions`'a
+    ulaştığında yeni giriş REDDEDİLİR (`missed_counter["capacity"]`) ve
+    sonuç kümesine hiç girmez. Eşitlikte (aynı 5m mumunda birden çok sembol
+    sinyali) `symbols` argümanındaki sıra kullanılır — canlı taramanın
+    `self._universe` döngü sırasına karşılık gelir. Bir pozisyon tam
+    `exit_time`'ında kapanıyorsa slot AYNI ANDA boşalmış sayılır (canlı
+    motorda da REST pozisyon özeti bir sonraki tur başında tazedir).
+
+    BİLİNEN SAPMALAR (kapsam dışı bırakıldı — görev notu):
+    1) Canlı motorda kapasite, emrin GÖNDERİLDİĞİ (pending) andan itibaren
+       dolar; maker modda hiç dolmayan bir emir de bekleme süresince bir
+       slot işgal eder. Backtest'te dolmayan maker sinyalleri hiçbir zaman
+       BacktestTrade'e dönüşmediğinden (bkz. `missed_counter["maker_missed"]`,
+       `_find_maker_fill`) bu bekleme penceresi burada modellenmiyor.
+    2) Bir aday kapasite yüzünden reddedildiğinde, o sembolün
+       `simulate_symbol` içinde ÜRETİLMİŞ sonraki sinyalleri (özellikle
+       `scalper_loss_cooldown_minutes` soğuması) yine de reddedilen işlem
+       GERÇEKLEŞMİŞ gibi hesaba katılmıştır — sembol simülasyonu
+       kapasiteden habersiz, kendi başına tamamlanır. Tam parite; kapasiteyi
+       BİLEN tek bir küresel event-driven simülasyona geçmeyi gerektirir.
+    """
+    max_positions_raw = getattr(cfg, "scalper_max_positions", 3)
+    max_positions = int(max_positions_raw) if max_positions_raw is not None else 3
+
+    order_index = {sym: idx for idx, sym in enumerate(symbols)}
+    ordered = sorted(
+        trades,
+        key=lambda t: (t.entry_time, order_index.get(t.symbol, len(symbols)), t.symbol),
+    )
+
+    accepted: List[BacktestTrade] = []
+    open_exit_times: List[int] = []  # min-heap: açık adayların exit_time'ları
+    for trade in ordered:
+        while open_exit_times and open_exit_times[0] <= trade.entry_time:
+            heapq.heappop(open_exit_times)
+
+        if len(open_exit_times) >= max_positions:
+            if missed_counter is not None:
+                missed_counter["capacity"] = missed_counter.get("capacity", 0) + 1
+            continue
+
+        heapq.heappush(open_exit_times, trade.exit_time)
+        accepted.append(trade)
+
+    return accepted
+
+
 async def run_backtest(
     days: int,
     symbols: List[str],
@@ -1338,6 +1408,12 @@ async def run_backtest(
             all_trades.extend(trades)
     finally:
         await fetcher.close()
+
+    # Canlı motor paritesi: kapasite kapısı (scalper_max_positions) semboller
+    # arası bir kısıttır — sembol-içi simulate_symbol döngüsünde uygulanamaz,
+    # bu yüzden tüm sembollerin adayları birleştikten SONRA burada, tek bir
+    # kronolojik geçişle uygulanır (bkz. _apply_capacity_gate docstring'i).
+    all_trades = _apply_capacity_gate(all_trades, symbols, cfg, missed_counter=missed_counter)
 
     return all_trades
 

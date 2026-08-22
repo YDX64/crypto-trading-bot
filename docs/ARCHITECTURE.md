@@ -256,8 +256,10 @@ entry_mode=maker` iken LIMIT dolum + timeout iptali), `fixed_roi` stop modu ve
 coin-bazlı dinamik kaldıraç (canlı `apply_stop_policy` AYNEN çağrılır —
 `backtest.py:49`), rejim kapısı paritesi (canlı `_evaluate_symbol` ile aynı
 mantık — commit `7640c0a "rejim kapısı paritesi"`). Sembol başına backtest'te
-**tek eşzamanlı pozisyon** (canlının `scalper_max_positions` kavramı burada
-yok — modül docstring'i, `backtest.py:14-17`).
+**tek eşzamanlı pozisyon**; semboller-ARASI `scalper_max_positions` kapasite
+kapısı ise `run_backtest`'te tüm sembollerin adayları birleştikten SONRA,
+kronolojik tek bir geçişle uygulanır (`_apply_capacity_gate`, parite ile
+canlı `_evaluate_symbol` kapasite kuralı — post-hoc, sembol-içi değil).
 
 Çıktı: konsol tablosu (strateji × işlem/kazanma%/PnL/profit factor/max
 drawdown/…, `print_report:902-948`) + iki kırılım tablosu: **REJİM
