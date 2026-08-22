@@ -18,6 +18,10 @@ Aynı kod, farklı env. Halka C asla `origin/main`'in ucunu almaz; yalnız B'de 
 2. Backtest: 3 rejim penceresinde P2 kuralı (`docs/DECISIONS.md`): AYI PF ≥ 1.1 **ve** BOĞA PnL kaybı ≤ %20, ≥60 işlem/pencere.
 3. B soak: ≥5 gün, içinde en az **1 düşüş günü** (BTC günlük < −%1.5); canlı defter rejime bölünmüş rapor
    (UP/FLAT/DOWN × LONG/SHORT) pozitif veya başabaş; `exit_reason=UNKNOWN` oranı < %5; 418/429 yok.
+   Rapor: `python3 scripts/ledger_report.py --since <soak-başlangıcı> --format md` — soak'un
+   ≥5 gün/≥1 DOWN günü/UNKNOWN<%5/rejim başına PnL≥0 maddelerini PASS/FAIL olarak tek tek yazdırır
+   (418/429 buna dahil DEĞİL — RUNBOOK/loglardan ayrıca doğrulanır); script hüküm vermez, madde 5'teki
+   insan onayının yerine geçmez.
 4. Operasyon: RUNBOOK güncel, DECISIONS satırı var, geri alma komutu yazılı ve denenmiş.
 5. İnsan onayı: kullanıcı "mainnet'e al" der; AI tek başına terfi ETMEZ.
 

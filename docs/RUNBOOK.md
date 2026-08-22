@@ -21,8 +21,20 @@ print("açık:", c.execute("SELECT symbol,direction FROM scalp_trades WHERE stat
 print("bugün:", c.execute("SELECT COUNT(*),SUM(CASE WHEN realized_pnl>0 THEN 1 ELSE 0 END),ROUND(SUM(realized_pnl),2) FROM scalp_trades WHERE status=\"CLOSED\" AND date(closed_at)=date(\"now\")").fetchone())
 PY'
 ```
-Haftalık: canlı defteri rejime böl (BTC günlük % → UP/FLAT/DOWN) ve yön/çıkış kırılımı çıkar
-(bkz. `docs/EXPERIMENTS.md` "rejim analizi" kalıbı). "Kazanıyor" yalnız üç rejimde de doğruysa söylenir.
+Haftalık: `scripts/ledger_report.py` canlı defteri rejime böler (BTC günlük % → UP/FLAT/DOWN),
+yön/çıkış-nedeni/sembol/gün kırılımlarını ve `docs/MAINNET_PLAN.md` §2.3 soak kontrol listesini
+(PASS/FAIL — hüküm vermez, insan karar verir) yazdırır. Elle SQL yazmaya gerek yok:
+```bash
+python3 scripts/ledger_report.py --since "2026-08-14 00:00" --format md   # son 7 gün varsayılan
+```
+Sunucuda (ör. D6 soak, 2026-08-21 12:35 UTC'den beri):
+```bash
+ssh awa 'cd /opt/tradingbot-v2 && .venv/bin/python scripts/ledger_report.py --since "2026-08-21 12:35" --format md'
+```
+Ağ erişimi yoksa/istenmiyorsa `--btc-klines-json <dosya>` ile Binance kline dizisi biçiminde
+çevrimdışı veri verilebilir. Çıktı biçimleri `text|md|json` (`--format`), dosyaya yazmak için
+`--out`. "Kazanıyor" yalnız üç rejimde de doğruysa (checklist'in rejim satırları PASS/N/A)
+söylenir — bkz. `docs/EXPERIMENTS.md` "rejim analizi" kalıbı (script bu kalıbı otomatikleştirir).
 
 ## Deploy ve geri alma
 ```bash

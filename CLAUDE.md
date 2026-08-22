@@ -21,12 +21,13 @@ Yeni sinyal kaynağı (haber botu vb.) eklemek: `docs/INTEGRATIONS.md`. Otomatik
   `systemctl`'deki `live-bot.service` **trading botu DEĞİLDİR** (futbol botu).
 - **Ayarlar:** `/opt/tradingbot-v2/.env` (commit'lenmez; her değişiklikte
   `backups/env.bak-<tarih>-<etiket>` yedeği). Varsayılanlar `src/core/config.py`.
+  Kapalı duran kanallar: `RISK_EVENT_SECRET` (boş = /risk-event 503), `SCALPER_SHADOW_MODE=false`.
 - **Veri:** `tradingbot.db` (sqlite, `scalp_trades`), `state/` (cooldown, entry-halt),
   `logs/bot.log` (uygulama), `logs/supervisor.log` (erişim logu — **secret içerir, dökme**).
 
 ## Nasıl çalıştırılır / test edilir / deploy edilir
 ```bash
-python3 -m pytest tests -q                      # 470+ test, <10 sn — her değişiklikten önce
+python3 -m pytest tests -q                      # 640+ test, ~20 sn — her değişiklikten önce
 scripts/deploy.sh awa                           # push edilmiş main'i sunucuya uygula (test + restart + sağlık + otomatik geri alma)
 DEPLOY_NO_RESTART=1 scripts/deploy.sh awa       # yalnız kod/test; süreci yeniden başlatma
 scripts/deploy.sh awa <önceki-commit>           # geri alma (backups/commit.prev-*)
