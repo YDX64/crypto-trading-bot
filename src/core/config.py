@@ -324,6 +324,15 @@ class Settings(BaseSettings):
     # _validate_binance_environment risk/webhook secret'larını ve allowlist'i
     # zorunlu kılar (aşağıda).
     scalper_shadow_mode: bool = False
+    # Gölge tekilleştirme penceresi (dakika, D14 review, bulgu A/B): occupancy
+    # bırakmayan gölge dalı düzeltilmezse aynı sembol her tarama turunda
+    # yeniden SHADOW satırı yazar (2-5x şişme) VE kapasite kapısı hiç
+    # devreye girmez. Bu pencere içinde aynı sembol yeniden kaydedilmez;
+    # ayrıca ScalpExecutor.shadow_active_count() bu pencereyi "açık" gibi
+    # sayıp SCALPER_MAX_POSITIONS'a karşı ölçer. ≤0/tanımsız ise
+    # scalper_loss_cooldown_minutes'e (o da yoksa 60 dk) düşer — canlıda aynı
+    # sembolün fiilen ne kadar süre meşgul sayılacağıyla aynı mertebede.
+    scalper_shadow_dedup_minutes: float = 0.0
     scalper_c_allowed_regimes: str = "UP,DOWN,RANGE"  # deney: "RANGE" ile sınırla
     scalper_d_use_eqhl: bool = True              # D süpürmesi EQH/EQL kümelerine bağlı
     scalper_eqhl_tolerance_pct: float = 0.05     # pivot eşitlik eşiği (%)
@@ -461,12 +470,26 @@ class Settings(BaseSettings):
                 # HENÜZ kurulu olmaması riske girmez. Gölge KAPALIYSA (gerçek
                 # emir gönderilecek demektir) bu üç koruma ZORUNLUDUR —
                 # docs/MAINNET_PLAN.md §5.3.
+                # .strip() ile: bu üç değeri okuyan HER tüketici (main.py:705
+                # tv_webhook_secret, main.py:793 risk_event_secret, engine.py
+                # ~1085 allowlist) zaten .strip() uygular; pydantic bunu
+                # otomatik yapmaz. Bare truthiness kontrolü yalnız boşluk
+                # içeren tırnaklı bir değeri ("   ") GEÇERLİ sayıp korumaları
+                # sessizce devre dışı bırakırdı (D14 review, bulgu C).
                 missing_mainnet_protections = []
-                if not self.risk_event_secret:
+                if not (self.risk_event_secret or "").strip():
                     missing_mainnet_protections.append("RISK_EVENT_SECRET")
-                if not self.tv_webhook_secret:
+                if not (self.tv_webhook_secret or "").strip():
                     missing_mainnet_protections.append("TV_WEBHOOK_SECRET")
-                if not self.scalper_symbol_allowlist:
+                # engine.py'nin allowlist parse'ıyla BİREBİR aynı süzgeç:
+                # yalnız virgül/boşluktan ibaret bir değer ("," veya "  ")
+                # boş evrene düşer, bu yüzden mainnet korumasında da boş
+                # sayılmalı.
+                if not [
+                    s
+                    for s in str(self.scalper_symbol_allowlist or "").split(",")
+                    if s.strip()
+                ]:
                     missing_mainnet_protections.append("SCALPER_SYMBOL_ALLOWLIST")
                 if missing_mainnet_protections:
                     raise ValueError(

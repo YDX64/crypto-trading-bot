@@ -1250,7 +1250,19 @@ class ScalperEngine:
                     return
                 if symbol in tracked or symbol in pending:
                     return
-                if len(tracked | pending) >= self.cfg.scalper_max_positions:
+                open_count = len(tracked | pending)
+                if bool(getattr(self.cfg, "scalper_shadow_mode", False)):
+                    # D14 review (bulgu B): gölge girişler tracked/pending'e
+                    # hiç girmediği için bu kapı canlıda hiç devreye girmiyordu
+                    # — gölge defteri canlının reddedeceği sinyalleri de
+                    # sınırsız biriktiriyordu. Tekilleştirme penceresindeki
+                    # sembol sayısı (shadow_active_count) "açık" gibi sayılır
+                    # ki gölge satır sayısı canlı kapasiteyle kıyaslanabilsin.
+                    shadow_active = self.executor.shadow_active_count()
+                    if open_count + shadow_active >= self.cfg.scalper_max_positions:
+                        self.logger.info(f"👻 {symbol}: GÖLGE kapasite dolu, sinyal açılmadı")
+                        return
+                elif open_count >= self.cfg.scalper_max_positions:
                     self.logger.info(f"⏭️ {symbol}: scalper pozisyon kapasitesi dolu, sinyal açılmadı")
                     return
                 try:

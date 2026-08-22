@@ -167,6 +167,13 @@ class ScalpExecutor:
         # process ömrü boyunca en az 60 dakika sürer; kalıcı global entry halt
         # gerektirecek belirsizlikler zaten PendingRecoveryError yolundadır.
         self._cooldowns: Dict[str, Dict[str, Any]] = {}
+        # Gölge modu tekilleştirme penceresi (D14 adversarial review, HIGH):
+        # shadow dalı hiçbir occupancy bırakmadığı için aynı sinyal her tarama
+        # turunda yeniden yazılıyordu (2-5x şişme). _cooldowns'a KASITLI
+        # DOKUNMADAN ayrı bir map: sembol -> son gölge kaydının epoch saniyesi.
+        # Gerçek girişlerin cooldown semantiğini etkilemez (test_cooldown_
+        # not_started_by_shadow_entry hâlâ _cooldowns == {} bekler).
+        self._shadow_recent: Dict[str, float] = {}
         self._reject_counters: Dict[str, int] = {}
         self._last_sizing_snapshot: Dict[str, Any] = {
             "mode": "uninitialized",
@@ -488,6 +495,13 @@ class ScalpExecutor:
         for symbol, state in list(self._cooldowns.items()):
             if float(state.get("expires_at") or 0.0) <= now:
                 self._cooldowns.pop(symbol, None)
+        # Gölge tekilleştirme penceresi de burada budanır (D14 review): süresi
+        # geçen kayıtlar map'te sonsuza dek birikmesin, shadow_active_count()
+        # bugünkü pencereyi yansıtsın.
+        hold = self._shadow_dedup_seconds()
+        for symbol, last in list(self._shadow_recent.items()):
+            if (now - last) >= hold:
+                self._shadow_recent.pop(symbol, None)
 
     def _load_cooldowns(self) -> None:
         """Diskteki cooldown state'ini yükle (restart koruması).
@@ -570,6 +584,40 @@ class ScalpExecutor:
         """Sembol giriş cooldown'unda mı? (loss_exit VEYA koruma hatası)"""
         self._prune_cooldowns()
         return str(symbol).upper() in self._cooldowns
+
+    def _shadow_dedup_seconds(self) -> float:
+        """Gölge tekilleştirme penceresi (saniye).
+
+        SCALPER_SHADOW_DEDUP_MINUTES tanımlı/pozitifse o kullanılır; yoksa
+        SCALPER_LOSS_COOLDOWN_MINUTES'e (canlıda aynı sembolün bir SL sonrası
+        ne kadar süre yeniden giremediği), o da yoksa/≤0 ise 60 dakikaya
+        düşer. Amaç: gölge deftirinin tekilleştirme aralığı, canlıda aynı
+        sembolün fiilen ne kadar süre "meşgul" sayılacağıyla aynı büyüklük
+        mertebesinde olsun (D14 review).
+        """
+        raw = getattr(self.cfg, "scalper_shadow_dedup_minutes", None)
+        if not raw:
+            raw = getattr(self.cfg, "scalper_loss_cooldown_minutes", 60)
+        try:
+            minutes = float(raw or 60)
+        except (TypeError, ValueError):
+            minutes = 60.0
+        if minutes <= 0:
+            minutes = 60.0
+        return minutes * 60.0
+
+    def shadow_active_count(self) -> int:
+        """Tekilleştirme penceresi içinde gölge kaydı yapılmış sembol sayısı.
+
+        Canlıda kapasite kapısı `tracked | pending` sayar; gölge modda bu
+        küme hep boş kalır (hiçbir borsa isteği gitmediği için pozisyon/
+        pending kurulmaz) — kapasite kapısı hiç devreye girmez ve gölge
+        defteri, canlının reddedeceği sinyalleri de sınırsız biriktirir
+        (D14 review, bulgu B). Engine bu sayıyı `open + shadow_active`
+        olarak `scalper_max_positions`'a karşı sayar.
+        """
+        self._prune_cooldowns()
+        return len(self._shadow_recent)
 
     def cooldown_snapshot(self) -> List[Dict[str, Any]]:
         """API/dashboard için aktif sembol cooldown'ları."""
@@ -805,6 +853,18 @@ class ScalpExecutor:
         #     hesabını değiştirir veya emir gönderir; gölge modda HİÇBİRİ
         #     ÇALIŞMAZ — sinyal SHADOW olarak deftere yazılır ve dönülür. ---
         if getattr(self.cfg, "scalper_shadow_mode", False):
+            # Tekilleştirme (D14 review, bulgu A): occupancy bırakmayan gölge
+            # dalı düzeltilmezse aynı sinyal her tarama turunda yeniden
+            # yazılır (2-5x şişme). Pencere içindeyse sessizce atla — canlıda
+            # bu sembol zaten açık pozisyon/cooldown nedeniyle yeniden
+            # denenmezdi.
+            key = symbol.upper()
+            now = time.time()
+            hold = self._shadow_dedup_seconds()
+            last = self._shadow_recent.get(key)
+            if last is not None and (now - last) < hold:
+                return None
+            self._shadow_recent[key] = now
             margin_usdt = (qty * entry_hint) / leverage if leverage else qty * entry_hint
             await self.tracker.record_shadow(
                 signal=signal,

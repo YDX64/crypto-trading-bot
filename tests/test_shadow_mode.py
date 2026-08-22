@@ -21,6 +21,8 @@ borsaya çıkmaz, bu nedenle canlı/harness paritesi bu madde için gerekmez
 
 from __future__ import annotations
 
+import asyncio
+import time
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Dict, List
@@ -42,11 +44,13 @@ from src.strategies.scalper.engine import ScalperEngine
 from src.strategies.scalper.executor import ScalpExecutor, ScalpPosition
 from src.strategies.scalper.tracker import ScalpTracker
 from src.strategies.scalper.types import (
+    Candle,
     Direction,
     Regime,
     ScalpSignal,
     StrategyContext,
 )
+from src.trading.symbol_reservations import symbol_reservations
 
 
 # --------------------------------------------------------------------------
@@ -85,6 +89,10 @@ class _FakeClient:
     async def get_account_balance(self):
         self.calls.append("get_account_balance")
         return self.balance
+
+    async def get_all_positions(self):
+        self.calls.append("get_all_positions")
+        return []
 
     async def quantize_quantity(self, symbol, quantity):
         self.calls.append("quantize_quantity")
@@ -263,6 +271,98 @@ class TestShadowModeExecutorOpen:
         assert result is None
         assert client.calls == []  # cooldown kapısı balance sorgusundan ÖNCE reddetti
         assert tracker.calls == []  # gölge kaydı bile yazılmadı
+
+
+# --------------------------------------------------------------------------
+# 1b) ScalpExecutor.try_open — gölge tekilleştirme penceresi (D14 adversarial
+#     review, bulgu A, HIGH): occupancy bırakmayan gölge dalı düzeltilmezse
+#     aynı sinyal her tarama turunda yeniden yazılır (2-5x şişme).
+# --------------------------------------------------------------------------
+
+class TestShadowModeDeduplication:
+    async def test_repeated_identical_signal_writes_one_shadow_row(self):
+        """AYNI executor'da art arda iki try_open çağrısı — pencere içindeyken
+        yalnız BİR record_shadow yazılmalı (review'ün 5 ardışık çağrıda 5
+        satır bulduğu regresyon)."""
+        client = _FakeClient(balance=10_000.0)
+        pm = _FakePm()
+        tracker = _FakeTracker()
+        cfg = _ShadowExecCfg(scalper_shadow_mode=True)
+        executor = ScalpExecutor(client=client, pm=pm, tracker=tracker, cfg=cfg)
+
+        result1 = await executor.try_open(_mk_signal(), _mk_ctx())
+        result2 = await executor.try_open(_mk_signal(), _mk_ctx())
+        result3 = await executor.try_open(_mk_signal(), _mk_ctx())
+
+        assert result1 is None and result2 is None and result3 is None
+        assert tracker.calls == ["record_shadow"]  # yalnız BİR kayıt, 3 çağrı değil
+        assert len(tracker.shadow_kwargs) == 1
+        assert executor.shadow_active_count() == 1
+
+    async def test_different_symbols_each_get_their_own_row(self):
+        """Tekilleştirme SEMBOL bazlıdır — farklı semboller birbirini engellemez."""
+        client = _FakeClient(balance=10_000.0)
+        pm = _FakePm()
+        tracker = _FakeTracker()
+        cfg = _ShadowExecCfg(scalper_shadow_mode=True)
+        executor = ScalpExecutor(client=client, pm=pm, tracker=tracker, cfg=cfg)
+
+        sig_a = _mk_signal()
+        sig_b = ScalpSignal(
+            strategy="C", symbol="OTHERUSDT", direction=Direction.LONG,
+            entry_price=100.0, stop_price=99.5, reason="shadow-test",
+            regime=Regime.UP, atr_5m=1.0, risk_multiplier=1.0,
+        )
+        await executor.try_open(sig_a, _mk_ctx())
+        await executor.try_open(sig_b, _mk_ctx())
+
+        assert len(tracker.shadow_kwargs) == 2
+        assert executor.shadow_active_count() == 2
+
+    async def test_second_row_allowed_after_dedup_window_expires(self):
+        """Pencere geçtikten sonra AYNI sembol yeniden kaydedilebilir — sonsuza
+        dek susturulmuyor, yalnız pencere içi tekrar engelleniyor."""
+        client = _FakeClient(balance=10_000.0)
+        pm = _FakePm()
+        tracker = _FakeTracker()
+        cfg = _ShadowExecCfg(scalper_shadow_mode=True)
+        executor = ScalpExecutor(client=client, pm=pm, tracker=tracker, cfg=cfg)
+
+        await executor.try_open(_mk_signal(), _mk_ctx())
+        assert len(tracker.shadow_kwargs) == 1
+
+        # Gerçek sleep yerine pencereyi geçmiş gibi göster — deterministik.
+        hold = executor._shadow_dedup_seconds()
+        executor._shadow_recent["TESTUSDT"] = time.time() - hold - 1.0
+
+        await executor.try_open(_mk_signal(), _mk_ctx())
+
+        assert tracker.calls == ["record_shadow", "record_shadow"]
+        assert len(tracker.shadow_kwargs) == 2
+        # Eski kayıt _prune_cooldowns ile budandı; yalnız TAZE kayıt kalmalı.
+        assert executor.shadow_active_count() == 1
+
+    def test_dedup_seconds_defaults_to_loss_cooldown_minutes(self):
+        cfg = _ShadowExecCfg(scalper_shadow_mode=True, scalper_loss_cooldown_minutes=45)
+        executor = ScalpExecutor(
+            client=_FakeClient(), pm=_FakePm(), tracker=_FakeTracker(), cfg=cfg,
+        )
+        assert executor._shadow_dedup_seconds() == pytest.approx(45 * 60.0)
+
+    def test_dedup_seconds_uses_explicit_scalper_shadow_dedup_minutes(self):
+        cfg = _ShadowExecCfg(scalper_shadow_mode=True, scalper_loss_cooldown_minutes=45)
+        cfg.scalper_shadow_dedup_minutes = 5  # ayrı alan — loss_cooldown'ı EZER
+        executor = ScalpExecutor(
+            client=_FakeClient(), pm=_FakePm(), tracker=_FakeTracker(), cfg=cfg,
+        )
+        assert executor._shadow_dedup_seconds() == pytest.approx(5 * 60.0)
+
+    def test_shadow_active_count_zero_when_nothing_recorded(self):
+        cfg = _ShadowExecCfg(scalper_shadow_mode=True)
+        executor = ScalpExecutor(
+            client=_FakeClient(), pm=_FakePm(), tracker=_FakeTracker(), cfg=cfg,
+        )
+        assert executor.shadow_active_count() == 0
 
 
 # --------------------------------------------------------------------------
@@ -458,6 +558,39 @@ class TestShadowModeMainnetValidation:
         assert s.scalper_shadow_mode is False
         assert s.risk_event_secret == "risk-secret"
 
+    def test_mainnet_without_shadow_whitespace_only_secrets_rejected(self):
+        """D14 review, bulgu C (HIGH): bare truthiness tırnaklı boşluğu
+        ("   ") DOLU sayıp korumaları sessizce devre dışı bırakıyordu —
+        tüketiciler (main.py, engine.py) zaten .strip() uyguluyor, validator
+        uygulamıyordu. Üçü de artık boş sayılmalı."""
+        with pytest.raises(ValueError, match="RISK_EVENT_SECRET"):
+            self._settings(
+                scalper_shadow_mode=False,
+                risk_event_secret="   ", tv_webhook_secret="\t",
+                scalper_symbol_allowlist="  ",
+            )
+
+    def test_mainnet_without_shadow_comma_only_allowlist_rejected(self):
+        """SCALPER_SYMBOL_ALLOWLIST=',' engine.py'de boş evrene ayrışır
+        (str.split(',') sonrası hepsi boş hücre) — mainnet korumasında da
+        boş sayılmalı, aksi halde bot sessizce hiç taramaz."""
+        with pytest.raises(ValueError, match="SCALPER_SYMBOL_ALLOWLIST"):
+            self._settings(
+                scalper_shadow_mode=False,
+                risk_event_secret="risk-secret", tv_webhook_secret="tv-secret",
+                scalper_symbol_allowlist=",,",
+            )
+
+    def test_mainnet_without_shadow_secrets_with_surrounding_whitespace_ok(self):
+        """Gerçek bir değerin ETRAFINDA boşluk olması (kopyala-yapıştır kazası)
+        reddedilmemeli — yalnız TAMAMEN boş/virgül olan değer reddedilir."""
+        s = self._settings(
+            scalper_shadow_mode=False,
+            risk_event_secret="  risk-secret  ", tv_webhook_secret="tv-secret",
+            scalper_symbol_allowlist=" BTCUSDT , ETHUSDT ",
+        )
+        assert s.scalper_shadow_mode is False
+
     def test_mainnet_shadow_mode_bypasses_secret_requirement(self):
         s = self._settings(
             scalper_shadow_mode=True,
@@ -512,3 +645,171 @@ class TestShadowModeStartupBanner:
         engine._maybe_log_shadow_mode_banner()
 
         assert warnings == []
+
+
+# --------------------------------------------------------------------------
+# 6) ScalperEngine._evaluate_symbol — gölge kapasite kapısı (D14 adversarial
+#    review, bulgu B): gölge girişler tracked/pending'e hiç girmediği için bu
+#    kapı canlıda hiç devreye girmiyordu. Fix: executor.shadow_active_count()
+#    (tekilleştirme penceresindeki sembol sayısı) engine'in kapasite
+#    kapısında open+shadow olarak SCALPER_MAX_POSITIONS'a karşı sayılır.
+# --------------------------------------------------------------------------
+
+@dataclass
+class _CapacityEngineCfg(_ShadowExecCfg):
+    scalper_max_positions: int = 2
+
+
+class _FakeExitsNoPositions:
+    """ExitManager'ın _evaluate_symbol'ün ihtiyaç duyduğu tek yüzeyi: hiçbir
+    zaman gerçek pozisyon izlemez — kapasite kapısının GÖLGE tarafını test
+    etmek için tracked/pending kasıtlı olarak hep boş."""
+
+    def tracked_symbols(self):
+        return set()
+
+    def track(self, sp):
+        """Gölge KAPALI kontrol testinde (record_open yolu) çağrılır — bu
+        testin amacı kapasite kapısı olduğu için izleme durumu kasıtlı
+        değişmeden kalır (tracked_symbols() hep boş)."""
+
+
+class _FixedCandleFetcher:
+    """KlineFetcher'ın get_klines'ını taklit eder — her sembol/zaman dilimi
+    için AYNI sabit mum listesini döner (rejim UNKNOWN kalır, 200'den az 4h
+    mumu olduğu için regime kapısı hiç devreye girmez — bu testin amacı
+    sinyal/rejim mantığı değil, kapasite kapısıdır)."""
+
+    def __init__(self, candles: List[Candle]):
+        self._candles = candles
+
+    async def get_klines(self, symbol, tf, limit):
+        return self._candles
+
+
+class _AlwaysLongSignalStrategy:
+    """Strateji C'nin gerçek RSI/BB koşullarına bağlı kalmadan HER zaman sabit
+    bir LONG sinyali üretir — bu testin amacı sinyal üretimini değil,
+    engine.py'deki kapasite kapısını (~1253) sınamaktır."""
+
+    def evaluate(self, ctx: StrategyContext):
+        return ScalpSignal(
+            strategy="C", symbol=ctx.symbol, direction=Direction.LONG,
+            entry_price=100.0, stop_price=99.5, reason="capacity-gate-test",
+            regime=ctx.regime, atr_5m=1.0, risk_multiplier=1.0,
+        )
+
+
+def _mk_capacity_test_candles(n: int = 5) -> List[Candle]:
+    interval = 5 * 60 * 1000
+    return [
+        Candle(
+            open_time=i * interval, open=100.0, high=101.0, low=99.0,
+            close=100.0, volume=10.0, close_time=i * interval + interval - 1,
+        )
+        for i in range(n)
+    ]
+
+
+class TestShadowModeCapacityGate:
+    async def _mk_engine(self, tracker: "_FakeTracker", cfg: Any, client: "_FakeClient"):
+        pm = _FakePm()
+        executor = ScalpExecutor(client=client, pm=pm, tracker=tracker, cfg=cfg)
+
+        engine = ScalperEngine.__new__(ScalperEngine)  # __init__ atlanır (ağ yok)
+        engine.cfg = cfg
+        engine.client = client
+        engine.executor = executor
+        engine.exits = _FakeExitsNoPositions()
+        engine.fetcher = _FixedCandleFetcher(_mk_capacity_test_candles())
+        engine._entry_lock = asyncio.Lock()
+        engine._opening_symbols = set()
+        engine._regimes = {}
+        engine._regime_cache = {}
+        # _entries_ready() bu alanlara bakar — hepsi "hazır" göstermeli.
+        engine._exchange_ready = True
+        engine._exchange_last_success_monotonic = time.monotonic()
+        engine._recovery_ready = True
+        engine._risk_ready = True
+        engine._entry_halted = False
+        engine._kill_switch = False
+        engine._signals_today = 0
+        return engine
+
+    async def test_capacity_gate_counts_shadow_active_across_symbols(self):
+        """max_positions=2, 3 AYRI sembolde (tekrar değil, farklı sembol) gölge
+        sinyal → yalnız 2 satır. Review'ün 'canlının reddedeceği sinyaller de
+        sınırsız gölge satırına dönüşüyor' bulgusunun tam regresyonu."""
+        symbol_reservations.clear()
+        try:
+            cfg = _CapacityEngineCfg(scalper_shadow_mode=True, scalper_max_positions=2)
+            tracker = _FakeTracker()
+            client = _FakeClient(balance=10_000.0)
+            engine = await self._mk_engine(tracker, cfg, client)
+
+            infos: List[str] = []
+            engine.logger = SimpleNamespace(
+                info=lambda msg, *a, **kw: infos.append(msg),
+                error=lambda *a, **kw: None,
+                warning=lambda *a, **kw: None,
+            )
+
+            strategies = [_AlwaysLongSignalStrategy()]
+            for symbol in ("AAAUSDT", "BBBUSDT", "CCCUSDT"):
+                await engine._evaluate_symbol(symbol, strategies)
+
+            assert len(tracker.shadow_kwargs) == 2  # 3 sembol değil, kapasite=2
+            recorded = {kw["signal"].symbol for kw in tracker.shadow_kwargs}
+            assert recorded == {"AAAUSDT", "BBBUSDT"}
+            assert engine.executor.shadow_active_count() == 2
+            assert any("GÖLGE kapasite dolu" in msg for msg in infos)
+        finally:
+            symbol_reservations.clear()
+
+    async def test_capacity_gate_inactive_when_shadow_mode_off(self):
+        """Kontrol: gölge KAPALIYSA bu yeni dal hiç devreye girmemeli — bugünkü
+        (gerçek tracked/pending'e dayalı) kapasite davranışı DEĞİŞMEMELİ."""
+        symbol_reservations.clear()
+        try:
+            cfg = _CapacityEngineCfg(scalper_shadow_mode=False, scalper_max_positions=2)
+            tracker = _FakeTracker()
+            client = _FakeClient(balance=10_000.0)
+            # Gölge kapalıyken gerçek emir yolu tetiklenir; PM'in dolum
+            # döndürmesi gerekir (aksi halde emir başarısız sayılır).
+            pm = _FakePm(entry_price=100.0, filled_qty=400.0)
+            engine = ScalperEngine.__new__(ScalperEngine)
+            engine.cfg = cfg
+            engine.client = client
+            engine.executor = ScalpExecutor(client=client, pm=pm, tracker=tracker, cfg=cfg)
+            engine.exits = _FakeExitsNoPositions()
+            engine.fetcher = _FixedCandleFetcher(_mk_capacity_test_candles())
+            engine._entry_lock = asyncio.Lock()
+            engine._opening_symbols = set()
+            engine._regimes = {}
+            engine._regime_cache = {}
+            engine._exchange_ready = True
+            engine._exchange_last_success_monotonic = time.monotonic()
+            engine._recovery_ready = True
+            engine._risk_ready = True
+            engine._entry_halted = False
+            engine._kill_switch = False
+            engine._signals_today = 0
+
+            infos: List[str] = []
+            engine.logger = SimpleNamespace(
+                info=lambda msg, *a, **kw: infos.append(msg),
+                error=lambda *a, **kw: None,
+                warning=lambda *a, **kw: None,
+            )
+
+            # exits sahte olduğu için gerçek açılan pozisyon tracked'e hiç
+            # girmez — yalnız GÖLGE dalının bu senaryoda ATLANDIĞINI (yani
+            # eski 'scalper pozisyon kapasitesi dolu' mesajının hâlâ kullanıma
+            # açık olduğunu) kanıtlamak yeterli; kapasite hiçbir zaman
+            # DOLMAZ çünkü _FakeExitsNoPositions.tracked_symbols() hep boş.
+            await engine._evaluate_symbol("AAAUSDT", [_AlwaysLongSignalStrategy()])
+
+            assert tracker.calls == ["record_open"]  # gölge kaydı YAZILMADI
+            assert not any("GÖLGE kapasite" in msg for msg in infos)
+        finally:
+            symbol_reservations.clear()
