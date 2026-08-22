@@ -28,8 +28,9 @@ Aynı kod, farklı env. Halka C asla `origin/main`'in ucunu almaz; yalnız B'de 
 - **Kill-switch:** `POST /risk-event {action: flatten}` (D10) — ayrı secret, süreli halt. Mainnet'te
   `RISK_EVENT_SECRET` ZORUNLU (boş bırakılamaz; başlangıç doğrulamasına eklenecek).
 - **Entry-halt otomatiği:** `SCALPER_ENTRY_HALT_ENABLED=true` (mainnet doğrulaması zaten `false`'u reddeder).
-- **Gölge modu (yazılacak):** `SCALPER_SHADOW_MODE=true` → sinyaller üretilir, loglanır, defterde
+- **Gölge modu (D14, YAZILDI):** `SCALPER_SHADOW_MODE=true` → sinyaller üretilir, loglanır, defterde
   "SHADOW" olarak kaydedilir, emir GÖNDERİLMEZ. Yeni parametre mainnet'te önce 3 gün gölge.
+  Ayrıntı: `docs/DECISIONS.md` D14, `docs/RUNBOOK.md` "Gölge modu".
 - **Mutabakat:** her gün `scalp_trades` ↔ Binance income (close ledger var) farkı > %1 ise Telegram uyarı + halt.
 - **Ağırlık/ban:** mainnet'te gerçek X-MBX-USED-WEIGHT; eşik 1800 → gerçek değere göre kalibre; ban = halt.
 - **Ayrı IP bağlama:** `BINANCE_BIND_IP` mainnet için ayrı (testnet ile aynı IP'den ban riskini ayırmak
@@ -52,12 +53,15 @@ ve mainnet defteri 2 hafta sonra aynı rejim-bölünmüş tabloyla testnet'le ka
    halka için ORTAK kod yolu. Testnet halkasının davranışı byte-for-byte DEĞİŞMEDİ
    (bkz. `tests/test_deploy_scripts.py`). Salt okunur `scripts/ring_env_diff.sh` eklendi (iki
    `.env` arasında `SCALPER_*`/`TV_*`/`RISK_*` farkını secret değerlerini maskeleyerek gösterir).
-2. Gölge modu (`SCALPER_SHADOW_MODE`) + testleri + harness paritesi gerektirmez (canlı-only).
-3. Mainnet başlangıç doğrulaması: `RISK_EVENT_SECRET` zorunlu, `TV_WEBHOOK_SECRET` zorunlu,
-   allowlist boş olamaz, `SCALPER_ENTRY_HALT_ENABLED=true`.
-   (Kısmen örtüşüyor: `server_deploy.sh` `RING=mainnet` iken bu üçünü — allowlist hariç —
-   deploy ANINDA `.env`'den kontrol eder ve reddeder; app'in kendi `src/core/config.py`
-   başlangıç doğrulaması bu maddenin kapsamında kalır, HENÜZ YAZILMADI.)
+2. ~~Gölge modu (`SCALPER_SHADOW_MODE`) + testleri + harness paritesi gerektirmez (canlı-only).~~
+   ✅ YAPILDI (D14, 2026-08-22): `docs/DECISIONS.md` D14, `tests/test_shadow_mode.py` (19 test).
+3. ~~Mainnet başlangıç doğrulaması: `RISK_EVENT_SECRET` zorunlu, `TV_WEBHOOK_SECRET` zorunlu,
+   allowlist boş olamaz, `SCALPER_ENTRY_HALT_ENABLED=true`.~~ ✅ YAPILDI (D14,
+   `Settings._validate_binance_environment`) — `SCALPER_ENTRY_HALT_ENABLED` kontrolü zaten
+   vardı; `RISK_EVENT_SECRET`/`TV_WEBHOOK_SECRET`/allowlist zorunluluğu bu turda eklendi,
+   TEK istisna `SCALPER_SHADOW_MODE=true` (emir gitmediği için bu üçü henüz kurulu olmasa da
+   riske girmez).
+   (Deploy-zamanı ek kontrol: `server_deploy.sh` `RING=mainnet` iken RISK_EVENT_SECRET/TV_WEBHOOK_SECRET/ENTRY_HALT'ı `.env`'den ayrıca doğrular.)
 4. ~~Ayrı supervisord programı + ayrı port (9092) + ayrı tünel + ayrı Telegram kanalı.~~
    Pipeline tarafı TAMAM (2026-08-22): `deploy.sh --ring mainnet`/`server_deploy.sh` varsayılanları
    port 9092 + `tradingbot_main` programını hedefler; eklenecek supervisord program tanımı
