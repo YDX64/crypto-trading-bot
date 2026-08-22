@@ -60,6 +60,17 @@ Koşuları sıralı yap (paralel = Binance 429). Sonuç `docs/EXPERIMENTS.md`'ye
 - Sürpriz bir şey görürsen önce `docs/DECISIONS.md`'de denenmiş mi bak; sonra
   `docs/RUNBOOK.md` tuzaklarına; sonra kodu oku. Uydurma; "kodda doğrulanamadı" de.
 
+## Yapay zekâ çalışma kuralı — model ve efor (KULLANICI KARARI, 2026-08-22)
+Bu proje gerçek parayla ilgilidir; ucuz/hızlı model ile "idare etme" YASAK.
+- **Her zaman en yüksek model + en yüksek efor.** Ana oturum: Opus 5 max / Fable 5 max
+  (ultracode açık). Alt ajanlar (`Agent`, `Workflow`): **Sonnet KULLANILMAZ** — `model: 'opus'`
+  (ya da fable) ve `effort: 'max'`/'xhigh'. Haiku yalnız salt-okuma dosya listeleme gibi
+  gerçekten mekanik işlerde; strateji/kod/analiz/incelemede ASLA.
+- Token maliyeti gerekçe değildir: yanlış bir parametre ya da gözden kaçan bir hata,
+  tasarruf edilen her token'dan pahalıdır.
+- Motor değişikliği, backtest yorumu, risk kararı, düşmanca inceleme: en yüksek model,
+  çok-mercekli (3+) inceleme + çürütme turu.
+
 ## Bu dosyayı güncelleme kuralı
 Canlıya giren her değişiklik aynı commit'te `docs/DECISIONS.md`'ye (ne/neden/kanıt/geri
 alma) ve gerekiyorsa buraya işlenir. Hafıza dosyaları/awa-brain yalnız işaretçidir.
