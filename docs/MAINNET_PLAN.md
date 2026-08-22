@@ -9,7 +9,7 @@ kanıtla gelir.
 |---|---|---|---|
 | A — Yerel + CI | kod, testler (566), altın backtest, autoresearch | geliştirici/AI | `git push` → CI yeşil |
 | B — Testnet (bugünkü canlı) | `awa:/opt/tradingbot-v2`, supervisord `tradingbot_v2` | `scripts/deploy.sh awa` | her değişiklik burada ≥5 gün soak |
-| C — Mainnet (henüz yok) | AYRI dizin `/opt/tradingbot-main`, AYRI supervisord programı `tradingbot_main`, AYRI `.env`/anahtar/DB/state/log/Telegram | `scripts/deploy.sh awa <etiket> --ring mainnet` (yazılacak) | yalnız **etiketli sürüm** (`vX.Y.Z`), açık onay |
+| C — Mainnet (dizin/program henüz yok, pipeline hazır) | AYRI dizin `/opt/tradingbot-main`, AYRI supervisord programı `tradingbot_main`, AYRI `.env`/anahtar/DB/state/log/Telegram | `scripts/deploy.sh awa <etiket> --ring mainnet` (bkz. §5 madde 1) | yalnız **etiketli sürüm** (`vX.Y.Z`), açık onay |
 
 Aynı kod, farklı env. Halka C asla `origin/main`'in ucunu almaz; yalnız B'de soak olmuş etiketi alır.
 
@@ -42,11 +42,28 @@ sinyal setinin kenarı daha ince olacak. Bu yüzden ilk faz **küçük sermaye +
 ve mainnet defteri 2 hafta sonra aynı rejim-bölünmüş tabloyla testnet'le karşılaştırılır.
 
 ## 5. Yapılacaklar (sıra)
-1. `scripts/deploy.sh --ring mainnet` + `server_deploy.sh` parametreleri (dizin/program/port/secret).
+1. ~~`scripts/deploy.sh --ring mainnet` + `server_deploy.sh` parametreleri (dizin/program/port/secret).~~
+   TAMAM (2026-08-22, `feat/deploy-rings`): `scripts/deploy.sh [host] [target] --ring testnet|mainnet`
+   eklendi — mainnet yalnız `vX.Y.Z` etiketini kabul eder (`origin/main`/çıplak commit RED), etiketin
+   origin'de var olduğunu doğrular, ring/host/hedef özetiyle `MAINNET` onay istemi ister
+   (`DEPLOY_CONFIRM=MAINNET` ile otomasyon bypass'ı). `scripts/server_deploy.sh` zaten var olan
+   `REPO_DIR`/`PROGRAM`/`HEALTH_URL` override'larına `RING=testnet|mainnet` eklendi: yalnız log
+   satırlarını ve aşağıdaki madde 3'ün deploy-zamanı ön kontrolünü etkiler, rollback mantığı iki
+   halka için ORTAK kod yolu. Testnet halkasının davranışı byte-for-byte DEĞİŞMEDİ
+   (bkz. `tests/test_deploy_scripts.py`). Salt okunur `scripts/ring_env_diff.sh` eklendi (iki
+   `.env` arasında `SCALPER_*`/`TV_*`/`RISK_*` farkını secret değerlerini maskeleyerek gösterir).
 2. Gölge modu (`SCALPER_SHADOW_MODE`) + testleri + harness paritesi gerektirmez (canlı-only).
 3. Mainnet başlangıç doğrulaması: `RISK_EVENT_SECRET` zorunlu, `TV_WEBHOOK_SECRET` zorunlu,
    allowlist boş olamaz, `SCALPER_ENTRY_HALT_ENABLED=true`.
-4. Ayrı supervisord programı + ayrı port (9092) + ayrı tünel + ayrı Telegram kanalı.
+   (Kısmen örtüşüyor: `server_deploy.sh` `RING=mainnet` iken bu üçünü — allowlist hariç —
+   deploy ANINDA `.env`'den kontrol eder ve reddeder; app'in kendi `src/core/config.py`
+   başlangıç doğrulaması bu maddenin kapsamında kalır, HENÜZ YAZILMADI.)
+4. ~~Ayrı supervisord programı + ayrı port (9092) + ayrı tünel + ayrı Telegram kanalı.~~
+   Pipeline tarafı TAMAM (2026-08-22): `deploy.sh --ring mainnet`/`server_deploy.sh` varsayılanları
+   port 9092 + `tradingbot_main` programını hedefler; eklenecek supervisord program tanımı
+   `docs/RUNBOOK.md` "Mainnet halkası" altında yazılı (snippet, henüz sunucuya UYGULANMADI).
+   KALAN (insan yapacak): `/opt/tradingbot-main` dizinini oluşturmak, supervisord'a programı
+   fiilen eklemek, ayrı SSH tüneli ve ayrı Telegram kanalını kurmak.
 5. TV alarmları: mainnet için ayrı webhook URL'si (`?ring=main` DEĞİL — ayrı secret ve yol `/tv-signal` aynı,
    host/port farklı; 14 Eylül yenilemesiyle birlikte kurulur) + alan adı + TLS.
 6. Go/no-go toplantısı: §2'deki 5 madde tek tek işaretlenir; kullanıcı onayı; küçük sermaye.

@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Sunucu tarafı deploy: /opt/tradingbot-v2 içinde çalışır (supervisord program: tradingbot_v2).
+# İki halka destekler (bkz. docs/MAINNET_PLAN.md §1): RING=testnet (varsayılan, davranış DEĞİŞMEDİ)
+# ve RING=mainnet (yalnız log satırlarında ve aşağıdaki ekstra ön kontrolde etkili).
 # Akış: ön kontroller → .env yedeği → hedef commit'e geç → testler → restart → sağlık → başarısızsa GERİ AL.
 # Kullanım: scripts/server_deploy.sh [hedef-ref]   (varsayılan: origin/main)
 #   DEPLOY_SKIP_TESTS=1   testleri atla (acil geri alma için)
 #   DEPLOY_NO_RESTART=1   yalnız kodu güncelle, süreci yeniden başlatma
+#   REPO_DIR / PROGRAM / HEALTH_URL   halka için dizin/program/sağlık uç noktası (deploy.sh --ring mainnet ayarlar)
+#   RING=testnet|mainnet   yalnız log satırları + mainnet'e özel .env ön kontrolü için (rollback mantığı ortak)
 set -euo pipefail
 
 REPO_DIR="${REPO_DIR:-/opt/tradingbot-v2}"
@@ -11,11 +15,17 @@ PROGRAM="${PROGRAM:-tradingbot_v2}"
 TARGET="${1:-origin/main}"
 PY="$REPO_DIR/.venv/bin/python"
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:9091/api/status}"
+RING="${RING:-testnet}"
 LOG="$REPO_DIR/logs/deploy.log"
 STAMP="$(date -u +%Y%m%d-%H%M%S)"
 
 log() { echo "[$(date -u '+%F %T')] $*" | tee -a "$LOG"; }
 die() { log "HATA: $*"; exit 1; }
+
+case "$RING" in
+  testnet|mainnet) ;;
+  *) die "geçersiz RING: '$RING' (testnet|mainnet olmalı)" ;;
+esac
 
 cd "$REPO_DIR" || die "repo dizini yok: $REPO_DIR"
 mkdir -p backups logs
@@ -27,8 +37,27 @@ if grep -qE 'HTTP 418|banned' <(tail -n 2000 logs/bot.log 2>/dev/null | awk -v s
 fi
 [ -n "$(git status --porcelain --untracked-files=no)" ] && die "çalışma ağacında commit'lenmemiş değişiklik var; deploy yalnız temiz ağaçta"
 
+# ── Mainnet'e özel ön kontrol (bkz. docs/MAINNET_PLAN.md §3) ────────────────
+if [ "$RING" = "mainnet" ]; then
+  [ -f .env ] || die "mainnet ön kontrolü başarısız: .env yok ($REPO_DIR)"
+  for KEY in RISK_EVENT_SECRET TV_WEBHOOK_SECRET; do
+    VAL="$(grep -E "^${KEY}=" .env | tail -1 | cut -d= -f2-)" || true
+    if [ -z "$VAL" ]; then
+      die "mainnet ön kontrolü başarısız: .env içinde ${KEY} boş veya yok — mainnet'te zorunlu"
+    fi
+  done
+  if ! grep -qE '^SCALPER_ENTRY_HALT_ENABLED=true$' .env; then
+    die "mainnet ön kontrolü başarısız: .env içinde SCALPER_ENTRY_HALT_ENABLED=true olmalı"
+  fi
+  log "mainnet ön kontrolü geçti: RISK_EVENT_SECRET + TV_WEBHOOK_SECRET dolu, entry-halt aktif"
+fi
+
 PREV="$(git rev-parse HEAD)"
-log "deploy başlıyor: $PREV → $TARGET"
+if [ "$RING" = "mainnet" ]; then
+  log "deploy başlıyor [ring=mainnet, repo=$REPO_DIR, program=$PROGRAM]: $PREV → $TARGET"
+else
+  log "deploy başlıyor: $PREV → $TARGET"
+fi
 
 # ── Yedekler ───────────────────────────────────────────────────────────────
 cp .env "backups/env.bak-$STAMP-deploy"
@@ -79,4 +108,8 @@ while [ "$waited" -lt "$HEALTH_TIMEOUT" ]; do
 done
 if [ "$healthy" != "1" ]; then log "sağlık uç noktası ${HEALTH_TIMEOUT}s içinde cevap vermedi: $HEALTH_URL"; rollback; fi
 PID="$(supervisorctl pid "$PROGRAM")"
-log "TAMAM: $PROGRAM RUNNING pid=$PID commit=$NEW (sağlık ${waited}s sonra)"
+if [ "$RING" = "mainnet" ]; then
+  log "TAMAM [ring=mainnet]: $PROGRAM RUNNING pid=$PID commit=$NEW (sağlık ${waited}s sonra)"
+else
+  log "TAMAM: $PROGRAM RUNNING pid=$PID commit=$NEW (sağlık ${waited}s sonra)"
+fi
