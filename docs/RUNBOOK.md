@@ -256,6 +256,9 @@ görünür (motor yok — bu bir arıza DEĞİL). Takipçinin durumu `/follower/
 - Takipçi giriş kilidi: `state/follower_entry_halt.json` (fail-closed, `scalper_entry_halt`
   ile KARIŞTIRMA). Açmak = nedeni anla → dosyayı `.cleared-<tarih>` yap → restart.
 - Deploy ön koşulu: bu dosya varken `scripts/deploy.sh awa --ring follower` REDDEDİLİR.
+- Kod geri alma: `scripts/deploy.sh awa <önceki-commit> --ring follower`
+  (önceki commit `/opt/tradingbot-ap/backups/commit.prev-*` dosyalarındadır;
+  akış test + restart + sağlık + otomatik geri alma ile AYNI).
 - İki halkanın `.env` farkını (secret DEĞERLERİ maskeli) görmek için:
   `MAIN_ENV=/opt/tradingbot-ap/.env scripts/ring_env_diff.sh awa`
 

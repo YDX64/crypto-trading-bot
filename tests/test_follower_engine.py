@@ -136,6 +136,8 @@ def _fake_position(symbol="BTCUSDT", direction=Direction.SHORT, qty=0.12):
         plan=plan,
         entry_candle_time=0,
         meta={"plan": {"leverage": 100, "sl_pct": 0.054, "sl_roi_pct": 5.4,
+                       "sl_pct_fill": 0.054, "tp_roi_pct": [2.7, 5.4, 8.1],
+                       "fee_roi_real_pct": 10.0, "tp1_covers_fees_real": False,
                        "margin_usdt": 100.0, "levels": {"source": "message"}}},
     )
 
@@ -713,6 +715,14 @@ class TestTelemetry:
         assert position["sl_roi_pct"] == 5.4
         assert position["margin_usdt"] == 100.0
         assert position["tp3"] == pytest.approx(77063.54)
+        # Ücret eşiği telemetrisi (D20): TP1 ROI %2.70 < komisyon %10 →
+        # yapısal negatif beklenti adayı, /follower/status'ta GÖRÜNÜR.
+        assert position["tp1_roi_pct"] == pytest.approx(2.7)
+        assert position["fee_roi_pct"] == pytest.approx(10.0)
+        assert position["tp1_covers_fees"] is False
+        assert position["sl_pct_fill"] == pytest.approx(0.054)
+        # Kapı varsayılan KAPALI olmalı.
+        assert snapshot["sizing"]["min_tp1_fee_ratio"] == 0.0
 
     async def test_unexpected_error_is_contained(self, tmp_path):
         engine = _make_engine(tmp_path)

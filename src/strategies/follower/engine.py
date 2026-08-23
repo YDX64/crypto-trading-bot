@@ -1094,7 +1094,13 @@ class FollowerEngine:
                     "tp2_done": sp.tp2_done,
                     "tp3_done": bool(getattr(sp, "tp3_done", False)),
                     "sl_pct": plan_meta.get("sl_pct"),
+                    "sl_pct_fill": plan_meta.get("sl_pct_fill"),
                     "sl_roi_pct": plan_meta.get("sl_roi_pct"),
+                    "tp1_roi_pct": (plan_meta.get("tp_roi_pct") or [None])[0],
+                    # Ücret eşiği (D20): TP1 ROI'si gidiş-dönüş komisyonu
+                    # karşılıyor mu? False = yapısal negatif beklenti adayı.
+                    "fee_roi_pct": plan_meta.get("fee_roi_real_pct"),
+                    "tp1_covers_fees": plan_meta.get("tp1_covers_fees_real"),
                     "margin_usdt": plan_meta.get("margin_usdt"),
                     "levels_source": (plan_meta.get("levels") or {}).get("source"),
                     "trade_id": sp.trade_id,
@@ -1143,6 +1149,10 @@ class FollowerEngine:
                     float(getattr(self.cfg, "follower_tp_rr2", 1.0)),
                     float(getattr(self.cfg, "follower_tp_rr3", 1.5)),
                 ],
+                # 0 = ücret eşiği kapısı KAPALI (varsayılan, kullanıcı kararı).
+                "min_tp1_fee_ratio": float(
+                    getattr(self.cfg, "follower_min_tp1_fee_ratio", 0.0)
+                ),
             },
             "brackets": self.brackets.snapshot(),
             "events": list(self._events),
