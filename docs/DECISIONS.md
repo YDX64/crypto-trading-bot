@@ -1636,6 +1636,7 @@ D21 ile ÇELİŞİRSE **D21-R3 bağlayıcıdır**. Beş bulgu, hepsi regresyon t
    hatayı önbelleğe almaz; `ledger_report.build_report` tek gövdeye indi.
 
 ### D22 — `-2021` sonrası acil kapanışın DÜRÜST kaydı + REST ağırlık telemetrisi + durum netliği · 2026-08-23 · **AKTİF (daraltılmış)**
+**CANLI (testnet, 2026-08-23 18:29 UTC):** merge 5985582 (1844 test) → `scripts/deploy.sh awa` (pid 1960198, sağlık 25 sn). Doğrulama: `entries_blocked_by=kill_switch`, `stale_reason=entries_blocked`, `rest_weight.enabled=false, last=21` (botun kendi ağırlığı küçük; 23 Ağu'daki 4059/dk tepe IP-geneli başlık → aynı sunucudaki DİĞER süreçler), `as_of` alanı var. Geri alma: `scripts/deploy.sh awa 17d2eee`.
 **Kanıt kaynağı:** 2026-08-23 canlı testnet logu (kod okumasıyla doğrulandı).
 **Kapsam uyarısı:** bu kararın İLK hâli daha genişti; 12 ajanlık düşmanca
 inceleme onu 4 yüksek bulguyla REDDETTİ ve karar aşağıdaki GÜVENLİ ALT KÜMEYE
