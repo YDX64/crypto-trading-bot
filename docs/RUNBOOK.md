@@ -239,22 +239,27 @@ Mainnet'te (testnet DEĞİLKEN) gölge KAPALIYSA `RISK_EVENT_SECRET`, `TV_WEBHOO
 `SCALPER_SYMBOL_ALLOWLIST` boş (veya yalnız boşluk/virgül) OLAMAZ — `_validate_binance_environment`
 startup'ta reddeder (docs/MAINNET_PLAN.md §5.3); doldurmadan kapatamazsın.
 
-## TV olay kanalı (`kind=exit|choch|trend|tp1`, D19) — allowlist, mod, doğrulama
+## TV olay kanalı (`kind=exit|choch|trend|tp1`, D19/D19a) — allowlist, mod, doğrulama
 
 **Ne yapar:** TradingView'in ÇIKIŞ ve YAPI/DÖNÜŞ alarmlarını (S&O `Exit Signal` /
 `Trend Catcher-Tracer Up|Down`, PAC `Bullish/Bearish S-CHOCH`, AlgoPro `🎯 TP1 Hit`)
 bota sokar. Bu alarmlar **giriş oyu DEĞİLDİR**: sağlamaya (TvConfluence) hiç girmez,
 `state/tv_events.json` defterine yazılır. Alarm mesaj şablonları ve koşul adları:
 `docs/INTEGRATIONS.md` §7.2. Varsayılan mod **`shadow`** — motor davranışı DEĞİŞMEZ.
+⚠️ Mesaj biçimi kritiktir: `src=`/`kind=` belirteçleri mesajın **BAŞINDA** olmalı
+(aşağıdaki "Tuzaklar"). D19a ile değişen semantikler için `docs/DECISIONS.md` D19a.
 
 **1) Alarmları kur (TV'de, mevcut alarmı KLONLAYARAK):** webhook URL'sine DOKUNMA
 (secret ve eski `?src=` kalsın); yalnız **koşulu** ve **mesajı** değiştir. Mesaj tek
 satır düz metin olmalı ve `{{ticker}}` içermek ZORUNDA, ör.
 `src=luxso_exit kind=exit {{ticker}}`.
 
-**2) `src` allowlist'ini DOĞRULA (sık atlanan adım):** kod varsayılanı dört olay
-kaynağını içerir, ama `.env` bu değişkeni AÇIKÇA set ediyorsa varsayılan devreye
-GİRMEZ:
+**2) `src` allowlist'ini DOĞRULA:** kod varsayılanı dört olay kaynağını içerir, ama
+`.env` bu değişkeni AÇIKÇA set ediyorsa varsayılan devreye GİRMEZ. ℹ️ **D19a'dan
+sonra bu adım kanalı ÖLDÜRMEZ** — olay yolu allowlist'ten bağımsızdır (istek
+`TV_WEBHOOK_SECRET` ile kimliklidir), eksik allowlist yalnız startup WARNING'i ve
+`/scalper/status` → `tv_events.allowlist_ok=false` üretir. Yine de düzeltilmeli:
+allowlist GİRİŞ yolunun sayım korumasıdır ve aynı etiket orada `tv`ye eşlenir.
 ```bash
 ssh awa 'cd /opt/tradingbot-v2 && grep -n "^TV_SOURCE_ALLOWLIST=" .env || echo "SATIR YOK -> kod varsayilani gecerli, ekleme gerekmez"'
 ```
@@ -291,13 +296,60 @@ gösteriyorsa `logs/bot.log`'un ilk satırlarına bak.
 
 **4) Doğrulama (restart'tan ~90 sn sonra):**
 ```bash
-curl -sS http://127.0.0.1:9091/scalper/status | python3 -c "import sys,json; d=json.load(sys.stdin)['tv_events']; print(d['mode'], d['exit_action'], d['gate_sources'], d['counters'])"
-ssh awa 'grep -a "TV olayı" /opt/tradingbot-v2/logs/bot.log | tail -20'
+ssh awa 'curl -sS http://127.0.0.1:9091/scalper/status' | python3 -c "import sys,json; d=json.load(sys.stdin)['tv_events']; print('mode=',d['mode'],'exit=',d['exit_action'],'losing=',d['exit_losing']); print('gate_enabled=',d['gate_enabled'],'window_open=',d['window_open'],'allowlist_ok=',d['allowlist_ok'],d['allowlist_missing']); print('persist=',d['persist']['ok'],d['persist']['errors']); print(d['counters'])"
+ssh awa 'grep -a "TV olayı\|TV yapı kapısı\|TV olay kanalı" /opt/tradingbot-v2/logs/bot.log | tail -20'
 ```
-Elle sağlama (secret'ı komut satırına YAZMA — `.env`'den oku):
+`allowlist_ok=false`, `gate_enabled=false`, `window_open=false` ya da
+`persist.ok=false` görürsen kanal SESSİZ demektir — adım 2/3'e dön.
+
+Elle sağlama **`?dry_run=1` ile** (secret'ı komut satırına YAZMA — `.env`'den oku).
+⚠️ `dry_run` olmadan bu komut CANLI DEFTERE gerçek bir olay yazar ve `active` modda
+açık pozisyonu etkileyebilir:
 ```bash
-ssh awa 'cd /opt/tradingbot-v2 && S=$(grep ^TV_WEBHOOK_SECRET= .env | cut -d= -f2-) && curl -sS -X POST "http://127.0.0.1:9091/tv-signal?secret=$S" -d "src=pac_choch kind=choch bearish BTCUSDT" | python3 -m json.tool'
+ssh awa 'cd /opt/tradingbot-v2 && S=$(grep ^TV_WEBHOOK_SECRET= .env | cut -d= -f2-) && curl -sS -X POST "http://127.0.0.1:9091/tv-signal?secret=$S&dry_run=1" -d "src=pac_choch kind=choch bearish BTCUSDT" | python3 -m json.tool'
 ```
+Beklenen: `"routed": "event"`, `"kind": "choch"`, `"direction": "SHORT"`,
+`"source": "pac_choch"`, `"dry_run": true`. **`"routed"` yoksa** (yanıtta `accepted`
+varsa) istek GİRİŞ yoluna düşmüştür → mesajda `kind=` belirteci mesajın BAŞINDA
+değildir (bkz. `docs/INTEGRATIONS.md` §7.1 "başlık koşusu").
+
+**5) Olay defterini sıfırlama (yalnız gerektiğinde):** ⚠️ `state/tv_events.json`
+dosyasını SİLMEK çalışan süreci temizlemez — defter RAM'de otoritedir ve bir
+sonraki olayda dosyayı geri yazar. İki doğru reçete var:
+```bash
+# (a) süreci durdurmadan: reset uç noktası
+ssh awa 'cd /opt/tradingbot-v2 && S=$(grep ^TV_WEBHOOK_SECRET= .env | cut -d= -f2-) && curl -sS -X POST "http://127.0.0.1:9091/tv-events/reset?secret=$S" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[\"reset\"], d[\"cleared_symbols\"], d[\"persisted\"])"'
+# (b) bakım penceresinde: dosyayı sil + restart (SIRA ÖNEMLİ)
+ssh awa 'cd /opt/tradingbot-v2 && rm -f state/tv_events.json && supervisorctl restart tradingbot_v2'
+```
+Defteri boşaltmak bir RİSK kapısını açmaz: en kötü sonucu kapı/çıkış tetiğinin
+yeni olay gelene kadar sessizleşmesidir (fail-open, `docs/INTEGRATIONS.md` §7.4).
+
+**Tuzaklar (D19a):**
+- Bir çıkış alarmının mesajından `kind=` düşerse **ya da belirteçler mesajın
+  BAŞINDA değilse** istek **422** alır (`olay kaynağı giriş oyu veremez`) — TV alarm
+  günlüğünde "webhook failed" görürsün. Bu BİLİNÇLİDİR: alternatifi, o alarmın
+  sessizce bir GİRİŞ OYUNA dönüşüp pozisyon açmasıydı. Çözüm: mesajı
+  `src=… kind=… {{ticker}}` sırasına getir (şablonlar: INTEGRATIONS §7.2);
+  alarmı SİLME.
+- `Kind: ...` / `Source: ...` gibi düz yazı başlangıçları GİRİŞ alarmlarını
+  bozmaz — `:` ayracı yalnız TANINAN bir değer taşıyorsa belirteç sayılır.
+- `SCALPER_TV_EVENTS_MAX_AGE_MIN=0` ya da boş `SCALPER_TV_EVENTS_GATE_SOURCES`
+  **KAPALI** demektir ("süresiz taze"/"tüm kaynaklar" DEĞİL). `MODE=active` iken
+  kanal HİÇBİR ŞEY yapamıyorsa (pencere 0, ya da kapı kaynağı yok **ve** `EXIT=off`)
+  süreç hiç kalkmaz (ValueError). Boş kapı kaynağı + `EXIT=be|close` GEÇERLİDİR
+  ("giriş kapısı yok, yalnız açık çık komutlarına uy").
+- `SCALPER_TV_EVENTS_EXIT=be` pozisyon **zarardayken uygulanmaz**; ne yapılacağını
+  `SCALPER_TV_EVENTS_EXIT_LOSING=skip|close` seçer (varsayılan `skip`). Sayaçlar:
+  `exits_skipped_losing` / `exits_closed_losing` / `exits_noop`.
+- **Gölge ölçümünü okurken** `would_exit`in ham sayısı yanıltıcıdır: aktifte hiçbir
+  şey olmayacak olaylar `would_exit_noop`tur. Gerçek etki `would_exit -
+  would_exit_noop`tur (D19a-2). Aynı şekilde `exits_applied` yalnız borsaya istek
+  gittiğinde artar; `exits_noop` dokunulmamış pozisyondur.
+- Fiyat okuması bozulursa (`get_current_price` hatası) TV çıkışları **hiçbir şey
+  yapmaz** ve olayı tüketmez — `exits_failed` artar, olay en fazla 3 turda yeniden
+  denenir. Bu, bayat fiyatla stop'u ters tarafa koyup acil kapanış tetiklememek
+  içindir.
 Beklenen: `"routed": "event"`, `"kind": "choch"`, `"structure": "BEAR"` ve **hiçbir işlem
 açılmaması** (yanıtta `accepted` alanı YOKTUR — olay yolu sağlamaya hiç girmez).
 

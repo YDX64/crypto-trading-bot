@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
@@ -183,6 +184,10 @@ class ExitManager:
         if current_price:
             self._update_mae_mfe(sp, current_price)
             sp.position.current_price = current_price
+            # D19a-2: fiyatın YAŞI da kaydedilir. `breakeven_side_ok` bayat
+            # fiyatla "kârda" hükmü verip stopu piyasanın ters tarafına
+            # koymasın (-2021 → _emergency_close).
+            sp.price_ts = time.monotonic()
 
         # TP1 dolum kontrolü → break-even
         if not sp.tp1_done:
@@ -429,6 +434,101 @@ class ExitManager:
         else:
             self.logger.warning(f"⚠️ {symbol}: trailing SL güncellenemedi, eski SL korunuyor")
 
+    # `breakeven_side_ok`ın kabul ettiği azami fiyat yaşı (sn). Safety turu
+    # saniyeler mertebesindedir; 30 sn, borsa okumalarında repo genelinde
+    # kullanılan tazelik eşiğidir (bkz. D10 dersi #2 `force_fresh`).
+    _BE_PRICE_MAX_AGE_S = 30.0
+
+    def breakeven_side_ok(self, symbol: str) -> Optional[bool]:
+        """BE hedefi piyasanın KORUYUCU tarafında mı? (D19a bulgu B)
+
+        Dönüş:
+          * `True`  → stop BE'ye çekilebilir (pozisyon kârda, pay dahil).
+          * `False` → BE piyasanın TERS tarafında (pozisyon ZARARDA). Böyle
+            bir stopu göndermek Binance'ten `-2021 Order would immediately
+            trigger` alır; `position_manager._replace_stop_loss` bunu
+            "koruma kararı" sayıp pozisyonu **ACİL KAPATIR**. Yani "yalnız
+            stop sıkışır, geri alınabilir" sanılan `SCALPER_TV_EVENTS_EXIT=be`
+            fiilen piyasa emriyle kapanışa dönüşürdü. ASLA denenmemeli.
+          * `None`  → bilinmiyor (fiyat ya da BE okunamadı) → yine
+            denenmemeli (fail-safe: eksik veriyle geri alınamaz emir yok).
+
+        Pay: `SCALPER_TV_EVENTS_BE_MARGIN_PCT` (varsayılan %0.05) — tick/
+        spread gürültüsünde sınıra teğet geçen fiyat "kârda" sayılmasın.
+        """
+        sp = self._positions.get(symbol)
+        if sp is None:
+            return None
+        try:
+            target = float(getattr(sp.plan, "breakeven_price", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if target <= 0.0:
+            return None
+        price = getattr(sp.position, "current_price", None)
+        try:
+            price = float(price or 0.0)
+        except (TypeError, ValueError):
+            price = 0.0
+        if price <= 0.0:
+            return None
+        # TAZELİK (D19a-2): `current_price` yalnız `get_current_price`
+        # BAŞARILI olduğunda yazılır (`step` → `if current_price:`); ticker
+        # birkaç tur hata verirse alan sessizce bayatlar. Damgasız ya da
+        # `_BE_PRICE_MAX_AGE_S`'ten eski fiyat "bilinmiyor"dur.
+        stamp = getattr(sp, "price_ts", None)
+        if stamp is None:
+            return None
+        try:
+            age = time.monotonic() - float(stamp)
+        except (TypeError, ValueError):
+            return None
+        if age > self._BE_PRICE_MAX_AGE_S:
+            return None
+        try:
+            margin_pct = float(
+                getattr(
+                    getattr(self, "cfg", None),
+                    "scalper_tv_events_be_margin_pct",
+                    0.05,
+                )
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            margin_pct = 0.05
+        margin = abs(target) * max(0.0, margin_pct) / 100.0
+        if sp.signal.direction == Direction.LONG:
+            return price > target + margin
+        return price < target - margin
+
+    def breakeven_would_act(self, symbol: str) -> bool:
+        """`force_breakeven` BORSAYA BİR EMİR GÖNDERİR miydi? (yan etkisiz)
+
+        `force_breakeven`ın kapılarını (izlenen pozisyon → `_closing` kilidi →
+        geçerli BE hedefi → "stop zaten en az BE kadar koruyucu" → zarar
+        kontrolü) AYNI SIRAYLA, ama hiçbir şey değiştirmeden uygular.
+        Gölge modunun "aktifte ne olurdu" tahmini bunu kullanır (D19a-2 R2-4):
+        aksi halde gölge sayacı, aktifte hiçbir isteğin gitmeyeceği olayları
+        da "çıkış olurdu" diye sayıp terfi kararını şişirirdi.
+        """
+        sp = self._positions.get(symbol)
+        if sp is None:
+            return False
+        closing = getattr(self, "_closing", None)
+        if closing and symbol in closing:
+            return False
+        try:
+            target = float(getattr(sp.plan, "breakeven_price", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return False
+        if target <= 0.0:
+            return False
+        if self._is_at_least_as_protective(
+            sp.signal.direction, sp.position.current_stoploss, target
+        ):
+            return False
+        return self.breakeven_side_ok(symbol) is True
+
     async def force_breakeven(self, symbol: str, *, reason: str) -> bool:
         """Dış tetikleyiciyle (TV olayı, D19) stopu ücret-dahil BE'ye çek.
 
@@ -446,6 +546,12 @@ class ExitManager:
             tighter` yolundan geçer (fazladan emir göndermez) ve bayrakları
             normal akışta kurar.
         Yani buradaki tek etki: stop SIKILAŞIR, asla gevşemez.
+
+        ZARARDA UYGULANMAZ (D19a bulgu B): BE piyasanın ters tarafındaysa
+        `breakeven_side_ok` False/None döner ve stop TAŞINMAZ — aksi halde
+        Binance -2021 → `position_manager._emergency_close` (piyasa emriyle
+        ACİL KAPANIŞ) tetiklenirdi. Zarardaki pozisyona ne yapılacağı
+        `SCALPER_TV_EVENTS_EXIT_LOSING` kararıdır (skip | close).
 
         Dönüş: stop BE'de mi (zaten öyleyse de True), değiştirilemediyse False.
         """
@@ -475,6 +581,20 @@ class ExitManager:
                 f"(SL={current_sl}), değişiklik yok"
             )
             return True
+
+        # D19a bulgu B — ZARARDA BE YASAK. Bu kontrol çağıranda da vardır
+        # (engine `_apply_tv_event_exits` skip/close politikasını uygular);
+        # burada ikinci kez yapılır çünkü -2021 → acil kapanış yolunun
+        # tetiklenmesi geri alınamaz ve tek bir çağıranın unutması yeterlidir.
+        side_ok = self.breakeven_side_ok(symbol)
+        if side_ok is not True:
+            self.logger.warning(
+                f"⚠️ {symbol}: {reason} — BE ({target}) piyasanın koruyucu "
+                f"tarafında DEĞİL (fiyat={getattr(sp.position, 'current_price', None)}, "
+                f"durum={'zararda' if side_ok is False else 'bilinmiyor'}); stop "
+                "taşınmadı (-2021 → acil kapanış riski)"
+            )
+            return False
 
         ok = await self.pm.replace_stop_loss(sp.position, target)
         if ok:

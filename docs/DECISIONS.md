@@ -311,6 +311,10 @@ PF > 1.4 ama boğada toplam PnL tabanın ~%42'si (bilinçli tercih: "her rejimde
 **Geri alma:** `cp backups/env.bak-20260823-025623-riskpaketi .env && supervisorctl restart tradingbot_v2`.
 
 ### D19 — TV olay kanalı: ÇIKIŞ + YAPI/DÖNÜŞ olayları (`kind=exit|choch|trend|tp1`) · 2026-08-23 · **GÖLGE (aktif DEĞİL)**
+> ⚠️ **Bu bölüm D19a ile GÜNCELLENDİ** (aynı gün, 14 düşmanca-inceleme düzeltmesi).
+> Aşağıdaki metin ilk tasarımı anlatır; **MIXED kuralı, `be`nin zararda
+> uygulanmaması, olay kaynaklarının giriş oyu verememesi ve tüketim
+> imleçlerinin kalıcılığı D19a'da değişti** — çelişki görürsen D19a bağlayıcıdır.
 **Ne:** TradingView'den bota bugüne kadar YALNIZ "gir" oyu geliyordu. Bu değişiklik
 göstergelerin ÇIKIŞ ve YAPI bilgisini de sokar: LuxAlgo S&O `Exit Signal` ve
 `Trend Catcher/Tracer Up|Down`, Price Action Concepts `Bullish/Bearish S-CHOCH`,
@@ -398,6 +402,111 @@ Kodun tamamını geri almak gerekirse bu commit'teki `src/services/tv_events.py`
 `src/strategies/scalper/engine.py` (TV olay bölümü + `_evaluate_symbol` kapısı +
 `_safety_tick` çağrısı + `_close_position_market` `exit_reason` parametresi),
 `src/strategies/scalper/exits.py` (`force_breakeven`) değişikliklerini revert et.
+
+### D19a — D19 düşmanca inceleme düzeltmeleri (24 bulgu, iki tur) · 2026-08-23 · **GÖLGE (aktif DEĞİL)**
+**Ne:** D19 commit'i (7178077) canlıya çıkmadan önce 19 ajanlık düşmanca bir inceleme
+yapıldı; **14 gerçek kusur** (3 high, 5 medium, 6 low) bulundu ve hepsi AYNI dalda
+düzeltildi. Düzeltmeler uygulandıktan sonra ikinci bir düşmanca tur daha koşuldu ve
+**10 kusur daha** çıktı (aşağıdaki ikinci tablo) — birincisi, birinci turun G1
+düzeltmesinin A bulgusunu geri getirmesiydi. Toplam **24 kusur**. Kanal hâlâ
+`shadow` varsayılanındadır — bu commit de hiçbir kapıyı aktif etmez. Aşağıdaki
+"bulgu → düzeltme → test" eşlemesi bağlayıcıdır; birini değiştiren diğerini de
+değiştirir.
+
+| # | Bulgu (mekanizma) | Düzeltme | Regresyon testi |
+|---|---|---|---|
+| **A** [high] | `kind` belirteci düşerse (yazım hatası, iç içe JSON, `kind:` ayracı) bir ÇIKIŞ alarmı GİRİŞ OYUNA dönüşür; üstelik gövdedeki `src` (`pac_choch` vb.) allowlist'te olduğu için **YENİ BİR SAĞLAMA KAYNAĞI** sayılır — `TV_CONFLUENCE_REQUIRED=2` iken LuxAlgo ailesi tek başına 2/2 kotayı doldurup **pozisyon açtırabilir**. | Yeni ayar `TV_EVENT_SOURCES` (vars. `luxso_exit,luxso_trend,pac_choch,algopro_tp1`): bu kümedeki bir kaynak `kind=entry` ile gelirse **422**. Kontrol ÇÖZÜLEN kaynağa değil isteğin TÜM kaynak adaylarına (gövde `src`, `?src=`) uygulanır — allowlist dışı bir ad `tv`ye eşlenip sıyrılamasın. Ayrıca ayraç `=` **VEYA** `:`; JSON'da üst düzey **ve** `data` alt nesnesi okunur. | `TestEventSourceCannotVoteEntry` (4 kaynak × 2 yol, açık `kind=entry`, allowlist düşürmesi, **`TvConfluence.vote()` HİÇ çağrılmaz**, mevcut 5 giriş kaynağının yanlış-pozitif almadığı) |
+| **B** [high] | `SCALPER_TV_EVENTS_EXIT=be` **zararda** pozisyonda stop'u piyasanın TERS tarafına koyar → Binance `-2021` → `position_manager._replace_stop_loss` bunu "koruma kararı" sayıp **`_emergency_close`** çağırır (kapatma başarısızsa `UnprotectedPositionError`). Yani "yalnız stop sıkışır, geri alınabilir" sanılan ayar fiilen **piyasa emriyle kapanış**tı. | `ExitManager.breakeven_side_ok()` (True/False/None) — BE yalnız pozisyon **kârdayken** (tek yönlü `SCALPER_TV_EVENTS_BE_MARGIN_PCT`=%0.05 payıyla) uygulanır. Kontrol hem motorda hem `force_breakeven` içinde (çift kapı). Zarardaki pozisyonun kaderi yeni `SCALPER_TV_EVENTS_EXIT_LOSING=skip\|close` (vars. **skip**). `None` (fiyat/BE okunamadı) = `close` bile UYGULANMAZ. Mevcut stop BE'den iyiyse gevşetme zaten yasaktı (`_is_at_least_as_protective`, değişmedi). | `TestLosingPositionNeverBreakeven` (LONG/SHORT zarar, pay sınırı, bilinmeyen fiyat, `close` politikası, kârda hâlâ çalışır, **`pm.replace_stop_loss` ASLA çağrılmaz → -2021 yolu dışlandı**, `breakeven_side_ok` matrisi) |
+| **C** [high] | TV çıkış dalında `UnprotectedPositionError` genel `except Exception`'a düşüyor, yalnız loglanıyordu — safety yolunun DİĞER her dalında entry-halt latch'ini tetikleyen olay TV dalında **sessizdi** (D10 dersi ihlali). | Ayrı `except UnprotectedPositionError` → `await self._latch_entry_halt(e, source="TV olay çıkışı")`; olay tüketilir (sonsuz yeniden deneme yok). Diğer istisnalar fail-open kalır. | `TestUnprotectedPositionLatch` (latch çağrısı + `source`, ikinci turda tekrar etmemesi, sıradan hatanın latch TETİKLEMEMESİ) |
+| **D** [medium] | Tüketim imleçleri yalnız RAM'deydi, defter ise diskte: her **restart** tüketilmiş bir çıkış olayını `max_age` (240 dk) boyunca YENİDEN tetikliyordu. Ayrıca **başarısız** bir aksiyon olayı "tüketilmiş" sayıyordu ve gölge sayaçları kalıcı değildi. | İmleçler (`consumed`) ve deneme sayaçları (`attempts`) defterle AYNI dosyada, atomik (`_STATE_VERSION=2`; v1 dosyası **atılmaz**, yükseltilir). Aksiyon başarısızsa olay tüketilmez, `_MAX_EXIT_ATTEMPTS=3` denemeye kadar tekrarlanır, sonra bırakılır (pozisyon normal SL/TP korumasında kalır). Sayaçlar + `counters_since` kalıcı. | `TestPersistentConsumption` (restart'ta yeniden tetiklenmeme, 3 deneme sonra bırakma, denemenin restart'ta sürmesi, sayaç/`since` kalıcılığı, v1 yükseltmesi, `EXIT=off`'ta imlecin kalıcı ilerlemesi) |
+| **E** [medium] | Sunucu `.env`'i `TV_SOURCE_ALLOWLIST`'i AÇIKÇA set ediyorsa kod varsayılanı devreye girmez → `src=pac_choch` sessizce eski `?src=luxso` etiketine düşer, kapı hiç eşleşmez: kanal **"kurulu görünüp ölü"**. | Olay yolu **allowlist'ten BAĞIMSIZ** (istek `TV_WEBHOOK_SECRET` ile kimlikli ve sağlamaya girmiyor): etiket gövdedeki değer olarak KALIR, allowlist dışıysa yalnız WARNING. `kind != entry` bir istek ASLA giriş yoluna düşmez. Startup'ta `TvEvents.log_config_health()` WARNING üretir; durum `/scalper/status` → `tv_events.allowlist_ok` / `allowlist_missing` / `gate_enabled` / `window_open`. | `TestAllowlistIndependenceAndHealth` (eksik allowlist teşhisi, varsayılanda sessizlik, `off` modda susma, gövde etiketinin korunması, dört `kind`in giriş yoluna DÜŞMEMESİ, status alanları) |
+| **F** [medium] | MIXED (kapı kaynakları çelişiyor) davranışı "ters olan engeller"di — PAC BULL + S&O trend BEAR gibi bir çelişki sembolü **İKİ YÖNE DE** 240 dk kilitliyordu: hiçbir kanıt üretmeyen durum en sert kararı veriyordu. Ayrıca olay yolu `SCALPER_TV_SYMBOL_ALLOWLIST`'i (D7) tanımıyordu. | MIXED → **kapı UYGULANMAZ** (çelişki "bilinmiyor"dur, "her iki yön de yasak" değil) + `mixed_skipped` sayacı + log; telemetride `structure: MIXED` görünmeye devam eder. Olay yolu D7 sembol allowlist'ini uygular (dışındaki sembol deftere YAZILMAZ; yanıt R1-4'ten sonra **200 + `applied:false`**). | `TestMixedAndSymbolAllowlist` (MIXED girişi engellemez / çıkışı tetiklemez, telemetride görünür, biri bayatlayınca kapı geri gelir, sembol allowlist'i kabul/ret) |
+| **G1** [medium] | `src=`/`kind=` gövdenin HER YERİNDE aranıyordu: TradingView'in `{{strategy.order.alert_message}}` gibi **kullanıcı metnini** gövdenin ortasına basan alanları mevcut bir alarmın kimliğini/yolunu değiştirebilirdi. | Belirteçler yalnız **başlık koşusu**ndan okunur (satır başından itibaren kesintisiz `anahtar=değer`; ilk serbest metin belirtecinde biter, ilk 5 satır). JSON'da yalnız üst düzey + `data`. İç içe JSON ve serbest metin ARANMAZ. | `TestHeaderRunScanning` (gerçek BotV3/AlgoPro/LuxAlgo gövdeleri, satır başı, koşunun bitişi, `:` ayracı, `data` sarmalayıcı, derin iç içe JSON, patolojik 8 KB gövdede doğrusal süre) |
+| **G2** [medium] | Kimliksiz bir istek `kind` doğrulamasına ulaşıp 422 mesajından geçerli `kind` listesini (kanalın varlığını ve sözleşmesini) öğrenebiliyordu. | Secret doğrulaması **gövde ayrıştırmasından ve HER 422'den ÖNCE**, sabit zamanlı (`_constant_time_equals`); saf çözücüler kendi içlerinde tekrar doğrular. `POST /tv-events/reset` aynı disiplinde. | `TestSecretBeforeParsing` (403 > geçersiz `kind` 422, > sembol 422, > olay-kaynağı 422; reset 403) |
+| **G3** [medium] | Olay yolu sembolü yalnız "USDT ile bitiyor mu" diye süzüyordu → defterde `"'; DROP--USDT"` gibi anahtar; defter ayrıca sınırsız büyüyebiliyordu. | `_TV_SYMBOL_RE.fullmatch` (giriş yolunun davranışı BİLİNÇLİ olarak değişmedi) + defter budaması: `_MAX_SYMBOLS=64`, `_MAX_STRUCTURE_SOURCES=16`, `_MAX_ATTEMPT_KEYS=16` (en eskiler düşer, aktif sembol korunur). | `TestEventSymbolValidationAndPruning` (bozuk sembol 422 + deftere yazılmaz, `BINANCE:ETHUSDT.P`/`1000PEPEUSDT` kabul, sembol ve kaynak sınırları) |
+| **G4** [low] | S&O "Trend Catcher" ile "Trend Tracer" aynı `src` etiketini (`luxso_trend`) paylaşır — kural belirsizdi. | Durum anahtarı `src`tir → iki alt-kaynak birbirini MIXED'e DÜŞÜRMEZ, **son olay kazanır**. Yeni `via=` alt-anahtarı YALNIZ TELEMETRİDİR (yön taramasından da çıkarılır). Kural INTEGRATIONS §7.3'te yazılı. | `TestViaSubSource` (MIXED oluşmaması, `via` ayrıştırma + yön, `via` yokluğu) |
+| **G5** [low] | `SCALPER_TV_EVENTS_MAX_AGE_MIN=0` "süresiz taze", boş `GATE_SOURCES` "tüm kaynaklar" gibi okunabiliyordu. | **SIFIR/BOŞ = KAPALI**: 0 → pencere kapalı, boş liste → hiçbir kaynak karar vermez. `MODE=active` + boş `GATE_SOURCES` **startup'ta ValueError** (kaynaksız kapı kesinlikle yazım hatasıdır). | `TestZeroMeansClosed` (pencere/kapı kapanışı, girişin engellenmemesi, validator: `active`+boş, geçersiz `EXIT_LOSING`, negatif `BE_MARGIN`, 0 max-age'in GEÇERLİ olması) |
+| **G6** [low] | Bir turda birden çok TV kapanışı safety turunu şişirip 30 sn'lik tazelik eşiğini aşabilirdi (reaper'ın 2026-08-14 dersi). | `_TV_EXIT_MAX_ACTIONS_PER_TICK=1`; kalan olaylar **tüketilmez**, sonraki turda ele alınır. | `TestPerTickActionLimit` (turda tek aksiyon, ikinci turda diğeri, ertelenen olayın tüketilmemesi) |
+| **G7** [low] | `state/tv_events.json`'u silmek ÇALIŞAN süreci temizlemez (RAM otoritedir, sonraki yazımda dosyayı geri yazar); kalıcılık hatası log seli üretebilirdi; RUNBOOK'un doğrulama adımı canlı deftere gerçek olay yazıyordu. | `POST /tv-events/reset?secret=` (RAM + disk), kalıcılık WARNING'i dakikada bir (`_PERSIST_WARN_INTERVAL_S=60`) + `/scalper/status` → `tv_events.persist{ok,errors,last_error,path}`, ve `POST /tv-signal?dry_run=1` (doğrular, DEFTERE YAZMAZ). RUNBOOK reçetesi buna göre yazıldı. | `TestResetAndPersistHealth` (reset RAM+disk, dry-run'ın defteri kirletmemesi, yazılamayan yolda tek WARNING + sayaç + fail-open, reset'in `persisted` raporu) |
+| **G8** [low] | `would_block` (gölge) ile `blocked` (aktif) farklı yerlerde sayılıyordu; gölge ölçümü aktif ölçümle birebir kıyaslanamıyordu. | `gate_hits` HER İKİ modda artar → sözleşme `gate_hits == would_block + blocked`. Çıkış tarafında `exit_hits` aynı rolü oynar. | `TestCounterContract` |
+
+**İKİNCİ TUR (2 ajanlık düşmanca inceleme, aynı gün):** ilk tur düzeltmeleri
+uygulandıktan sonra kod yeniden saldırıya uğradı ve **10 kusur daha** bulundu
+(2 high, 6 medium, 2 low). Hepsi bu commit'te kapalıdır:
+
+| # | Bulgu | Düzeltme | Test |
+|---|---|---|---|
+| **R1-1** [high] | G1 daraltması bulgu A'yı GERİ getiriyordu: `BTCUSDT.P src=pac_choch kind=choch bearish` gibi bir gövdede belirteçler okunmaz → `kind` yokluğu "entry" → `bearish` yönü çözer → **CHoCH alarmı pozisyon açar** (uçtan uca `external_signal` çağrıldığı ölçüldü). | Gövdenin TAMAMINDA `src=` taraması (`_tv_body_event_source_mentions`) — **yalnız `tv_event_sources` içindeki adlar** guard'a EK ADAY olarak verilir. Yönlendirme DEĞİŞMEZ (G1 korunur), ama okunamayan bir olay alarmı 422 ile GÖRÜNÜR biçimde ölür ("mesajın BAŞINDA değil" ipucuyla). | `TestMidMessageTokensFailLoud` — değişmez kural: olay alarmı ya olay yoluna gider ya 422 alır, **`external_signal` ASLA çağrılmaz**; serbest metinde `kind=exit` geçen meşru AlgoPro girişi etkilenmez |
+| **R1-2** [medium] | `kind`e `:` ayracı eklenmesi YENİ bir sert 422 yaratıyordu: `Kind: Bullish Reversal BTCUSDT.P` ile başlayan masum bir GİRİŞ alarmı bugün kabul edilirken 422 alırdı. | Ayraç YAKALANIR: `=` kasıtlı belirteçtir (tanınmayan değer → 422, D19 kuralı korunur); `:` düz yazı noktalamasıdır → değer TANINAN bir küme içinde değilse belirteç YOK SAYILIR. | `TestColonSeparatorIsProseSafe` (4 düz yazı biçimi yok sayılır, `Kind:` ile başlayan giriş alarmı hâlâ açar, `kind:exit` hâlâ yönlendirir, `=` hâlâ sert) |
+| **R1-3** [medium] | `config.py` yorumu koduyla çelişiyordu ve `active` + boş `GATE_SOURCES` MEŞRU bir "yalnız-çıkış" yapılandırmasını başlatılamaz kılıyordu (`pending_exit` `gate_sources`a bakmaz). Ayrıca `max_age=0` aynı sessiz ölümü üretirken fail-fast DEĞİLDİ (asimetri). | Kural gerçek niyete çevrildi: **`active` iken kanal HİÇBİR ŞEY yapamıyorsa** ValueError (`can_gate or can_exit`). Yorum kodla hizalandı. | `TestZeroMeansClosed` (kapı+çıkış ölü → hata, `max_age=0` → hata, yalnız-çıkış → GEÇERLİ) |
+| **R1-4** [medium] | Sembol allowlist'i olay yolunda 422, giriş yolunda 200 döndürüyordu: aynı sembolde kurulu iki alarmdan biri TV'de yeşil, diğeri kırmızı. | Olay yolu da **200 + `applied:false` + `reason:"symbol_allowlist"`**; 422 yalnız BİÇİM hataları için. | `TestMixedAndSymbolAllowlist` (200 + applied:false, defter boş, sayaç 1) |
+| **R1-5** [low] | `dry_run=1`, sembol allowlist reddinde `note()` çağırdığı için CANLI deftere kalıcı bir sayaç yazıyordu (docstring'in aksine). | Sayaç `if not dry_run` altında. | `test_dry_run_does_not_count_symbol_allowlist_rejection` (sayaç sözlüğü byte-aynı) |
+| **R1-9** [low] | Yön taramasında `src` sıyırması JSON gövdede ÇALIŞMIYORDU (`"src": "…"` — anahtarla ayraç arasında tırnak var); tireli bir kaynak adı (`pac-bull`, `luxso-down`) yön sanılırdı. | Regex sıyırmasına ek olarak ÇÖZÜLMÜŞ değerler (üst düzey + `data`) metinden çıkarılır. | `TestDirectionScanStripsResolvedValues` |
+| **R2-1** [high] | Motor, zarar kontrolünü `force_breakeven`dan ÖNCE yapıyordu: stopu ZATEN BE'de olan (TP1 dolmuş, D4 reaper muafiyetindeki) bir koşucu, fiyat geri çekildiğinde `EXIT_LOSING=close` ile **piyasadan kapatılıyordu** (ölçüldü: 1 reduce-only MARKET). | SIRA tersine çevrildi: önce `force_breakeven` (kendi içinde `_closing` → hedef → "zaten koruyucu" → zarar kapılarını uygular ve zararda EMİR GÖNDERMEZ), sonra "neden olmadı" teşhisi. | `test_stop_already_at_breakeven_is_never_market_closed` |
+| **R2-2** [medium] | `side_ok is None` (geçici ticker hatası) olayı KALICI olarak yutuyordu: fiyat geri gelip pozisyon kâra geçse bile olay bir daha değerlendirilmiyordu. | `None` → `"failed"`: olay tüketilmez, `_MAX_EXIT_ATTEMPTS` kadar yeniden denenir. | `test_unknown_price_is_treated_as_unsafe_and_retried` |
+| **R2-3/4** [medium] | `exits_applied`, borsaya HİÇBİR isteğin gitmediği durumları da sayıyordu ("zararda skip" ve "stop zaten BE'de"); gölge modu ise aktifte hiçbir şey olmayacak olayı ayırt edemiyordu — G8 parite iddiası çıkış tarafında tutmuyordu. Bu sayı terfi kararının GİRDİSİ. | Üç durumlu dönüş (`applied`/`noop`/`failed`): `applied` yalnız stop gerçekten taşındıysa ya da pozisyon kapandıysa. Yeni sayaçlar `exits_noop` + `would_exit_noop`; gölge tahmini yan etkisiz `ExitManager.breakeven_would_act()` ile yapılır (`force_breakeven`ın kapılarını AYNI sırayla, hiçbir şeyi değiştirmeden uygular). | `TestShadowPredictsActive` (zararda no-op, stop zaten BE'de no-op, `close` politikasında no-op DEĞİL, kârlıda no-op değil, gölge `would_exit_noop` ↔ aktif `exits_noop`), `TestCounterAlgebra` (kimlikler) |
+| **R2-5** [medium] | `position.current_price` yalnız ticker okuması BAŞARILI olduğunda yazılıyor ve zaman damgası taşımıyordu → birkaç tur hata verirse BAYAT fiyat "kârda" hükmü verip **tam da engellenmek istenen** -2021 → `_emergency_close` yolunu açıyordu (gerçek `step()` ile ölçüldü). | `ScalpPosition.price_ts` (monotonic) `step()` içinde basılır; `breakeven_side_ok` damgasız ya da `_BE_PRICE_MAX_AGE_S=30 sn`'den eski fiyatta **None** ("bilinmiyor") döner. | `test_stale_price_is_not_treated_as_profit` |
+| **R2-6** [medium] | `_prune`, AÇIK POZİSYONU ve bekleyen tüketilmemiş olayı olan sembolü bir alarm selinde defterden düşürebiliyordu (80 sembollük selde BTCUSDT düştü). | `TvEvents.protect(symbols)` — motor her safety turunda `exits.tracked_symbols()`'ı bildirir; korunan semboller eviction adayı DEĞİLDİR (`_MAX_PROTECTED_SYMBOLS=32`). | `TestPruningProtectsOpenPositions` |
+| **R2-7** [low] | Pencere KAPALIYKEN (`max_age=0`) imleçler ilerlemiyordu → operatör pencereyi açınca birikmiş olaylar ANINDA toplu tetikliyordu (INTEGRATIONS §7.4'ün vaadinin tersi). | `_advance_tv_seen()` kapısına `not window_open()` eklendi. | `TestClosedWindowAdvancesCursors` |
+| **R2-8** [low] | `note()` her sayaç artışında tam JSON + 2 fsync yazıyordu (~2.5 ms, event-loop üzerinde senkron). | Sayaç yazımı saniyede bire debounce edildi (`_COUNTER_PERSIST_MIN_INTERVAL_S`); olay/tüketim yazımları ANINDA kalıcı kalır ve bekleyen sayaçları da diske indirir. | `TestLedgerRobustness::test_counter_writes_are_debounced` / `test_ingest_is_never_debounced` |
+| **R2-9** [low] | `attempts` budaması LEKSİKOGRAFİK sıralıyordu (`"exit:10" < "exit:2"`) → EN YENİ denemenin sayacı düşebilirdi (latent). | `(grup, int(seq))` ile sayısal sıralama (`_attempt_sort_key`), `_load`'da da. | `test_attempt_keys_are_pruned_numerically` |
+| **R2-10** [low] | Bozuk/eksik `structure` alanı `""` hükmü üretip `BULL\|BEAR\|MIXED\|NONE` sözleşmesini bozuyordu. | `_load` yalnız `BULL`/`BEAR` satırlarını geri yükler. | `test_corrupt_structure_row_is_dropped` |
+
+**Kusur bulunmadığı DOĞRULANAN alanlar** (iki tur, hepsi çalıştırılarak): `_TV_HEADER_RUN_RE`
+ReDoS yok (17 düşmanca 8 KB desen, azami 0.26 ms); JSON gövdede `kind:`/`src:` yanlış
+eşleşmesi yok; `_tv_event_symbol` kalibrasyonu (`1000PEPEUSDT`, `BINANCE:BTCUSDT.P`
+geçer; `'; DROP--USDT`, `BTC\x00USDT`, `BTCUSDT\nEVIL` reddedilir); secret disiplini
+(403 her 422'den önce, sabit zamanlı, hiçbir yanıtta/logda yok); mevcut 49 giriş
+alarmının gerçek gövdeleri aynen kabul; `ok`/`status` değişkeni her dalda tanımlı
+(UnboundLocalError yok); `UnprotectedPositionError` latch'i tam bir kez; restart'ta
+imleç davranışı; v1 durum dosyası yükseltmesi; `_MAX_EXIT_ATTEMPTS` ve kalıcı açlık
+yokluğu; `gate_hits == would_block + blocked`; `breakeven_side_ok` işaret/pay mantığı
+(LONG/SHORT simetrik); `force_breakeven` iç sıralaması; `_persist` atomikliği;
+`luxso_trend` alt-kaynaklarının MIXED üretmemesi; giriş tarafı fail-open sözleşmesi.
+
+**Neden bu kadar sıkı:** kanal `shadow` olsa bile kod yolu canlıda çalışır (`/tv-signal`
+her istekte gövdeyi ayrıştırır). Bulgu A ve B `shadow`da bile **gerçek para** etkisi
+taşıyordu: A giriş yolundadır (moddan bağımsız), B ise `active`e geçildiği ilk gün
+sessizce piyasa emri gönderirdi.
+
+**Yeni ayarlar (hepsi geriye uyumlu varsayılan):** `TV_EVENT_SOURCES`,
+`SCALPER_TV_EVENTS_EXIT_LOSING=skip`, `SCALPER_TV_EVENTS_BE_MARGIN_PCT=0.05`
+(`env.example` güncellendi).
+
+**Davranış değişiklikleri (D19'a göre):** (1) olay kaynağından gelen giriş oyu 422
+(gövdenin herhangi bir yerinde geçse bile); (2) `be` yalnız pozisyon kârdayken —
+zararda `SCALPER_TV_EVENTS_EXIT_LOSING` karar verir, fiyat bayat/okunamazsa hiçbir
+şey yapılmaz ve olay yeniden denenir; (3) MIXED artık ENGELLEMEZ (D19'da
+engelliyordu); (4) olay yolu allowlist yerine TV sembol allowlist'ini uygular
+(200 + `applied:false`); (5) `src`/`kind` yalnız başlık koşusundan okunur, `:`
+ayracı yalnız TANINAN değerlerde sayılır; (6) tüketim kalıcı, başarısız aksiyon
+tüketmez; (7) tur başına 1 çıkış aksiyonu; (8) `active` iken kanal hiçbir şey
+yapamıyorsa süreç başlamaz; (9) `exits_applied` yalnız borsaya gerçekten istek
+gidince artar (`exits_noop` ayrı).
+Mevcut 49 GİRİŞ alarmının davranışı DEĞİŞMEDİ — `tests/test_tv_signal_bridge.py`
+tek satır değişmeden geçiyor.
+
+⚠️ **Operatör notu (alarm kurulumu):** yönlendirme belirteçleri (`src=`, `kind=`)
+alarm mesajının **BAŞINDA** olmalıdır (`docs/INTEGRATIONS.md` §7.2 şablonları buna
+uyar). Ortada kalırlarsa istek ya yine olay yoluna gider ya **422** alır — ama
+**hiçbir koşulda giriş oyuna dönüşmez**. 422 alan alarm TV'de "webhook failed"
+görünür; çözüm mesajı düzeltmektir, alarmı silmek değil.
+
+**Kanıt:** `python3 -m pytest tests -q` → **877 passed, 1 skipped**
+(D19 tabanı: 744 passed, 1 skipped → +133 test; `tests/test_tv_events.py` 68 → 201).
+`tests/test_tv_signal_bridge.py` TEK SATIR değişmeden geçiyor (49 alarmın regresyonu).
+Ayrıca `TestRoutingInvariants` iki DEĞİŞMEZ kuralı tohumlanmış rastgele gövdelerle
+tarar: (1) hiçbir GİRİŞ alarmı olay-kaynağı koruması yüzünden yanlışlıkla 422 almaz,
+(2) hiçbir OLAY alarmı — belirteç nereye yazılırsa yazılsın — `external_signal`'a ya
+da `TvConfluence.vote()`'a ULAŞMAZ.
+
+**Geri alma:** D19 ile aynı — `.env`'den `SCALPER_TV_EVENTS_*` kaldır (varsayılan
+`shadow`), tamamen kapatmak için `SCALPER_TV_EVENTS_MODE=off`. Kod düzeyinde geri
+almak gerekirse bu commit'teki `src/main.py`, `src/core/config.py`,
+`src/services/tv_events.py`, `src/strategies/scalper/engine.py`,
+`src/strategies/scalper/exits.py` değişikliklerini revert et; D19'un kendisi
+bağımsız olarak ayakta kalır (ama A/B/C bulguları geri gelir — **önerilmez**).
+
 
 ## Reddedilen kararlar (kanıtla)
 
