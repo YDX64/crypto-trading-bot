@@ -445,11 +445,33 @@ YATAY 145 +2392.3 / 1.29 · BOĞA 90 +3901.7 / 2.43.
 > koşu = kapı + ikinci-derece etkiler; fark = ikinci-derece terim.** Bu, E8.5'teki defter-üstü
 > simülasyonların da nasıl okunacağını belirler — onlar da saf kapı etkisidir.
 >
-> **İkinci-derece terim ikiye ayrılır** (ikisi de "bir işlemi kaldırmanın yan etkisi", kapı
-> etkisi DEĞİL): (a) semboller-arası **kapasite yeniden tahsisi** (`_apply_capacity_gate`;
-> boşalan slota sonraki aday girer), (b) sembol-içi **kayıp-cooldown serbest kalması**
-> (`backtest.py:849-850` — engellenen işlem SL olmadığı için cooldown kurulmaz ve o sembolde
-> bastırılmış sonraki girişler açılabilir hale gelir).
+> **İkinci-derece terim ÜÇE ayrılır** (üçü de "bir işlemi kaldırmanın yan etkisi", kapı etkisi
+> DEĞİL) — ve bu koşuda paylar ölçüldü (D15 ajanı, V1c AYI, 11 yeni giren işlemin her biri
+> hangi pencereye düşüyor; script `scratchpad/mechanism_split.py`):
+>
+> | # | Mekanizma | Kod yolu | V1c AYI payı |
+> |---|---|---|---|
+> | (a) | semboller-arası **kapasite yeniden tahsisi** | `_apply_capacity_gate` | **0 işlem / 0.0** |
+> | (b) | sembol-içi **kayıp-cooldown serbest kalması** | `backtest.py:849-850` (SL olmayınca cooldown kurulmaz) | **0 işlem / 0.0** |
+> | (c) | sembol-içi **işgal penceresi serbest kalması** | `backtest.py:851` `i = trade.exit_idx + 1` (kabul) ↔ `805/821/837/844` `i += 1` (ret) | **11 işlem / +1217.4 (%100)** |
+>
+> (c) şu demek: KABUL edilen bir işlem tarama imlecini tüm tutma penceresinin sonuna atlatıyor,
+> ENGELLENEN sinyalde imleç yalnız bir mum ilerliyor — yani bir işlemi engellemek o sembolde
+> ortalama bir tutma penceresi kadar (ayı penceresinde ~190 dk) arama alanı serbest bırakıyor.
+> Yeni girenlerin HEPSİ, aynı sembolde engellenen bir işlemin `[entry_time, exit_time]`
+> penceresinin İÇİNE düşüyor. Toplam +1217.4, benim bağımsız hesabımla (+1217.5) ve bacak
+> atfıyla (LONG +1060.0 + SHORT +157.5) birebir tutuyor — üç hesap aynı.
+>
+> **Yani "kapasite terimi" adı YANLIŞTI** (önce ben koydum, D15 ajanı kabul etti, sonra ölçüp
+> ikimizi de çürüttü): `_apply_capacity_gate` bu koşuda TEK bir işlem bile üretmemiş. Bu bir
+> tesadüf de değil — repo'nun kendi kanıtı aynı yöne bakıyor: **E4h** (`SCALPER_MAX_POSITIONS`
+> 5→3) üç pencerede de tabanla BİREBİR aynı sonucu vermişti (toplam Δ **+0.00**), ve P1 bunu
+> "kapasite kapısı hiç fark yaratmadı" diye zaten not etmişti. 8 sembol / 5 slot ile kapasite
+> kapısı pratikte hiç bağlamıyor. (b) gerçek bir kod yolu ama burada sıfır katkı verdi.
+>
+> Bu bir harness artefaktı DEĞİL: canlı motorda da sembolde açık pozisyon varken ikinci giriş
+> yoktur. Büyüklüğü ≈ ortalama tutma süresi / giriş TF oranına bağlıdır — canlıdaki 1m girişte
+> yapısal olarak büyüktür.
 >
 > **ÖN-ELEME KURALI — ilk yazdığım hâli YANLIŞTI, D15 ajanının çürütmesiyle düzeltildi.**
 > "Post-hoc negatifse aday elenir" GÜVENLİ DEĞİL: ikinci-derece terim saf kapı etkisinden
@@ -466,8 +488,10 @@ YATAY 145 +2392.3 / 1.29 · BOĞA 90 +3901.7 / 2.43.
 > Pozitif kol da bir GARANTİ değil: ikinci-derece terim ilkesel olarak negatif de olabilir
 > (boşalan slota daha kötü işlemler girerse). Ölçtüğümüz üç pencerede ≥0 çıktı (eşik %1.3
 > iki yönlü: AYI +1217.5, YATAY +585.7, BOĞA ≈0 — BOĞA'da zaten yalnız 1 işlem engelleniyor).
-> Pozitif çıkma EĞİLİMİNİN yapısal nedeni: yerine geçen işlemler de kapıdan geçiyor, yani
-> tabandan değil FİLTRELENMİŞ dağılımdan çekiliyorlar.
+> Pozitif çıkma EĞİLİMİNİN yapısal nedeni (mekanizma (c) belli olunca daha net): yerine geçen
+> işlemler hem kapıdan geçiyor (tabandan değil FİLTRELENMİŞ dağılımdan çekiliyorlar) hem de
+> AYNI SEMBOLDE, engellenen işlemin kendi penceresinde açılıyorlar. Yine de **eğilim, kural
+> değil**: işgal penceresinin serbest kalması ilkesel olarak daha kötü işlemler de getirebilir.
 >
 > **Ayrışmanın geçerlilik koşulu:** "kalan = 0" bir ÖZDEŞLİK DEĞİL, bu koşu çiftinde çıkan
 > ampirik bir sonuçtur. Burada tutmasının nedeni: harness boyutlaması sabit `initial_balance`
