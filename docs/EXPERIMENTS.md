@@ -490,6 +490,13 @@ SHORT-ağırlıklı. Bağlam-TF kuralı "üst TF'ye karşı işlem açma" demek 
 kârının ters-trend dip alımından geldiği pencerelerde (YATAY: `RSI(15m)<50` 54 LONG'un
 50'si kazanan) doğrudan kârı kesiyor. **Hüküm: kanıt yetersiz — uygulanmaz.**
 
+> **Ön-eleme kuralına ÇEKİNCE (D15 ajanı, 2026-08-23):** "post-hoc terim negatifse motor-içi koşuya girmeye değmez"
+> kuralı güvenli DEĞİL — LONG bacağında saf kapı etkisi +76 (gürültü) iken kapasite terimi +1060; saf etki −76 olsaydı
+> motor-içi sonuç yine ≈ +984 olurdu. Savunulabilir biçim ASİMETRİK: güçlü pozitif post-hoc → güvenli aday; sıfır civarı
+> ya da hafif negatif → hüküm verilemez, motor-içi koşu ŞART. Ayrıca "kalıntı = 0" bir özdeşlik değil, bu koşu çiftine
+> özgü ampirik sonuç (sabit `initial_balance`, kapasite kapısında ortak adayların sırası değişmedi); başka adaylarda
+> kapasite kapısı/kayıp-cooldown ortak işlemleri kaydırırsa ayrışma temiz çıkmaz — kural uygulanmadan önce kalıntı kontrol edilmeli.
+
 ### E8.7 — TV SHORT kaynak kalitesi (15 işlem, PF 0.15)
 Kaynak eşlemesi `bot.log` "Sağlama tamam" satırlarından. Sunucudaki log tutma penceresi
 **2026-08-16 00:05**'te başlıyor (`bot.log.7.gz`), TV işlemleri ise 08-12'de başlamış: bu yüzden
