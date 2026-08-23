@@ -567,14 +567,30 @@ class ScalpTracker:
         Pencere ALT sınırı: kapanıştan en az `min_age_minutes` geçmiş olmalı
         (aksi hâlde "60 dakikada döndü mü" sorusu henüz yanıtlanamaz).
         ÜST sınır: eski kayıtları sonsuza dek yeniden denemeyelim.
+
+        **LIMIT, "ölçülmüş" filtresinden SONRA uygulanır** (D21-R3, bulgu 5):
+        `postmortem` alanı JSON metninin İÇİNDEDİR, SQL onu göremez. SQL
+        tarafında `limit(20)` uygulanırsa ve en yeni 20 kapanışın hepsi zaten
+        ölçülmüşse fonksiyon BOŞ döner — arkadaki ölçülmemiş satırlar hiç
+        görülmez ve sonsuza dek ölçülmez. Bu yüzden pencere `scan_limit`
+        kadar taranır, ölçülmemişler süzülür ve `limit` en sonda uygulanır.
+        `scan_limit` taramayı yine de sınırlar (12 saatlik pencerede
+        binlerce satır olamaz ama savunma ucuzdur).
         """
         if min_age_minutes <= 0:
             return []
         newest = now - timedelta(minutes=min_age_minutes)
         oldest = now - timedelta(hours=max(1.0, float(max_age_hours)))
+        wanted = max(1, int(limit))
+        scan_limit = max(200, wanted * 10)
         async with AsyncSessionLocal() as session:
             result = await session.execute(
-                select(ScalpTradeModel)
+                select(
+                    ScalpTradeModel.id,
+                    ScalpTradeModel.symbol,
+                    ScalpTradeModel.closed_at,
+                    ScalpTradeModel.forensics,
+                )
                 .where(
                     ScalpTradeModel.status == "CLOSED",
                     ScalpTradeModel.forensics.isnot(None),
@@ -582,22 +598,24 @@ class ScalpTracker:
                     ScalpTradeModel.closed_at >= oldest,
                 )
                 .order_by(ScalpTradeModel.closed_at.desc())
-                .limit(max(1, int(limit)))
+                .limit(scan_limit)
             )
-            trades = list(result.scalars().all())
+            trades = list(result.all())
 
         out: List[Dict[str, Any]] = []
-        for trade in trades:
-            document = self.parse_forensics(trade.forensics)
+        for trade_id, symbol, closed_at, raw_forensics in trades:
+            document = self.parse_forensics(raw_forensics)
             if not document or document.get("postmortem") is not None:
                 continue
             out.append({
-                "id": int(trade.id),
-                "symbol": trade.symbol,
-                "closed_at": trade.closed_at,
+                "id": int(trade_id),
+                "symbol": symbol,
+                "closed_at": closed_at,
                 "entry": document.get("entry") or {},
                 "exit": document.get("exit") or {},
             })
+            if len(out) >= wanted:
+                break
         return out
 
     async def record_postmortem(

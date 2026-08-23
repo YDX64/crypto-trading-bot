@@ -2313,30 +2313,62 @@ async def scalper_trades(
     ]
 
 
-def _parse_since(value: Optional[str]) -> Optional[datetime]:
+#: `?since=`/`?until=` için azami geriye bakış. Pencereyi sınırsız bırakmak
+#: SQL taramasını ve `summarize` maliyetini pano yoklamasıyla çarpar; ayrıca
+#: `9999999999d` gibi bir değer `timedelta`'yı taşırıp 500 üretir (D21-R3,
+#: bulgu 5). Sınır aşılırsa 400 döner — sessizce kırpmak raporu YANLIŞ okutur.
+FORENSICS_MAX_WINDOW_DAYS = 365
+#: `?since=` verilmediğinde adli özet penceresi.
+FORENSICS_DEFAULT_SINCE = "7d"
+
+
+def _parse_since(
+    value: Optional[str], *, max_days: int = FORENSICS_MAX_WINDOW_DAYS
+) -> Optional[datetime]:
     """`?since=` metnini naive UTC datetime'a çevirir.
 
     Kabul edilenler: `7d` / `36h` (göreli), `YYYY-MM-DD`,
-    `YYYY-MM-DD HH:MM[:SS]`, `YYYY-MM-DDTHH:MM[:SS]`. Çözülemeyen değer 400
-    verir — sessizce "tüm zamanlar"a düşmek raporu YANLIŞ okutur.
+    `YYYY-MM-DD HH:MM[:SS]`, `YYYY-MM-DDTHH:MM[:SS]`. Çözülemeyen ya da
+    `max_days`'i aşan değer 400 verir — sessizce "tüm zamanlar"a düşmek ya da
+    pencereyi kırpmak raporu YANLIŞ okutur; 500 ise istemciye "sunucu bozuk"
+    der, oysa hata girdidedir.
     """
     text = (value or "").strip()
     if not text:
         return None
     now = datetime.utcnow()
+    limit = now - timedelta(days=max(1, int(max_days)))
     if re.fullmatch(r"\d+[dh]", text.lower()):
-        amount = int(text[:-1])
-        hours = amount * 24 if text[-1].lower() == "d" else amount
-        return now - timedelta(hours=hours)
-    for fmt in (
-        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
-        "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M",
-    ):
         try:
-            return datetime.strptime(text, fmt)
-        except ValueError:
-            continue
-    raise HTTPException(status_code=400, detail=f"since ayrıştırılamadı: {value!r}")
+            amount = int(text[:-1])
+            hours = amount * 24 if text[-1].lower() == "d" else amount
+            parsed = now - timedelta(hours=hours)
+        except (ValueError, OverflowError, OSError):
+            raise HTTPException(
+                status_code=400,
+                detail=f"since aralık dışı (en fazla {max_days} gün): {value!r}",
+            )
+    else:
+        parsed = None
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
+            "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M",
+        ):
+            try:
+                parsed = datetime.strptime(text, fmt)
+                break
+            except ValueError:
+                continue
+        if parsed is None:
+            raise HTTPException(
+                status_code=400, detail=f"since ayrıştırılamadı: {value!r}"
+            )
+    if parsed < limit:
+        raise HTTPException(
+            status_code=400,
+            detail=f"since aralık dışı (en fazla {max_days} gün): {value!r}",
+        )
+    return parsed
 
 
 @app.get("/scalper/trades/{trade_id}/forensics")
@@ -2366,9 +2398,14 @@ async def scalper_forensics_summary(
 
     Bir işlem birden çok etiket taşıyabilir; satır toplamı işlem sayısını
     AŞABİLİR. `_etiketsiz_` satırı kıyas tabanıdır.
+
+    `since` verilmezse varsayılan pencere son `FORENSICS_DEFAULT_SINCE`'tır:
+    "tüm zamanlar" hem DB'yi hem de okuyanı yanıltır (kayıt D21 ile başladı).
+    Üst sınır `FORENSICS_MAX_WINDOW_DAYS`; aşan değer 400 döner.
     """
     return await ScalpTracker().forensics_summary(
-        since=_parse_since(since), until=_parse_since(until)
+        since=_parse_since(since or FORENSICS_DEFAULT_SINCE),
+        until=_parse_since(until),
     )
 
 

@@ -80,6 +80,11 @@ ssh awa 'cd /opt/tradingbot-v2 && .venv/bin/python scripts/ledger_report.py --si
 - **Post-mortem gecikmelidir.** `noise_stop` etiketi kapanıştan
   `SCALPER_FORENSICS_POSTMORTEM_MIN` (vars. 60) dakika SONRA belirir; taze bir
   kapanışta yokluğu "yok" demek değildir, "henüz ölçülmedi" demektir.
+- **`postmortem.note` "ölçülemedi" diyorsa** (D21-R3) o işlem için mum verisi
+  3 denemede alınamamıştır (yavaş/erişilemez veri host'u ya da sembol o
+  kaynakta yok). Bu bir motor arızası DEĞİLDİR — ölçüm eksiğidir; kapanışın
+  kendisi ve `entry`/`exit` bölümleri etkilenmez. Ölçüm turu safety turunu
+  bloklamaz: ayrı bir task'ta koşar ve istek 5 sn'de kesilir.
 - **Kayıt bir kanıt değil, kanıt kaynağıdır.** Bir etiketin PnL'i kötü diye
   parametre değiştirmek CLAUDE.md yasak #1'i ihlal eder — önce 3 rejim
   penceresinde backtest.

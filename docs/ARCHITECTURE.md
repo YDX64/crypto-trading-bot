@@ -282,7 +282,7 @@ inceleme bulgusu; çelişki görürsen D19a bağlayıcıdır).
 | `src/trading/binance_client_improved.py` | İmzalı/imzasız REST istemcisi, okuma önbellekleri, ağırlık telemetrisi | `_get_account:711`, `get_position_risk:1360`, `get_all_positions:1424`, `_request_with_retry:329` (weight header, satır 391-415), `_invalidate_read_caches:161` |
 | `src/trading/position_manager.py` | Güvenli pozisyon açma/kapama, boşluksuz SL değişimi, acil kapatma | `UnprotectedPositionError:32`, `open_position:63`, `_emergency_close:416`, `replace_stop_loss:803` |
 | `src/strategies/scalper/forensics.py` | İşlem adli kaydı — SAF katman (D21): etiket kuralları, belge kurucuları, özet | `classify_entry`, `classify_exit`, `classify`, `build_entry`, `build_exit`, `postmortem_from_candles`, `summarize`, `TAG_LABELS` |
-| `src/strategies/scalper/forensics_log.py` | `logs/trades.jsonl` append-only olay akışı (günlük rotasyon, 30 gün) | `append`, `log_path` |
+| `src/strategies/scalper/forensics_log.py` | `logs/trades.jsonl` append-only olay akışı (günlük rotasyon, 30 gün); motor yolu kuyruğa yazar, disk yazımı ayrı iş parçacığında | `append_soon`, `append`, `drain`, `log_path` |
 | `src/models/scalp_trade.py` | `scalp_trades` ORM modeli | `ScalpTradeModel:16`, `forensics` (D21, JSON metni) |
 
 ### `config.py` — öne çıkan `SCALPER_*` ayarları (varsayılan → anlam)
@@ -529,22 +529,34 @@ alanındadır, `forensics.postmortem_from_candles` yalnız `closed_at`'ten SONRA
 kapanmış mumlara bakar (daha eskiler açıkça elenir) ve sonuç hiçbir karar
 yolunda okunmaz.
 
-**Restart davranışı:** `exits.recover()` ile kurtarılan bir pozisyonun
-BELLEKTEKİ giriş belgesi yoktur (DB'deki `entry` bölümü aynen durur), bu yüzden
-kapanışta yalnız ÇIKIŞ etiketleri türetilebilir. `tracker.record_close` bu
-nedenle `verdict`i ÜZERİNE YAZMAZ, mevcutla BİRLEŞTİRİR — aksi hâlde restart
-bir veri kaybına dönerdi. Maker modunda giriş bağlamı dolum anına kadar
-bellekte bekler (`executor._pending_forensics`); restart'ta kaybolur ve o tek
+**Restart davranışı (D21-R3):** `exits.recover()` DB'deki `forensics.entry`
+bölümünü belleğe GERİ YÜKLER (`_restore_forensics_entry`), bu yüzden restart
+sonrası kapanan bir işlemin `verdict`i giriş etiketlerini de taşır. Yalnız
+BELLEKTE tutulan çıkış zaman çizgisi damgaları (TP1/BE anı, trailing sayacı ve
+son trail stopu) restart'ta gerçekten kaybolmuştur: kapanış belgesi bunları
+`null` bırakır ve `exit.path.restart_gap = true` ile nedenini söyler — `0`
+yazmak "hiç olmadı" demek olurdu, yani uydurma. `path.initial_stop` de
+kurtarmadaki CANLI stop yerine giriş belgesindeki GERÇEK ilk stoptan gelir.
+`price_ts` KASITLI geri yüklenmez (karar-yolu tazelik damgası, D19a-2).
+`tracker.record_close` `verdict`i ÜZERİNE YAZMAZ, mevcutla BİRLEŞTİRİR. Maker
+modunda giriş bağlamı dolum anına kadar bellekte bekler
+(`executor._pending_forensics`, `sembol|yön|created_at_ms` kimliğiyle
+damgalıdır — kimlik tutmazsa bağlam atılır); restart'ta kaybolur ve o tek
 işlemin kaydı eksik kalır — işlem akışı ETKİLENMEZ.
 
 **REST maliyeti:** giriş/çıkış tarafında **sıfır** ek istek — bağlam yalnız
 senkron anlık görüntülerden (`_market_gate_status`, `tv_events.snapshot`,
 `_kline_source_snapshot`) ve `StrategyContext`'te ZATEN çekilmiş serilerden
 türetilir (`structure.py` ile aynı ilke). Tek ek istek post-mortem turundadır:
-`engine._forensics_postmortem_tick` safety turunda ama **dakikada en fazla bir
-kez** ve **tur başına EN FAZLA BİR sembol** için `1m` limit 150 (ağırlık 2)
-çeker — pratikte saatte birkaç istek, §2 ağırlık tablosunu anlamlı biçimde
-değiştirmez. `SCALPER_FORENSICS_POSTMORTEM_MIN=0` bu turu tamamen kapatır.
+`engine._forensics_postmortem_tick` safety turundan TETİKLENİR ama **AYRI bir
+task'ta** koşar (D21-R3 — tur onu beklemez), **dakikada en fazla bir kez** ve
+**tur başına EN FAZLA BİR sembol** için `SCALPER_TF_ENTRY` (varsayılan `5m`)
+limit 150 → **ağırlık 2** çeker; istek `asyncio.wait_for` ile **5 sn**'de
+kesilir. Üst sınır **saatte 60 istek / 120 ağırlık** (ortalama 2 ağırlık/dk);
+ölçülecek kapanış yoksa sıfır istek, yani §2 ağırlık tablosunu anlamlı biçimde
+değiştirmez. Host geneli bir piyasa-verisi kesintisinde tur hiç başlatılmaz
+(`exits._market_data_down_reason` ya da `MarketDataGuard.blocked_until`).
+`SCALPER_FORENSICS_POSTMORTEM_MIN=0` bu turu tamamen kapatır.
 
 **Okuma yolları:** `GET /scalper/trades/{id}/forensics` (tek işlem),
 `GET /scalper/forensics/recent?limit=` (liste),

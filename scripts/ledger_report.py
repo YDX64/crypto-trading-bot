@@ -606,28 +606,11 @@ def build_report(
     notes: List[str],
     forensics: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
+    # `forensics` YOKSA anahtar hiç eklenmez (renderer'lar `is not None` ile
+    # bölümü açar). Tek gövde: iki ayrı sözlük tutmak, birine eklenen bir
+    # alanın diğerinde unutulmasına davetiyedir (D21-R3, bulgu 5).
     headline = build_headline(trades, daily_changes, days)
-    if forensics is not None:
-        return {
-            "meta": {
-                "since": since.strftime("%Y-%m-%d %H:%M"),
-                "until": until.strftime("%Y-%m-%d %H:%M"),
-                "generated_at": datetime.now(timezone.utc).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ) + "Z",
-            },
-            "regime_direction": build_regime_direction_table(
-                trades, daily_changes, days
-            ),
-            "exit_reason_direction": build_exit_reason_direction_table(trades),
-            "symbol": build_symbol_table(trades),
-            "daily": build_daily_table(trades, daily_changes, days),
-            "headline": headline,
-            "checklist": build_checklist(headline, since, until),
-            "forensics": forensics,
-            "notes": notes,
-        }
-    return {
+    report: Dict[str, Any] = {
         "meta": {
             "since": since.strftime("%Y-%m-%d %H:%M"),
             "until": until.strftime("%Y-%m-%d %H:%M"),
@@ -639,8 +622,11 @@ def build_report(
         "daily": build_daily_table(trades, daily_changes, days),
         "headline": headline,
         "checklist": build_checklist(headline, since, until),
-        "notes": notes,
     }
+    if forensics is not None:
+        report["forensics"] = forensics
+    report["notes"] = notes
+    return report
 
 
 # --------------------------------------------------------------------------

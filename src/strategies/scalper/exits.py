@@ -1195,6 +1195,45 @@ class ExitManager:
                 f"kez loglanır, kapanış akışı ETKİLENMEZ"
             )
 
+    def _restore_forensics_entry(self, sp: ScalpPosition, trade: Any) -> None:
+        """Restart kurtarmasında DB'deki `forensics.entry`'yi belleğe geri al.
+
+        Düşmanca inceleme bulgusu 2 (D21-R3): `recover()` D21 damgalarını
+        (`tp1_at`/`be_at`/`trail_updates`/`last_trail_stop`…) geri yüklemiyordu,
+        bu yüzden restart sonrası kapanan bir işlemin ÇIKIŞ zaman çizgisi
+        yanlış okunuyordu (0 trailing güncellemesi = "hiç trail olmadı" gibi)
+        ve `verdict` yalnız çıkış etiketlerinden ibaret kalıyordu.
+
+        Doğru davranış: DB'de KAYITLI olan (`entry`) bölüm geri yüklenir —
+        bu gerçek bir ölçümdür. Yalnız BELLEKTE tutulan damgalar restart'ta
+        gerçekten kaybolmuştur; onlar `null` kalır ve kayıt
+        `path.restart_gap=true` ile bunu açıkça söyler. UYDURMA değer yazılmaz.
+
+        `price_ts` KASITLI olarak geri yüklenmez: o bir karar-yolu tazelik
+        damgasıdır (D19a-2, `breakeven_side_ok`); restart sonrası "taze"
+        göstermek stopu piyasanın ters tarafına koydurabilir. Adli kayıtta da
+        yeri yoktur.
+        """
+        try:
+            document = ScalpTracker.parse_forensics(
+                getattr(trade, "forensics", None)
+            ) or {}
+        except Exception as e:  # pragma: no cover - savunma
+            self._forensics_warn(f"recover_parse {type(e).__name__}: {e}")
+            document = {}
+        sp.forensics_restart_gap = True
+        entry_doc = document.get("entry")
+        if isinstance(entry_doc, dict):
+            sp.forensics_entry = entry_doc
+        opened_at = getattr(trade, "opened_at", None)
+        if opened_at is not None and sp.opened_epoch is None:
+            try:
+                if opened_at.tzinfo is None:
+                    opened_at = opened_at.replace(tzinfo=timezone.utc)
+                sp.opened_epoch = opened_at.timestamp()
+            except Exception:  # pragma: no cover - savunma
+                sp.opened_epoch = None
+
     def _build_exit_forensics(
         self,
         *,
@@ -1227,6 +1266,10 @@ class ExitManager:
                 except Exception as e:
                     self._forensics_warn(f"context_cb {type(e).__name__}: {e}")
 
+            entry_doc = getattr(sp, "forensics_entry", None)
+            entry_doc = entry_doc if isinstance(entry_doc, dict) else None
+            restart_gap = bool(getattr(sp, "forensics_restart_gap", False))
+
             path = {
                 "tp1_at": getattr(sp, "tp1_at", None),
                 "tp1_price": getattr(sp.plan, "tp1_price", None),
@@ -1243,6 +1286,17 @@ class ExitManager:
                 "final_stop": getattr(sp.position, "current_stoploss", None),
                 "age_hours": None if duration is None else round(duration / 3600.0, 3),
             }
+            if restart_gap:
+                # Restart kurtarması: aşağıdaki damgalar YALNIZ bellekteydi ve
+                # restart'ta kayboldu. `0` yazmak "hiç olmadı" der — bu bir
+                # uydurmadır. Bilinmeyen = `null`, ve `restart_gap` bunun
+                # nedenini söyler (D21-R3, bulgu 2).
+                path["restart_gap"] = True
+                if not path["trail_updates"]:
+                    path["trail_updates"] = None
+                # `plan.initial_stop` kurtarmada CANLI stop ile kurulur, ilk
+                # stop DEĞİLDİR. Gerçek ilk stop DB'deki giriş belgesindedir.
+                path["initial_stop"] = (entry_doc or {}).get("stop_price")
 
             exit_doc = fx.build_exit(
                 at=datetime.fromtimestamp(now, tz=timezone.utc).isoformat(
@@ -1267,7 +1321,6 @@ class ExitManager:
                 verification_notes=verification_notes,
             )
             thresholds = fx.thresholds_from_cfg(self.cfg)
-            entry_doc = getattr(sp, "forensics_entry", None)
             verdict = fx.classify(entry_doc, exit_doc, thresholds)
             return exit_doc, verdict
         except Exception as e:
@@ -1282,11 +1335,15 @@ class ExitManager:
         exit_document: Dict[str, Any],
         verdict: List[str],
     ) -> None:
-        """`logs/trades.jsonl`'e tek satır yaz (fail-safe)."""
+        """`logs/trades.jsonl`'e tek satır yaz (fail-safe, safety turunu bloklamaz).
+
+        `append_soon` kuyruğa koyar; disk yazımı ayrı yazıcı iş parçacığında
+        olur (D21-R3) — `_finalize_close` safety turunun ortasındadır.
+        """
         try:
             from src.strategies.scalper import forensics_log
 
-            forensics_log.append(
+            forensics_log.append_soon(
                 "exit",
                 {
                     "trade_id": int(trade_id),
@@ -2092,6 +2149,7 @@ class ExitManager:
             tp2_done=tp2_done,
             trailing_active=tp1_done or tp2_done,
         )
+        self._restore_forensics_entry(sp, trade)
         self.track(sp)
         self.logger.info(
             f"♻️ recover(): {symbol} #{trade.id} izlemeye geri alındı "

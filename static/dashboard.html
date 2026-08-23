@@ -1444,6 +1444,12 @@
 
   function renderForensicsCard(row){
     if (!row) return '<div class="placeholder small">yükleniyor…</div>';
+    // "Okunamadı" ile "kayıt yok" AYRI şeylerdir (D21-R3, bulgu 5): uç hata
+    // verdiğinde "kayıt yok" demek, ölçülmüş bir işlemi ölçülmemiş gösterir.
+    if (row.fx_error){
+      return '<div class="placeholder small">adli kayıt OKUNAMADI (' +
+        escapeHtml(row.fx_error) + ') — kart yeniden açılınca tekrar denenir</div>';
+    }
     if (!row.has_forensics){
       return '<div class="placeholder small">bu işlem için adli kayıt yok ' +
         '(D21 öncesi işlem ya da kayıt kapalıydı)</div>';
@@ -1577,9 +1583,17 @@
     }
     fxOpenId = id;
     renderTrades(lastTradesRes);
-    if (fxCache[id]) return;
+    // Hatalı yanıt önbellekte KALMAZ: kart yeniden açılınca tekrar denenir.
+    if (fxCache[id] && !fxCache[id].fx_error) return;
+    delete fxCache[id];
     fetchJSON("/scalper/trades/" + id + "/forensics").then(function(res){
-      fxCache[id] = res.ok ? res.data : { has_forensics: false };
+      if (res.ok){
+        fxCache[id] = res.data;
+      } else {
+        fxCache[id] = {
+          fx_error: res.networkError ? "bağlantı yok" : ("HTTP " + res.status)
+        };
+      }
       if (fxOpenId === id) renderTrades(lastTradesRes);
     });
   }

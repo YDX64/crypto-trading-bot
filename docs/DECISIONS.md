@@ -1569,9 +1569,13 @@ SONRAKİ mumlarla ve pencere DOLDUKTAN sonra hesaplanır, hiçbir karar yolunda
 okunmaz (`tests/test_forensics.py::TestPostmortem::
 test_candles_before_close_are_ignored`).
 
-**Maliyet:** giriş/çıkış tarafında SIFIR ek REST isteği. Post-mortem turu safety
-turunda ama dakikada en fazla bir kez ve tur başına EN FAZLA BİR sembol çalışır;
-istek `1m` limit 150 (ağırlık 2) — pratikte saatte birkaç istek.
+**Maliyet:** giriş/çıkış tarafında SIFIR ek REST isteği. Post-mortem safety
+turundan TETİKLENİR ama AYRI bir task'ta koşar (tur onu beklemez, bkz. D21-R3);
+dakikada en fazla bir tur ve tur başına EN FAZLA BİR sembol çalışır. İstek
+`SCALPER_TF_ENTRY` (varsayılan `5m`) limit 150 → **ağırlık 2**, `asyncio.wait_for`
+ile 5 sn'de kesilir. Üst sınır: dakikada 1 istek = **tepe saatte 60 istek /
+120 ağırlık** (ortalama 2 ağırlık/dk); ölçülmemiş kapanış yoksa sıfır istek —
+pratikte kapanış sayısı kadar, yani günde birkaç düzine.
 `SCALPER_FORENSICS_POSTMORTEM_MIN=0` bu turu tamamen kapatır.
 
 **Kanıt:** `tests/test_forensics.py` (97 test) + tüm paket yeşil (1722 test).
@@ -1583,6 +1587,52 @@ altyapısıdır.
 **Geri alma:** `.env`'de `SCALPER_FORENSICS_ENABLED=false` (kayıt durur, motor
 aynen çalışır). Tam geri alma: bu commit'i revert et; `scalp_trades.forensics`
 sütunu kalırsa zararsızdır (hiçbir kod yolu okumaz).
+
+#### D21-R3 — düşmanca inceleme düzeltmeleri · 2026-08-23
+
+D21 ile ÇELİŞİRSE **D21-R3 bağlayıcıdır**. Beş bulgu, hepsi regresyon testli
+(`tests/test_forensics.py`); hiçbiri karar yolunu (emir/kapı/çıkış) değiştirmez.
+
+1. **[medium] Post-mortem safety turunu bloklayabiliyordu.** `_safety_tick`
+   içinde `await`lenen `fetcher.get_klines` yavaş/5xx bir veri host'unda
+   `KlineFetcher`'ın 3 deneme × 15 sn'si yüzünden ~48 sn askıda kalır; bu süre
+   boyunca TP1→BE, trailing, reaper, rezervasyon senkronu ve kill-switch
+   gecikir, `/health` 503'e düşer ve watchdog restart eder (2026-08-14 yolu).
+   **Düzeltme:** tur `engine._forensics_postmortem_schedule()` ile AYRI bir
+   task'a alındı (safety turu beklemez); istek `asyncio.wait_for(..., 5 sn)`
+   ile kesiliyor; piyasa-verisi kesintisinde tur hiç başlatılmıyor (iki
+   bağımsız sinyal: `exits._market_data_down_reason` VE
+   `MarketDataGuard.blocked_until` — ikincisi açık pozisyon yokken ban'ı gören
+   tek sinyaldir, böylece geçici bir ban ölçülebilir bir kapanışı
+   "ölçülemedi"ye çevirmez); eşzamanlı EN FAZLA BİR post-mortem; başarısız
+   ölçüm en fazla 3 kez denenip `postmortem.note="ölçülemedi (…)"` ile
+   kapatılıyor (sonsuz yeniden deneme yok). `stop()` task'ı iptal eder.
+2. **[medium] `recover()` D21 damgalarını geri yüklemiyordu.** Restart sonrası
+   kapanan işlemin ÇIKIŞ zaman çizgisi yanlış okunuyordu (`trail_updates=0` =
+   "hiç trail olmadı" gibi) ve giriş etiketleri kayboluyordu. **Düzeltme:**
+   `exits._restore_forensics_entry` DB'deki `forensics.entry`'yi belleğe geri
+   alır (gerçek ölçüm), kapanış belgesi `path.restart_gap=true` taşır,
+   yalnız bellekte tutulan damgalar `null` kalır (UYDURMA değer yok) ve
+   `path.initial_stop` kurtarmadaki CANLI stop yerine giriş belgesindeki
+   GERÇEK ilk stoptan gelir. `price_ts` KASITLI geri yüklenmez (karar-yolu
+   tazelik damgası, D19a-2).
+3. **[low] JSONL yazımı `_entry_lock` altında senkrondu.** **Düzeltme:**
+   `forensics_log.append_soon` yalnız kuyruğa koyar; gerçek `write()` ayrı bir
+   daemon yazıcı iş parçacığındadır (`forensics-jsonl-writer`). Kuyruk üst
+   sınırı 2000 satır; taşarsa satır düşer ve tek sefer WARNING'e yazılır.
+   Senkron `append` yalnız test/araç yolunda kalır.
+4. **[low] Maker modunda yetim adli bağlam başka sinyale iliştirilebilirdi.**
+   **Düzeltme:** bağlam artık `PendingEntry` kurulduktan SONRA saklanır ve
+   `sembol|yön|created_at_ms` kimliğiyle damgalanır; dolumda kimlik yeniden
+   hesaplanıp karşılaştırılır, uyuşmazsa bağlam ATILIR ve WARNING düşer.
+5. **[low] Küçük sertleştirmeler.** `executor._forensics_warn` artık `getattr`
+   savunmalı; `/scalper/forensics/summary` `since` yokken varsayılan `7d`
+   kullanır, üst sınır 365 gündür ve aralık dışı/taşan değer **400** döner
+   (eskiden `9999999999d` → `timedelta` taşması → 500);
+   `tracker.postmortem_candidates` LIMIT'i "ölçülmüş" filtresinden SONRA
+   uygular (aksi hâlde en yeni 20 kapanış ölçülmüşse kuyruk sonsuza dek boş
+   görünüyordu); pano "okunamadı" ile "kayıt yok"u AYRI mesajla gösterir ve
+   hatayı önbelleğe almaz; `ledger_report.build_report` tek gövdeye indi.
 
 ## Reddedilen kararlar (kanıtla)
 

@@ -10,9 +10,15 @@ Kapsam:
   7. Tracker turu (gerçek geçici SQLite): giriş → çıkış → post-mortem.
   8. HTTP uçları (mock tracker).
   9. `scripts/ledger_report.py --forensics` bölümü ve etiket metni paritesi.
+ 10. D21-R3 düşmanca inceleme düzeltmeleri (bölüm 13): post-mortem'in safety
+     turunu bloklamaması, restart kurtarmasında adli birleştirme, JSONL
+     yazımının kilit dışına alınması, maker bağlam kimliği ve uç/rapor/pano
+     sertleştirmeleri.
 """
 
+import asyncio
 import json
+import queue
 import sqlite3
 import sys
 import time
@@ -1154,6 +1160,9 @@ class TestEnginePostmortemTick:
         )
 
         await engine._forensics_postmortem_tick()
+        # D21-R3: JSONL yazımı ayrı yazıcı iş parçacığındadır — dosyayı
+        # okumadan önce kuyruk boşaltılır.
+        assert forensics_log.drain() is True
 
         assert list(written) == [5]           # tur başına EN FAZLA BİR sembol
         assert written[5]["returned_to_entry"] is True
@@ -1548,3 +1557,561 @@ class TestLedgerReportForensics:
         ])
         report = json.loads(out.read_text(encoding="utf-8"))
         assert report["forensics"][0]["tag"] == "noise_stop"
+
+
+# --------------------------------------------------------------------------
+# 13) D21-R3 — düşmanca inceleme düzeltmeleri
+# --------------------------------------------------------------------------
+
+class TestPostmortemNeverBlocksSafetyTick:
+    """Bulgu 1: teşhis işi bir koruma işini ASLA geciktirmemeli."""
+
+    def _safety_engine(self, order):
+        engine = _forensics_engine(
+            cfg=SimpleNamespace(
+                scalper_forensics_enabled=True,
+                scalper_forensics_postmortem_min=60.0,
+            )
+        )
+        engine._kill_switch = False
+        engine._entry_halted = False
+        engine._entry_lock = asyncio.Lock()
+        engine.executor = SimpleNamespace(
+            pending_symbols=lambda: set(),
+            check_pending=_async_return([]),
+            cancel_all_pending=_async_return([]),
+        )
+
+        async def _step():
+            order.append("exits")
+
+        engine.exits = SimpleNamespace(step=_step, _market_data_down_reason=None)
+
+        async def _noop():
+            order.append("noop")
+
+        engine._apply_structure_exits = _noop
+        engine._apply_tv_event_exits = _noop
+        engine._reap_aged_positions = _noop
+        engine._track_opened_positions = lambda *a, **k: None
+        engine._sync_scalper_reservations = lambda: order.append("reservations")
+
+        async def _kill():
+            order.append("kill_switch")
+
+        engine._update_kill_switch = _kill
+        return engine
+
+    async def test_safety_tick_returns_before_the_postmortem_finishes(self):
+        order = []
+        engine = self._safety_engine(order)
+
+        async def _slow_tick():
+            order.append("postmortem_start")
+            await asyncio.sleep(0.2)
+            order.append("postmortem_end")
+
+        engine._forensics_postmortem_tick = _slow_tick
+
+        started = time.monotonic()
+        await engine._safety_tick()
+        elapsed = time.monotonic() - started
+
+        # Tur post-mortem'i BEKLEMEDİ ...
+        assert elapsed < 0.1
+        assert "postmortem_end" not in order
+        # ... ve koruma işleri (rezervasyon senkronu + kill switch) tamamlandı.
+        assert order[-2:] == ["reservations", "kill_switch"]
+
+        await asyncio.sleep(0.3)
+        assert "postmortem_end" in order
+
+    async def test_only_one_postmortem_runs_at_a_time(self):
+        order = []
+        engine = self._safety_engine(order)
+        runs = {"n": 0}
+
+        async def _slow_tick():
+            runs["n"] += 1
+            await asyncio.sleep(0.15)
+
+        engine._forensics_postmortem_tick = _slow_tick
+
+        engine._forensics_postmortem_schedule()
+        engine._forensics_postmortem_schedule()
+        engine._forensics_postmortem_schedule()
+        await asyncio.sleep(0.05)
+        assert runs["n"] == 1
+
+        await asyncio.sleep(0.2)
+        assert runs["n"] == 1
+        assert engine._forensics_postmortem_task is None   # referans temizlendi
+
+    async def test_market_data_outage_skips_the_round_entirely(self):
+        order = []
+        engine = self._safety_engine(order)
+        engine.exits._market_data_down_reason = "ban 418"
+        runs = {"n": 0}
+
+        async def _tick():
+            runs["n"] += 1
+
+        engine._forensics_postmortem_tick = _tick
+        engine._forensics_postmortem_schedule()
+        await asyncio.sleep(0.02)
+
+        assert runs["n"] == 0
+        # Sayaç HARCANMADI: kesinti bitince ilk turda yeniden denenir.
+        assert engine._forensics_postmortem_at == 0.0
+
+    async def test_ban_on_the_kline_host_also_skips_the_round(self):
+        """Açık pozisyon yokken `_market_data_down_reason` hiç dolmaz —
+        ban'ı gören tek sinyal guard'dır (D21-R3)."""
+        from src.strategies.scalper.data import MarketDataGuard, host_of
+
+        order = []
+        engine = self._safety_engine(order)
+        engine.fetcher = SimpleNamespace(base_url="https://data.example.test")
+        host = host_of("https://data.example.test")
+        MarketDataGuard.trip(host, "418 test banı", 120.0, hard=True)
+        try:
+            assert engine._forensics_postmortem_blocked() is not None
+            runs = {"n": 0}
+
+            async def _tick():
+                runs["n"] += 1
+
+            engine._forensics_postmortem_tick = _tick
+            engine._forensics_postmortem_schedule()
+            await asyncio.sleep(0.02)
+            assert runs["n"] == 0
+        finally:
+            MarketDataGuard._state(host).blocked_until = 0.0
+            MarketDataGuard._state(host).hard_ban = False
+        assert engine._forensics_postmortem_blocked() is None
+
+    async def test_task_exception_is_consumed_and_warned_once(self):
+        order = []
+        engine = self._safety_engine(order)
+
+        async def _boom():
+            raise RuntimeError("post-mortem patladı")
+
+        engine._forensics_postmortem_tick = _boom
+        engine._forensics_postmortem_schedule()
+        await asyncio.sleep(0.02)
+
+        assert engine._forensics_error_logged is True
+        assert engine._forensics_postmortem_task is None
+
+
+class TestPostmortemTimeoutAndAttemptBudget:
+    """Bulgu 1: yavaş host tur içinde beklenmez, sonsuz da denenmez."""
+
+    def _engine(self, get_klines, record):
+        cfg = SimpleNamespace(
+            scalper_forensics_enabled=True,
+            scalper_forensics_postmortem_min=60.0,
+            scalper_tf_entry="5m",
+        )
+
+        async def _candidates(**kwargs):
+            return [{"id": 7, "symbol": "SLOWUSDT",
+                     "closed_at": datetime.utcnow() - timedelta(minutes=90),
+                     "entry": {}, "exit": {}}]
+
+        return _forensics_engine(
+            cfg=cfg,
+            tracker=SimpleNamespace(postmortem_candidates=_candidates,
+                                    record_postmortem=record),
+            fetcher=SimpleNamespace(get_klines=get_klines),
+        )
+
+    async def test_slow_host_is_cut_off_and_retried_at_most_three_times(self):
+        marked = {}
+
+        async def _record(trade_id, postmortem):
+            marked[trade_id] = postmortem
+            return True
+
+        async def _hang(symbol, interval, limit):
+            await asyncio.sleep(5.0)
+            raise AssertionError("zaman aşımına düşmeliydi")
+
+        engine = self._engine(_hang, _record)
+        engine._FORENSICS_POSTMORTEM_TIMEOUT = 0.01
+
+        for attempt in range(3):
+            engine._forensics_postmortem_at = 0.0        # dakika kapısını aç
+            await engine._forensics_postmortem_tick()
+            if attempt < 2:
+                assert marked == {}                      # ertelendi, yazılmadı
+
+        assert "ölçülemedi" in marked[7]["note"]
+        assert "3 deneme" in marked[7]["note"]
+        assert marked[7]["returned_to_entry"] is None
+        # Sayaç temizlendi: aynı işlem kuyruğa geri dönerse sıfırdan başlar.
+        assert 7 not in engine._forensics_postmortem_attempts
+
+    async def test_successful_measurement_clears_the_attempt_counter(self):
+        closed_at = datetime.utcnow() - timedelta(minutes=90)
+        closed_ms = int(closed_at.replace(tzinfo=timezone.utc).timestamp() * 1000)
+        marked = {}
+
+        async def _record(trade_id, postmortem):
+            marked[trade_id] = postmortem
+            return True
+
+        async def _klines(symbol, interval, limit):
+            return [_candle(closed_ms + 60_000, high=101.0, low=99.0)]
+
+        engine = self._engine(_klines, _record)
+        engine._forensics_postmortem_attempts = {7: 2}
+        await engine._forensics_postmortem_tick()
+
+        assert 7 in marked
+        assert engine._forensics_postmortem_attempts == {}
+
+    async def test_kline_request_uses_the_configured_entry_timeframe(self):
+        """Maliyet metni (D21/ARCHITECTURE) `SCALPER_TF_ENTRY` demeli."""
+        seen = []
+        closed_at = datetime.utcnow() - timedelta(minutes=90)
+        closed_ms = int(closed_at.replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+        async def _klines(symbol, interval, limit):
+            seen.append((symbol, interval, limit))
+            return [_candle(closed_ms + 60_000, high=101.0, low=99.0)]
+
+        engine = self._engine(_klines, _async_return(True))
+        engine.cfg.scalper_tf_entry = "5m"
+        await engine._forensics_postmortem_tick()
+        assert seen == [("SLOWUSDT", "5m", 150)]
+
+
+class TestRecoverRestoresForensics:
+    """Bulgu 2: restart sonrası zaman çizgisi UYDURULMAZ, birleştirilir."""
+
+    def _manager(self):
+        manager = _exit_manager()
+        manager._forensics_error_logged = False
+        return manager
+
+    def test_entry_document_is_restored_from_the_database(self):
+        manager = self._manager()
+        sp = ScalpPosition(
+            trade_id=3,
+            signal=_exec_signal(),
+            position=SimpleNamespace(symbol="TESTUSDT"),
+            plan=SimpleNamespace(),
+            entry_candle_time=0,
+        )
+        opened_at = datetime.utcnow() - timedelta(hours=2)
+        trade = SimpleNamespace(
+            forensics=json.dumps({
+                "v": 1,
+                "entry": {"direction": "LONG", "stop_price": 98.0,
+                          "leader_gate": {"verdict": "etkin_değil"}},
+            }),
+            opened_at=opened_at,
+        )
+
+        manager._restore_forensics_entry(sp, trade)
+
+        assert sp.forensics_restart_gap is True
+        assert sp.forensics_entry["stop_price"] == 98.0
+        assert sp.opened_epoch == pytest.approx(
+            opened_at.replace(tzinfo=timezone.utc).timestamp()
+        )
+        # Karar-yolu tazelik damgası KASITLI geri yüklenmez (D19a-2).
+        assert sp.price_ts is None
+
+    def test_corrupt_document_does_not_raise(self):
+        manager = self._manager()
+        sp = ScalpPosition(
+            trade_id=3, signal=_exec_signal(),
+            position=SimpleNamespace(symbol="TESTUSDT"),
+            plan=SimpleNamespace(), entry_candle_time=0,
+        )
+        manager._restore_forensics_entry(
+            sp, SimpleNamespace(forensics="{bozuk", opened_at=None)
+        )
+        assert sp.forensics_entry is None
+        assert sp.forensics_restart_gap is True
+
+    def test_exit_document_marks_the_restart_gap_without_inventing_values(self):
+        manager = self._manager()
+        sp = _tracked_position(
+            tp1_at=None, be_at=None, be_price=None,
+            trail_updates=0, last_trail_stop=None,
+            forensics_restart_gap=True,
+            forensics_entry={"direction": "LONG", "stop_price": 97.5,
+                             "leader_gate": {"verdict": "etkin_değil"}},
+        )
+        doc, verdict = manager._build_exit_forensics(
+            symbol="TESTUSDT", sp=sp, exit_price=99.0, realized_pnl=-8.0,
+            gross_pnl=-7.5, pnl_source="binance_income_net", exit_reason="SL",
+            verification_notes=[],
+        )
+
+        path = doc["path"]
+        assert path["restart_gap"] is True
+        assert path["tp1_at"] is None and path["be_at"] is None
+        assert path["trail_updates"] is None       # "0" UYDURMA olurdu
+        # İlk stop kurtarmadaki CANLI stop değil, giriş belgesindeki gerçek.
+        assert path["initial_stop"] == 97.5
+        # Giriş belgesi geri geldiği için GİRİŞ etiketleri de türetilebiliyor.
+        assert fx.TAG_GATE_BYPASSED in verdict
+
+    def test_normal_close_is_unchanged_by_the_restart_branch(self):
+        manager = self._manager()
+        sp = _tracked_position()
+        doc, _verdict = manager._build_exit_forensics(
+            symbol="TESTUSDT", sp=sp, exit_price=101.0, realized_pnl=5.0,
+            gross_pnl=6.0, pnl_source="binance_income_net", exit_reason="TRAIL",
+            verification_notes=[],
+        )
+        path = doc["path"]
+        assert "restart_gap" not in path
+        assert path["trail_updates"] == 4
+        assert path["initial_stop"] == 99.0
+
+
+class TestForensicsLogQueue:
+    """Bulgu 3: disk yazımı çağıranın (ve `_entry_lock`ın) dışında."""
+
+    def test_append_soon_returns_before_the_write_happens(self, tmp_path,
+                                                          monkeypatch):
+        monkeypatch.setenv("TRADINGBOT_LOG_DIR", str(tmp_path))
+        forensics_log.reset_error_state()
+        calls = []
+        real_append = forensics_log.append
+
+        def _slow_append(event, payload, **kwargs):
+            time.sleep(0.15)
+            calls.append(event)
+            return real_append(event, payload, **kwargs)
+
+        monkeypatch.setattr(forensics_log, "append", _slow_append)
+
+        started = time.monotonic()
+        assert forensics_log.append_soon("entry", {"trade_id": 1}) is True
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.05          # çağıran yazımı BEKLEMEDİ
+        assert forensics_log.drain(timeout=5.0) is True
+        assert calls == ["entry"]
+        assert (tmp_path / "trades.jsonl").exists()
+
+    def test_queue_overflow_drops_the_new_line_and_warns_once(self, monkeypatch):
+        forensics_log.reset_error_state()
+        monkeypatch.setattr(forensics_log, "_queue", queue.Queue(1))
+        monkeypatch.setattr(forensics_log, "_ensure_writer", lambda: None)
+
+        assert forensics_log.append_soon("entry", {"trade_id": 1}) is True
+        assert forensics_log.append_soon("entry", {"trade_id": 2}) is False
+        assert forensics_log.queue_snapshot()["dropped"] == 1
+
+    def test_queued_line_lands_on_disk_after_drain(self, tmp_path,
+                                                   monkeypatch):
+        monkeypatch.setenv("TRADINGBOT_LOG_DIR", str(tmp_path))
+        forensics_log.reset_error_state()
+        assert forensics_log.append_soon("exit", {"trade_id": 9}) is True
+        assert forensics_log.drain(timeout=5.0) is True
+        line = json.loads(
+            (tmp_path / "trades.jsonl").read_text(encoding="utf-8").strip()
+        )
+        assert line["trade_id"] == 9
+
+    def test_payload_mutation_after_enqueue_does_not_change_the_line(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("TRADINGBOT_LOG_DIR", str(tmp_path))
+        forensics_log.reset_error_state()
+        payload = {"trade_id": 4, "symbol": "TESTUSDT"}
+        forensics_log.append_soon("entry", payload)
+        payload["symbol"] = "SONRADAN"
+        assert forensics_log.drain(timeout=5.0) is True
+        line = json.loads(
+            (tmp_path / "trades.jsonl").read_text(encoding="utf-8").strip()
+        )
+        assert line["symbol"] == "TESTUSDT"
+
+    def test_engine_paths_use_the_queue_not_the_blocking_writer(self):
+        """Sözleşme: motor yolunda senkron `append` çağrısı KALMAMALI."""
+        for name in ("executor.py", "exits.py", "engine.py"):
+            src = (
+                REPO_ROOT / "src" / "strategies" / "scalper" / name
+            ).read_text(encoding="utf-8")
+            assert "forensics_log.append(" not in src, name
+            assert "forensics_log.append_soon(" in src, name
+
+
+class TestPendingForensicsIdentity:
+    """Bulgu 4: yetim bağlam BAŞKA bir sinyale iliştirilemez."""
+
+    def _executor(self):
+        executor = ScalpExecutor(
+            client=_FakeClient(), pm=_FakePm(), tracker=_FakeTracker(),
+            cfg=_ExecCfg(),
+        )
+        return executor
+
+    def _pending(self, created_at_ms: int, direction=Direction.LONG):
+        import dataclasses
+
+        from src.strategies.scalper.executor import PendingEntry
+
+        signal = dataclasses.replace(_exec_signal(), direction=direction)
+        return PendingEntry(
+            signal=signal, order_id=1, client_order_id="cid-1",
+            limit_price=100.0, quantity=1.0, created_monotonic=0.0,
+            created_at_ms=created_at_ms,
+        )
+
+    def test_matching_identity_returns_the_context(self):
+        executor = self._executor()
+        pending = self._pending(1_700_000_000_000)
+        executor._store_pending_forensics(pending, {"source": "C"})
+        assert executor._take_pending_forensics(pending) == {"source": "C"}
+        # Tek kullanımlık: ikinci dolum aynı bağlamı YENİDEN almaz.
+        assert executor._take_pending_forensics(pending) is None
+
+    def test_orphan_context_is_dropped_for_a_different_signal(self):
+        executor = self._executor()
+        first = self._pending(1_700_000_000_000)
+        executor._store_pending_forensics(first, {"source": "C", "rr": 1.9})
+
+        # Aynı sembol, YENİ bir niyet (farklı zaman damgası): eski bağlam
+        # bu doluma iliştirilmemeli.
+        second = self._pending(1_700_000_600_000)
+        assert executor._take_pending_forensics(second) is None
+
+    def test_direction_flip_also_invalidates_the_context(self):
+        executor = self._executor()
+        stamp = 1_700_000_000_000
+        executor._store_pending_forensics(self._pending(stamp), {"source": "C"})
+        flipped = self._pending(stamp, direction=Direction.SHORT)
+        assert executor._take_pending_forensics(flipped) is None
+
+    def test_legacy_shaped_entry_is_ignored(self):
+        executor = self._executor()
+        pending = self._pending(1_700_000_000_000)
+        executor._pending_forensics["TESTUSDT"] = {"source": "C"}   # kimliksiz
+        assert executor._take_pending_forensics(pending) is None
+
+    async def test_context_is_stored_only_after_the_order_intent_exists(self):
+        """Emir hiç konmadıysa yetim bağlam BİRİKMEZ."""
+        executor = self._executor()
+        executor.cfg = _ExecCfg()
+        executor.cfg.scalper_entry_mode = "maker"
+        seen = {}
+
+        async def _open(signal, ctx, side, quantity, *, forensics=None):
+            seen["forensics"] = forensics
+
+        executor._open_maker_entry = _open
+        await executor.try_open(
+            _exec_signal(), _exec_ctx(), forensics={"source": "C"}
+        )
+
+        assert seen["forensics"]["source"] == "C"
+        assert executor._pending_forensics == {}     # saklama emirle birlikte
+
+
+class TestForensicsHardening:
+    """Bulgu 5: uç/rapor/pano sertleştirmeleri."""
+
+    def test_forensics_warn_survives_a_missing_flag(self):
+        executor = ScalpExecutor.__new__(ScalpExecutor)
+        from src.core.logger import app_logger
+
+        executor.logger = app_logger
+        executor._forensics_warn("test")            # AttributeError YOK
+        assert executor._forensics_error_logged is True
+
+    def test_huge_relative_since_is_a_400_not_a_500(self):
+        import src.main as main
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException) as err:
+            main._parse_since("9999999999d")
+        assert err.value.status_code == 400
+
+    def test_window_beyond_the_cap_is_rejected(self):
+        import src.main as main
+        from fastapi import HTTPException
+
+        assert main._parse_since("30d") is not None
+        with pytest.raises(HTTPException) as err:
+            main._parse_since(f"{main.FORENSICS_MAX_WINDOW_DAYS + 5}d")
+        assert err.value.status_code == 400
+        with pytest.raises(HTTPException):
+            main._parse_since("1990-01-01")
+
+    async def test_summary_defaults_to_seven_days(self, monkeypatch):
+        import src.main as main
+
+        seen = {}
+
+        async def _summary(since=None, until=None):
+            seen["since"] = since
+            return {"tags": []}
+
+        monkeypatch.setattr(
+            main, "ScalpTracker",
+            lambda: SimpleNamespace(forensics_summary=_summary),
+        )
+        await main.scalper_forensics_summary()
+        delta = datetime.utcnow() - seen["since"]
+        assert timedelta(days=6, hours=23) < delta < timedelta(days=7, hours=1)
+
+    async def test_candidate_limit_is_applied_after_the_measured_filter(
+        self, real_tracker
+    ):
+        """En yeni kapanışlar ölçülmüşse kuyruk BOŞ görünmemeli."""
+        now = datetime.utcnow()
+        rows = []
+        for i in range(6):
+            measured = i < 4          # en yeni 4'ü zaten ölçülmüş
+            document = {"v": 1, "entry": {}, "exit": {}}
+            if measured:
+                document["postmortem"] = {"candles_seen": 3}
+            rows.append((i, now - timedelta(minutes=90 + i), document))
+
+        async with tracker_module.AsyncSessionLocal() as session:
+            for idx, closed_at, document in rows:
+                session.add(ScalpTradeModel(
+                    strategy="C", symbol=f"S{idx}USDT", direction="LONG",
+                    entry_price=100.0, quantity=1.0, leverage=20,
+                    margin_usdt=10.0, status="CLOSED", closed_at=closed_at,
+                    signal_reason="test", forensics=json.dumps(document),
+                ))
+            await session.commit()
+
+        candidates = await real_tracker.postmortem_candidates(
+            now=now, min_age_minutes=60.0, limit=2
+        )
+        assert [row["symbol"] for row in candidates] == ["S4USDT", "S5USDT"]
+
+    def test_build_report_has_one_body_for_both_branches(self):
+        module = _load_ledger_report()
+        args = ([], {}, datetime(2026, 8, 20), datetime(2026, 8, 22),
+                ["2026-08-20"], ["not"])
+        plain = module.build_report(*args)
+        tagged = module.build_report(*args, forensics=[])
+
+        assert "forensics" not in plain
+        assert tagged["forensics"] == []
+        assert set(tagged) - set(plain) == {"forensics"}
+        for key in plain:
+            if key != "meta":
+                assert tagged[key] == plain[key], key
+
+    def test_dashboard_separates_read_error_from_missing_record(self):
+        html = (REPO_ROOT / "static" / "dashboard.html").read_text(
+            encoding="utf-8"
+        )
+        assert "adli kayıt OKUNAMADI" in html
+        assert "row.fx_error" in html
+        # Hatalı yanıt önbellekte KALMAZ (yeniden denenebilir).
+        assert "!fxCache[id].fx_error" in html

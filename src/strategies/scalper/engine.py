@@ -158,6 +158,15 @@ class ScalperEngine:
     _VIRTUAL_EQUITY_CACHE_TTL = 30.0
     _EXCHANGE_PROBE_INTERVAL = 30.0
     _RESERVATION_OWNER = "scalper"
+    # D21 post-mortem: mum isteği için üst sınır. `KlineFetcher` kendi içinde
+    # 3 deneme × 15 sn yeniden dener; yavaş/5xx bir veri host'unda bu ~48 sn
+    # eder. Post-mortem AYRI bir task'ta koşsa bile açık uçlu beklemez: bir
+    # teşhis isteği bir sonraki turu ve `stop()`u geciktirmemelidir.
+    _FORENSICS_POSTMORTEM_TIMEOUT = 5.0
+    # Aynı işlem için azami ölçüm denemesi; sonra "ölçülemedi" yazılır.
+    # Sonsuz yeniden deneme kuyruğun BAŞINI tıkar (aday listesi kapanış
+    # zamanına göre sıralıdır) ve her dakika boşa istek yakar.
+    _FORENSICS_POSTMORTEM_MAX_ATTEMPTS = 3
     # Piyasa verisi kesintisi uyarısının azami sıklığı (sn). Tarama turu 30
     # sn'de bir döner; uzun bir banda (180 sn+) her tur satır basmak logu
     # doldurur ve gerçek olayları gizler.
@@ -284,6 +293,14 @@ class ScalperEngine:
         self._forensics_error_logged: bool = False
         # Post-mortem turu (kapanıştan N dk sonra) için son çalıştırma anı.
         self._forensics_postmortem_at: float = 0.0
+        # Post-mortem AYRI bir arka plan task'ında koşar: safety turu onu
+        # BEKLEMEZ (D21-R3, düşmanca inceleme bulgusu 1). Aynı anda EN FAZLA
+        # BİR post-mortem çalışır; referans burada tutulur ki `stop()` onu
+        # iptal edebilsin ve ikinci bir tur başlatılmasın.
+        self._forensics_postmortem_task: Optional[asyncio.Task] = None
+        # trade_id -> başarısız ölçüm denemesi. 3'te bir kez "ölçülemedi"
+        # yazılır; sonsuz yeniden deneme kuyruğu tıkar.
+        self._forensics_postmortem_attempts: Dict[int, int] = {}
         self._balance_cache: Tuple[Optional[float], float] = (None, 0.0)
         self._daily_pnl: float = 0.0
         self._daily_pnl_source: str = "unavailable"
@@ -439,7 +456,14 @@ class ScalperEngine:
         self.running = False
         tasks = [
             task
-            for task in (self._task, self._safety_task, self._exchange_task)
+            for task in (
+                self._task,
+                self._safety_task,
+                self._exchange_task,
+                # D21 post-mortem arka plan task'ı: kapanışta askıda kalmasın
+                # (yalnız teşhis işi — iptali hiçbir koruma işini etkilemez).
+                getattr(self, "_forensics_postmortem_task", None),
+            )
             if task is not None
         ]
         for task in tasks:
@@ -1086,9 +1110,14 @@ class ScalperEngine:
         # "yaş" değil "TV_EVENT" olarak etiketlenmeli.
         await self._apply_tv_event_exits()
         await self._reap_aged_positions()
-        # D21 post-mortem: TÜM çıkış/koruma işlerinden SONRA (bir teşhis işi
-        # asla bir koruma işini geciktirmez) ve dakikada en fazla bir kez.
-        await self._forensics_postmortem_tick()
+        # D21 post-mortem: TÜM çıkış/koruma işlerinden SONRA ve AYRI bir
+        # task'ta — safety turu onu BEKLEMEZ. Yavaş/5xx bir veri host'unda
+        # `get_klines` üç deneme × 15 sn boyunca askıda kalabilir; bunu tur
+        # içinde beklemek TP1→BE, trailing ve kill-switch'i geciktirir,
+        # `/health` 503'e düşer ve watchdog restart'ı davet eder
+        # (2026-08-14 dersi). Bir teşhis işi asla bir koruma işini
+        # geciktirmez.
+        self._forensics_postmortem_schedule()
         self._sync_scalper_reservations()
         was_blocked = self._kill_switch or self._entry_halted
         await self._update_kill_switch()
@@ -1969,17 +1998,21 @@ class ScalperEngine:
             self._forensics_warn(f"close_context {type(e).__name__}: {e}")
             return {}
 
-    async def _forensics_postmortem_tick(self) -> None:
-        """Kapanıştan N dk SONRA "fiyat girişe döndü mü" alanını doldur.
+    def _forensics_postmortem_schedule(self) -> None:
+        """Post-mortem turunu ARKA PLANDA başlat — safety turu BEKLEMEZ.
 
-        **Look-ahead değildir:** yalnız kapanış zamanından SONRAKİ mumlara
-        bakar ve sonucu kaydın AYRI `postmortem` alanına yazar; hiçbir kapı,
-        boyutlama ya da çıkış kararı bu alanı okumaz.
+        Düşmanca inceleme bulgusu 1 (D21-R3): tur içinde `await` edilen bir
+        mum isteği yavaş/5xx bir veri host'unda ~48 sn (3 deneme × 15 sn)
+        askıda kalır ve TP1→BE, trailing, kill-switch ile rezervasyon
+        senkronunu geciktirir; `/health` 503'e düşer, watchdog restart eder.
+        Bu yüzden ölçüm ayrı bir task'a alınır:
 
-        Maliyet: tur başına EN FAZLA BİR sembol (2026-08-14 watchdog dersi:
-        bir safety turu asla uzun sürmemeli) ve mum isteği tarama turununkiyle
-        AYNI biçimdedir (`KlineFetcher` TTL önbelleğine düşebilir). Post-mortem
-        penceresi `SCALPER_FORENSICS_POSTMORTEM_MIN=0` ile tamamen kapatılır.
+        * eşzamanlı EN FAZLA BİR post-mortem (task referansı kontrol edilir),
+        * host geneli piyasa-verisi kesintisinde tur hiç başlatılmaz,
+        * dakikada en fazla bir kez (teşhis işi, koruma işi değil).
+
+        Bu fonksiyon SENKRONDUR ve hiçbir şeyi beklemez; hatası da motoru
+        düşürmez (`_forensics_postmortem_done` istisnayı tüketir).
         """
         if not self._forensics_enabled():
             return
@@ -1987,6 +2020,94 @@ class ScalperEngine:
             getattr(self.cfg, "scalper_forensics_postmortem_min", 60.0) or 0.0
         )
         if window_min <= 0:
+            return
+        task = getattr(self, "_forensics_postmortem_task", None)
+        if task is not None and not task.done():
+            return
+        if self._forensics_postmortem_blocked() is not None:
+            return
+        if time.monotonic() - float(
+            getattr(self, "_forensics_postmortem_at", 0.0)
+        ) < 60.0:
+            return
+        try:
+            new_task = asyncio.create_task(
+                self._forensics_postmortem_tick(),
+                name="scalper-forensics-postmortem",
+            )
+        except RuntimeError:  # pragma: no cover - çalışan olay döngüsü yok
+            self._forensics_postmortem_task = None
+            return
+        self._forensics_postmortem_task = new_task
+        new_task.add_done_callback(self._forensics_postmortem_done)
+
+    def _forensics_postmortem_done(self, task: "asyncio.Task") -> None:
+        """Task bitince istisnayı TÜKET: teşhis işi motoru asla düşürmez."""
+        if getattr(self, "_forensics_postmortem_task", None) is task:
+            self._forensics_postmortem_task = None
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self._forensics_warn(f"postmortem_task {type(exc).__name__}: {exc}")
+
+    def _forensics_postmortem_blocked(self) -> Optional[str]:
+        """Tur atlanmalı mı? (atlanmalıysa neden metni, değilse None)
+
+        İki bağımsız sinyal:
+
+        1. `exits._market_data_down_reason` — BU safety turunda host geneli bir
+           piyasa-verisi kesintisi görüldü (trailing zaten atlandı).
+        2. `MarketDataGuard.blocked_until` — kline host'u ban/kesici altında.
+           (1) yalnız AÇIK POZİSYON varken dolar; ban sırasında hiç pozisyon
+           yoksa tek uyarı budur.
+
+        Kesinti sırasında teşhis isteği atmak ne veri getirir ne de ağırlık
+        bütçesi bırakır: tur hiç başlatılmaz ve deneme sayacı HARCANMAZ —
+        yani geçici bir ban, ölçülebilir bir kapanışı "ölçülemedi"ye çevirmez.
+        """
+        reason = getattr(
+            getattr(self, "exits", None), "_market_data_down_reason", None
+        )
+        if reason:
+            return str(reason)
+        try:
+            base_url = str(getattr(self.fetcher, "base_url", "") or "")
+            if base_url:
+                blocked_until = MarketDataGuard.blocked_until(host_of(base_url))
+                if blocked_until and time.time() < blocked_until:
+                    return f"kline host'u ban altında ({blocked_until:.0f}'a kadar)"
+        except Exception:  # pragma: no cover - teşhis kapısı asla patlamamalı
+            return None
+        return None
+
+    async def _forensics_postmortem_tick(self) -> None:
+        """Kapanıştan N dk SONRA "fiyat girişe döndü mü" alanını doldur.
+
+        **Look-ahead değildir:** yalnız kapanış zamanından SONRAKİ mumlara
+        bakar ve sonucu kaydın AYRI `postmortem` alanına yazar; hiçbir kapı,
+        boyutlama ya da çıkış kararı bu alanı okumaz.
+
+        Maliyet: tur başına EN FAZLA BİR sembol ve dakikada en fazla bir tur;
+        istek `SCALPER_TF_ENTRY` (varsayılan 5m) limit 150'dir (ağırlık 2) ve
+        `asyncio.wait_for` ile 5 sn'de kesilir. Post-mortem penceresi
+        `SCALPER_FORENSICS_POSTMORTEM_MIN=0` ile tamamen kapatılır.
+
+        Bu fonksiyon `_forensics_postmortem_schedule` tarafından AYRI bir
+        task'ta çalıştırılır; safety turu onu beklemez.
+        """
+        if not self._forensics_enabled():
+            return
+        window_min = float(
+            getattr(self.cfg, "scalper_forensics_postmortem_min", 60.0) or 0.0
+        )
+        if window_min <= 0:
+            return
+        blocked = self._forensics_postmortem_blocked()
+        if blocked is not None:
+            # Sayaç HARCANMAZ ve `_forensics_postmortem_at` tazelenmez:
+            # kesinti bitince ilk turda yeniden denenir.
+            self.logger.debug(f"Post-mortem turu atlandı (piyasa verisi yok): {blocked}")
             return
         now = time.monotonic()
         # Dakikada bir yeter: bu bir teşhis işidir, bir koruma değil.
@@ -2013,7 +2134,10 @@ class ScalperEngine:
                 closed_at.replace(tzinfo=timezone.utc).timestamp() * 1000
             )
             tf_entry = str(getattr(self.cfg, "scalper_tf_entry", "5m") or "5m")
-            candles = await self.fetcher.get_klines(symbol, tf_entry, 150)
+            candles = await asyncio.wait_for(
+                self.fetcher.get_klines(symbol, tf_entry, 150),
+                timeout=self._FORENSICS_POSTMORTEM_TIMEOUT,
+            )
             postmortem = fx.postmortem_from_candles(
                 entry=row.get("entry"),
                 exit_=row.get("exit"),
@@ -2028,10 +2152,11 @@ class ScalperEngine:
                     "pencereyi kapsayan mum bulunamadı; ölçüm yapılamadı"
                 )
             await self.tracker.record_postmortem(int(row["id"]), postmortem)
+            self._forensics_postmortem_attempt_clear(row)
             try:
                 from src.strategies.scalper import forensics_log
 
-                forensics_log.append(
+                forensics_log.append_soon(
                     "postmortem",
                     {
                         "trade_id": int(row["id"]),
@@ -2041,6 +2166,16 @@ class ScalperEngine:
                 )
             except Exception as e:  # pragma: no cover - savunma
                 self._forensics_warn(f"postmortem_log {type(e).__name__}: {e}")
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            # Veri host'u yavaş: tur zaten kesildi (safety turu ETKİLENMEDİ).
+            # Deneme sayılır; 3'ünde de dönmezse "ölçülemedi" yazılır.
+            await self._forensics_postmortem_defer(
+                row,
+                f"veri host'u {self._FORENSICS_POSTMORTEM_TIMEOUT:g} sn içinde "
+                f"yanıt vermedi",
+            )
         except MarketDataRequestError as e:
             # SEMBOL kapsamlı ve KALICI hata (ör. `-1121 Invalid symbol` —
             # ayrı market-data host'unda gerçekçidir). Her dakika yeniden
@@ -2049,16 +2184,67 @@ class ScalperEngine:
             # arkasındaki hiçbir işlem ölçülemez. "Ölçülemedi" diye işaretle
             # ve geç (bir kayıt eksiği, kilitlenmiş bir kuyruktan iyidir).
             if row is not None:
+                self._forensics_postmortem_attempt_clear(row)
                 await self._forensics_mark_unmeasured(
-                    row, f"sembol veri kaynağında bulunamadı ({e})"
+                    row, f"ölçülemedi: sembol veri kaynağında bulunamadı ({e})"
                 )
         except MarketDataUnavailable as e:
-            # HOST geneli (ban/bütçe): geçicidir, işaretleme YAPILMAZ —
-            # sonraki turda aynı satır yeniden denenir. Teşhis işi için tek
-            # WARNING satırı bile fazladır (tarama turu zaten uyarıyor).
+            # HOST geneli (ban/bütçe): geçicidir ama sonsuz da olamaz —
+            # kuyruğun BAŞINI tıkamasın diye deneme bütçesinden düşülür.
+            # Teşhis işi için tek WARNING satırı bile fazladır (tarama turu
+            # zaten uyarıyor).
             self.logger.debug(f"Post-mortem atlandı (piyasa verisi yok): {e}")
+            await self._forensics_postmortem_defer(row, f"piyasa verisi yok ({e})")
         except Exception as e:
+            await self._forensics_postmortem_defer(row, f"{type(e).__name__}: {e}")
             self._forensics_warn(f"postmortem {type(e).__name__}: {e}")
+
+    def _forensics_postmortem_attempts_map(self) -> Dict[int, int]:
+        attempts = getattr(self, "_forensics_postmortem_attempts", None)
+        if not isinstance(attempts, dict):
+            attempts = {}
+            self._forensics_postmortem_attempts = attempts
+        return attempts
+
+    def _forensics_postmortem_attempt_clear(self, row: Optional[Dict[str, Any]]) -> None:
+        if not row:
+            return
+        try:
+            self._forensics_postmortem_attempts_map().pop(int(row.get("id") or 0), None)
+        except Exception:  # pragma: no cover - savunma
+            pass
+
+    async def _forensics_postmortem_defer(
+        self, row: Optional[Dict[str, Any]], note: str
+    ) -> None:
+        """Ölçüm başarısız: denemeyi say, bütçe dolunca "ölçülemedi" yaz.
+
+        Sonsuz yeniden deneme YOKTUR: aynı işlem için en fazla
+        `_FORENSICS_POSTMORTEM_MAX_ATTEMPTS` deneme yapılır, sonra kayda
+        `note="ölçülemedi (...)"` düşülür ve satır kuyruktan çıkar.
+        """
+        if not row:
+            return
+        attempts = self._forensics_postmortem_attempts_map()
+        try:
+            trade_id = int(row.get("id") or 0)
+        except (TypeError, ValueError):  # pragma: no cover - savunma
+            return
+        count = int(attempts.get(trade_id, 0)) + 1
+        if len(attempts) > 256:
+            # Sayaç sözlüğü sızmasın: aday penceresi zaten 12 saatliktir.
+            attempts.clear()
+        attempts[trade_id] = count
+        if count < self._FORENSICS_POSTMORTEM_MAX_ATTEMPTS:
+            self.logger.debug(
+                f"Post-mortem ertelendi (#{trade_id}, deneme {count}/"
+                f"{self._FORENSICS_POSTMORTEM_MAX_ATTEMPTS}): {note}"
+            )
+            return
+        attempts.pop(trade_id, None)
+        await self._forensics_mark_unmeasured(
+            row, f"ölçülemedi ({count} deneme): {note}"
+        )
 
     async def _forensics_mark_unmeasured(
         self, row: Dict[str, Any], note: str
