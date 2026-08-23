@@ -497,6 +497,78 @@ KORUMA yoktur. Sırayla bak:
 ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date +%Y%m%d)-marketgate-off && { grep -q "^SCALPER_MARKET_GATE=" .env && sed -i "s/^SCALPER_MARKET_GATE=.*/SCALPER_MARKET_GATE=false/" .env || echo "SCALPER_MARKET_GATE=false" >> .env; } && ./.venv/bin/python -c "from src.core.config import settings as s; assert not s.scalper_market_gate, \"KAPI HÂLÂ AÇIK\"; print(\"gate=\", s.scalper_market_gate)" && supervisorctl restart tradingbot_v2'
 ```
 Varsayılan zaten kapalı (satırı silmek de eşdeğerdir); kod geri alınmasına gerek yok.
+## Kline kaynağını mainnet'e alma (`SCALPER_MARKET_DATA_BASE_URL`, D17)
+Ne yapar: YALNIZ public `/fapi/v1/klines` çekimi verilen host'tan yapılır. Emir, bakiye,
+pozisyon, evren taraması (`ticker/24hr`), `exchangeInfo` ve income `BINANCE_BASE_URL`'de
+KALIR — API anahtarı bu host'a asla gitmez. Amaç: testnet'te işlem yaparken RSI/Bollinger/
+diverjans/rejim/ATR'yi GERÇEK piyasa mumlarından hesaplamak ve backtest harness'iyle (zaten
+mainnet) aynı veriye oturmak. Ayrıntı: `docs/DECISIONS.md` D17.
+
+⚠️ **Bu bir soak değişikliğidir**, ayar değil sinyal etkiler: yürüyen bir soak varken AÇMA
+(değişiklikler üst üste bindirilirse atıf bulanıklaşır — bkz. D11 notu). **D16 risk paketi
+2026-08-23 03:10 sunucu saatinde GERİ ALINDI**, yani bugün geçerli olan tek demet **D6**'dır;
+"D6+D16 soak" ifadesi geçen eski metinler bu yüzden düzeltildi. Ayrı host kullanırken
+`SCALPER_SYMBOL_ALLOWLIST` dolu olsun: işlem host'unda olup veri host'unda olmayan bir sembol
+her taramada `Kline çekme kalıcı hata ... code=-1121` satırı üretir (tur kesilmez, yalnız o
+sembol atlanır).
+
+⚠️ `sed -i` eşleşme bulamazsa 0 ile çıkar (gölge modu bölümündeki tuzağın aynısı) — bu yüzden
+`{ grep -q ... && sed ... || echo ...; }` grubu + restart'tan ÖNCE `assert`'li geri-okuma:
+```bash
+ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date -u +%Y%m%d-%H%M%S)-klinesrc && { grep -q "^SCALPER_MARKET_DATA_BASE_URL=" .env && sed -i "s#^SCALPER_MARKET_DATA_BASE_URL=.*#SCALPER_MARKET_DATA_BASE_URL=https://fapi.binance.com#" .env || echo "SCALPER_MARKET_DATA_BASE_URL=https://fapi.binance.com" >> .env; } && ./.venv/bin/python -c "from src.core.config import settings as s; assert s.kline_source == \"separate\", \"KLINE KAYNAĞI DEĞİŞMEDİ — .env yazılmadı\"; print(\"market_data=\", s.market_data_base_url, \"| trading=\", s.binance_base_url)" && supervisorctl restart tradingbot_v2'
+```
+(Yedek damgası saat-dakika-saniye içerir — `server_deploy.sh`'nin `STAMP` deseni:
+`date +%Y%m%d` kullanılsaydı aynı gün ikinci koşu TEMİZ yedeği ezerdi ve ertesi gün
+"aynı-gün yedeği" hiç bulunmazdı.)
+**ZORUNLU doğrulama — dördü geçmeden değişiklik YAPILMIŞ SAYILMAZ:**
+1. Yukarıdaki komutun kendi `assert`'i restart'tan ÖNCE `market_data= https://fapi.binance.com |
+   trading= https://testnet.binancefuture.com` basmalı (basmazsa komut `AssertionError` ile durur,
+   restart hiç çalışmaz).
+2. `.env` satırının gerçekten yazıldığı (yorum satırı/çift satır tuzağı):
+   `ssh awa "grep -n '^SCALPER_MARKET_DATA_BASE_URL=' /opt/tradingbot-v2/.env"` → **tek** satır
+   ve değeri `https://fapi.binance.com` olmalı.
+3. Restart sonrası (~90 sn) BANNER satırı — kaynak: `engine._log_kline_source()`:
+   `ssh awa 'grep "📡 Kline kaynağı" /opt/tradingbot-v2/logs/bot.log | tail -1'` (SON satır —
+   `-m1` kullanma, dosyadaki İLK/eski restart'ı gösterir) →
+   `📡 Kline kaynağı: fapi.binance.com (AYRI — emirler: testnet.binancefuture.com)`.
+4. Çalışan süreçten (`GET /scalper/status`, alanlar `engine._kline_source_snapshot()`):
+   ```bash
+   curl -sS http://127.0.0.1:9091/scalper/status | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['kline_source']=='separate', d['kline_source']; assert d['scan_status']=='ok', d['scan_status']; print(d['market_data_base_url'], d['trading_base_url'], d['market_data_guard'])"
+   ```
+**İlk saat — gerçekten basılan dizeler** (eski metin, bilinmeyen-sembol yolunun HİÇ basmadığı
+bir dize arıyordu; aşağıdakiler koddan doğrulanmıştır):
+
+| Ne aranır | Anlamı / eylem |
+|---|---|
+| `grep -c "Kline çekme kalıcı hata" logs/bot.log` | Sembol veri host'unda YOK (`code=-1121`). Allowlist'ten çıkar. |
+| `grep -c "Piyasa verisi host geneli engel" logs/bot.log` | 401/403/451 — WAF/coğrafi engel. Ayarı geri al. |
+| `grep -c "🚫 Piyasa verisi IP ban" logs/bot.log` | GERÇEK ban (418/-1003). Ayarı geri al; **ban aktifken restart YASAK**. |
+| `grep -c "⏳ Piyasa verisi hız sınırı" logs/bot.log` | Tek başına 429 (soft throttle) — ban değil; tekrarlıyorsa bütçeyi/TOP_N'i düşür. |
+| `grep -c "⚖️ Piyasa verisi ağırlık bütçesi doldu" logs/bot.log` | Kendi 600/dk tavanımız bağladı — hesap (ARCHITECTURE §2) ile gerçek arasında sapma var. |
+| `grep -c "koruma tarafında değil" logs/bot.log` | Ötelenmiş trailing SL yanlış tarafa düştü, emir gönderilmedi. Sürekliyse iki defter arasındaki baz bozuk. |
+
+Hepsi 0 olmalı. Çalışan süreçten aynı üç sayaç:
+```bash
+curl -sS http://127.0.0.1:9091/scalper/status | python3 -c "import sys,json; d=json.load(sys.stdin); print('kline_source=',d['kline_source'],'| scan_status=',d['scan_status'],'| guard=',d.get('market_data_guard'),'| trailing_skips=',d.get('trailing_skips'))"
+```
+`scan_status` `"ok"` olmalı; `"degraded:market_data"` = son tarama turu piyasa verisi
+kesintisiyle YARIDA kesildi (sağlık yeşil kalır — bilinçli, watchdog restart'ı ban ortasında
+felaket yoludur). `market_data_guard.hard_ban=true` = gerçek ban.
+
+ℹ️ Yan etki (bilinçli): GERÇEK ban satırı `HTTP 418`/`banned` içerdiği için
+`scripts/server_deploy.sh`'nin "son 15 dk'da ban izi" kilidi MAİNNET VERİ banında da deploy'u
+reddeder — testnet emirleri etkilenmemiş olsa bile. Yanlış-pozitif tarafta kalmak bilinçli
+tercihtir; acil deploy gerekiyorsa önce ayarı geri al, 15 dk bekle. Tek başına 429 bu kilidi
+**tetiklemez** (satırda "banned" geçmez) — bir hız uyarısı deploy'u 15 dakika kilitlememeli.
+
+**Geri alma (tek satır, restart dahil — YEDEK DOSYASINA BAĞLI DEĞİL):**
+```bash
+ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date -u +%Y%m%d-%H%M%S)-klinesrc-off && { grep -q "^SCALPER_MARKET_DATA_BASE_URL=" .env && sed -i "s#^SCALPER_MARKET_DATA_BASE_URL=.*#SCALPER_MARKET_DATA_BASE_URL=#" .env || true; } && ./.venv/bin/python -c "from src.core.config import settings as s; assert s.kline_source == \"trading_host\", \"KLINE KAYNAĞI HÂLÂ AYRI — .env yazılmadı\"; print(\"kline_source=\", s.kline_source)" && supervisorctl restart tradingbot_v2'
+```
+Bilinçli olarak `cp backups/env.bak-...` KULLANILMAZ: soak günlerce sürer, "bugünün"
+yedeği ertesi gün yoktur ve acil geri alma tam da o anda `cp: No such file` ile ölürdü.
+Satırı boşaltmak = varsayılan (kapalı); silmek de eşdeğerdir. Restart sonrası aynı dört
+doğrulamayı `trading_host` bekleyerek tekrarla.
 
 ## Güvenlik borçları
 1. Webhook düz HTTP + IP, secret sorgu dizesinde. Erişim logu kısmı ÇÖZÜLDÜ (D9,

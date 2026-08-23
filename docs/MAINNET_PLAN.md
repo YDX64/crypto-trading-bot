@@ -36,7 +36,21 @@ Aynı kod, farklı env. Halka C asla `origin/main`'in ucunu almaz; yalnız B'de 
   "SHADOW" olarak kaydedilir, emir GÖNDERİLMEZ. Yeni parametre mainnet'te önce 3 gün gölge.
   Ayrıntı: `docs/DECISIONS.md` D14, `docs/RUNBOOK.md` "Gölge modu".
 - **Mutabakat:** her gün `scalp_trades` ↔ Binance income (close ledger var) farkı > %1 ise Telegram uyarı + halt.
+- **Piyasa verisi kaynağı (D17):** mainnet halkasında `SCALPER_MARKET_DATA_BASE_URL` **boş ya da
+  mainnet host'u** olmalıdır — testnet host'u startup'ta reddedilir (`_validate_binance_environment`),
+  çünkü gerçek parayla açılan bir pozisyonun RSI/BB/rejim kararı sahte mumlardan gelemez.
+  `.env` kopyalama hatasına karşı ikinci kalkan: `scripts/ring_env_diff.sh` çıktısında bu satır
+  iki halkada FARKLI olmalıdır (testnet halkası mainnet verisi okuyabilir, tersi YASAK).
+  ⚠️ `MARKET_DATA_ALLOWED_HOSTS` yalnız USDⓈ-M Futures uçlarını içerir; Binance SPOT testnet'i
+  (`testnet.binance.vision`) BİLİNÇLİ olarak yoktur — `/fapi/...` yollarını sunmaz, kabul
+  edilseydi her kline isteği 404 dönerdi ve "URL geçerli" yanılsaması olurdu.
+  Doğrulama: `GET /scalper/status` → `kline_source`/`market_data_base_url`/`market_data_guard`.
 - **Ağırlık/ban:** mainnet'te gerçek X-MBX-USED-WEIGHT; eşik 1800 → gerçek değere göre kalibre; ban = halt.
+  Public kline yolu D17'den beri host başına oran/KAYAN-ağırlık/ban korumasına tabidir
+  (`MarketDataGuard`, bütçe 600 ağırlık/60 sn; CANLI profilde (1m/5m/15m) HESAPLANAN kullanım
+  140-180 ağırlık/dk, henüz ölçülmedi — `docs/ARCHITECTURE.md` §2). Hata kapsamı ayrımı da
+  mainnet için kritiktir: 401/403/451 ve tükenmiş 5xx HOST geneli sayılır (tur kesilir), yalnız
+  400/404 sembol kapsamlıdır. Tek başına 429 GERÇEK ban değildir ve deploy kilidini kapatmaz.
 - **Ayrı IP bağlama:** `BINANCE_BIND_IP` mainnet için ayrı (testnet ile aynı IP'den ban riskini ayırmak
   mümkün değilse en azından kota farkındalığı).
 

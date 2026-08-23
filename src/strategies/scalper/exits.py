@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from src.core.logger import app_logger
 from src.models.position import PositionModel, PositionStatus, PositionSide
+from src.strategies.scalper.data import MarketDataUnavailable
 from src.strategies.scalper.executor import ScalpPosition
 from src.strategies.scalper.indicators import chandelier_stop
 from src.strategies.scalper.tracker import ScalpTracker
@@ -39,6 +41,30 @@ from src.trading.binance_client_improved import (
 from src.trading.position_manager import PositionManager, UnprotectedPositionError
 
 KlineFetch = Callable[[str, str, int], Awaitable[List[Candle]]]
+
+# --- D17: ayrı market-data host'unda fiyat uzayı çevirisi ----------------
+# Chandelier seviyesi VERİ host'unun mumlarından çıkar ama emir İŞLEM host'una
+# gider. Baz (iki defter arasındaki anlık fark) her turda YENİDEN ölçülür:
+#     baz = işlem_host_güncel_fiyat − veri_host_son_kapanış
+# Aşağıdaki sabitler bu çevirinin akıl sağlığı sınırlarıdır.
+#
+# İşlem host'u fiyatının azami yaşı (sn). `_step_one` her turda (≈2 sn)
+# `client.get_current_price` ile tazeler; bu sınır yalnız o çağrının başarısız
+# olduğu ya da restart kurtarmasının ilk turu gibi durumlar içindir — bayat bir
+# işlem fiyatı ile taze bir veri kapanışını çıkarmak SAHTE bir baz üretir.
+_TRADING_PRICE_MAX_AGE_SECONDS = 30.0
+# Baz, işlem fiyatının bu yüzdesini aşarsa çeviri güvenilmez sayılır (yanlış
+# sembol/ölçek, borsalardan birinin donması). E8.0 ölçümü: iki defter arası
+# medyan sapma %0.054 — %2 tavanı normal işletmede asla bağlamaz.
+_MAX_PRICE_BASIS_PCT = 2.0
+# Koruma-tarafı kapısı payı (yüzde): stop, güncel fiyattan en az bu kadar uzak
+# ve DOĞRU tarafta olmalı. Binance koşullu emri MARK fiyatına göre tetikler;
+# `get_current_price` son işlem fiyatını verir — aradaki tipik baz bu payın
+# altındadır. `should_update` eşiğiyle (±%0.05) aynı büyüklükte tutuldu.
+_PROTECTIVE_GATE_MARGIN_PCT = 0.05
+# Aynı sembol için kapı/çeviri uyarısı en fazla bu sıklıkta loglanır (safety
+# turu 2 sn'de bir döner — aksi halde saatte 1800 satır).
+_TRAILING_SKIP_LOG_INTERVAL_SECONDS = 60.0
 
 
 @dataclass(frozen=True)
@@ -86,6 +112,18 @@ class ExitManager:
         # SL/negatif kapanışta executor'ın sembol cooldown'unu başlatır.
         # Opsiyonel: verilmezse (eski kurulum/testler) davranış değişmez.
         self._loss_cooldown_cb = loss_cooldown_cb
+        # D17: piyasa verisi host GENELİ kesildiğinde (ban/bütçe) her tur her
+        # sembol için ayrı WARNING basılmasın — tur başına bir kez.
+        self._market_data_down_reason: Optional[str] = None
+        # D17 fiyat-uzayı çevirisi (ayrı market-data host'u):
+        #   * sembol → işlem host'u fiyatının en son tazelendiği monotonic an
+        #     (bayat fiyatla baz ölçülemez),
+        #   * atlanan trailing güncellemesi sayaçları (teşhis; /scalper/status),
+        #   * sembol başına oran-sınırlı uyarı zamanı.
+        self._trading_price_seen_at: Dict[str, float] = {}
+        self._trailing_space_skips: int = 0    # baz ölçülemedi
+        self._trailing_gate_skips: int = 0     # koruma-tarafı kapısı reddetti
+        self._trailing_skip_log_at: Dict[str, float] = {}
 
     def _maybe_start_loss_cooldown(
         self,
@@ -136,6 +174,10 @@ class ExitManager:
 
     async def step(self) -> None:
         """Engine her turda çağırır: her izlenen sembol için bir adım işlet."""
+        # Tur başında sıfırlanır: host geneli bir piyasa-verisi kesintisi bu
+        # tur içinde yalnız BİR kez loglanır ve kalan sembollerde trailing
+        # atlanır. TP/kapanış tespiti İMZALI yoldan geldiği için ATLANMAZ.
+        self._market_data_down_reason = None
         for symbol in list(self._positions.keys()):
             sp = self._positions.get(symbol)
             if sp is None:
@@ -183,6 +225,14 @@ class ExitManager:
         if current_price:
             self._update_mae_mfe(sp, current_price)
             sp.position.current_price = current_price
+            # D17: bu fiyat İŞLEM host'undandır ve ayrı market-data host'unda
+            # fiyat-uzayı bazının tek eş-anlı referansıdır — tazeliği kayıtlı
+            # olmalı (bkz. _to_trading_price_space).
+            seen_at = getattr(self, "_trading_price_seen_at", None)
+            if seen_at is None:
+                seen_at = {}
+                self._trading_price_seen_at = seen_at
+            seen_at[symbol] = time.monotonic()
 
         # TP1 dolum kontrolü → break-even
         if not sp.tp1_done:
@@ -371,11 +421,156 @@ class ExitManager:
             return False
         return True
 
+    def _market_data_is_separate(self) -> bool:
+        """Kline'lar İŞLEM borsasından FARKLI bir host'tan mı geliyor? (D17)
+
+        Varsayılan (ayar boş) ve tüm eski test çiftleri için False → davranış
+        bugünküyle birebir aynıdır.
+        """
+        market_url = str(
+            getattr(self.cfg, "scalper_market_data_base_url", "") or ""
+        ).strip()
+        if not market_url:
+            return False
+        trading_url = str(getattr(self.cfg, "binance_base_url", "") or "").strip()
+        return bool(trading_url) and market_url != trading_url
+
+    def _to_trading_price_space(
+        self,
+        sp: ScalpPosition,
+        price: float,
+        data_reference: float,
+        symbol: str = "",
+    ) -> Optional[float]:
+        """Chandelier'ın MUTLAK seviyesini işlem borsasının fiyat uzayına taşı.
+
+        D17 düşmanca inceleme bulgusu (HIGH): ayrı market-data host'unda
+        `chandelier_stop` mainnet mumlarından MUTLAK bir fiyat üretir, ama bu
+        değer `pm.replace_stop_loss` ile TESTNET'e emir olarak gönderilir. İki
+        defter arasındaki baz farkı `k×ATR`'yi aşarsa Binance -2021 verir ve
+        `position_manager._replace_stop_loss` bunu "piyasa stop'u geçti" sayıp
+        pozisyonu ACİL KAPATIR — yani kârlı bir koşucu, borsalar arası fiyat
+        farkı yüzünden piyasa emriyle kapanabilirdi (log "eski SL korunuyor"
+        derken kayıt TRAIL olarak etiketlenirdi). Ters yönde de gerçekleşen
+        risk boyutlamadan sapar ve canlı defteri (nihai hakem) kirletir.
+
+        BAZ DİNAMİKTİR (ikinci tur inceleme, iki HIGH'ı birlikte kapatır):
+            baz = işlem_host_güncel_fiyat − veri_host_son_kapanış
+        İkisi de AYNI TURDA ölçülür: `sp.position.current_price` `_step_one`'da
+        işlem host'undan tazelenir; `data_reference` chandelier'ı hesaplayan
+        mum serisinin son KAPANMIŞ mumunun kapanışıdır. İlk sürümdeki statik
+        baz (`position.entry_price − signal.entry_price`) iki yerde kırılıyordu:
+          1. yalnız GİRİŞ anında ölçülüp pozisyon ömrü boyunca sabit
+             uygulanıyordu — iki defter arasındaki baz saatler içinde kayar;
+          2. `recover()` (restart) `signal.entry_price` ile
+             `position.entry_price`'ı AYNI değerden (`trade.entry_price`)
+             kurduğu için baz 0 çıkıyordu → düzeltme sessizce no-op oluyordu
+             (DB'de sinyal-anı fiyatı kolonu yok). Dinamik baz her turda
+             yeniden ölçüldüğü için restart'ta ek alana/migrasyona GEREK YOK.
+
+        `executor._delay_adjusted_stop` ile DESEN aynıdır (mutlak seviyeyi
+        ötele, MESAFEYİ koru), ama referansları farklıdır ve olmalıdır:
+        oradaki öteleme TEK SEFERLİK bir gecikme telafisidir (sinyal anı →
+        gerçek dolum, aynı host) ve koruma tarafını GİRİŞ fiyatına göre
+        denetler; buradaki öteleme SÜREKLİ bir borsa-arası baz çevirisidir ve
+        koruma tarafı GÜNCEL fiyata göre denetlenir (pozisyon çoktan açık,
+        piyasa girişten uzaklaşmış olabilir).
+
+        Dönüş `None` = çeviri güvenilir DEĞİL (bayat/eksik işlem fiyatı, absürt
+        baz): çağıran turu atlar, borsadaki SL yerinde kalır — fail-closed.
+        Aynı host'ta (varsayılan, ayar boş) hiç uygulanmaz: `price` aynen döner.
+        """
+        if not self._market_data_is_separate():
+            return price
+        if price <= 0:
+            return price
+        trading_ref = float(getattr(sp.position, "current_price", 0.0) or 0.0)
+        data_ref = float(data_reference or 0.0)
+        if trading_ref <= 0 or data_ref <= 0:
+            return None
+        if not self._trading_price_is_fresh(symbol):
+            return None
+        basis = trading_ref - data_ref
+        if abs(basis) > trading_ref * (_MAX_PRICE_BASIS_PCT / 100.0):
+            return None
+        adjusted = price + basis
+        if adjusted <= 0:
+            return None
+        return adjusted
+
+    def _trading_price_is_fresh(self, symbol: str) -> bool:
+        """`sp.position.current_price` bu turda işlem host'undan tazelendi mi?
+
+        Bayat bir işlem fiyatını taze bir veri kapanışından çıkarmak SAHTE bir
+        baz üretir; en tehlikeli hâli `recover()` sonrası ilk turdur (orada
+        `current_price` = giriş fiyatıdır, saatler önceki bir değer olabilir).
+        """
+        seen_at = getattr(self, "_trading_price_seen_at", None)
+        if not isinstance(seen_at, dict):
+            return False
+        stamp = seen_at.get(symbol)
+        if stamp is None:
+            return False
+        return (time.monotonic() - float(stamp)) <= _TRADING_PRICE_MAX_AGE_SECONDS
+
+    @staticmethod
+    def _is_protective_side(
+        direction: Direction, new_stop: float, current_price: float
+    ) -> bool:
+        """Stop, güncel fiyatın KORUMA tarafında ve pay kadar uzakta mı?
+
+        LONG stop güncel fiyatın ALTINDA, SHORT stop ÜSTÜNDE olmalıdır; aksi
+        halde Binance emri -2021 ("Order would immediately trigger") ile
+        reddeder ve `position_manager._replace_stop_loss` bunu bir çıkış
+        kararı sayıp pozisyonu PİYASA emriyle kapatır.
+        """
+        if current_price <= 0 or new_stop <= 0:
+            return False
+        margin = _PROTECTIVE_GATE_MARGIN_PCT / 100.0
+        if direction == Direction.LONG:
+            return new_stop < current_price * (1.0 - margin)
+        return new_stop > current_price * (1.0 + margin)
+
+    def _log_trailing_skip(self, symbol: str, message: str) -> None:
+        """Sembol başına oran-sınırlı WARNING (safety turu 2 sn'de bir döner)."""
+        log_at = getattr(self, "_trailing_skip_log_at", None)
+        if log_at is None:
+            log_at = {}
+            self._trailing_skip_log_at = log_at
+        now = time.monotonic()
+        last = log_at.get(symbol, 0.0)
+        if now - last < _TRAILING_SKIP_LOG_INTERVAL_SECONDS:
+            return
+        log_at[symbol] = now
+        self.logger.warning(message)
+
+    def trailing_skip_snapshot(self) -> Dict[str, int]:
+        """Teşhis: fiyat-uzayı/koruma-kapısı yüzünden atlanan güncellemeler."""
+        return {
+            "price_space_skips": int(getattr(self, "_trailing_space_skips", 0) or 0),
+            "protective_gate_skips": int(
+                getattr(self, "_trailing_gate_skips", 0) or 0
+            ),
+        }
+
     async def _update_trailing(self, symbol: str, sp: ScalpPosition) -> None:
+        if self._market_data_down_reason is not None:
+            # Bu turda host geneli kesinti zaten raporlandı; sembol sembol
+            # tekrar denemek ne veri getirir ne de log değeri katar.
+            return
         try:
             candles = await self.kline_fetch(
                 symbol, str(getattr(self.cfg, "scalper_tf_entry", "5m") or "5m"), 200
             )
+        except MarketDataUnavailable as e:
+            # Host geneli (ban/ağırlık bütçesi): turun kalanında trailing
+            # atlanır, TEK satır loglanır. SL/TP borsada yerinde durur.
+            self._market_data_down_reason = str(e)
+            self.logger.warning(
+                f"⛔ Piyasa verisi kullanılamıyor ({e}); bu safety turunda "
+                f"trailing güncellemesi atlandı ({symbol} ve kalan semboller)"
+            )
+            return
         except Exception as e:
             self.logger.warning(f"⚠️ {symbol}: trailing için mum verisi alınamadı ({e}), tur atlanıyor")
             return
@@ -410,6 +605,29 @@ class ExitManager:
             self.logger.debug(f"{symbol}: chandelier için yetersiz veri, trailing bu turda atlandı")
             return
 
+        # D17: mumlar ayrı bir borsadan geliyorsa seviyeyi İŞLEM borsasının
+        # fiyat uzayına taşı (aynı host'ta no-op). Baz DİNAMİKTİR: bu turda
+        # işlem host'undan okunan fiyat ile chandelier'ı besleyen serinin son
+        # KAPANMIŞ mumu arasındaki fark.
+        translated = self._to_trading_price_space(
+            sp, raw_stop, candles[-1].close, symbol
+        )
+        if translated is None:
+            # Baz güvenilir ölçülemedi (bayat işlem fiyatı / absürt fark):
+            # YABANCI uzaydan emir göndermektense turu atla — borsadaki SL
+            # yerinde kalır (fail-closed).
+            self._trailing_space_skips = (
+                int(getattr(self, "_trailing_space_skips", 0) or 0) + 1
+            )
+            self._log_trailing_skip(
+                symbol,
+                f"⚠️ {symbol}: piyasa verisi/işlem fiyatı arasındaki baz "
+                f"ölçülemedi (ayrı host); trailing güncellemesi atlandı, "
+                f"eski SL korunuyor",
+            )
+            return
+        raw_stop = translated
+
         floor = self._active_runner_floor(sp)
         current_sl = sp.position.current_stoploss or floor
         if direction == Direction.LONG:
@@ -420,6 +638,29 @@ class ExitManager:
             should_update = new_stop < current_sl * 0.9995
 
         if not should_update:
+            return
+
+        # KORUMA-TARAFI KAPISI (yalnız ayrı market-data host'unda): seviye
+        # işlem host'unun GÜNCEL fiyatına göre yanlış taraftaysa emri hiç
+        # gönderme. Gönderilseydi Binance -2021 verir, `position_manager`
+        # bunu "piyasa stop'u geçti" sayıp pozisyonu PİYASA emriyle kapatırdı
+        # (kârlı koşucu, borsalar arası baz yüzünden). Aynı host'ta (varsayılan)
+        # kapı UYGULANMAZ: oradaki -2021 → acil kapatma davranışı kanıta dayalı
+        # bir karardır (position_manager._replace_stop_loss) ve backtest kanıtı
+        # olmadan değiştirilmez.
+        if self._market_data_is_separate() and not self._is_protective_side(
+            direction, new_stop, float(sp.position.current_price or 0.0)
+        ):
+            self._trailing_gate_skips = (
+                int(getattr(self, "_trailing_gate_skips", 0) or 0) + 1
+            )
+            self._log_trailing_skip(
+                symbol,
+                f"⚠️ {symbol}: hesaplanan trailing SL ({new_stop}) işlem "
+                f"host'unun güncel fiyatına ({sp.position.current_price}) göre "
+                f"koruma tarafında değil; emir GÖNDERİLMEDİ, eski SL "
+                f"({current_sl}) korunuyor",
+            )
             return
 
         ok = await self.pm.replace_stop_loss(sp.position, new_stop)
@@ -1327,6 +1568,13 @@ class ExitManager:
             label="TP2/recovery",
         )
 
+        # NOT (D17): `signal.entry_price` burada `position.entry_price` ile
+        # AYNI değerden (`trade.entry_price`) kurulur — DB'de sinyal-anı
+        # fiyatı için kolon yoktur. Fiyat-uzayı çevirisi bir dönem bu farkı
+        # statik baz olarak kullanıyordu; restart sonrası baz 0 çıktığı için
+        # düzeltme SESSİZCE no-op oluyordu (düşmanca inceleme, HIGH). Çeviri
+        # artık her turda dinamik ölçülüyor (`_to_trading_price_space`), bu
+        # yüzden burada ek alan/migrasyon GEREKMEZ.
         signal = ScalpSignal(
             strategy=trade.strategy,
             symbol=symbol,

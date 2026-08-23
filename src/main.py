@@ -1263,6 +1263,12 @@ _EMPTY_SCALPER_STATUS = {
     "enabled": False,
     "running": False,
     "shadow_mode": settings.scalper_shadow_mode,
+    # D17: motor kurulmamışken bile "kline verisi nereden gelecek" görünür
+    # olsun (ayardan türetilir; motor varken engine.snapshot() fetcher'ın
+    # GERÇEK base_url'ini raporlar).
+    "market_data_base_url": settings.market_data_base_url,
+    "trading_base_url": settings.binance_base_url,
+    "kline_source": settings.kline_source,
     "scan_interval": settings.scalper_scan_interval_seconds,
     "safety_interval": settings.scalper_safety_interval_seconds,
     "health": {"healthy": False, "running": False, "reason": "engine_not_created"},
@@ -1311,6 +1317,13 @@ _EMPTY_SCALPER_STATUS = {
     "entry_halted_at": None,
     "signals_today": 0,
     "last_scan_at": None,
+    # D17: piyasa verisi kesintisiyle KESİLEN tarama turu "başarılı" sayılmaz;
+    # durum burada görünür ("ok" | "degraded:market_data").
+    "scan_status": "ok",
+    "scan_degraded_reason": None,
+    "scan_degraded_at": None,
+    "scan_degraded_count": 0,
+    "trailing_skips": {},
     "tracked": [],
     "pending_entries": [],
     "cooldowns": [],
