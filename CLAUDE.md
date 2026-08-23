@@ -8,6 +8,13 @@ Binance USDⓈ-M Futures için Python (FastAPI + asyncio) scalping botu. Aktif s
 **C** (RSI ucu + Bollinger taşması + RSI diverjansı, ters yön giriş) — `src/strategies/scalper/`.
 Sinyal kaynakları: botun kendi taraması + TradingView webhook'ları (LuxAlgo OSC/S&O,
 AlgoPro) → `src/services/tv_confluence.py` sağlaması (2 farklı kaynak / 420 sn).
+TV'nin ÇIKIŞ/YAPI alarmları (S&O Exit, Trend Catcher/Tracer, PAC CHoCH, AlgoPro TP1)
+AYRI bir yoldan gelir: gövdede `kind=exit|choch|trend|tp1` → `src/services/tv_events.py`
+(sağlamaya GİRMEZ). Varsayılan `SCALPER_TV_EVENTS_MODE=shadow` = motor davranışı
+değişmez; bkz. `docs/DECISIONS.md` D19 + **D19a** (24 düşmanca inceleme bulgusu;
+D19 ile çelişirse **D19a bağlayıcıdır**) + `docs/INTEGRATIONS.md` §7. Alarm mesajında
+`src=`/`kind=` belirteçleri mesajın **BAŞINDA** olmalıdır; olay kaynakları
+(`TV_EVENT_SOURCES`) giriş oyu VEREMEZ (422).
 Ayrıntı: `docs/ARCHITECTURE.md`. Kararlar ve kanıtları: `docs/DECISIONS.md`.
 İşletme: `docs/RUNBOOK.md`. Deney defteri: `docs/EXPERIMENTS.md`.
 Yeni sinyal kaynağı (haber botu vb.) eklemek: `docs/INTEGRATIONS.md`. Otomatik deney döngüsü:

@@ -86,6 +86,14 @@ class ScalpPosition:
     trailing_active: bool = False
     mae_pct: float = 0.0             # en kötü (olumsuz) ROI% ucu — negatif veya 0
     mfe_pct: float = 0.0             # en iyi (olumlu) ROI% ucu — pozitif veya 0
+    # `position.current_price`ın en son BAŞARIYLA okunduğu an (monotonic).
+    # D19a-2: `position.current_price` yalnız `get_current_price` başarılı
+    # olduğunda güncellenir ve bir zaman damgası taşımaz — ticker birkaç tur
+    # hata verirse alan BAYAT kalır. "Pozisyon kârda mı" kararı bayat fiyatla
+    # verilirse stop piyasanın ters tarafına gider (-2021 → acil kapanış), ki
+    # `breakeven_side_ok` tam da bunu engellemek için yazıldı. None/eski damga
+    # = "bilinmiyor" (fail-safe).
+    price_ts: Optional[float] = None
 
 
 @dataclass

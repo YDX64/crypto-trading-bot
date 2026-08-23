@@ -216,6 +216,20 @@ vermeli; ters yön oyu geldiğinde HER İKİ tarafın oyları silinir (`vote()`,
 satır 56-63). `?src=` yoksa kaynak, AlgoPro'nun varsayılan mesaj biçiminden
 ("`| TF:`"/"`| Price:`") tahmin edilir, yoksa `"tv"` (`main.py:645-647`).
 
+**İKİNCİ TV yolu (D19/D19a, 2026-08-23):** aynı `/tv-signal` uç noktası, gövdesinde
+`kind=exit|choch|trend|tp1` taşıyan istekleri **sağlamaya HİÇ sokmadan**
+`src/services/tv_events.py` defterine yazar (`_handle_tv_event`). O defter
+motorun İKİ yerinde okunur: `_evaluate_symbol`'deki yapı kapısı (rejim
+kapısının hemen yanında) ve `_safety_tick`'teki BE/kapanış tetikleyicisi
+(`_apply_tv_event_exits`, `exits.step()` ile reaper arasında).
+Üç kademeli (`SCALPER_TV_EVENTS_MODE=off|shadow|active`, varsayılan `shadow` =
+davranış değişmez). İki yön arasındaki ayrım **tek yönlüdür**: `TV_EVENT_SOURCES`
+listesindeki bir kaynak GİRİŞ OYU VEREMEZ (422) ve `kind != entry` bir istek
+sağlamaya giremez. Yardımcı uçlar: `POST /tv-signal?dry_run=1` (doğrula, yazma) ve
+`POST /tv-events/reset?secret=` (defteri RAM+diskte sıfırla).
+Ayrıntı: `docs/INTEGRATIONS.md` §7, `docs/DECISIONS.md` D19 + **D19a** (24 düşmanca
+inceleme bulgusu; çelişki görürsen D19a bağlayıcıdır).
+
 ## 3. Modül haritası
 
 | Dosya | Sorumluluk | Anahtar semboller |
@@ -234,7 +248,8 @@ satır 56-63). `?src=` yoksa kaynak, AlgoPro'nun varsayılan mesaj biçiminden
 | `src/strategies/scalper/types.py` | Ortak veri sözleşmesi (saf, IO'suz) | `Regime:21`, `StrategyContext:59`, `ScalpSignal:77`, `ExitPlan:101`, `resolve_trail_mult:152`, `fee_aware_breakeven_price:176` |
 | `src/strategies/scalper/backtest.py` | Tarihsel simülasyon + CLI | `_build_arg_parser:1348`, `main_async:1372`, `print_report:902` |
 | `src/strategies/scalper/indicators.py` | Saf gösterge fonksiyonları (RSI/BB/ATR/MFI/chandelier/OB/EQH-EQL...) | `chandelier_stop:280`, `equilibrium:549`, `rsi_series:58` |
-| `src/services/tv_confluence.py` | Çoklu-kaynak TV sağlama motoru | `TvConfluence.vote:45` |
+| `src/services/tv_confluence.py` | Çoklu-kaynak TV sağlama motoru (yalnız GİRİŞ oyları) | `TvConfluence.vote:45` |
+| `src/services/tv_events.py` | TV ÇIKIŞ + YAPI/DÖNÜŞ olay defteri (D19/D19a; sağlamaya GİRMEZ) | `TvEvents.ingest`, `fresh_gate_structures`, `structure_verdict` (MIXED), `pending_exit`, `consumed_seq`/`mark_consumed`/`note_attempt` (kalıcı tüketim), `protect` (budama muafiyeti), `config_health`, `snapshot`, `reset`; süreç-tekili `tv_events` |
 | `src/trading/binance_client_improved.py` | İmzalı/imzasız REST istemcisi, okuma önbellekleri, ağırlık telemetrisi | `_get_account:711`, `get_position_risk:1360`, `get_all_positions:1424`, `_request_with_retry:329` (weight header, satır 391-415), `_invalidate_read_caches:161` |
 | `src/trading/position_manager.py` | Güvenli pozisyon açma/kapama, boşluksuz SL değişimi, acil kapatma | `UnprotectedPositionError:32`, `open_position:63`, `_emergency_close:416`, `replace_stop_loss:803` |
 | `src/models/scalp_trade.py` | `scalp_trades` ORM modeli | `ScalpTradeModel:16` |
@@ -254,6 +269,13 @@ satır 56-63). `?src=` yoksa kaynak, AlgoPro'nun varsayılan mesaj biçiminden
 | `scalper_market_gate_run_pct` / `_run_days` | `0.0` / `3` | Uzama alt-kapısı — **varsayılan KAPALI**, iki bağımsız ölçüm çürüttü (D15) |
 | `scalper_market_gate_retry_sec` | `60.0` | Lider verisi alınamazsa negatif önbellek (sn; 0 = kapalı) |
 | `scalper_market_data_base_url` | `""` | Boş = kline'lar işlem host'undan; dolu = YALNIZ public kline o host'tan (D17, bkz. §2 "Kline veri kaynağı") |
+| `scalper_tv_events_mode` | `"shadow"` | TV olay kanalı (D19): `off`/`shadow`/`active` — `shadow` motor davranışını DEĞİŞTİRMEZ |
+| `scalper_tv_events_exit` | `"be"` | `active` modda açık pozisyona uygulanan aksiyon: `off`/`be`/`close` (`be` YALNIZ pozisyon kârdayken) |
+| `scalper_tv_events_exit_losing` | `"skip"` | `be` seçiliyken pozisyon ZARARDAYSA: `skip` (dokunma) / `close` (reduce-only MARKET) — D19a B |
+| `scalper_tv_events_be_margin_pct` | `0.05` | BE hedefinin piyasadan güvenli uzaklığı (%, tek yönlü pay) |
+| `scalper_tv_events_max_age_min` | `240.0` | Olayın tazelik penceresi (dk) — kapı ve çıkış tetiği için; **0 = KAPALI** |
+| `scalper_tv_events_gate_sources` | `"pac_choch,luxso_trend"` | Yapı durumunu KARARA sokan kaynaklar (diğerleri yalnız telemetri); **boş = hiçbiri** |
+| `tv_event_sources` | `"luxso_exit,luxso_trend,pac_choch,algopro_tp1"` | Bu `src` etiketleri GİRİŞ OYU VEREMEZ (422) — D19a A |
 | `scalper_tf_entry/context/regime` | `5m/15m/4h` | Giriş/bağlam/rejim zaman dilimleri |
 | `scalper_c_rsi_long_max/short_min` | `25.0/75.0` | C'nin RSI uç eşiği |
 | `scalper_c_require_divergence` | `True` | C'de RSI diverjans şartı |

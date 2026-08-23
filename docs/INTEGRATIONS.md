@@ -12,7 +12,8 @@ POST http://<sunucu>/tv-signal?secret=<TV_WEBHOOK_SECRET>&src=<kaynak>
 Content-Type: application/json
 {"symbol": "BTCUSDT", "side": "buy"}          # side: buy|long|bull  /  sell|short|bear
 ```
-- `src`: `TV_SOURCE_ALLOWLIST` içinde olmalı (varsayılan `luxosc,luxso,algopro,botv3,tv`).
+- `src`: `TV_SOURCE_ALLOWLIST` içinde olmalı (varsayılan `luxosc,luxso,algopro,botv3,tv` +
+  D19 olay kaynakları `luxso_exit,luxso_trend,pac_choch,algopro_tp1` — bkz. §7).
   Yeni kaynak = bu listeye bir isim eklemek (`.env`), başka hiçbir kod değişmez. Listede
   olmayan `src` uyarıyla `tv`'ye eşlenir (sinyal düşmez, ama ayrı kaynak sayılmaz).
 - Sağlama (`src/services/tv_confluence.py`): aynı sembol + aynı yön için **2 FARKLI kaynak**,
@@ -173,3 +174,306 @@ doğrular.
 3. Testnet: allowlist'e ekle → ≥5 gün → canlı defterde kaynak bazlı PF.
 4. Mainnet: yalnız etiketli sürümle (CLAUDE.md terfi kuralı) — ayıda PF ≥ 1.1 **ve**
    boğada PnL kaybı ≤ %20 kanıtı olmadan yok.
+
+## 7. TV olay kanalı — ÇIKIŞ ve YAPI/DÖNÜŞ olayları (D19, 2026-08-23)
+
+Bugüne kadar TradingView'den bota YALNIZ "gir" oyu geliyordu (§1). Göstergelerin
+asıl bilgisi ise çoğu zaman **çıkışta ve yapıda**: LuxAlgo S&O "Exit Signal",
+S&O "Trend Catcher/Tracer Up|Down", Price Action Concepts "Bullish/Bearish S-CHOCH",
+AlgoPro "🎯 TP1 Hit". Bu kanal onları motora sokar.
+
+### 7.1 Yönlendirme GÖVDEDEN yapılır (URL değişmez)
+Kullanıcı yeni alarmları TV'de **mevcut alarmları klonlayarak** kuruyor: webhook
+URL'si (secret ve eski `?src=luxso`) aynen kalıyor, yalnız **alarm koşulu ve mesaj
+gövdesi** değişiyor. Bu yüzden yönlendirme gövdeden okunur:
+
+- **JSON gövde** → **üst düzey** `src` (veya `source`), `kind`, `via` alanları;
+  yaygın webhook sarmalayıcısı olduğu için **üst düzey `data` nesnesi** de okunur.
+  ⚠️ **Daha derin iç içe JSON ARANMAZ** (D19a G1) — okunmayan `kind` "entry"ye
+  düşer ve aşağıdaki olay-kaynağı koruması devreye girer.
+- **Düz metin gövde** → `src=<token>` / `kind=<token>` / `via=<token>` **belirteçleri**;
+  ayraç `=` **veya** `:`, ayırıcı boşluk/virgül/`|`, büyük-küçük harf duyarsız.
+  ⚠️ **Belirteçler YALNIZ "başlık koşusu"ndan okunur** (D19a G1): satır başından
+  itibaren kesintisiz `anahtar=değer` dizisi; ilk serbest metin belirtecinde biter
+  (ilk 5 satır taranır). Yani mesaj `src=… kind=… {{ticker}} …` diye BAŞLAMALIDIR.
+  Gerekçe: TradingView'in `{{strategy.order.alert_message}}` gibi alanları kullanıcı
+  metnini gövdenin ortasına basar; serbest metin taransaydı o metin mevcut bir
+  alarmın kimliğini (`src`) ya da yolunu (`kind`) değiştirebilirdi.
+  🔒 **Belirteçler ortada kalırsa istek SESSİZCE giriş oyuna DÖNÜŞMEZ** (D19a-2 R1-1):
+  gövdenin tamamı ayrıca `src=<olay kaynağı>` için taranır ve bulunursa istek **422**
+  alır ("mesajın BAŞINDA değil" ipucuyla). Yani yanlış yerleştirilmiş bir olay alarmı
+  ya doğru yola gider ya GÖRÜNÜR biçimde ölür; asla pozisyon açmaz.
+  ⚠️ **`=` ile `:` aynı sertlikte DEĞİLDİR** (D19a-2 R1-2): `=` kasıtlı bir
+  belirteçtir, tanınmayan değeri 422'dir. `:` düz yazı noktalamasıdır ("Kind: Bullish
+  Reversal") — bu yüzden `:` ile gelen `src`/`kind` YALNIZ tanınan bir değer
+  taşıyorsa sayılır, aksi halde YOK SAYILIR.
+- `kind` **yoksa** → `entry`: **bugünkü davranış birebir korunur** (mevcut 49 alarm
+  hiç etkilenmez, sağlamaya girer, `external_signal`'a gider).
+- `kind ∈ {entry, exit, choch, trend, tp1}`. **Tanınmayan `kind` 422 ile REDDEDİLİR**
+  — "entry"ye düşürülmez: bir çıkış alarmının yazım hatası yüzünden pozisyon açması
+  kabul edilemez. (Bu, `?src=` allowlist'inin "reddetme, `tv`ye eşle" davranışının
+  bilinçli tersidir; orada en kötü sonuç bir oyun sayılmamasıdır.)
+- 🔒 **OLAY KAYNAĞI GİRİŞ OYU VEREMEZ** (D19a A): `TV_EVENT_SOURCES` listesindeki
+  bir kaynak (`luxso_exit`, `luxso_trend`, `pac_choch`, `algopro_tp1`) `kind=entry`
+  ile gelirse istek **422**'dir. Kontrol isteğin TÜM kaynak adaylarına uygulanır:
+  başlık koşusundaki gövde `src`i, `?src=` ve **gövdenin herhangi bir yerinde**
+  geçen `src=<olay kaynağı>` (D19a-2 R1-1). Böylece allowlist dışı bir ad `tv`ye
+  eşlenip sıyrılamaz. Gerekçe: `kind` düşerse istek sessizce bir OY olur ve gövdedeki
+  `src` **yeni bir sağlama kaynağı** sayılır — `TV_CONFLUENCE_REQUIRED=2` iken
+  LuxAlgo ailesi tek başına kotayı doldurup pozisyon açtırabilirdi.
+- **`src` önceliği (GİRİŞ yolu):** gövdedeki `src` **allowlist'teyse** URL'deki
+  `?src=`'i GEÇERSİZ KILAR (klon senaryosunun tamamı bu). Allowlist dışındaysa
+  geçersiz kılma YAPILMAZ: WARNING + bugünkü `?src=` davranışı
+  (yanıt `body_src_rejected: true`).
+- **`src` (OLAY yolu) allowlist'ten BAĞIMSIZDIR** (D19a E): istek
+  `TV_WEBHOOK_SECRET` ile kimliklidir ve sağlamaya hiç girmez, dolayısıyla bir
+  "hayalet kaynak" giriş açtıramaz. Gövdedeki etiket **KORUNUR**; allowlist dışıysa
+  yalnız WARNING + yanıtta `source_allowlisted: false`. (Eski davranışta etiket
+  sessizce eski `?src=luxso`ya düşüyor ve kapı hiç eşleşmiyordu — kanal "kurulu
+  görünüp ölü" oluyordu.)
+- **Sembol allowlist'i (D7) olay yolunda da uygulanır** (D19a F):
+  `SCALPER_TV_SYMBOL_ALLOWLIST` doluysa dışındaki sembolün olayı deftere YAZILMAZ (OSC kanıtı
+  olmayan sembolde kapı/çıkış kanıtsız karar vermesin). Yanıt **200 +
+  `applied: false, reason: "symbol_allowlist"`**tir — 422 DEĞİL: aynı ayar GİRİŞ
+  yolunda da sessizce reddeder (`accepted: false`, 200) ve aynı sembolde kurulu iki
+  alarmdan biri TV'de yeşil diğeri kırmızı görünmemelidir (D19a-2 R1-4). 422 yalnız
+  BİÇİM hataları içindir (secret, `kind`, sembol biçimi, eksik yön).
+- Sembol biçimi olay yolunda **tam eşleşmeyle** doğrulanır (`_TV_SYMBOL_RE`,
+  D19a G3); giriş yolunun daha gevşek davranışı bilinçli olarak DEĞİŞMEDİ.
+- **Secret her şeyden ÖNCE doğrulanır** (D19a G2, sabit zamanlı): kimliksiz bir
+  istek 422 mesajlarından kanalın sözleşmesini öğrenemez.
+- `kind != entry` olan istek **sağlamaya (TvConfluence) HİÇ girmez** ve
+  `engine.external_signal` **çağrılmaz** — yalnız `src/services/tv_events.py`
+  defterine yazılır. Motor hazır olmasa bile olay kaydedilir (503 dönmez).
+
+Yeni kaynak etiketleri: `luxso_exit`, `luxso_trend`, `pac_choch`, `algopro_tp1`.
+Kod varsayılanı (`tv_source_allowlist`) bunları içerir; sunucu `.env`'i
+`TV_SOURCE_ALLOWLIST`'i AÇIKÇA set ediyorsa **olay yolu yine çalışır** ama giriş
+yolundaki aynı etiket `tv`ye eşlenir — startup'ta WARNING ve
+`/scalper/status` → `tv_events.allowlist_ok=false` bunu görünür kılar
+(bkz. `docs/RUNBOOK.md` "TV olay kanalı" adım 2).
+
+### 7.2 Alarm mesaj şablonları (TV'de klonlarken yapıştır)
+Her biri **tek satır düz metin**tir; `{{ticker}}` **zorunludur** (sembol ondan
+çözülür — `BINANCE:BTCUSDT.P` biçimi de kabul edilir). Koşul adları TradingView
+alarm diyaloğundan okunmuştur; mevcut alarmlar 5 dakikalık grafiklerdedir.
+
+⚠️ **Belirteçler mesajın BAŞINDA olmalı** (D19a G1): `src=` ve `kind=` satırın ilk
+belirteçleri olacak, `{{ticker}}` ve serbest metin SONRA gelecek. Aşağıdaki
+şablonlar bu kurala uyar; kendi metnini eklerken sıralamayı bozma.
+
+**LuxAlgo® — Signals & Overlays™ [7.3.1]**
+
+| Alarm koşulu | Mesaj |
+|---|---|
+| `Exit Signal` (mavi X, **yönsüz**) | `src=luxso_exit kind=exit {{ticker}}` |
+| `Trend Catcher Up` | `src=luxso_trend kind=trend up {{ticker}}` |
+| `Trend Catcher Down` | `src=luxso_trend kind=trend down {{ticker}}` |
+| `Trend Tracer Up` | `src=luxso_trend kind=trend up {{ticker}}` |
+| `Trend Tracer Down` | `src=luxso_trend kind=trend down {{ticker}}` |
+
+**LuxAlgo® — Price Action Concepts™ [2.3.3]**
+
+| Alarm koşulu | Mesaj |
+|---|---|
+| `Bullish S-CHOCH` (swing) | `src=pac_choch kind=choch bullish {{ticker}}` |
+| `Bearish S-CHOCH` (swing) | `src=pac_choch kind=choch bearish {{ticker}}` |
+| `Bullish I-CHOCH` (internal, opsiyonel) | `src=pac_choch kind=choch bullish {{ticker}}` |
+| `Bearish I-CHOCH` (internal, opsiyonel) | `src=pac_choch kind=choch bearish {{ticker}}` |
+
+**AlgoPro V1.6**
+
+| Alarm koşulu | Mesaj |
+|---|---|
+| `🎯 TP1 Hit` (**yönsüz**) | `src=algopro_tp1 kind=tp1 {{ticker}}` |
+| `⚪ Exit Signal` (**yönsüz**, opsiyonel) | `src=algopro_tp1 kind=exit {{ticker}}` |
+| `🎯 TP2 Hit` / `🏆 TP3 Hit` (opsiyonel) | `src=algopro_tp1 kind=tp1 {{ticker}}` |
+
+Notlar:
+- **`src` bir KAYNAK kimliğidir, kind değildir.** `algopro_tp1`, AlgoPro'nun çıkış
+  ailesinin (TP1/TP2/TP3/Exit) tek etiketidir. Ayrı saymak istenirse yeni bir isim
+  `TV_SOURCE_ALLOWLIST`'e eklenmeli (kod değişmez, §1'deki kural).
+- `🛑 Stop Loss Hit` **bağlanmaz**: kendi SL'imiz zaten borsada duruyor.
+- Mevcut GİRİŞ alarmları (S&O `Bullish/Bearish Confirmation(+)`, `Any Bullish/Bearish
+  Contrarian`, AlgoPro `🟢 Buy Signal` / `🔴 Sell Signal`) **değiştirilmez** — onların
+  mesajında `kind` yoktur, bugünkü yolda kalırlar.
+- `I-BOS`/`S-BOS` (kırılım) **bağlanmaz**: BOS trendin devamıdır, CHoCH ise dönüştür;
+  kapının anlamı dönüş bilgisidir.
+
+### 7.3 Yön semantiği (iki farklı şey)
+- `choch` / `trend` → olayın yönü **YAPININ** yönüdür: `bullish`/`up` → `BULL`,
+  `bearish`/`down` → `BEAR`. **Yön ZORUNLUDUR**, çözülemezse 422.
+- `exit` / `tp1` → olayın yönü (varsa) **KAPATILACAK POZİSYONUN** yönüdür.
+  "Bullish Exit" = *LONG pozisyon için çıkış*; **yapı yukarı döndü demek DEĞİLDİR**
+  ve yapı durumunu güncellemez. Gerçek alarm koşulları (`Exit Signal`, `🎯 TP1 Hit`)
+  **yönsüzdür**: yön yoksa sembolde açık pozisyon hangi yöndeyse ona uygulanır;
+  yön VARSA ve açık pozisyonla uyuşmuyorsa **uygulanmaz + loglanır**.
+
+Yön sözlüğü: `buy|long|bull|bullish|up` ↔ `sell|short|bear|bearish|down`
+(**sözcük sınırıyla** — `up` alt-dize olarak "SETUP"/"SUPPORT" içinde geçer;
+giriş yolunun alt-dize taraması DEĞİŞMEDİ).
+
+**Aynı `src`i paylaşan alt-kaynaklar — "SON OLAY KAZANIR"** (D19a G4): S&O
+"Trend Catcher" ile "Trend Tracer" ikisi de `luxso_trend` etiketlidir. Durum
+anahtarı `src` olduğu için bu ikisi birbirini **MIXED'e DÜŞÜRMEZ**: sembolün
+`luxso_trend` yapısı her zaman en son gelen olayın yönüdür. Hangisinin geldiğini
+görmek istersen mesaja isteğe bağlı `via=catcher` / `via=tracer` ekle — `via`
+**yalnız telemetridir** (karara girmez, yön taramasından çıkarılır,
+`/scalper/status` → `structures.<src>.via`). İki alt-kaynağı AYRI saymak istersen
+doğru yol `via` değil, yeni bir `src` etiketidir (§1'deki kural).
+
+### 7.4 Motor etkisi — üç mod
+`SCALPER_TV_EVENTS_MODE=off|shadow|active` (varsayılan **shadow**):
+
+| Mod | Giriş kapısı | Çıkış tetiği | Emir/stop |
+|---|---|---|---|
+| `off` | yok | yok | değişmez |
+| `shadow` | "ne olurdu" logu + `would_block` | "ne olurdu" logu + `would_exit` | **değişmez** |
+| `active` | ters yapıda giriş ENGELLENİR | BE veya kapanış UYGULANIR | değişir |
+
+- **Giriş kapısı (`active`):** sembolün yapı durumu sinyale tersse
+  (`BEAR` iken `LONG`, `BULL` iken `SHORT`) ve olay `SCALPER_TV_EVENTS_MAX_AGE_MIN`
+  (varsayılan 240 dk) içindeyse giriş engellenir. Kapı **rejim kapısının hemen
+  yanındadır** (`engine._evaluate_symbol`) — yani C stratejisi ve TV dış sinyali
+  AYNI tek giriş noktasından geçer. Ret sayacı: `tv_structure_gate`
+  (`/scalper/status` → `entry_rejects`).
+- Kapıyı hangi kaynakların besleyeceğini `SCALPER_TV_EVENTS_GATE_SOURCES`
+  (varsayılan `pac_choch,luxso_trend`) seçer; **listede olmayan kaynaklar yalnız
+  telemetride görünür**, karar vermez.
+- **ÇELİŞKİ (MIXED) → KAPI UYGULANMAZ** (D19a F): kapı kaynakları farklı yön
+  söylüyorsa (PAC BULL + S&O trend BEAR) çelişki **"bilinmiyor"** demektir,
+  "her iki yön de yasak" DEĞİL. Eski kural ("ters olan engeller") sembolü
+  `max_age` boyunca **iki yöne de** kilitliyordu — hiçbir kanıt üretmeyen bir durum
+  en sert kararı veriyordu. Artık sayaç (`mixed_skipped`) + log üretilir, giriş
+  bugünkü davranışla sürer; telemetride `structure: MIXED` görünmeye devam eder.
+- **SIFIR/BOŞ = KAPALI** (D19a G5): `SCALPER_TV_EVENTS_MAX_AGE_MIN=0` "süresiz
+  taze" DEĞİL, **pencere kapalı**; boş `SCALPER_TV_EVENTS_GATE_SOURCES` "tüm
+  kaynaklar" DEĞİL, **hiçbir kaynak karar vermez**. Durum `/scalper/status` →
+  `tv_events.gate_enabled` / `window_open`. Pencere kapalıyken tüketim imleçleri
+  YİNE DE ilerletilir (D19a-2 R2-7) — operatör pencereyi açtığında birikmiş
+  olaylar toplu tetiklemesin.
+- **`active` iken kanal HİÇBİR ŞEY yapamıyorsa süreç BAŞLAMAZ** (D19a-2 R1-3):
+  `MODE=active` + (`MAX_AGE_MIN=0` **veya** (boş `GATE_SOURCES` **ve** `EXIT=off`))
+  → startup'ta `ValueError`. `active` bilinçli bir karardır; sessizce ölü bir kanal
+  operatörü yanıltır. **Boş `GATE_SOURCES` + `EXIT=be|close` GEÇERLİDİR** ("giriş
+  kapısı yok ama açık çık komutlarına uy") — çünkü `gate_sources` yalnız yapı
+  olaylarını süzer, `exit`/`tp1` ondan bağımsızdır (aşağıdaki "kaynak kapsamı farkı").
+- **Çıkış tetikleyicisi (`active`, `SCALPER_TV_EVENTS_EXIT=off|be|close`,
+  varsayılan `be`):** açık pozisyonla aynı sembolde ters CHoCH/trend (yalnız kapı
+  kaynakları; MIXED'te hiçbir şey yapılmaz) ya da `exit`/`tp1` olayı gelince
+  - `be` → stop BE'ye çekilir: **mevcut BE mekanizması**
+    (`ExitManager.force_breakeven` → `pm.replace_stop_loss` boşluksuz deseni;
+    `_is_at_least_as_protective` gevşetmeyi yasaklar). **Yeni emir yolu yazılmadı.**
+    `tp1_done`/`trailing_active` bayrakları **bilinçli olarak değiştirilmez**
+    (aksi halde pozisyon D4 reaper muafiyetine girer ve chandelier izi TP1 dolmadan
+    başlardı — sessiz davranış değişikliği olurdu).
+    🔒 **YALNIZ POZİSYON KÂRDAYKEN** (D19a B): fiyat BE'nin koruyucu tarafında ve
+    `SCALPER_TV_EVENTS_BE_MARGIN_PCT` (%0.05) payı kadar uzakta olmalıdır. Zararda
+    BE, stop'u piyasanın TERS tarafına koymaktır → Binance `-2021` →
+    `position_manager._emergency_close`: "geri alınabilir" sanılan ayar fiilen
+    **piyasa emriyle kapanış** olurdu. Kontrol hem motorda hem `force_breakeven`
+    içinde yapılır (çift kapı).
+    **SIRA:** motor ÖNCE `force_breakeven`ı çağırır, SONRA "neden olmadı" diye
+    bakar (D19a-2 R2-1). Tersi, stopu ZATEN BE'de olan (TP1 dolmuş, D4 reaper
+    muafiyetindeki) bir koşucuyu fiyat geri çekildiğinde `EXIT_LOSING=close` ile
+    piyasadan kapattırıyordu.
+    **BAYAT FİYAT = BİLİNMİYOR** (D19a-2 R2-5): `position.current_price` yalnız
+    ticker okuması başarılı olduğunda yazılır; `price_ts` damgası yoksa ya da
+    30 sn'den eskiyse karar verilmez, hiçbir emir gönderilmez ve olay **tüketilmez**
+    (sonraki turlarda yeniden denenir).
+  - `close` → reaper/risk-olayı `flatten` ile **AYNI** reduce-only MARKET çağrısı
+    (`_submit_reduce_only_market_close`), **aynı** `force_fresh=True` doğrulaması ve
+    **aynı** tek-finalizer kilidi (`ExitManager._closing`), `exit_reason="TV_EVENT"`.
+- **`SCALPER_TV_EVENTS_EXIT_LOSING=skip|close`** (varsayılan `skip`, D19a B):
+  `be` seçiliyken pozisyon ZARARDAYSA ne yapılacağı. `skip` = hiçbir şey (logla +
+  `exits_skipped_losing` ve `exits_noop` say; pozisyon normal SL/TP/trailing
+  korumasında kalır). `close` = reduce-only MARKET kapanış (bilinçli, geri alınamaz
+  karar). Fiyat ya da BE **okunamıyorsa/bayatsa** `close` bile UYGULANMAZ.
+- **Kaynak kapsamı farkı:** `gate_sources` YALNIZ yapı olaylarını (`choch`/`trend`)
+  süzer. `exit`/`tp1` olayları **kaynak ayrımı yapılmadan** uygulanır — bunlar açık bir
+  "çık" komutudur ve zaten webhook secret'ıyla kimliklenmiştir.
+- `SCALPER_TV_EVENTS_EXIT=off` çıkış tetiğini **gölgede de** kapatır (`would_exit`
+  sayılmaz); giriş kapısı bundan etkilenmez. İmleçler yine de ilerletilir ki mod
+  sonradan açılınca birikmiş olaylar toplu tetiklenmesin.
+- **TUR BAŞINA EN FAZLA 1 çıkış aksiyonu** (D19a G6, `_TV_EXIT_MAX_ACTIONS_PER_TICK`):
+  reaper'ın 2026-08-14 dersiyle aynı — eşzamanlı çoklu kapanış safety turunu şişirip
+  borsa tazelik eşiğini (30 sn) aştırıyordu. Ertelenen olaylar **tüketilmez**,
+  sonraki turda ele alınır.
+- **Bir olay bir kez tetikler** (sembol başına olay sırası imleci) ve
+  **pozisyon açılışından ÖNCEKİ olaylar sayılmaz** — aksi halde 3 saat önce gelmiş
+  bir "exit" alarmı yeni açılan pozisyonu doğduğu anda kapatırdı. İmleç **kalıcıdır**
+  (`state/tv_events.json`, D19a D): restart tüketilmiş bir olayı YENİDEN tetiklemez.
+  **Başarısız** bir aksiyon olayı tüketmez; en fazla 3 denemede uygulanamazsa olay
+  bırakılır (pozisyon normal korumasında kalır) — sonsuz yeniden deneme yok.
+- **FAIL-OPEN:** bu bir SİNYAL kanalıdır. Defter bozuksa/okunamıyorsa girişler
+  DURMAZ ve pozisyon KAPANMAZ; bugünkü davranış aynen sürer. (Risk kapıları —
+  risk-olayı halt, kill switch, entry latch — fail-CLOSED'dır; bu değil.)
+  **TEK İSTİSNA:** TV çıkış dalında `UnprotectedPositionError` görülürse entry-halt
+  latch'i tetiklenir (D10 deseni, D19a C) — korunamayan pozisyon her yolda aynı
+  ciddiyettedir.
+
+### 7.5 Telemetri, kalıcılık ve bakım uçları
+- `GET /scalper/status` → `tv_events`: `mode`, `exit_action`, `exit_losing`,
+  `max_age_minutes`, `window_open`, `gate_enabled`, `gate_sources`,
+  `event_sources`, `allowlist_ok`, `allowlist_missing`, `symbol_allowlist`,
+  `persist` (`ok`/`errors`/`last_error`/`last_error_at`/`path`), `counters`,
+  `counters_since` ve `symbols` (sembol → `structure`, `structure_source`,
+  `structure_age_s`, kaynak bazlı `structures` (+`via`), `last_event`, `last_exit`,
+  `consumed`). **Secret içermez.**
+- **Sayaç sözleşmesi** (D19a G8): `gate_hits == would_block + blocked` ve
+  `exit_hits == would_exit + exits_attempted`, `exits_attempted == exits_applied +
+  exits_noop + exits_failed`. `gate_hits`/`exit_hits` HER İKİ modda artar, böylece
+  gölge ölçümü aktif ölçümle birebir kıyaslanabilir.
+  ⚠️ **`exits_applied` yalnız BORSAYA GERÇEKTEN İSTEK GİTTİĞİNDE artar**
+  (D19a-2 R2-3): stop gerçekten taşındı ya da pozisyon kapandı. Hiçbir isteğin
+  gitmediği durumlar (`stop zaten en az BE kadar koruyucu`, `zararda + skip`)
+  **`exits_noop`**tur. Gölge tarafındaki karşılığı **`would_exit_noop`** = "aktifte
+  borsaya hiçbir istek GİTMEZDİ" (`ExitManager.breakeven_would_act`, yan etkisiz).
+  Terfi kararında `would_exit`in ham sayısı değil, `would_exit - would_exit_noop`
+  okunur.
+  Diğerleri: `ingested`, `mixed_skipped`, `exits_skipped_losing`,
+  `exits_closed_losing`, `rejected_entry_from_event_source`,
+  `rejected_symbol_allowlist`.
+- Log satırları: `🧭 TV olayı: SYMBOL kind=… dir=… ← src` (alma),
+  `⛔ … TV yapı kapısı` (aktif ret), `👻 … GÖLGE` (gölge),
+  `🤷 … ÇELİŞİYOR` (MIXED), `🛑 … pozisyon zararda` (BE atlandı),
+  `🚫 TV olayı uygulanmadı: … TV sembol allowlist'i dışında`,
+  `⛔ TV webhook: olay kaynağı … GİRİŞ OYU gönderdi` (422),
+  `🧪 TV olayı (DRY-RUN, deftere YAZILMADI)`, `🧹 TV olay defteri sıfırlandı`,
+  `⚠️ TV olay kanalı: …` (startup yapılandırma sağlığı),
+  `🛡️ … SL ücret-dahil BE'ye çekildi` (BE).
+- Durum dosyası `state/tv_events.json` (atomik yazım: tmp + `os.replace` + fsync).
+  Olaylar, tüketim imleçleri, deneme sayaçları ve telemetri sayaçları AYNI dosyada.
+  Olay ve tüketim yazımları ANINDA kalıcıdır; telemetri sayaçları saniyede bir
+  yazılır (D19a-2 R2-8 — `_persist` ~2.5 ms'lik senkron bir işlemdir ve alarm
+  hacmiyle orantılı olarak event-loop'u bloklardı). Açık pozisyonlu semboller
+  defter budamasından MUAFTIR (`TvEvents.protect`, D19a-2 R2-6).
+  **Bozuk dosya = boş durum + WARNING** (fail-closed DEĞİL, yukarıdaki gerekçe).
+  v1 (ilk D19) dosyası atılmaz, imleçsiz olarak yükseltilir. Yazılamayan bir yol
+  kanalı durdurmaz: defter RAM'de çalışır, WARNING **dakikada bir** (log seli
+  koruması) yazılır, sağlık `status.tv_events.persist`'te görünür.
+- **`POST /tv-signal?dry_run=1`** — isteği doğrular ve yönlendirme kararını döndürür
+  ama **DEFTERE YAZMAZ** (kurulum doğrulaması canlı defteri kirletmesin).
+- **`POST /tv-events/reset?secret=<TV_WEBHOOK_SECRET>`** — defteri RAM **ve** diskte
+  sıfırlar. ⚠️ Dosyayı elle silmek ÇALIŞAN süreci temizlemez: RAM otoritedir ve bir
+  sonraki yazımda dosyayı geri yazar. Doğru reçete bu uç ya da restart'tır
+  (`docs/RUNBOOK.md`). Defteri boşaltmak bir RİSK kapısını açmaz — en kötü sonucu
+  kapı/çıkış tetiğinin veri gelene kadar sessizleşmesidir.
+
+### 7.6 Backtest paritesi — bilinçli boşluk
+TV olayları geçmişte YOKTUR (alarm geçmişi indirilemez, gösterge çıktısı harness'ta
+yeniden üretilmez). Bu yüzden `backtest.py`'ye **DOKUNULMADI** ve bu kanal
+**"yalnız canlı"**dır — D10 risk-olayı kanalıyla aynı gerekçe ve aynı kabul.
+Terfi hattı bu yüzden §4'ün 2. adımını (backtest) ATLAR ve kanıt yükünü gölge
+ölçümüne yıkar:
+
+1. **Gölge** (varsayılan): `SCALPER_TV_EVENTS_MODE=shadow`, alarmlar kurulu.
+   ≥5 gün. Ölçüm: `would_block` sayacı vs aynı pencerede açılan işlemlerin
+   sonucu — "engellenecek olan sinyaller gerçekten kaybettirdi mi?"
+   (`scripts/ledger_report.py` + `logs/bot.log` `👻 TV yapı kapısı` satırları).
+2. **Defter ölçümü:** engellenecek girişlerin gerçekleşen PnL'i ve BE'ye
+   çekilecek pozisyonların nihai `exit_reason`/PnL'i; rejime (UP/FLAT/DOWN gün)
+   bölünmeden hüküm verilmez (CLAUDE.md "Karar verirken").
+3. **Aktif:** önce `SCALPER_TV_EVENTS_EXIT=be` (geri alınabilir, yalnız stop
+   sıkışır), sonra gerekirse `close`. `active` kararı `docs/DECISIONS.md`'ye
+   yeni bir satır olarak girer (D19 gölge kararının üstüne).
