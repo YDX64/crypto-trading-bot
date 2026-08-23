@@ -398,6 +398,80 @@
   .exit-sl{color:var(--loss); background:var(--loss-bg); border-color:var(--loss-border);}
   .exit-tp{color:var(--profit); background:var(--profit-bg); border-color:var(--profit-border);}
   .exit-trail{color:var(--gold); background:var(--gold-bg); border-color:var(--gold-border);}
+
+  /* ---------- adli kart (işlem forensics, D21) ---------- */
+  /* Tasarım kuralı: BÜYÜK sayı + AZ renk. Tek bakışta "ne oldu"; ayrıntı
+     alttaki üç blokta. Mevcut pano diliyle aynı token'lar kullanılır. */
+  tr.fx-clickable{cursor:pointer;}
+  tr.fx-clickable.fx-open{background:rgba(255,255,255,0.035);}
+  .fx-caret{
+    display:inline-block; width:12px; color:var(--text-faint);
+    font-family:var(--mono); font-size:11px;
+  }
+  .fx-card{
+    margin-top:12px;
+    background:var(--bg-alt);
+    border:1px solid var(--border);
+    border-left:3px solid var(--border-strong);
+    border-radius:var(--radius);
+    padding:16px 18px 18px;
+  }
+  .fx-head{display:flex; align-items:center; gap:18px; flex-wrap:wrap; margin-bottom:6px;}
+  .fx-pnl{font-family:var(--mono); font-size:34px; font-weight:800; line-height:1;}
+  .fx-roi{font-family:var(--mono); font-size:16px; font-weight:700; color:var(--text-dim);}
+  .fx-headline{font-size:13px; color:var(--text-dim);}
+  .fx-tags{display:flex; gap:6px; flex-wrap:wrap; margin:10px 0 14px;}
+  .fx-tag{
+    display:inline-flex; align-items:center; gap:6px;
+    padding:4px 9px; border-radius:5px; font-size:11px; font-weight:700;
+    border:1px solid var(--loss-border); background:var(--loss-bg); color:var(--loss);
+  }
+  .fx-tag .fx-tag-note{font-weight:500; color:var(--text-dim); font-size:10.5px;}
+  .fx-tag-clean{border-color:var(--profit-border); background:var(--profit-bg); color:var(--profit);}
+  .fx-grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(290px,1fr)); gap:14px;}
+  .fx-block{
+    background:var(--panel); border:1px solid var(--border);
+    border-radius:var(--radius); padding:12px 14px;
+  }
+  .fx-block h4{
+    margin:0 0 9px; font-size:10.5px; letter-spacing:0.07em;
+    text-transform:uppercase; color:var(--text-faint); font-weight:700;
+  }
+  .fx-kv{display:flex; justify-content:space-between; gap:14px; padding:3px 0; font-size:12px;}
+  .fx-kv .k{color:var(--text-dim);}
+  .fx-kv .v{font-family:var(--mono); color:var(--text); text-align:right;}
+  .fx-ok{color:var(--profit);}
+  .fx-off{color:var(--text-faint);}
+  .fx-warn{color:var(--orange);}
+  .fx-bad{color:var(--loss);}
+  .fx-steps{list-style:none; margin:0; padding:0;}
+  .fx-steps li{
+    display:flex; gap:10px; align-items:baseline;
+    padding:4px 0 4px 12px; font-size:12px;
+    border-left:2px solid var(--border-strong);
+  }
+  .fx-steps li.fx-skip{color:var(--text-faint); border-left-color:var(--border);}
+  .fx-steps .fx-when{font-family:var(--mono); font-size:11px; color:var(--text-faint); margin-left:auto;}
+  .fx-mm{margin-top:10px;}
+  .fx-mm-bar{
+    position:relative; height:12px; border-radius:3px;
+    background:rgba(255,255,255,0.05); display:flex; overflow:hidden;
+  }
+  .fx-mm-neg{background:var(--loss); opacity:0.85;}
+  .fx-mm-pos{background:var(--profit); opacity:0.85;}
+  .fx-mm-mid{position:absolute; top:-2px; bottom:-2px; width:1px; background:var(--text-faint);}
+  .fx-mm-legend{display:flex; justify-content:space-between; font-size:10.5px; color:var(--text-faint); margin-top:4px; font-family:var(--mono);}
+
+  /* ---------- "neler etkiliyor" paneli ---------- */
+  .impact-row{display:flex; align-items:center; gap:12px; padding:7px 2px;}
+  .impact-name{width:210px; min-width:150px; font-size:12px;}
+  .impact-name small{display:block; color:var(--text-faint); font-size:10.5px;}
+  .impact-count{width:110px; font-family:var(--mono); font-size:11px; color:var(--text-dim); text-align:right;}
+  .impact-track{flex:1; height:14px; background:rgba(255,255,255,0.04); border-radius:3px; position:relative;}
+  .impact-fill{position:absolute; top:0; bottom:0; border-radius:3px;}
+  .impact-fill.neg{background:var(--loss); opacity:0.8;}
+  .impact-fill.pos{background:var(--profit); opacity:0.8;}
+  .impact-pnl{width:110px; text-align:right; font-family:var(--mono); font-weight:700; font-size:12.5px;}
   .exit-other{color:var(--text-dim); background:rgba(255,255,255,0.05); border-color:var(--border);}
 
   .regime-chip{
@@ -658,6 +732,22 @@
       <div class="table-wrap" id="trades-wrap">
         <div class="placeholder">yükleniyor…</div>
       </div>
+      <!-- Adli kart (D21) tablonun DIŞINDA durur: tablo yatay kayan ve
+           min-width'li bir kaptır, kart ise tam panel genişliğini kullanmalı. -->
+      <div id="trades-detail"></div>
+    </div>
+  </div>
+
+  <!-- 5b. NELER ETKİLİYOR (etiket × sonuç, D21) -->
+  <div class="section">
+    <div class="section-head">
+      <div class="section-title">Neler Etkiliyor</div>
+      <div class="section-sub" id="impact-sub">son 30 gün · etiket başına gerçekleşen K/Z</div>
+    </div>
+    <div class="panel">
+      <div id="impact-wrap">
+        <div class="placeholder">yükleniyor…</div>
+      </div>
     </div>
   </div>
 
@@ -679,6 +769,9 @@
   "use strict";
 
   var REFRESH_MS = 5000;
+  // "Neler etkiliyor" panelinin yenilenme aralığı (ms) ve son çekim anı.
+  var IMPACT_MS = 60000;
+  var impactAt = 0;
   var STRAT_LABELS = {
     A: "A — Trend Kırılması",
     B: "B — Trend İçi Uç Avcısı",
@@ -1301,6 +1394,210 @@
     lastLabel.className = last > 0 ? "profit-text" : (last < 0 ? "loss-text neg" : "");
   }
 
+  // ---- adli kayıt (D21) ------------------------------------------------
+  // Etiket açıklamaları src/strategies/scalper/forensics.py::TAG_LABELS ile
+  // AYNI metinlerdir. Sunucu zaten `label` göndermiyor (liste ucu hafif
+  // kalsın diye), bu yüzden eşleme burada tekrarlanır.
+  var FX_TAG_LABELS = {
+    counter_drift_long: "lider düşerken LONG açıldı",
+    relief_rally_short: "lider yükselirken SHORT açıldı",
+    late_entry_after_run: "çok günlük koşunun ARDINDAN aynı yöne girildi",
+    tv_single_family: "TV sağlaması aynı aileden iki kaynakla doldu",
+    stale_signal: "sinyal ile dolum arasında uzun gecikme",
+    gate_bypassed: "kapı açık ama ETKİN DEĞİL (fail-open) iken girildi",
+    fee_dominated: "ücretler kârın yarısından fazlasını yedi",
+    mfe_giveback: "kâr TP1 hedefini gördü ama zararla kapandı",
+    noise_stop: "stop sonrası fiyat girişe geri döndü (gürültü)"
+  };
+
+  var fxOpenId = null;      // açık adli kartın işlem id'si (tek seferde bir)
+  var fxCache = {};         // id -> /scalper/trades/{id}/forensics yanıtı
+  var lastTradesRes = null; // yeniden çizim için son liste yanıtı
+
+  function fxTagBadge(tag){
+    return '<span class="fx-tag">' + escapeHtml(tag) +
+      '<span class="fx-tag-note">' + escapeHtml(FX_TAG_LABELS[tag] || "") + '</span></span>';
+  }
+
+  function fxKv(key, value, cls){
+    return '<div class="fx-kv"><span class="k">' + escapeHtml(key) +
+      '</span><span class="v ' + (cls || "") + '">' + value + '</span></div>';
+  }
+
+  function fxGateChip(state){
+    if (state === "passed") return '<span class="fx-ok">✓ geçti</span>';
+    if (state === "off") return '<span class="fx-off">— kapalı</span>';
+    if (state === "shadow") return '<span class="fx-off">gölge</span>';
+    if (state === "degraded") return '<span class="fx-warn">⚠ etkin değil</span>';
+    return '<span class="fx-off">?</span>';
+  }
+
+  function fxNum(value, digits, suffix){
+    if (!isNum(value)) return "—";
+    return value.toFixed(digits === undefined ? 2 : digits) + (suffix || "");
+  }
+
+  function fxClock(iso){
+    if (!iso) return "—";
+    return fmtClock(iso);
+  }
+
+  function renderForensicsCard(row){
+    if (!row) return '<div class="placeholder small">yükleniyor…</div>';
+    // "Okunamadı" ile "kayıt yok" AYRI şeylerdir (D21-R3, bulgu 5): uç hata
+    // verdiğinde "kayıt yok" demek, ölçülmüş bir işlemi ölçülmemiş gösterir.
+    if (row.fx_error){
+      return '<div class="placeholder small">adli kayıt OKUNAMADI (' +
+        escapeHtml(row.fx_error) + ') — kart yeniden açılınca tekrar denenir</div>';
+    }
+    if (!row.has_forensics){
+      return '<div class="placeholder small">bu işlem için adli kayıt yok ' +
+        '(D21 öncesi işlem ya da kayıt kapalıydı)</div>';
+    }
+    var e = row.entry || {};
+    var x = row.exit || {};
+    var ind = e.indicators || {};
+    var gate = e.leader_gate || {};
+    var gates = e.gates || {};
+    var path = x.path || {};
+    var pm = row.postmortem;
+
+    var pnlCls = pnlClass(row.realized_pnl);
+    var html = '<div class="fx-card">';
+
+    // --- üst: büyük K/Z + tek satır özet ---
+    html += '<div class="fx-head">' +
+      '<span class="fx-pnl ' + pnlCls + '">' + fmtUsdt(row.realized_pnl) + '</span>' +
+      '<span class="fx-roi ' + pnlCls + '">' + fmtPct(row.roi_pct) + '</span>' +
+      '<span class="fx-headline">#' + row.id + ' · ' + escapeHtml(row.symbol) + ' · ' +
+      escapeHtml(row.direction || "") + ' · ' + escapeHtml(e.source || "C") + ' sinyali · ' +
+      escapeHtml(x.reason || row.exit_reason || "?") + ' ile çıkış</span>' +
+      '</div>';
+
+    // --- etiket rozetleri ---
+    var tags = row.verdict || [];
+    html += '<div class="fx-tags">';
+    if (tags.length === 0){
+      html += '<span class="fx-tag fx-tag-clean">etiket yok' +
+        '<span class="fx-tag-note">kural tabanlı bir kusur bulunamadı</span></span>';
+    } else {
+      tags.forEach(function(tag){ html += fxTagBadge(tag); });
+    }
+    html += '</div>';
+
+    html += '<div class="fx-grid">';
+
+    // --- 1) neden girildi ---
+    html += '<div class="fx-block"><h4>Neden girildi</h4>';
+    html += fxKv("Sinyal", escapeHtml(e.signal_reason || row.signal_reason || "—"));
+    html += fxKv("RSI (giriş / bağlam)",
+      fxNum(ind.rsi_entry, 0) + " / " + fxNum(ind.rsi_context, 0));
+    html += fxKv("Bollinger %B", fxNum(ind.bb_percent_b, 0, "%"));
+    html += fxKv("Diverjans",
+      (ind.bullish_divergence ? "boğa" : (ind.bearish_divergence ? "ayı" : "yok")));
+    html += fxKv("ATR", fxNum(ind.atr_pct, 2, "%"));
+    html += fxKv("Rejim", escapeHtml((e.regime || {}).value || "—"));
+    html += fxKv("EMA50 / EMA200", fmtPrice(ind.ema50) + " / " + fmtPrice(ind.ema200));
+    html += fxKv("BTC gün sapması", fxNum(gate.day_drift_pct, 2, "%"),
+      isNum(gate.day_drift_pct) && Math.abs(gate.day_drift_pct) >= 1 ? "fx-warn" : "");
+    if (e.tv && e.tv.sources){
+      html += fxKv("TV kaynakları", escapeHtml(e.tv.sources.join(", ")));
+    }
+    html += '<div class="fx-kv" style="margin-top:8px;"><span class="k">Kapılar</span>' +
+      '<span class="v">' +
+      "rejim " + fxGateChip(gates.regime) + " · lider " + fxGateChip(gates.leader) +
+      "<br>yapı " + fxGateChip(gates.structure) + " · TV yapı " + fxGateChip(gates.tv_structure) +
+      '</span></div>';
+    html += '</div>';
+
+    // --- 2) nasıl çıkıldı (zaman çizgisi) ---
+    html += '<div class="fx-block"><h4>Nasıl çıkıldı</h4><ul class="fx-steps">';
+    html += '<li><span>Giriş ' + fmtPrice(e.fill_price || row.entry_price) + '</span>' +
+      '<span class="fx-when">' + fxClock(e.at || row.opened_at) + '</span></li>';
+    html += '<li class="' + (path.tp1_done ? "" : "fx-skip") + '"><span>TP1 ' +
+      (path.tp1_done ? fmtPrice(path.tp1_price) : "dolmadı") + '</span>' +
+      '<span class="fx-when">' + fxClock(path.tp1_at) + '</span></li>';
+    html += '<li class="' + (path.be_at ? "" : "fx-skip") + '"><span>Break-even ' +
+      (path.be_at ? fmtPrice(path.be_price) : "yok") + '</span>' +
+      '<span class="fx-when">' + fxClock(path.be_at) + '</span></li>';
+    html += '<li class="' + (path.trail_updates ? "" : "fx-skip") + '"><span>Trailing ×' +
+      (path.trail_updates || 0) +
+      (isNum(path.last_trail_stop) ? " → " + fmtPrice(path.last_trail_stop) : "") + '</span></li>';
+    html += '<li><span>Çıkış ' + fmtPrice(x.exit_price || row.exit_price) + ' (' +
+      escapeHtml(x.reason || row.exit_reason || "?") + ')</span>' +
+      '<span class="fx-when">' + fxClock(x.at || row.closed_at) + '</span></li>';
+    html += '</ul>';
+    html += fxKv("Süre", isNum(path.age_hours) ? fxNum(path.age_hours, 2, " sa") : "—");
+    html += fxKv("İlk stop → son stop",
+      fmtPrice(path.initial_stop) + " → " + fmtPrice(path.final_stop));
+
+    // MAE/MFE çubuğu
+    var mae = isNum(x.mae_roi_pct) ? Math.abs(x.mae_roi_pct) : 0;
+    var mfe = isNum(x.mfe_roi_pct) ? Math.abs(x.mfe_roi_pct) : 0;
+    var span = Math.max(mae, mfe, 1);
+    html += '<div class="fx-mm"><div class="fx-mm-bar">' +
+      '<div class="fx-mm-neg" style="width:' + (mae / (span * 2) * 100) + '%;"></div>' +
+      '<div class="fx-mm-pos" style="width:' + (mfe / (span * 2) * 100) + '%;"></div>' +
+      '<div class="fx-mm-mid" style="left:50%;"></div>' +
+      '</div><div class="fx-mm-legend"><span>MAE ' + fxNum(x.mae_roi_pct, 1, "% ROI") +
+      '</span><span>MFE ' + fxNum(x.mfe_roi_pct, 1, "% ROI") + '</span></div></div>';
+    html += '</div>';
+
+    // --- 3) ne ters gitti (maliyet/kayma/post-mortem) ---
+    html += '<div class="fx-block"><h4>Ne ters gitti</h4>';
+    html += fxKv("Kayma (aleyhte)", fxNum(e.slippage_pct, 3, "%"),
+      isNum(e.slippage_pct) && e.slippage_pct > 0 ? "fx-warn" : "");
+    html += fxKv("Sinyal → dolum", fxNum(e.fill_latency_sec, 1, " sn"));
+    html += fxKv("Brüt / net K/Z",
+      fmtUsdt(x.gross_pnl) + " / " + fmtUsdt(x.realized_pnl));
+    // Ücret ve marj bir K/Z DEĞİLDİR: fmtUsdt'nin "+" işareti burada
+    // "kazanç" gibi okunurdu — düz sayı kullanılır.
+    html += fxKv("Ücret (tahmini)",
+      isNum(x.fee_estimate) ? fmtNum(x.fee_estimate, 2) + " USDT" : "—");
+    html += fxKv("PnL kaynağı", escapeHtml(x.pnl_source || row.pnl_source || "—"));
+    html += fxKv("Stop mesafesi",
+      fxNum(e.stop_distance_pct, 2, "%") + " (ROI " + fxNum(e.stop_roi_pct, 0, "%") + ")");
+    html += fxKv("R:R (giriş anı)", fxNum(e.rr, 2));
+    html += fxKv("Kaldıraç / marj",
+      (e.leverage || "—") + "x / " +
+      (isNum(e.margin_usdt) ? fmtNum(e.margin_usdt, 2) + " USDT" : "—"));
+    if (pm){
+      var pmText = pm.returned_to_entry === true
+        ? ("evet, " + fxNum(pm.minutes_to_return, 0) + " dk sonra")
+        : (pm.returned_to_entry === false ? "hayır" : "ölçülemedi");
+      html += fxKv("Kapanıştan sonra girişe döndü mü?", escapeHtml(pmText),
+        pm.returned_to_entry === true ? "fx-bad" : "");
+      html += fxKv("Pencerede en iyi hareket", fxNum(pm.max_favorable_pct, 2, "%"));
+    }
+    html += '</div>';
+
+    html += '</div></div>';
+    return html;
+  }
+
+  function fxToggle(id){
+    if (fxOpenId === id){
+      fxOpenId = null;
+      renderTrades(lastTradesRes);
+      return;
+    }
+    fxOpenId = id;
+    renderTrades(lastTradesRes);
+    // Hatalı yanıt önbellekte KALMAZ: kart yeniden açılınca tekrar denenir.
+    if (fxCache[id] && !fxCache[id].fx_error) return;
+    delete fxCache[id];
+    fetchJSON("/scalper/trades/" + id + "/forensics").then(function(res){
+      if (res.ok){
+        fxCache[id] = res.data;
+      } else {
+        fxCache[id] = {
+          fx_error: res.networkError ? "bağlantı yok" : ("HTTP " + res.status)
+        };
+      }
+      if (fxOpenId === id) renderTrades(lastTradesRes);
+    });
+  }
+
   function renderTrades(tradesRes){
     var wrap = qs("trades-wrap");
 
@@ -1310,6 +1607,7 @@
       return;
     }
 
+    lastTradesRes = tradesRes;
     var trades = tradesRes.data;
     drawSparkline(trades);
 
@@ -1326,9 +1624,9 @@
     }).slice(0, 30);
 
     var html = '<table><thead><tr>' +
-      '<th>Zaman</th><th>Strateji</th><th>Sembol</th><th>Yön</th>' +
+      '<th></th><th>Zaman</th><th>Strateji</th><th>Sembol</th><th>Yön</th>' +
       '<th class="num">Giriş → Çıkış</th><th class="num">K/Z</th>' +
-      '<th class="num">ROI</th><th>Kaynak</th><th>Çıkış</th>' +
+      '<th class="num">ROI</th><th>Kaynak</th><th>Çıkış</th><th>Etiket</th>' +
       '</tr></thead><tbody>';
 
     sorted.forEach(function(t){
@@ -1338,7 +1636,16 @@
         t.pnl_source === "binance_income_net";
       var source = isVerified ? "NET" : (t.pnl_source === "fallback" ? "BRÜT TAHMİN" : "LEGACY");
       var sourceCls = isVerified ? "pnl-source-verified" : (t.pnl_source === "fallback" ? "pnl-source-fallback" : "pnl-source-legacy");
-      html += '<tr>' +
+      var open = fxOpenId === t.id;
+      var clickable = t.has_forensics !== false;
+      var tags = t.verdict || [];
+      var tagCell = tags.length
+        ? '<span class="fx-tag" style="padding:2px 7px;">' + escapeHtml(tags[0]) +
+          (tags.length > 1 ? " +" + (tags.length - 1) : "") + '</span>'
+        : '<span class="cell-dim">—</span>';
+      html += '<tr' + (clickable ? ' class="fx-clickable' + (open ? ' fx-open' : '') +
+          '" data-fx-id="' + t.id + '"' : '') + '>' +
+        '<td class="fx-caret">' + (clickable ? (open ? "▾" : "▸") : "") + '</td>' +
         '<td class="cell-dim">' + fmtDateTime(t.closed_at) + '</td>' +
         '<td>' + strategyBadge(t.strategy) + '</td>' +
         '<td class="cell-symbol">' + escapeHtml(t.symbol) + '</td>' +
@@ -1348,10 +1655,81 @@
         '<td class="num ' + pnlCls + '">' + fmtPct(t.roi_pct) + '</td>' +
         '<td class="' + sourceCls + '">' + source + '</td>' +
         '<td>' + exitReasonChip(t.exit_reason) + '</td>' +
+        '<td>' + tagCell + '</td>' +
         '</tr>';
     });
 
     html += '</tbody></table>';
+    wrap.innerHTML = html;
+
+    Array.prototype.forEach.call(
+      wrap.querySelectorAll("tr[data-fx-id]"),
+      function(tr){
+        tr.addEventListener("click", function(){
+          fxToggle(parseInt(tr.getAttribute("data-fx-id"), 10));
+        });
+      }
+    );
+
+    renderTradeDetail(sorted);
+  }
+
+  function renderTradeDetail(visibleTrades){
+    var box = qs("trades-detail");
+    if (!box) return;
+    if (fxOpenId === null){
+      box.innerHTML = "";
+      return;
+    }
+    var found = visibleTrades.some(function(t){ return t.id === fxOpenId; });
+    if (!found){
+      // Açık kart artık listede değil (yeni işlemler onu dışarı itti).
+      fxOpenId = null;
+      box.innerHTML = "";
+      return;
+    }
+    box.innerHTML = renderForensicsCard(fxCache[fxOpenId]);
+  }
+
+  // ---------------------------------------------------------------
+  // 5b. neler etkiliyor (etiket × sonuç)
+  // ---------------------------------------------------------------
+
+  function renderImpact(summaryRes){
+    var wrap = qs("impact-wrap");
+    var sub = qs("impact-sub");
+    if (!summaryRes || !summaryRes.ok || !summaryRes.data){
+      notConnected(wrap);
+      return;
+    }
+    var data = summaryRes.data;
+    var rows = (data.tags || []).filter(function(r){ return r.trades > 0; });
+    sub.textContent = "son 30 gün · " + (data.trades || 0) + " işlem · adli kayıtlı " +
+      (data.with_forensics || 0) + ", kayıtsız " + (data.without_forensics || 0);
+
+    if (rows.length === 0){
+      notConnected(wrap, "bu pencerede etiketlenecek işlem yok");
+      return;
+    }
+
+    var maxAbs = rows.reduce(function(acc, r){
+      return Math.max(acc, Math.abs(r.pnl || 0));
+    }, 1);
+
+    var html = "";
+    rows.forEach(function(r){
+      var neg = (r.pnl || 0) < 0;
+      var width = Math.abs(r.pnl || 0) / maxAbs * 100;
+      html += '<div class="impact-row">' +
+        '<div class="impact-name">' + escapeHtml(r.tag) +
+        '<small>' + escapeHtml(r.label || "") + '</small></div>' +
+        '<div class="impact-count">' + r.trades + ' işlem · WR %' +
+        (isNum(r.winrate) ? r.winrate.toFixed(0) : "?") + '</div>' +
+        '<div class="impact-track"><div class="impact-fill ' + (neg ? "neg" : "pos") +
+        '" style="width:' + width + '%;"></div></div>' +
+        '<div class="impact-pnl ' + pnlClass(r.pnl) + '">' + fmtUsdt(r.pnl) + '</div>' +
+        '</div>';
+    });
     wrap.innerHTML = html;
   }
 
@@ -1430,6 +1808,13 @@
       fetchJSON("/scalper/stats"),
       fetchJSON("/scalper/trades")
     ];
+    // "Neler etkiliyor" 30 GÜNLÜK bir toplamdır; 5 saniyede bir yeniden
+    // hesaplatmak boşa iştir (ve panonun botu aç bırakması bu repoda
+    // yaşanmış bir arızadır). Dakikada bir yeter.
+    var wantImpact = impactAt === 0 || (Date.now() - impactAt) >= IMPACT_MS;
+    if (wantImpact){
+      endpoints.push(fetchJSON("/scalper/forensics/summary?since=30d"));
+    }
 
     Promise.all(endpoints).then(function(results){
       var health = results[0];
@@ -1440,6 +1825,8 @@
       var scalperStatus = results[5];
       var scalperStats = results[6];
       var scalperTrades = results[7];
+      var forensicsSummary = wantImpact ? results[8] : null;
+      if (wantImpact) impactAt = Date.now();
 
       // bağlantı bandı: sadece gerçek ağ hatalarında (sunucuya ulaşılamıyor)
       // göster — 404/503 gibi uygulama düzeyi yanıtlar normal karşılanır.
@@ -1452,6 +1839,7 @@
       renderPositions(positions, scalperStatus);
       renderRegimeMap(scalperStatus);
       renderTrades(scalperTrades);
+      if (forensicsSummary) renderImpact(forensicsSummary);
       renderWaiting(waiting);
 
       setLastUpdate();

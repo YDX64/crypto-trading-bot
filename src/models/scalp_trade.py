@@ -8,7 +8,7 @@ takibi için.
 """
 
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Float, DateTime
+from sqlalchemy import Column, Integer, String, Float, DateTime, Text
 
 from src.core.database import Base
 
@@ -59,3 +59,10 @@ class ScalpTradeModel(Base):
     entry_order_id = Column(String, nullable=True)
 
     notes = Column(String, nullable=True)
+
+    # İşlem adli kaydı (D21, gözlemlenebilirlik) — JSON metni:
+    #   {"v":1,"entry":{...},"exit":{...},"verdict":[...],"postmortem":{...}}
+    # Geriye uyumlu: eski satırlarda NULL kalır ve HİÇBİR karar yolu bu
+    # sütunu okumaz (yalnız uçlar/pano/rapor okur). Şema tamamlaması
+    # `src/core/database.py::_ensure_schema_migrations` içindedir.
+    forensics = Column(Text, nullable=True)

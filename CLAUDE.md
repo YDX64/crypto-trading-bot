@@ -42,10 +42,16 @@ Yeni sinyal kaynağı (haber botu vb.) eklemek: `docs/INTEGRATIONS.md`. Otomatik
   önce `docs/RUNBOOK.md` "Kline kaynağını mainnet'e alma").
 - **Veri:** `tradingbot.db` (sqlite, `scalp_trades`), `state/` (cooldown, entry-halt),
   `logs/bot.log` (uygulama), `logs/supervisor.log` (erişim logu — **secret içerir, dökme**).
+- **Bir işlemi incelemek:** her işlemin "neden girildi / nasıl çıkıldı / ne ters gitti"
+  kaydı `scalp_trades.forensics` + `logs/trades.jsonl`'dedir (D21, YALNIZ GÖZLEM —
+  motor davranışını değiştirmez). Panoda "Son İşlemler" satırına tıkla; uçlar
+  `/scalper/trades/{id}/forensics`, `/scalper/forensics/summary?since=7d`;
+  rapor `scripts/ledger_report.py --forensics`. Reçete: `docs/RUNBOOK.md`
+  "Bir işlemi nasıl incelerim".
 
 ## Nasıl çalıştırılır / test edilir / deploy edilir
 ```bash
-python3 -m pytest tests -q                      # 1580 test, ~35 sn — her değişiklikten önce
+python3 -m pytest tests -q                      # 1751 test, ~37 sn — her değişiklikten önce
 scripts/deploy.sh awa                           # push edilmiş main'i sunucuya uygula (test + restart + sağlık + otomatik geri alma)
 DEPLOY_NO_RESTART=1 scripts/deploy.sh awa       # yalnız kod/test; süreci yeniden başlatma
 scripts/deploy.sh awa <önceki-commit>           # geri alma (backups/commit.prev-*)

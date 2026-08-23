@@ -78,6 +78,10 @@ def _settings(**overrides) -> Settings:
         app_env="production",
     )
     values.update(overrides)
+    # Süreç env'indeki SCALPER_MARKET_DATA_BASE_URL (sunucuda ayar AÇIK) bu
+    # testlerin "boş ayar" varsayımını kirletmesin (2026-08-23 deploy dersi):
+    # yalnız açıkça verilmediyse boşa sabitle.
+    values.setdefault("scalper_market_data_base_url", "")
     return Settings(_env_file=None, **values)
 
 

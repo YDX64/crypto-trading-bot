@@ -158,6 +158,15 @@ class ScalperEngine:
     _VIRTUAL_EQUITY_CACHE_TTL = 30.0
     _EXCHANGE_PROBE_INTERVAL = 30.0
     _RESERVATION_OWNER = "scalper"
+    # D21 post-mortem: mum isteği için üst sınır. `KlineFetcher` kendi içinde
+    # 3 deneme × 15 sn yeniden dener; yavaş/5xx bir veri host'unda bu ~48 sn
+    # eder. Post-mortem AYRI bir task'ta koşsa bile açık uçlu beklemez: bir
+    # teşhis isteği bir sonraki turu ve `stop()`u geciktirmemelidir.
+    _FORENSICS_POSTMORTEM_TIMEOUT = 5.0
+    # Aynı işlem için azami ölçüm denemesi; sonra "ölçülemedi" yazılır.
+    # Sonsuz yeniden deneme kuyruğun BAŞINI tıkar (aday listesi kapanış
+    # zamanına göre sıralıdır) ve her dakika boşa istek yakar.
+    _FORENSICS_POSTMORTEM_MAX_ATTEMPTS = 3
     # Piyasa verisi kesintisi uyarısının azami sıklığı (sn). Tarama turu 30
     # sn'de bir döner; uzun bir banda (180 sn+) her tur satır basmak logu
     # doldurur ve gerçek olayları gizler.
@@ -227,6 +236,10 @@ class ScalperEngine:
             # CANLI fiyatı da AYNI fetcher'dan (aynı host, aynı ağırlık
             # bütçesi/kesici) gelir. Aynı host'ta hiç çağrılmaz.
             data_price_fetch=self.fetcher.get_price,
+            # D21: kapanış anındaki piyasa bağlamı (sembol rejimi, lider gün
+            # sapması, BTC fiyatı). SENKRON ve önbellekten okunur — ek REST
+            # çağrısı YOKTUR; yalnız adli kayda yazılır.
+            forensics_context_cb=self._forensics_close_context,
         )
 
         # _task eski iç kullanımlar için scan task alias'ı olarak korunur.
@@ -276,6 +289,18 @@ class ScalperEngine:
         # yeniden DENENMEZ (boşa REST + kline kilidi tutmayı önler).
         self._market_gate_retry_after: float = 0.0
         self._market_gate_warn_at: Dict[str, float] = {}
+        # D21 adli kayıt: kurulum hatası bir kez uyarılır, akış etkilenmez.
+        self._forensics_error_logged: bool = False
+        # Post-mortem turu (kapanıştan N dk sonra) için son çalıştırma anı.
+        self._forensics_postmortem_at: float = 0.0
+        # Post-mortem AYRI bir arka plan task'ında koşar: safety turu onu
+        # BEKLEMEZ (D21-R3, düşmanca inceleme bulgusu 1). Aynı anda EN FAZLA
+        # BİR post-mortem çalışır; referans burada tutulur ki `stop()` onu
+        # iptal edebilsin ve ikinci bir tur başlatılmasın.
+        self._forensics_postmortem_task: Optional[asyncio.Task] = None
+        # trade_id -> başarısız ölçüm denemesi. 3'te bir kez "ölçülemedi"
+        # yazılır; sonsuz yeniden deneme kuyruğu tıkar.
+        self._forensics_postmortem_attempts: Dict[int, int] = {}
         self._balance_cache: Tuple[Optional[float], float] = (None, 0.0)
         self._daily_pnl: float = 0.0
         self._daily_pnl_source: str = "unavailable"
@@ -431,7 +456,14 @@ class ScalperEngine:
         self.running = False
         tasks = [
             task
-            for task in (self._task, self._safety_task, self._exchange_task)
+            for task in (
+                self._task,
+                self._safety_task,
+                self._exchange_task,
+                # D21 post-mortem arka plan task'ı: kapanışta askıda kalmasın
+                # (yalnız teşhis işi — iptali hiçbir koruma işini etkilemez).
+                getattr(self, "_forensics_postmortem_task", None),
+            )
             if task is not None
         ]
         for task in tasks:
@@ -1078,6 +1110,14 @@ class ScalperEngine:
         # "yaş" değil "TV_EVENT" olarak etiketlenmeli.
         await self._apply_tv_event_exits()
         await self._reap_aged_positions()
+        # D21 post-mortem: TÜM çıkış/koruma işlerinden SONRA ve AYRI bir
+        # task'ta — safety turu onu BEKLEMEZ. Yavaş/5xx bir veri host'unda
+        # `get_klines` üç deneme × 15 sn boyunca askıda kalabilir; bunu tur
+        # içinde beklemek TP1→BE, trailing ve kill-switch'i geciktirir,
+        # `/health` 503'e düşer ve watchdog restart'ı davet eder
+        # (2026-08-14 dersi). Bir teşhis işi asla bir koruma işini
+        # geciktirmez.
+        self._forensics_postmortem_schedule()
         self._sync_scalper_reservations()
         was_blocked = self._kill_switch or self._entry_halted
         await self._update_kill_switch()
@@ -1513,7 +1553,18 @@ class ScalperEngine:
             ),
         }
 
-    async def _evaluate_symbol(self, symbol: str, enabled_strategies: list) -> None:
+    async def _evaluate_symbol(
+        self,
+        symbol: str,
+        enabled_strategies: list,
+        *,
+        external_meta: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """`external_meta` (D21): TV kaynağı/sağlama özeti — YALNIZ adli kayıt.
+
+        Hiçbir kapıya girmez; None (varsayılan) verildiğinde bu fonksiyon
+        eskisiyle birebir aynıdır.
+        """
         owner = symbol_reservations.owner(symbol)
         if owner is not None and owner != self._RESERVATION_OWNER:
             return
@@ -1583,6 +1634,9 @@ class ScalperEngine:
             sig = strat.evaluate(ctx)
             if sig is None:
                 continue
+            # D21 adli kayıt: sinyalin doğduğu an. Kapılar + emir gecikmesi
+            # (`stale_signal`) buradan ölçülür. Karar yoluna GİRMEZ.
+            signal_epoch = time.time()
             # 2026-08-16 rejim kapisi: C, DOWN rejimde LONG / UP rejimde SHORT
             # acamaz (30 saatlik RANGE/DOWN penceresinde rejime ters girisler
             # -35 USDT kanatti). 2026-08-18: TV muafiyeti KALDIRILDI (ayrı
@@ -1731,8 +1785,30 @@ class ScalperEngine:
                 self._opening_symbols.add(symbol)
                 unsafe_failure = False
                 sp = None
+                # D21: giriş-anı bağlamı. Yalnız hazır anlık görüntüleri okur
+                # (yeni REST çağrısı YOK) ve hata hâlinde None döner —
+                # girişi ASLA engellemez.
+                forensics_ctx = self._forensics_entry_context(
+                    symbol=symbol,
+                    signal=sig,
+                    ctx=ctx,
+                    structure_state=structure_state,
+                    is_external=is_external,
+                    signal_epoch=signal_epoch,
+                    open_positions=open_count,
+                    external_meta=external_meta,
+                )
                 try:
-                    sp = await self.executor.try_open(sig, ctx)
+                    # `forensics=` YALNIZ bağlam kurulabildiyse geçilir:
+                    # executor yerine iki-argümanlı bir çift koyan
+                    # test/entegrasyon kurulumları bu yolla bozulmaz ve adli
+                    # kaydın kapalı olması giriş akışını hiç değiştirmez.
+                    if forensics_ctx is not None:
+                        sp = await self.executor.try_open(
+                            sig, ctx, forensics=forensics_ctx
+                        )
+                    else:
+                        sp = await self.executor.try_open(sig, ctx)
                 except UnprotectedPositionError:
                     # Sembol, outer loop kalıcı entry latch'i etkinleştirene
                     # kadar in-flight kümesinde kalır. Bu kısa aralıkta safety
@@ -1773,6 +1849,415 @@ class ScalperEngine:
             # Sembol başına tek deneme: sinyal bulunduğu an (başarılı ya da
             # başarısız) bu sembol için tur biter.
             break
+
+    # ------------------------------------------------------------------
+    # İşlem adli kaydı (D21) — YALNIZ GÖZLEM
+    # ------------------------------------------------------------------
+
+    def _forensics_enabled(self) -> bool:
+        return bool(getattr(self.cfg, "scalper_forensics_enabled", True))
+
+    def _forensics_warn(self, message: str) -> None:
+        """Adli kayıt arızasını BİR KEZ duyur; hiçbir akışı kesme."""
+        if not getattr(self, "_forensics_error_logged", False):
+            self._forensics_error_logged = True
+            self.logger.warning(
+                f"⚠️ Adli kayıt bağlamı kurulamadı ({message}) — bu uyarı bir "
+                f"kez loglanır, giriş/çıkış akışı ETKİLENMEZ"
+            )
+
+    def _forensics_entry_context(
+        self,
+        *,
+        symbol: str,
+        signal: Any,
+        ctx: StrategyContext,
+        structure_state: Any,
+        is_external: bool,
+        signal_epoch: float,
+        open_positions: int,
+        external_meta: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Giriş anındaki "neden girildi" bağlamı.
+
+        YENİ REST ÇAĞRISI YOKTUR: yalnız `ctx`'te zaten bulunan seriler ve
+        senkron anlık görüntüler (`_market_gate_status`, `tv_events.snapshot`,
+        `_kline_source_snapshot`) okunur. Hata hâlinde None döner ve giriş
+        normal biçimde sürer — bu bir gözlem katmanıdır, güvenlik kilidi
+        DEĞİLDİR.
+        """
+        if not self._forensics_enabled():
+            return None
+        try:
+            from src.strategies.scalper import forensics as fx
+
+            direction = getattr(signal.direction, "value", str(signal.direction))
+            gate_status = self._market_gate_status()
+            leader_gate = fx.leader_gate_snapshot(gate_status)
+
+            # Lider (BTC) fiyatı: kapı görüntüsü BAYAT değilse okunur.
+            btc_price = None
+            if not gate_status.get("stale"):
+                cached = getattr(self, "_market_gate_cache", {}).get(
+                    self._market_gate_leader()
+                )
+                if cached:
+                    btc_price = (cached[0] or {}).get("last_close")
+
+            regime_filter_on = bool(
+                getattr(self.cfg, "scalper_regime_filter", True)
+            ) and (
+                not is_external
+                or bool(getattr(self.cfg, "scalper_tv_regime_filter", True))
+            )
+            tv_mode = self._tv_events_mode()
+            gates = {
+                "regime": "passed" if regime_filter_on else "off",
+                "leader": {
+                    "kapalı": "off",
+                    "geçti": "passed",
+                    "etkin_değil": "degraded",
+                }.get(leader_gate.get("verdict"), "off"),
+                "structure": (
+                    "passed"
+                    if bool(getattr(self.cfg, "scalper_structure_gate", False))
+                    else "off"
+                ),
+                "tv_structure": {
+                    "off": "off", "shadow": "shadow", "active": "passed",
+                }.get(tv_mode, "off"),
+                "capacity": "passed",
+                "cooldown": "passed",
+            }
+
+            tv_structure = None
+            ledger = self._tv_ledger()
+            if ledger is not None and tv_mode != "off":
+                verdict, rows = ledger.structure_verdict(symbol)
+                tv_structure = {
+                    "mode": tv_mode,
+                    "verdict": verdict,
+                    "sources": sorted(
+                        {str(row.get("source")) for row in rows if row.get("source")}
+                    ),
+                }
+
+            entry_candles = list(getattr(ctx, "candles_5m", None) or [])
+            candle_age = None
+            if entry_candles:
+                candle_age = max(
+                    0.0, signal_epoch - entry_candles[-1].close_time / 1000.0
+                )
+
+            context: Dict[str, Any] = {
+                "source": "TV" if is_external else "C",
+                "signal_epoch": signal_epoch,
+                "signal_at": datetime.fromtimestamp(
+                    signal_epoch, tz=timezone.utc
+                ).isoformat(timespec="seconds"),
+                "candle_age_sec": None if candle_age is None else round(candle_age, 1),
+                "indicators": fx.indicator_snapshot(ctx, self.cfg),
+                "regime": {
+                    "value": getattr(ctx.regime, "value", str(ctx.regime)),
+                    "tf": str(getattr(self.cfg, "scalper_tf_regime", "4h") or "4h"),
+                    "direction": direction,
+                },
+                "leader_gate": leader_gate,
+                "structure": structure_snapshot(structure_state) or None,
+                "tv_structure": tv_structure,
+                "gates": gates,
+                "kline_source": self._kline_source_snapshot().get("kline_source"),
+                "open_positions": int(open_positions),
+                "daily_pnl": self._daily_pnl,
+                "btc_price": btc_price,
+            }
+            if external_meta:
+                context["tv"] = dict(external_meta)
+            return context
+        except Exception as e:
+            self._forensics_warn(f"{type(e).__name__}: {e}")
+            return None
+
+    def _forensics_close_context(self, symbol: str) -> Dict[str, Any]:
+        """Kapanış anındaki piyasa bağlamı — SENKRON, hiç IO yapmaz."""
+        try:
+            gate_status = self._market_gate_status()
+            btc_price = None
+            if not gate_status.get("stale"):
+                cached = getattr(self, "_market_gate_cache", {}).get(
+                    self._market_gate_leader()
+                )
+                if cached:
+                    btc_price = (cached[0] or {}).get("last_close")
+            return {
+                "regime": self._regimes.get(str(symbol).upper()),
+                "leader_day_drift_pct": gate_status.get("day_drift_pct"),
+                "btc_price": btc_price,
+            }
+        except Exception as e:
+            self._forensics_warn(f"close_context {type(e).__name__}: {e}")
+            return {}
+
+    def _forensics_postmortem_schedule(self) -> None:
+        """Post-mortem turunu ARKA PLANDA başlat — safety turu BEKLEMEZ.
+
+        Düşmanca inceleme bulgusu 1 (D21-R3): tur içinde `await` edilen bir
+        mum isteği yavaş/5xx bir veri host'unda ~48 sn (3 deneme × 15 sn)
+        askıda kalır ve TP1→BE, trailing, kill-switch ile rezervasyon
+        senkronunu geciktirir; `/health` 503'e düşer, watchdog restart eder.
+        Bu yüzden ölçüm ayrı bir task'a alınır:
+
+        * eşzamanlı EN FAZLA BİR post-mortem (task referansı kontrol edilir),
+        * host geneli piyasa-verisi kesintisinde tur hiç başlatılmaz,
+        * dakikada en fazla bir kez (teşhis işi, koruma işi değil).
+
+        Bu fonksiyon SENKRONDUR ve hiçbir şeyi beklemez; hatası da motoru
+        düşürmez (`_forensics_postmortem_done` istisnayı tüketir).
+        """
+        if not self._forensics_enabled():
+            return
+        window_min = float(
+            getattr(self.cfg, "scalper_forensics_postmortem_min", 60.0) or 0.0
+        )
+        if window_min <= 0:
+            return
+        task = getattr(self, "_forensics_postmortem_task", None)
+        if task is not None and not task.done():
+            return
+        if self._forensics_postmortem_blocked() is not None:
+            return
+        if time.monotonic() - float(
+            getattr(self, "_forensics_postmortem_at", 0.0)
+        ) < 60.0:
+            return
+        try:
+            new_task = asyncio.create_task(
+                self._forensics_postmortem_tick(),
+                name="scalper-forensics-postmortem",
+            )
+        except RuntimeError:  # pragma: no cover - çalışan olay döngüsü yok
+            self._forensics_postmortem_task = None
+            return
+        self._forensics_postmortem_task = new_task
+        new_task.add_done_callback(self._forensics_postmortem_done)
+
+    def _forensics_postmortem_done(self, task: "asyncio.Task") -> None:
+        """Task bitince istisnayı TÜKET: teşhis işi motoru asla düşürmez."""
+        if getattr(self, "_forensics_postmortem_task", None) is task:
+            self._forensics_postmortem_task = None
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self._forensics_warn(f"postmortem_task {type(exc).__name__}: {exc}")
+
+    def _forensics_postmortem_blocked(self) -> Optional[str]:
+        """Tur atlanmalı mı? (atlanmalıysa neden metni, değilse None)
+
+        İki bağımsız sinyal:
+
+        1. `exits._market_data_down_reason` — BU safety turunda host geneli bir
+           piyasa-verisi kesintisi görüldü (trailing zaten atlandı).
+        2. `MarketDataGuard.blocked_until` — kline host'u ban/kesici altında.
+           (1) yalnız AÇIK POZİSYON varken dolar; ban sırasında hiç pozisyon
+           yoksa tek uyarı budur.
+
+        Kesinti sırasında teşhis isteği atmak ne veri getirir ne de ağırlık
+        bütçesi bırakır: tur hiç başlatılmaz ve deneme sayacı HARCANMAZ —
+        yani geçici bir ban, ölçülebilir bir kapanışı "ölçülemedi"ye çevirmez.
+        """
+        reason = getattr(
+            getattr(self, "exits", None), "_market_data_down_reason", None
+        )
+        if reason:
+            return str(reason)
+        try:
+            base_url = str(getattr(self.fetcher, "base_url", "") or "")
+            if base_url:
+                blocked_until = MarketDataGuard.blocked_until(host_of(base_url))
+                if blocked_until and time.time() < blocked_until:
+                    return f"kline host'u ban altında ({blocked_until:.0f}'a kadar)"
+        except Exception:  # pragma: no cover - teşhis kapısı asla patlamamalı
+            return None
+        return None
+
+    async def _forensics_postmortem_tick(self) -> None:
+        """Kapanıştan N dk SONRA "fiyat girişe döndü mü" alanını doldur.
+
+        **Look-ahead değildir:** yalnız kapanış zamanından SONRAKİ mumlara
+        bakar ve sonucu kaydın AYRI `postmortem` alanına yazar; hiçbir kapı,
+        boyutlama ya da çıkış kararı bu alanı okumaz.
+
+        Maliyet: tur başına EN FAZLA BİR sembol ve dakikada en fazla bir tur;
+        istek `SCALPER_TF_ENTRY` (varsayılan 5m) limit 150'dir (ağırlık 2) ve
+        `asyncio.wait_for` ile 5 sn'de kesilir. Post-mortem penceresi
+        `SCALPER_FORENSICS_POSTMORTEM_MIN=0` ile tamamen kapatılır.
+
+        Bu fonksiyon `_forensics_postmortem_schedule` tarafından AYRI bir
+        task'ta çalıştırılır; safety turu onu beklemez.
+        """
+        if not self._forensics_enabled():
+            return
+        window_min = float(
+            getattr(self.cfg, "scalper_forensics_postmortem_min", 60.0) or 0.0
+        )
+        if window_min <= 0:
+            return
+        blocked = self._forensics_postmortem_blocked()
+        if blocked is not None:
+            # Sayaç HARCANMAZ ve `_forensics_postmortem_at` tazelenmez:
+            # kesinti bitince ilk turda yeniden denenir.
+            self.logger.debug(f"Post-mortem turu atlandı (piyasa verisi yok): {blocked}")
+            return
+        now = time.monotonic()
+        # Dakikada bir yeter: bu bir teşhis işidir, bir koruma değil.
+        if now - float(getattr(self, "_forensics_postmortem_at", 0.0)) < 60.0:
+            return
+        self._forensics_postmortem_at = now
+
+        row: Optional[Dict[str, Any]] = None
+        try:
+            from src.strategies.scalper import forensics as fx
+
+            candidates = await self.tracker.postmortem_candidates(
+                now=datetime.utcnow(),
+                min_age_minutes=window_min,
+            )
+            if not candidates:
+                return
+            row = candidates[0]           # tur başına EN FAZLA BİR sembol
+            symbol = str(row.get("symbol") or "").upper()
+            closed_at = row.get("closed_at")
+            if not symbol or closed_at is None:
+                return
+            closed_ms = int(
+                closed_at.replace(tzinfo=timezone.utc).timestamp() * 1000
+            )
+            tf_entry = str(getattr(self.cfg, "scalper_tf_entry", "5m") or "5m")
+            candles = await asyncio.wait_for(
+                self.fetcher.get_klines(symbol, tf_entry, 150),
+                timeout=self._FORENSICS_POSTMORTEM_TIMEOUT,
+            )
+            postmortem = fx.postmortem_from_candles(
+                entry=row.get("entry"),
+                exit_=row.get("exit"),
+                candles=candles,
+                closed_at_ms=closed_ms,
+                th=fx.thresholds_from_cfg(self.cfg),
+            )
+            if not postmortem.get("candles_seen"):
+                # Pencereyi kapsayan mum yok (ör. sembol veri kaynağında yok):
+                # boş bir kayıt yazıp konuyu kapat — sonsuz yeniden deneme yok.
+                postmortem["note"] = (
+                    "pencereyi kapsayan mum bulunamadı; ölçüm yapılamadı"
+                )
+            await self.tracker.record_postmortem(int(row["id"]), postmortem)
+            self._forensics_postmortem_attempt_clear(row)
+            try:
+                from src.strategies.scalper import forensics_log
+
+                forensics_log.append_soon(
+                    "postmortem",
+                    {
+                        "trade_id": int(row["id"]),
+                        "symbol": symbol,
+                        "postmortem": postmortem,
+                    },
+                )
+            except Exception as e:  # pragma: no cover - savunma
+                self._forensics_warn(f"postmortem_log {type(e).__name__}: {e}")
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            # Veri host'u yavaş: tur zaten kesildi (safety turu ETKİLENMEDİ).
+            # Deneme sayılır; 3'ünde de dönmezse "ölçülemedi" yazılır.
+            await self._forensics_postmortem_defer(
+                row,
+                f"veri host'u {self._FORENSICS_POSTMORTEM_TIMEOUT:g} sn içinde "
+                f"yanıt vermedi",
+            )
+        except MarketDataRequestError as e:
+            # SEMBOL kapsamlı ve KALICI hata (ör. `-1121 Invalid symbol` —
+            # ayrı market-data host'unda gerçekçidir). Her dakika yeniden
+            # denemek hem boşunadır hem de kuyruğu TIKAR: aday listesi
+            # kapanış zamanına göre sıralıdır, bu satır çözülene kadar
+            # arkasındaki hiçbir işlem ölçülemez. "Ölçülemedi" diye işaretle
+            # ve geç (bir kayıt eksiği, kilitlenmiş bir kuyruktan iyidir).
+            if row is not None:
+                self._forensics_postmortem_attempt_clear(row)
+                await self._forensics_mark_unmeasured(
+                    row, f"ölçülemedi: sembol veri kaynağında bulunamadı ({e})"
+                )
+        except MarketDataUnavailable as e:
+            # HOST geneli (ban/bütçe): geçicidir ama sonsuz da olamaz —
+            # kuyruğun BAŞINI tıkamasın diye deneme bütçesinden düşülür.
+            # Teşhis işi için tek WARNING satırı bile fazladır (tarama turu
+            # zaten uyarıyor).
+            self.logger.debug(f"Post-mortem atlandı (piyasa verisi yok): {e}")
+            await self._forensics_postmortem_defer(row, f"piyasa verisi yok ({e})")
+        except Exception as e:
+            await self._forensics_postmortem_defer(row, f"{type(e).__name__}: {e}")
+            self._forensics_warn(f"postmortem {type(e).__name__}: {e}")
+
+    def _forensics_postmortem_attempts_map(self) -> Dict[int, int]:
+        attempts = getattr(self, "_forensics_postmortem_attempts", None)
+        if not isinstance(attempts, dict):
+            attempts = {}
+            self._forensics_postmortem_attempts = attempts
+        return attempts
+
+    def _forensics_postmortem_attempt_clear(self, row: Optional[Dict[str, Any]]) -> None:
+        if not row:
+            return
+        try:
+            self._forensics_postmortem_attempts_map().pop(int(row.get("id") or 0), None)
+        except Exception:  # pragma: no cover - savunma
+            pass
+
+    async def _forensics_postmortem_defer(
+        self, row: Optional[Dict[str, Any]], note: str
+    ) -> None:
+        """Ölçüm başarısız: denemeyi say, bütçe dolunca "ölçülemedi" yaz.
+
+        Sonsuz yeniden deneme YOKTUR: aynı işlem için en fazla
+        `_FORENSICS_POSTMORTEM_MAX_ATTEMPTS` deneme yapılır, sonra kayda
+        `note="ölçülemedi (...)"` düşülür ve satır kuyruktan çıkar.
+        """
+        if not row:
+            return
+        attempts = self._forensics_postmortem_attempts_map()
+        try:
+            trade_id = int(row.get("id") or 0)
+        except (TypeError, ValueError):  # pragma: no cover - savunma
+            return
+        count = int(attempts.get(trade_id, 0)) + 1
+        if len(attempts) > 256:
+            # Sayaç sözlüğü sızmasın: aday penceresi zaten 12 saatliktir.
+            attempts.clear()
+        attempts[trade_id] = count
+        if count < self._FORENSICS_POSTMORTEM_MAX_ATTEMPTS:
+            self.logger.debug(
+                f"Post-mortem ertelendi (#{trade_id}, deneme {count}/"
+                f"{self._FORENSICS_POSTMORTEM_MAX_ATTEMPTS}): {note}"
+            )
+            return
+        attempts.pop(trade_id, None)
+        await self._forensics_mark_unmeasured(
+            row, f"ölçülemedi ({count} deneme): {note}"
+        )
+
+    async def _forensics_mark_unmeasured(
+        self, row: Dict[str, Any], note: str
+    ) -> None:
+        """Post-mortem kuyruğunu tıkamasın diye "ölçülemedi" kaydı yaz."""
+        try:
+            await self.tracker.record_postmortem(
+                int(row["id"]),
+                {"window_minutes": 0.0, "candles_seen": 0,
+                 "returned_to_entry": None, "tags": [], "note": note},
+            )
+        except Exception as e:  # pragma: no cover - savunma
+            self._forensics_warn(f"postmortem_mark {type(e).__name__}: {e}")
 
     def _safety_interval_seconds(self) -> float:
         """Hatalı/negatif ayarı yoğun bir busy-loop'a çevirmeden sınırla."""
@@ -2541,11 +3026,20 @@ class ScalperEngine:
             )
             return True
 
-    async def external_signal(self, symbol: str, direction: Direction) -> Dict[str, Any]:
+    async def external_signal(
+        self,
+        symbol: str,
+        direction: Direction,
+        *,
+        tv_meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """TradingView webhook köprüsü: dış sinyali normal giriş hattına sok.
 
         Dönen sözlük teşhis içindir; kabul edilen sinyal bile risk
         kapılarında reddedilebilir — kesin sonuç log + DB'dedir.
+
+        `tv_meta` (D21): hangi TV kaynakları oy verdi / sağlama penceresi —
+        YALNIZ adli kayıt içindir, hiçbir kapıya girmez.
         """
         symbol = str(symbol).upper()
         if not self.running:
@@ -2588,7 +3082,19 @@ class ScalperEngine:
             extra={"trade": True},
         )
         try:
-            await self._evaluate_symbol(symbol, [_ExternalSignalStrategy(direction)])
+            # `external_meta` YALNIZ dolu olduğunda geçilir: `_evaluate_symbol`
+            # yerine iki-argümanlı bir çift koyan test/entegrasyon kurulumları
+            # (ör. tests/test_market_data_source.py) bu yolla bozulmaz.
+            if tv_meta:
+                await self._evaluate_symbol(
+                    symbol,
+                    [_ExternalSignalStrategy(direction)],
+                    external_meta=tv_meta,
+                )
+            else:
+                await self._evaluate_symbol(
+                    symbol, [_ExternalSignalStrategy(direction)]
+                )
         except MarketDataUnavailable as e:
             # D17: piyasa verisi host geneli kesikken (ban/ağırlık bütçesi) bu
             # istisna FastAPI'ye sızıp /tv-signal'i HTTP 500'e düşürürdü;

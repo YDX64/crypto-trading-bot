@@ -1509,6 +1509,131 @@ canlı testnet davranışı HER İKİ durumda da aynıdır). Bulgu 3 → giriş 
 çıkar. Hiçbiri `.env` değişikliği gerektirmez.
 
 
+### D21 — İşlem adli kaydı (trade forensics) · 2026-08-23 · **AKTİF (yalnız gözlemlenebilirlik — DAVRANIŞ DEĞİŞİKLİĞİ YOK)**
+
+**Ne:** her scalp işlemi için giriş ve çıkış ANINDA bilinen bağlamın tamamı tek
+bir JSON belgesine yazılır (`scalp_trades.forensics` + append-only
+`logs/trades.jsonl`), kural tabanlı etiketlerle (`verdict`) sınıflandırılır ve
+üç HTTP ucundan + panodaki "adli kart"tan okunur.
+
+**Neden (kullanıcı talebi, 2026-08-23):** "kayıplar/kazançlar: hangi coin, hangi
+hareket, hangi sinyal, hangi giriş/çıkış, neler etkiliyor — %100 görürsek
+önler, düzeltir, geliştiririz." Bugüne kadar bir kaybın nedeni ancak
+`logs/bot.log` içinde elle arayarak, çoğu zaman da hiç bulunamayarak
+çıkarılıyordu (XRP #152 analizi bunun tipik örneğidir). Sinyal-öncelik kuralı
+(kullanıcı kararı, 2026-08-23) boyut/TP/stop ayarıyla kayıp küçültmeyi YASAKLAR;
+geriye kalan tek yol sinyal kalitesini ÖLÇMEKTİR ve ölçüm için önce KAYIT gerekir.
+
+**Kapsam sınırı (bağlayıcı):** bu bir GÖZLEM katmanıdır, güvenlik kilidi değildir.
+- Hiçbir kapı, boyutlama, stop/TP seviyesi ya da çıkış kararı `forensics`
+  alanını OKUMAZ. `BOT_MODE=scalper` emir akışı byte-for-byte aynıdır.
+- Kayıt kurulumundaki her hata yutulur ve TEK SEFER WARNING'e düşer
+  (`_forensics_warn`); işlem açılmaya/kapanmaya devam eder
+  (`tests/test_forensics.py::TestForensicsNeverBlocksTrading`).
+- Backtest harness'ına DOKUNULMADI (P1 paritesi bu maddede gerekmez: harness
+  zaten borsaya çıkmaz ve adli kayıt bir karar kuralı değildir).
+- **AlgoPro takipçi halkası (D20):** `FollowerExitManager`, `ExitManager`ın
+  `_finalize_close`'unu MİRAS ALIR, bu yüzden takipçi kapanışları da bir `exit`
+  belgesi + çıkış etiketleri yazar (kendi DB'sine, kendi `logs/trades.jsonl`'ine).
+  `entry` bölümü orada YOKTUR (takipçinin kendi executor'ı bağlam üretmez) ve
+  BE damgası da yoktur (takipçinin ayrı `_check_tp1_breakeven` yolu). Davranışı
+  ETKİLEMEZ; halkanın giriş/çıkış mantığına dokunulmadı.
+
+**Nerede:**
+- `src/strategies/scalper/forensics.py` — SAF katman: etiket kuralları
+  (`classify_entry`/`classify_exit`), belge kurucuları, `summarize`. IO/saat yok.
+- `src/strategies/scalper/forensics_log.py` — `logs/trades.jsonl` (günlük
+  rotasyon, 30 gün saklama, secret YOK).
+- `engine._forensics_entry_context` (giriş bağlamı; YENİ REST ÇAĞRISI YOK — yalnız
+  `_market_gate_status`, `tv_events` ve `ctx`'teki hazır seriler),
+  `executor._build_entry_forensics` (gerçek dolum sayılarıyla birleştirir),
+  `exits._build_exit_forensics` (zaman çizgisi + etiketler),
+  `engine._forensics_postmortem_tick` (kapanıştan N dk SONRA).
+- `tracker.record_open/record_close/record_postmortem` + okuma yardımcıları;
+  şema `database._ensure_schema_migrations` (idempotent `ALTER TABLE`).
+- Uçlar: `GET /scalper/trades/{id}/forensics`, `/scalper/forensics/recent`,
+  `/scalper/forensics/summary?since=`. Pano: "Son İşlemler" satırına tıklayınca
+  açılan adli kart + "Neler Etkiliyor" paneli.
+- Rapor: `scripts/ledger_report.py --forensics` (etiket × sonuç tablosu).
+
+**Etiketler (kural tabanlı, dürüst):** `counter_drift_long`,
+`relief_rally_short`, `late_entry_after_run`, `tv_single_family`,
+`stale_signal`, `gate_bypassed` (giriş anı); `fee_dominated`, `mfe_giveback`
+(kapanış anı); `noise_stop` (post-mortem). Her etiket için pozitif VE negatif
+test vardır. Eşikler `SCALPER_FORENSICS_*` ile ayarlanır.
+
+**Look-ahead:** `entry`/`exit` yalnız o anda bilinen değerleri taşır.
+Kapanıştan SONRA ölçülebilen tek büyüklük (`noise_stop` — "stop yedikten sonra
+fiyat girişe döndü mü") AYRI bir `postmortem` alanındadır, kapanış zamanından
+SONRAKİ mumlarla ve pencere DOLDUKTAN sonra hesaplanır, hiçbir karar yolunda
+okunmaz (`tests/test_forensics.py::TestPostmortem::
+test_candles_before_close_are_ignored`).
+
+**Maliyet:** giriş/çıkış tarafında SIFIR ek REST isteği. Post-mortem safety
+turundan TETİKLENİR ama AYRI bir task'ta koşar (tur onu beklemez, bkz. D21-R3);
+dakikada en fazla bir tur ve tur başına EN FAZLA BİR sembol çalışır. İstek
+`SCALPER_TF_ENTRY` (varsayılan `5m`) limit 150 → **ağırlık 2**, `asyncio.wait_for`
+ile 5 sn'de kesilir. Üst sınır: dakikada 1 istek = **tepe saatte 60 istek /
+120 ağırlık** (ortalama 2 ağırlık/dk); ölçülmemiş kapanış yoksa sıfır istek —
+pratikte kapanış sayısı kadar, yani günde birkaç düzine.
+`SCALPER_FORENSICS_POSTMORTEM_MIN=0` bu turu tamamen kapatır.
+
+**Kanıt:** `tests/test_forensics.py` (97 test) + tüm paket yeşil (1722 test).
+Canlı defterden bir "etiket → PnL" hükmü HENÜZ YOKTUR — kayıt bugün başlıyor;
+ilk hüküm en az bir haftalık testnet verisiyle `--forensics` raporundan
+çıkarılacaktır. Yani bu karar bir STRATEJİ kanıtı değil, kanıt ÜRETME
+altyapısıdır.
+
+**Geri alma:** `.env`'de `SCALPER_FORENSICS_ENABLED=false` (kayıt durur, motor
+aynen çalışır). Tam geri alma: bu commit'i revert et; `scalp_trades.forensics`
+sütunu kalırsa zararsızdır (hiçbir kod yolu okumaz).
+
+#### D21-R3 — düşmanca inceleme düzeltmeleri · 2026-08-23
+
+D21 ile ÇELİŞİRSE **D21-R3 bağlayıcıdır**. Beş bulgu, hepsi regresyon testli
+(`tests/test_forensics.py`); hiçbiri karar yolunu (emir/kapı/çıkış) değiştirmez.
+
+1. **[medium] Post-mortem safety turunu bloklayabiliyordu.** `_safety_tick`
+   içinde `await`lenen `fetcher.get_klines` yavaş/5xx bir veri host'unda
+   `KlineFetcher`'ın 3 deneme × 15 sn'si yüzünden ~48 sn askıda kalır; bu süre
+   boyunca TP1→BE, trailing, reaper, rezervasyon senkronu ve kill-switch
+   gecikir, `/health` 503'e düşer ve watchdog restart eder (2026-08-14 yolu).
+   **Düzeltme:** tur `engine._forensics_postmortem_schedule()` ile AYRI bir
+   task'a alındı (safety turu beklemez); istek `asyncio.wait_for(..., 5 sn)`
+   ile kesiliyor; piyasa-verisi kesintisinde tur hiç başlatılmıyor (iki
+   bağımsız sinyal: `exits._market_data_down_reason` VE
+   `MarketDataGuard.blocked_until` — ikincisi açık pozisyon yokken ban'ı gören
+   tek sinyaldir, böylece geçici bir ban ölçülebilir bir kapanışı
+   "ölçülemedi"ye çevirmez); eşzamanlı EN FAZLA BİR post-mortem; başarısız
+   ölçüm en fazla 3 kez denenip `postmortem.note="ölçülemedi (…)"` ile
+   kapatılıyor (sonsuz yeniden deneme yok). `stop()` task'ı iptal eder.
+2. **[medium] `recover()` D21 damgalarını geri yüklemiyordu.** Restart sonrası
+   kapanan işlemin ÇIKIŞ zaman çizgisi yanlış okunuyordu (`trail_updates=0` =
+   "hiç trail olmadı" gibi) ve giriş etiketleri kayboluyordu. **Düzeltme:**
+   `exits._restore_forensics_entry` DB'deki `forensics.entry`'yi belleğe geri
+   alır (gerçek ölçüm), kapanış belgesi `path.restart_gap=true` taşır,
+   yalnız bellekte tutulan damgalar `null` kalır (UYDURMA değer yok) ve
+   `path.initial_stop` kurtarmadaki CANLI stop yerine giriş belgesindeki
+   GERÇEK ilk stoptan gelir. `price_ts` KASITLI geri yüklenmez (karar-yolu
+   tazelik damgası, D19a-2).
+3. **[low] JSONL yazımı `_entry_lock` altında senkrondu.** **Düzeltme:**
+   `forensics_log.append_soon` yalnız kuyruğa koyar; gerçek `write()` ayrı bir
+   daemon yazıcı iş parçacığındadır (`forensics-jsonl-writer`). Kuyruk üst
+   sınırı 2000 satır; taşarsa satır düşer ve tek sefer WARNING'e yazılır.
+   Senkron `append` yalnız test/araç yolunda kalır.
+4. **[low] Maker modunda yetim adli bağlam başka sinyale iliştirilebilirdi.**
+   **Düzeltme:** bağlam artık `PendingEntry` kurulduktan SONRA saklanır ve
+   `sembol|yön|created_at_ms` kimliğiyle damgalanır; dolumda kimlik yeniden
+   hesaplanıp karşılaştırılır, uyuşmazsa bağlam ATILIR ve WARNING düşer.
+5. **[low] Küçük sertleştirmeler.** `executor._forensics_warn` artık `getattr`
+   savunmalı; `/scalper/forensics/summary` `since` yokken varsayılan `7d`
+   kullanır, üst sınır 365 gündür ve aralık dışı/taşan değer **400** döner
+   (eskiden `9999999999d` → `timedelta` taşması → 500);
+   `tracker.postmortem_candidates` LIMIT'i "ölçülmüş" filtresinden SONRA
+   uygular (aksi hâlde en yeni 20 kapanış ölçülmüşse kuyruk sonsuza dek boş
+   görünüyordu); pano "okunamadı" ile "kayıt yok"u AYRI mesajla gösterir ve
+   hatayı önbelleğe almaz; `ledger_report.build_report` tek gövdeye indi.
+
 ## Reddedilen kararlar (kanıtla)
 
 | Fikir | Tarih | Sonuç | Neden reddedildi |

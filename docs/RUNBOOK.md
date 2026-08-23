@@ -36,6 +36,61 @@ Ağ erişimi yoksa/istenmiyorsa `--btc-klines-json <dosya>` ile Binance kline di
 `--out`. "Kazanıyor" yalnız üç rejimde de doğruysa (checklist'in rejim satırları PASS/N/A)
 söylenir — bkz. `docs/EXPERIMENTS.md` "rejim analizi" kalıbı (script bu kalıbı otomatikleştirir).
 
+## Bir işlemi nasıl incelerim (işlem adli kaydı, D21)
+
+Soru: "bu kayıp neden oldu?" — artık `bot.log` taramaya gerek yok. Her işlem
+için giriş ve çıkış ANINDA bilinen her şey kaydedilir (bkz.
+`docs/ARCHITECTURE.md` §5.1, `docs/DECISIONS.md` D21). **Bu kayıt yalnız
+gözlemdir; hiçbir kapı/boyutlama/çıkış kararını etkilemez.**
+
+**1) Panodan (en hızlı yol).** `/dashboard` → "Son İşlemler" tablosunda bir
+satıra TIKLA → altında adli kart açılır: üstte büyük K/Z + etiket rozetleri,
+sonra üç blok — "Neden girildi" (sinyal, RSI/BB/diverjans/ATR, rejim,
+EMA50/200, BTC gün sapması, kapılar ✓/✗), "Nasıl çıkıldı" (giriş → TP1 → BE →
+trailing → çıkış zaman çizgisi + MAE/MFE çubuğu), "Ne ters gitti" (kayma,
+sinyal→dolum gecikmesi, brüt/net, ücret, R:R, post-mortem). Satırın "Etiket"
+sütunu boşsa kural tabanlı bir kusur bulunamamıştır.
+
+**2) Uçlardan (JSON).**
+```bash
+ssh awa 'curl -s localhost:9091/scalper/trades/152/forensics | python3 -m json.tool'
+ssh awa 'curl -s "localhost:9091/scalper/forensics/recent?limit=20"'
+ssh awa 'curl -s "localhost:9091/scalper/forensics/summary?since=7d" | python3 -m json.tool'
+```
+`summary` "neler etkiliyor" sorusunun cevabıdır: her etiket için işlem
+sayısı/WR/PnL. `_etiketsiz_` satırı KIYAS TABANIDIR; `without_forensics` ise
+"ölçülmemiş" işlem sayısıdır (etiketsiz ≠ temiz).
+
+**3) Olay akışından (`jq` ile).** `logs/trades.jsonl` append-only, satır başına
+tek JSON (`event` = `entry`/`exit`/`postmortem`), günlük rotasyonlu, 30 gün:
+```bash
+ssh awa 'cd /opt/tradingbot-v2 && jq -c "select(.event==\"exit\" and (.verdict|index(\"noise_stop\")))" logs/trades.jsonl | tail -5'
+ssh awa 'cd /opt/tradingbot-v2 && jq -r "select(.trade_id==152)" logs/trades.jsonl'
+```
+
+**4) Rapordan (haftalık).** `--forensics` etiket × sonuç bölümünü ekler:
+```bash
+ssh awa 'cd /opt/tradingbot-v2 && .venv/bin/python scripts/ledger_report.py --since "2026-08-23" --forensics --format md'
+```
+
+**Tuzaklar:**
+- **"Etiketsiz" ≠ "temiz".** D21 öncesi kapanan işlemlerin `forensics` sütunu
+  NULL'dur; raporda `_etiketsiz_` satırına düşerler. Notlar bölümü kaç işlemin
+  ölçülmediğini yazar — hüküm verirken bunu düş.
+- **Post-mortem gecikmelidir.** `noise_stop` etiketi kapanıştan
+  `SCALPER_FORENSICS_POSTMORTEM_MIN` (vars. 60) dakika SONRA belirir; taze bir
+  kapanışta yokluğu "yok" demek değildir, "henüz ölçülmedi" demektir.
+- **`postmortem.note` "ölçülemedi" diyorsa** (D21-R3) o işlem için mum verisi
+  3 denemede alınamamıştır (yavaş/erişilemez veri host'u ya da sembol o
+  kaynakta yok). Bu bir motor arızası DEĞİLDİR — ölçüm eksiğidir; kapanışın
+  kendisi ve `entry`/`exit` bölümleri etkilenmez. Ölçüm turu safety turunu
+  bloklamaz: ayrı bir task'ta koşar ve istek 5 sn'de kesilir.
+- **Kayıt bir kanıt değil, kanıt kaynağıdır.** Bir etiketin PnL'i kötü diye
+  parametre değiştirmek CLAUDE.md yasak #1'i ihlal eder — önce 3 rejim
+  penceresinde backtest.
+- **Kapatmak güvenlidir:** `SCALPER_FORENSICS_ENABLED=false` yalnız kaydı
+  durdurur; motor davranışı her iki durumda da aynıdır.
+
 ## Deploy ve geri alma
 
 **Üç halka vardır** ve her biri AYRI dizin/süreç/port/`.env` taşır. `--ring`

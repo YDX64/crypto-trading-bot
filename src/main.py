@@ -15,7 +15,7 @@ import re
 import signal
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import FastAPI, Depends, HTTPException, Request, Security, status
@@ -1514,7 +1514,10 @@ async def tradingview_webhook(request: Request):
                 "confluence": verdict,
                 **source_fields,
             }
-        result = await scalper_engine.external_signal(symbol, direction)
+        # D21: sağlama özeti YALNIZ adli kayda taşınır (karar yoluna girmez).
+        result = await scalper_engine.external_signal(
+            symbol, direction, tv_meta={"source": source, **verdict}
+        )
         return {
             "symbol": symbol,
             "direction": direction.value,
@@ -1523,7 +1526,19 @@ async def tradingview_webhook(request: Request):
             **source_fields,
         }
 
-    result = await scalper_engine.external_signal(symbol, direction)
+    result = await scalper_engine.external_signal(
+        symbol,
+        direction,
+        tv_meta={
+            "source": source,
+            "sources": [source],
+            "votes": 1,
+            "required": required,
+            "window_seconds": float(
+                getattr(settings, "tv_confluence_window_seconds", 0.0) or 0.0
+            ),
+        },
+    )
     return {"symbol": symbol, "direction": direction.value, **source_fields, **result}
 
 
@@ -2286,9 +2301,112 @@ async def scalper_trades(
             "closed_at": t.closed_at.isoformat() if t.closed_at else None,
             "signal_reason": t.signal_reason,
             "pnl_source": None if t.status == "SHADOW" else ScalpTracker._pnl_source(t.notes),
+            # D21: panonun "adli kart" düğmesini göstermesi için yeterli olan
+            # tek bit. Kaydın kendisi /scalper/trades/{id}/forensics'tedir —
+            # bu liste ucu 50 işlemlik JSON'u şişirmemelidir.
+            "has_forensics": bool(t.forensics),
+            "verdict": list(
+                (ScalpTracker.parse_forensics(t.forensics) or {}).get("verdict") or []
+            ),
         }
         for t in result.scalars().all()
     ]
+
+
+#: `?since=`/`?until=` için azami geriye bakış. Pencereyi sınırsız bırakmak
+#: SQL taramasını ve `summarize` maliyetini pano yoklamasıyla çarpar; ayrıca
+#: `9999999999d` gibi bir değer `timedelta`'yı taşırıp 500 üretir (D21-R3,
+#: bulgu 5). Sınır aşılırsa 400 döner — sessizce kırpmak raporu YANLIŞ okutur.
+FORENSICS_MAX_WINDOW_DAYS = 365
+#: `?since=` verilmediğinde adli özet penceresi.
+FORENSICS_DEFAULT_SINCE = "7d"
+
+
+def _parse_since(
+    value: Optional[str], *, max_days: int = FORENSICS_MAX_WINDOW_DAYS
+) -> Optional[datetime]:
+    """`?since=` metnini naive UTC datetime'a çevirir.
+
+    Kabul edilenler: `7d` / `36h` (göreli), `YYYY-MM-DD`,
+    `YYYY-MM-DD HH:MM[:SS]`, `YYYY-MM-DDTHH:MM[:SS]`. Çözülemeyen ya da
+    `max_days`'i aşan değer 400 verir — sessizce "tüm zamanlar"a düşmek ya da
+    pencereyi kırpmak raporu YANLIŞ okutur; 500 ise istemciye "sunucu bozuk"
+    der, oysa hata girdidedir.
+    """
+    text = (value or "").strip()
+    if not text:
+        return None
+    now = datetime.utcnow()
+    limit = now - timedelta(days=max(1, int(max_days)))
+    if re.fullmatch(r"\d+[dh]", text.lower()):
+        try:
+            amount = int(text[:-1])
+            hours = amount * 24 if text[-1].lower() == "d" else amount
+            parsed = now - timedelta(hours=hours)
+        except (ValueError, OverflowError, OSError):
+            raise HTTPException(
+                status_code=400,
+                detail=f"since aralık dışı (en fazla {max_days} gün): {value!r}",
+            )
+    else:
+        parsed = None
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
+            "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M",
+        ):
+            try:
+                parsed = datetime.strptime(text, fmt)
+                break
+            except ValueError:
+                continue
+        if parsed is None:
+            raise HTTPException(
+                status_code=400, detail=f"since ayrıştırılamadı: {value!r}"
+            )
+    if parsed < limit:
+        raise HTTPException(
+            status_code=400,
+            detail=f"since aralık dışı (en fazla {max_days} gün): {value!r}",
+        )
+    return parsed
+
+
+@app.get("/scalper/trades/{trade_id}/forensics")
+async def scalper_trade_forensics(trade_id: int):
+    """Tek bir işlemin adli kaydı (D21): neden girildi / nasıl çıkıldı.
+
+    Eski (kayıt öncesi) işlemlerde `has_forensics=false` döner — bu bir hata
+    değil, "o işlem ölçülmedi" demektir.
+    """
+    row = await ScalpTracker().forensics_for(trade_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"İşlem bulunamadı: #{trade_id}")
+    return row
+
+
+@app.get("/scalper/forensics/recent")
+async def scalper_forensics_recent(limit: int = 50):
+    """Son kapanmış işlemlerin adli kaydı (en yeni önce)."""
+    return await ScalpTracker().recent_forensics(limit)
+
+
+@app.get("/scalper/forensics/summary")
+async def scalper_forensics_summary(
+    since: Optional[str] = None, until: Optional[str] = None
+):
+    """Etiket × sonuç tablosu — "neler etkiliyor" sorusunun cevabı.
+
+    Bir işlem birden çok etiket taşıyabilir; satır toplamı işlem sayısını
+    AŞABİLİR. `_etiketsiz_` satırı kıyas tabanıdır.
+
+    `since` verilmezse varsayılan pencere son `FORENSICS_DEFAULT_SINCE`'tır:
+    "tüm zamanlar" hem DB'yi hem de okuyanı yanıltır (kayıt D21 ile başladı).
+    Üst sınır `FORENSICS_MAX_WINDOW_DAYS`; aşan değer 400 döner.
+    """
+    return await ScalpTracker().forensics_summary(
+        since=_parse_since(since or FORENSICS_DEFAULT_SINCE),
+        until=_parse_since(until),
+    )
 
 
 async def main():

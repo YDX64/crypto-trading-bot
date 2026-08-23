@@ -88,6 +88,11 @@ def _ensure_schema_migrations(sync_conn) -> None:
         # halkasında NULL kalır — davranışı etkilemez, yalnız şema tamamlanır.
         sync_conn.execute(text("ALTER TABLE scalp_trades ADD COLUMN tp3_algo_id VARCHAR"))
         app_logger.info("🔧 scalp_trades.tp3_algo_id sütunu eklendi (migration)")
+    if "forensics" not in columns:
+        # D21 işlem adli kaydı (JSON metni). Yalnız GÖZLEM: hiçbir karar
+        # yolu okumaz, eski satırlarda NULL kalır (geriye uyumlu).
+        sync_conn.execute(text("ALTER TABLE scalp_trades ADD COLUMN forensics TEXT"))
+        app_logger.info("🔧 scalp_trades.forensics sütunu eklendi (migration)")
 
 
 async def init_db():

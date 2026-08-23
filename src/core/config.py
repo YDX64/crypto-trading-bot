@@ -441,6 +441,19 @@ class Settings(BaseSettings):
     # "off" (varsayılan, hiçbir şey) | "be" (stopu break-even'a çek) |
     # "close" (reduce-only MARKET ile kapat).
     scalper_structure_exit: str = "off"
+    # --- İşlem adli kaydı (D21, 2026-08-23) — YALNIZ GÖZLEM -------------
+    # Hiçbir kapı/boyutlama/çıkış kararı bu ayarları okumaz; kapatılırsa
+    # yalnız kayıt tutulmaz, motor davranışı HER İKİ durumda da aynıdır.
+    scalper_forensics_enabled: bool = True
+    # Kapanıştan sonra "fiyat girişe döndü mü" penceresi (dk; 0 = KAPALI).
+    # Post-mortem yalnız bu pencere DOLDUKTAN sonra hesaplanır — look-ahead
+    # değildir (bkz. forensics.postmortem_from_candles).
+    scalper_forensics_postmortem_min: float = 60.0
+    # Etiket eşikleri (bkz. forensics.VerdictThresholds):
+    scalper_forensics_counter_drift_pct: float = 1.0   # ters-gün etiketi
+    scalper_forensics_run_pct: float = 5.0             # geç-giriş etiketi
+    scalper_forensics_stale_signal_sec: float = 30.0   # sinyal→dolum gecikmesi
+    scalper_forensics_fee_ratio: float = 0.5           # net/brüt eşiği
     scalper_c_allowed_regimes: str = "UP,DOWN,RANGE"  # deney: "RANGE" ile sınırla
     scalper_d_use_eqhl: bool = True              # D süpürmesi EQH/EQL kümelerine bağlı
     scalper_eqhl_tolerance_pct: float = 0.05     # pivot eşitlik eşiği (%)

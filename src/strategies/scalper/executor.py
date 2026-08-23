@@ -95,6 +95,24 @@ class ScalpPosition:
     # = "bilinmiyor" (fail-safe).
     price_ts: Optional[float] = None
 
+    # --- İşlem adli kaydı (D21) — YALNIZ GÖZLEM ---------------------------
+    # Bu alanların HİÇBİRİ bir karar yolunda okunmaz; çıkış zaman çizgisini
+    # (giriş → TP1 → BE → trailing → çıkış) kapanışta yeniden kurabilmek
+    # içindirler. Varsayılanları bugünkü davranışı birebir korur.
+    forensics_entry: Optional[Dict[str, Any]] = None
+    opened_epoch: Optional[float] = None      # giriş anı (unix, UTC)
+    tp1_at: Optional[str] = None              # TP1 doğrulandığı an (ISO UTC)
+    tp2_at: Optional[str] = None
+    be_at: Optional[str] = None               # stop BE'ye çekildiği an
+    be_price: Optional[float] = None
+    trail_updates: int = 0                    # gönderilen trailing güncellemesi
+    last_trail_stop: Optional[float] = None
+    # Restart sonrası `exits.recover()` ile kurtarıldıysa True: bellekteki
+    # zaman çizgisi damgaları (TP1/BE anı, trailing sayacı) restart ÖNCESİNİ
+    # KAPSAMAZ. Kapanış belgesi bunu `path.restart_gap=true` ile bildirir ve
+    # bilinmeyen damgaları `null` bırakır — uydurma değer yazılmaz (D21-R3).
+    forensics_restart_gap: bool = False
+
 
 @dataclass
 class PendingEntry:
@@ -182,7 +200,17 @@ class ScalpExecutor:
         # Gerçek girişlerin cooldown semantiğini etkilemez (test_cooldown_
         # not_started_by_shadow_entry hâlâ _cooldowns == {} bekler).
         self._shadow_recent: Dict[str, float] = {}
+        # D21 adli kayıt: maker modunda giriş bağlamı, dolum anına kadar
+        # bellekte bekler. Değer biçimi:
+        #   sembol -> {"key": "SEMBOL|YÖN|created_at_ms", "context": {...}}
+        # `key` emrin kimliğidir ve dolumda YENİDEN hesaplanıp karşılaştırılır
+        # (D21-R3, bulgu 4): yetim bir bağlam başka bir sinyalin dolumuna
+        # iliştirilemez. Kalıcı DEĞİLDİR — restart'ta kayıt eksik kalır,
+        # işlem akışı etkilenmez.
+        self._pending_forensics: Dict[str, Dict[str, Any]] = {}
         self._reject_counters: Dict[str, int] = {}
+        # Adli kayıt kurulumu bir kez uyarır (gözlem asla girişi engellemez).
+        self._forensics_error_logged: bool = False
         self._last_sizing_snapshot: Dict[str, Any] = {
             "mode": "uninitialized",
             "exchange_available": None,
@@ -401,6 +429,11 @@ class ScalpExecutor:
         self._remove_pending_record(symbol)
         if self._pending.get(symbol) is pending:
             self._pending.pop(symbol, None)
+        # D21: dolmayan/iptal edilen niyetin adli bağlamı birikmesin.
+        # (Dolum yolunda bağlam zaten `pop` ile tüketilmiştir.)
+        forensics_map = getattr(self, "_pending_forensics", None)
+        if forensics_map is not None:
+            forensics_map.pop(str(symbol).upper(), None)
 
     def _record_order_state(
         self, pending: PendingEntry, order: Dict[str, Any], *, phase: Optional[str] = None
@@ -739,9 +772,24 @@ class ScalpExecutor:
         return effective
 
     async def try_open(
-        self, signal: ScalpSignal, ctx: StrategyContext
+        self,
+        signal: ScalpSignal,
+        ctx: StrategyContext,
+        *,
+        forensics: Optional[Dict[str, Any]] = None,
     ) -> Optional[ScalpPosition]:
+        """`forensics` (D21): motorun kurduğu giriş-anı bağlamı.
+
+        YALNIZ GÖZLEM — hiçbir kapıya, boyutlamaya ya da emre girmez. None
+        (varsayılan) verildiğinde bu fonksiyon eskisiyle birebir aynıdır.
+        """
         symbol = signal.symbol
+        # Sözlüğü kopyala: çağıranın nesnesini bu fonksiyonun ara sonuçlarıyla
+        # kirletmeyelim (aynı sinyal başka bir yolda yeniden kullanılabilir).
+        # `is not None`: BOŞ bir sözlük de geçerli bir bağlamdır (kapı
+        # sonuçları aşağıda ona yazılır); `if forensics` onu sessizce
+        # "bağlam yok"a çevirirdi.
+        forensics = dict(forensics) if forensics is not None else None
         direction = signal.direction
         entry_hint = signal.entry_price
         stop_price = signal.stop_price
@@ -792,6 +840,8 @@ class ScalpExecutor:
                 f"[%{self.cfg.scalper_min_stop_pct}-%{self.cfg.scalper_max_stop_pct}]), sinyal atlandı"
             )
             return None
+        if forensics is not None:
+            forensics.setdefault("gates", {})["stop_distance"] = "passed"
 
         # --- 3. R:R kapısı ---
         # Beklenen harman getiri (ROI%): tp1_roi*tp1_frac + tp2_roi*tp2_frac + tp1_roi*runner_frac
@@ -800,6 +850,10 @@ class ScalpExecutor:
         # rr = beklenen_getiri / sl_riski ; rr < cfg.scalper_min_rr -> None
         # cfg.scalper_min_rr <= 0 ise kapı atlanır
         min_rr = self.cfg.scalper_min_rr
+        if forensics is not None:
+            forensics.setdefault("gates", {})["min_rr"] = (
+                "passed" if min_rr > 0 else "off"
+            )
         if min_rr > 0:
             tp1_frac = self.cfg.scalper_tp1_fraction
             tp2_frac = self.cfg.scalper_tp2_fraction
@@ -821,6 +875,8 @@ class ScalpExecutor:
                     f"beklenen_getiri=%{expected_roi:.2f}, sl_riski=%{sl_risk_roi:.2f}), sinyal atlandı"
                 )
                 return None
+            if forensics is not None:
+                forensics["rr"] = rr
 
         # --- 4. Risk bazlı boyutlama + nominal tavan ---
         price_distance = abs(entry_hint - stop_price)
@@ -900,7 +956,17 @@ class ScalpExecutor:
 
         # --- 7a. Maker modu: LIMIT GTX emri kor, PendingEntry olarak sakla ---
         if getattr(self.cfg, "scalper_entry_mode", "taker") == "maker":
-            await self._open_maker_entry(signal=signal, ctx=ctx, side=side, quantity=qty)
+            # Adli bağlam dolum anında (check_pending → _on_pending_filled)
+            # gerekir; bellekte sembol başına saklanır. Restart'ta kaybolur —
+            # kayıt eksik kalır, İŞLEM ETKİLENMEZ (gözlem, kilit değil).
+            # D21-R3 (bulgu 4): saklama artık BURADA değil, PendingEntry
+            # kurulduktan SONRA yapılır ve emrin kimliğiyle damgalanır —
+            # emir hiç konmazsa yetim bir bağlam kalmaz, kalırsa da başka bir
+            # sinyalin dolumuna iliştirilemez.
+            await self._open_maker_entry(
+                signal=signal, ctx=ctx, side=side, quantity=qty,
+                forensics=forensics,
+            )
             return None
 
         # --- 7b. Taker modu (varsayılan): Market emri — BU NOKTADAN SONRA
@@ -945,6 +1011,7 @@ class ScalpExecutor:
             filled_qty=filled_qty,
             entry_order_id=str(entry_order.get("orderId") or ""),
             entry_candle_time=entry_candle_time,
+            forensics=forensics,
         )
 
     def _configured_conservative_fee_rate(self) -> float:
@@ -1362,6 +1429,7 @@ class ScalpExecutor:
         filled_qty: float,
         entry_order_id: str,
         entry_candle_time: int,
+        forensics: Optional[Dict[str, Any]] = None,
     ) -> Optional[ScalpPosition]:
         symbol = signal.symbol
         stop_price = self._delay_adjusted_stop(
@@ -1476,6 +1544,20 @@ class ScalpExecutor:
             tp2_algo_id=tp2_algo_id,
         )
 
+        opened_epoch = time.time()
+        forensics_document = self._build_entry_forensics(
+            context=forensics,
+            signal=signal,
+            direction=direction,
+            entry_price=entry_price,
+            filled_qty=filled_qty,
+            leverage=leverage,
+            margin_usdt=margin_usdt,
+            stop_price=stop_price,
+            plan=plan,
+            opened_epoch=opened_epoch,
+        )
+
         try:
             trade_id = await self.tracker.record_open(
                 signal=signal,
@@ -1487,6 +1569,7 @@ class ScalpExecutor:
                 tp1_algo_id=tp1_algo_id,
                 tp2_algo_id=tp2_algo_id,
                 entry_order_id=entry_order_id,
+                forensics=forensics_document,
             )
         except Exception as e:
             self.logger.critical(
@@ -1501,26 +1584,226 @@ class ScalpExecutor:
             extra={"trade": True},
         )
 
+        if forensics_document is not None:
+            self._forensics_event(
+                "entry",
+                trade_id=trade_id,
+                symbol=symbol,
+                document=forensics_document,
+            )
+
         return ScalpPosition(
             trade_id=trade_id,
             signal=signal,
             position=position,
             plan=plan,
             entry_candle_time=entry_candle_time,
+            forensics_entry=(forensics_document or {}).get("entry"),
+            opened_epoch=opened_epoch,
         )
+
+    # ------------------------------------------------------------------
+    # İşlem adli kaydı (D21) — YALNIZ GÖZLEM, akışı ASLA engellemez
+    # ------------------------------------------------------------------
+
+    def _forensics_enabled(self) -> bool:
+        return bool(getattr(self.cfg, "scalper_forensics_enabled", True))
+
+    def _forensics_warn(self, message: str) -> None:
+        """Adli kayıt arızasını bir KEZ duyur; akışı asla kesme.
+
+        `getattr` savunması: `ScalpExecutor.__new__` ile `__init__` atlanarak
+        kurulan test çiftlerinde bu alan yoktur; adli kayıt yolunda bir
+        `AttributeError` işlemi ETKİLEMEMELİDİR (D21-R3, bulgu 5).
+        """
+        if not getattr(self, "_forensics_error_logged", False):
+            self._forensics_error_logged = True
+            self.logger.warning(
+                f"⚠️ Adli kayıt kurulamadı ({message}) — bu uyarı bir kez "
+                f"loglanır, işlem akışı ETKİLENMEZ"
+            )
+
+    @staticmethod
+    def _forensics_pending_key(pending: PendingEntry) -> str:
+        """Bekleyen maker emrinin adli kimliği: sembol|yön|zaman damgası.
+
+        Bağlam bu kimlikle damgalanır ve dolumda YENİDEN hesaplanıp
+        karşılaştırılır. Yetim bir bağlam (emir konmadı/iptal oldu ama sözlük
+        temizlenmedi) böylece BAŞKA bir sinyalin dolumuna iliştirilemez —
+        yanlış "neden girildi" kaydı, hiç kayıt olmamasından kötüdür
+        (D21-R3, bulgu 4).
+        """
+        signal = getattr(pending, "signal", None)
+        symbol = str(getattr(signal, "symbol", "") or "").upper()
+        direction = getattr(signal, "direction", None)
+        direction = str(getattr(direction, "value", direction) or "").upper()
+        return f"{symbol}|{direction}|{int(getattr(pending, 'created_at_ms', 0) or 0)}"
+
+    def _store_pending_forensics(
+        self, pending: PendingEntry, forensics: Optional[Dict[str, Any]]
+    ) -> None:
+        """Dolum anına kadar bekleyecek giriş bağlamını kimliğiyle sakla."""
+        if forensics is None:
+            return
+        # getattr savunması: __init__'i atlayan test çiftleri bu alanı
+        # kurmayabilir.
+        pending_map = getattr(self, "_pending_forensics", None)
+        if pending_map is None:
+            return
+        pending_map[str(getattr(pending.signal, "symbol", "")).upper()] = {
+            "key": self._forensics_pending_key(pending),
+            "context": forensics,
+        }
+
+    def _take_pending_forensics(
+        self, pending: PendingEntry
+    ) -> Optional[Dict[str, Any]]:
+        """Dolan emrin giriş bağlamını al; kimlik uyuşmazsa ATIP uyar."""
+        pending_map = getattr(self, "_pending_forensics", None)
+        if not pending_map:
+            return None
+        symbol = str(getattr(pending.signal, "symbol", "")).upper()
+        stored = pending_map.pop(symbol, None)
+        if stored is None:
+            return None
+        if not isinstance(stored, dict) or "key" not in stored:
+            # Eski/biçimsiz kayıt: kimliği doğrulanamayan bağlam KULLANILMAZ.
+            self.logger.warning(
+                f"⚠️ {symbol}: adli giriş bağlamı kimliksiz, atıldı "
+                f"(kayıt eksik kalır, işlem akışı ETKİLENMEZ)"
+            )
+            return None
+        expected = self._forensics_pending_key(pending)
+        if stored.get("key") != expected:
+            self.logger.warning(
+                f"⚠️ {symbol}: adli giriş bağlamı BAŞKA bir sinyale ait "
+                f"(beklenen={expected}, bulunan={stored.get('key')}), atıldı — "
+                f"kayıt eksik kalır, işlem akışı ETKİLENMEZ"
+            )
+            return None
+        return stored.get("context")
+
+    def _build_entry_forensics(
+        self,
+        *,
+        context: Optional[Dict[str, Any]],
+        signal: ScalpSignal,
+        direction: Direction,
+        entry_price: float,
+        filled_qty: float,
+        leverage: int,
+        margin_usdt: float,
+        stop_price: float,
+        plan: ExitPlan,
+        opened_epoch: float,
+    ) -> Optional[Dict[str, Any]]:
+        """Motorun bağlamını GERÇEK dolum sayılarıyla birleştirip belge kur."""
+        if not self._forensics_enabled():
+            return None
+        try:
+            from src.strategies.scalper import forensics as fx
+
+            context = dict(context or {})
+            signal_epoch = context.pop("signal_epoch", None)
+            latency = None
+            if isinstance(signal_epoch, (int, float)):
+                latency = max(0.0, opened_epoch - float(signal_epoch))
+            entry = fx.build_entry(
+                at=datetime.fromtimestamp(opened_epoch, tz=timezone.utc).isoformat(
+                    timespec="seconds"
+                ),
+                signal=signal,
+                ctx=None,
+                cfg=self.cfg,
+                fill_price=entry_price,
+                quantity=filled_qty,
+                leverage=leverage,
+                margin_usdt=margin_usdt,
+                stop_price=stop_price,
+                tp1_price=plan.tp1_price,
+                tp2_price=plan.tp2_price,
+                breakeven_price=plan.breakeven_price,
+                signal_at=context.pop("signal_at", None),
+                fill_latency_sec=latency,
+                entry_mode=str(getattr(self.cfg, "scalper_entry_mode", "taker")),
+                indicators=context.pop("indicators", None),
+                regime_info=context.pop("regime", None),
+                leader_gate=context.pop("leader_gate", None),
+                structure=context.pop("structure", None),
+                tv_structure=context.pop("tv_structure", None),
+                gates=context.pop("gates", None),
+                tv=context.pop("tv", None),
+                source=str(context.pop("source", "C")),
+                kline_source=context.pop("kline_source", None),
+                open_positions=context.pop("open_positions", None),
+                daily_pnl=context.pop("daily_pnl", None),
+                btc_price=context.pop("btc_price", None),
+                rr=context.pop("rr", None),
+            )
+            # Motorun eklediği ve build_entry'nin tanımadığı alanlar kaybolmasın.
+            for key, value in context.items():
+                entry.setdefault(key, value)
+            thresholds = fx.thresholds_from_cfg(self.cfg)
+            return {
+                "v": fx.FORENSICS_VERSION,
+                "entry": entry,
+                "verdict": fx.classify_entry(entry, thresholds),
+            }
+        except Exception as e:
+            self._forensics_warn(f"{type(e).__name__}: {e}")
+            return None
+
+    def _forensics_event(
+        self, event: str, *, trade_id: int, symbol: str, document: Dict[str, Any]
+    ) -> None:
+        """`logs/trades.jsonl`'e tek satır yaz (fail-safe, KİLİT DIŞINDA).
+
+        `append_soon` yalnız kuyruğa koyar; gerçek `write()` ayrı bir yazıcı
+        iş parçacığındadır. Bu çağrı `engine._entry_lock` altında yapılır ve
+        yavaş bir disk orada TP1→BE/trailing/kill-switch işlerini
+        geciktirmemelidir (D21-R3, düşmanca inceleme bulgusu 3).
+        """
+        try:
+            from src.strategies.scalper import forensics_log
+
+            forensics_log.append_soon(
+                event,
+                {
+                    "trade_id": int(trade_id),
+                    "symbol": str(symbol),
+                    "verdict": list(document.get("verdict") or []),
+                    "entry": document.get("entry"),
+                },
+            )
+        except Exception as e:  # pragma: no cover - savunma
+            self._forensics_warn(f"{type(e).__name__}: {e}")
 
     # ------------------------------------------------------------------
     # Maker modu — Faz 1: LIMIT GTX girişini kor, PendingEntry olarak sakla.
     # ------------------------------------------------------------------
 
     async def _open_maker_entry(
-        self, signal: ScalpSignal, ctx: StrategyContext, side: str, quantity: float
+        self,
+        signal: ScalpSignal,
+        ctx: StrategyContext,
+        side: str,
+        quantity: float,
+        *,
+        forensics: Optional[Dict[str, Any]] = None,
     ) -> None:
         async with self._pending_lock:
-            await self._open_maker_entry_locked(signal, ctx, side, quantity)
+            await self._open_maker_entry_locked(
+                signal, ctx, side, quantity, forensics=forensics
+            )
 
     async def _open_maker_entry_locked(
-        self, signal: ScalpSignal, ctx: StrategyContext, side: str, quantity: float
+        self,
+        signal: ScalpSignal,
+        ctx: StrategyContext,
+        side: str,
+        quantity: float,
+        *,
+        forensics: Optional[Dict[str, Any]] = None,
     ) -> None:
         self._assert_recovery_ready()
         symbol = signal.symbol
@@ -1575,6 +1858,7 @@ class ScalpExecutor:
         # uzlaştırılır; ikinci bir emir gönderilmez.
         self._store_pending_record(pending)
         self._pending[symbol] = pending
+        self._store_pending_forensics(pending, forensics)
 
         try:
             order = await self._place_limit_entry(
@@ -1913,6 +2197,7 @@ class ScalpExecutor:
                 filled_qty=filled_qty,
                 entry_order_id=str(order.get("orderId") or pending.order_id),
                 entry_candle_time=entry_candle_time,
+                forensics=self._take_pending_forensics(pending),
             )
         except UnprotectedPositionError:
             pending.phase = "RECOVERY_REQUIRED"

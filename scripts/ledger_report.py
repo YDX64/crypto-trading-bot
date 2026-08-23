@@ -14,6 +14,7 @@ Veritabanına/`.env`'e/sunucuya ASLA yazmaz, sadece OKUR.
 
 Kullanım:
     python3 scripts/ledger_report.py --since "2026-08-21 12:35" --format md
+    python3 scripts/ledger_report.py --since "2026-08-21" --forensics   # D21 etiket × sonuç
     python3 scripts/ledger_report.py --since "2026-08-14" --until "2026-08-21" \
         --btc-klines-json data/btc_1d.json --format json --out report.json
 
@@ -185,6 +186,144 @@ def load_closed_trades(
         ))
     trades.sort(key=lambda t: t.closed_at)
     return trades, skipped
+
+
+# --------------------------------------------------------------------------
+# İşlem adli kaydı (D21) — etiket × sonuç
+# --------------------------------------------------------------------------
+
+#: `src/strategies/scalper/forensics.py::TAG_LABELS` ile AYNI metinler.
+#: Bu script bilinçli olarak yalnız stdlib kullanır (sunucuda `.venv`
+#: olmadan da koşabilmeli), bu yüzden eşleme burada TEKRARLANIR. Yeni bir
+#: etiket eklenirse iki taraf da güncellenmelidir — `tests/test_ledger_report.py`
+#: bu eşitliği DOĞRULAR, yani sessizce ayrışamazlar.
+FORENSICS_TAG_LABELS: Dict[str, str] = {
+    "counter_drift_long": "lider düşerken LONG açıldı",
+    "relief_rally_short": "lider yükselirken SHORT açıldı",
+    "late_entry_after_run": "çok günlük koşunun ARDINDAN aynı yöne girildi",
+    "tv_single_family": "TV sağlaması aynı aileden iki kaynakla doldu",
+    "stale_signal": "sinyal ile dolum arasında uzun gecikme",
+    "gate_bypassed": "kapı açık ama ETKİN DEĞİL (fail-open) iken girildi",
+    "fee_dominated": "ücretler kârın yarısından fazlasını yedi",
+    "mfe_giveback": "kâr TP1 hedefini gördü ama zararla kapandı",
+    "noise_stop": "stop sonrası fiyat pencerede girişe geri döndü (gürültü)",
+}
+
+UNTAGGED_KEY = "_etiketsiz_"
+
+
+def load_forensics_rows(
+    db_path: str,
+    since: datetime,
+    until: datetime,
+    strategy: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Kapanmış işlemlerin (etiketler, pnl) çiftleri + uyarı notları.
+
+    `forensics` sütunu YOKSA (eski DB, migration çalışmamış) boş liste ve
+    açıklayıcı bir not döner — rapor ÇÖKMEZ.
+    """
+    wanted_strategy = (strategy or "").strip().upper() or None
+    notes: List[str] = []
+    con = sqlite3.connect(db_path)
+    try:
+        con.row_factory = sqlite3.Row
+        try:
+            cur = con.execute(
+                "SELECT id, strategy, realized_pnl, closed_at, forensics "
+                "FROM scalp_trades WHERE status = 'CLOSED'"
+            )
+        except sqlite3.OperationalError as exc:
+            notes.append(
+                f"Adli kayıt sütunu okunamadı ({exc}); bu bölüm boş — DB "
+                f"migration'ı (scalp_trades.forensics) henüz çalışmamış olabilir."
+            )
+            return [], notes
+        raw_rows = cur.fetchall()
+    finally:
+        con.close()
+
+    rows: List[Dict[str, Any]] = []
+    without = 0
+    for row in raw_rows:
+        if wanted_strategy is not None:
+            if str(row["strategy"] or "").strip().upper() != wanted_strategy:
+                continue
+        closed_dt = _parse_db_timestamp(row["closed_at"])
+        if closed_dt is None or not (since <= closed_dt <= until):
+            continue
+        document: Dict[str, Any] = {}
+        if row["forensics"]:
+            try:
+                parsed = json.loads(row["forensics"])
+                if isinstance(parsed, dict):
+                    document = parsed
+            except (TypeError, ValueError):
+                document = {}
+        if not document:
+            without += 1
+        rows.append({
+            "id": row["id"],
+            "pnl": float(row["realized_pnl"] or 0.0),
+            "tags": [t for t in (document.get("verdict") or []) if t],
+        })
+
+    if without:
+        notes.append(
+            f"{without} kapanmış işlemin adli kaydı YOK (D21 öncesi ya da "
+            f"SCALPER_FORENSICS_ENABLED=false) — bunlar '{UNTAGGED_KEY}' "
+            f"satırına düşer; 'etiketsiz' ≠ 'temiz'."
+        )
+    return rows, notes
+
+
+def build_forensics_table(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Etiket × sonuç tablosu (en zararlıdan en kârlıya sıralı).
+
+    Bir işlem birden çok etiket taşıyabilir; satırların işlem toplamı genel
+    işlem sayısını AŞABİLİR — bu kasıtlıdır.
+    """
+    buckets: Dict[str, Dict[str, float]] = {}
+    for row in rows:
+        pnl = float(row.get("pnl") or 0.0)
+        tags = []
+        for tag in row.get("tags") or []:
+            if tag not in tags:
+                tags.append(tag)
+        for name in tags or [UNTAGGED_KEY]:
+            bucket = buckets.setdefault(
+                name,
+                {"trades": 0.0, "wins": 0.0, "pnl": 0.0,
+                 "gross_win": 0.0, "gross_loss": 0.0},
+            )
+            bucket["trades"] += 1
+            bucket["pnl"] += pnl
+            if pnl > 0:
+                bucket["wins"] += 1
+                bucket["gross_win"] += pnl
+            elif pnl < 0:
+                bucket["gross_loss"] += abs(pnl)
+
+    table: List[Dict[str, Any]] = []
+    for name, bucket in buckets.items():
+        trades = int(bucket["trades"])
+        wins = int(bucket["wins"])
+        gross_loss = bucket["gross_loss"]
+        table.append({
+            "tag": name,
+            "label": FORENSICS_TAG_LABELS.get(name, ""),
+            "trades": trades,
+            "wins": wins,
+            "winrate": (wins / trades * 100.0) if trades else 0.0,
+            "pnl": bucket["pnl"],
+            "avg_pnl": (bucket["pnl"] / trades) if trades else 0.0,
+            "profit_factor": (
+                (bucket["gross_win"] / gross_loss) if gross_loss > 0
+                else (float("inf") if bucket["gross_win"] > 0 else 0.0)
+            ),
+        })
+    table.sort(key=lambda item: (item["pnl"], -item["trades"]))
+    return table
 
 
 # --------------------------------------------------------------------------
@@ -465,9 +604,13 @@ def build_report(
     until: datetime,
     days: List[str],
     notes: List[str],
+    forensics: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
+    # `forensics` YOKSA anahtar hiç eklenmez (renderer'lar `is not None` ile
+    # bölümü açar). Tek gövde: iki ayrı sözlük tutmak, birine eklenen bir
+    # alanın diğerinde unutulmasına davetiyedir (D21-R3, bulgu 5).
     headline = build_headline(trades, daily_changes, days)
-    return {
+    report: Dict[str, Any] = {
         "meta": {
             "since": since.strftime("%Y-%m-%d %H:%M"),
             "until": until.strftime("%Y-%m-%d %H:%M"),
@@ -479,8 +622,11 @@ def build_report(
         "daily": build_daily_table(trades, daily_changes, days),
         "headline": headline,
         "checklist": build_checklist(headline, since, until),
-        "notes": notes,
     }
+    if forensics is not None:
+        report["forensics"] = forensics
+    report["notes"] = notes
+    return report
 
 
 # --------------------------------------------------------------------------
@@ -560,6 +706,22 @@ _TABLE1_HEADERS = ["Rejim", "Yön", "İşlem", "WR%", "PnL", "PF", "Ort.Kazanç"
 _TABLE2_HEADERS = ["ÇıkışNedeni", "Yön", "İşlem", "WR%", "PnL", "PF", "Ort.Kazanç", "Ort.Kayıp"]
 _TABLE3_HEADERS = ["Sembol", "İşlem", "WR%", "PnL", "PF", "Ort.Kazanç", "Ort.Kayıp"]
 _TABLE4_HEADERS = ["Gün", "Rejim", "BTC%", "İşlem", "GünPnL", "KümülatifPnL"]
+_TABLE5_HEADERS = ["Etiket", "İşlem", "WR%", "PnL", "Ort.PnL", "PF", "Anlamı"]
+
+
+def _forensics_rows(report: Dict[str, Any]) -> List[List[str]]:
+    rows: List[List[str]] = []
+    for item in report.get("forensics") or []:
+        rows.append([
+            item["tag"],
+            str(item["trades"]),
+            f"{item['winrate']:.1f}",
+            f"{item['pnl']:.2f}",
+            f"{item['avg_pnl']:.2f}",
+            _fmt_pf(item["profit_factor"]),
+            item.get("label") or "",
+        ])
+    return rows
 
 
 def render_text(report: Dict[str, Any]) -> str:
@@ -608,6 +770,15 @@ def render_text(report: Dict[str, Any]) -> str:
     lines.append(
         f"  Rejim gün sayısı   : UP={rdc['UP']} FLAT={rdc['FLAT']} DOWN={rdc['DOWN']} ?={rdc['?']}"
     )
+
+    if report.get("forensics") is not None:
+        lines.append("")
+        lines.append("5b) ETİKET x SONUÇ (işlem adli kaydı, D21)")
+        lines.append(_render_table(_TABLE5_HEADERS, _forensics_rows(report)))
+        lines.append(
+            "   (Bir işlem birden çok etiket taşıyabilir — satır toplamı işlem"
+            " sayısını aşabilir.)"
+        )
 
     lines.append("")
     lines.append("6) SOAK KONTROL LİSTESİ (docs/MAINNET_PLAN.md §2 madde 3)")
@@ -662,6 +833,16 @@ def render_md(report: Dict[str, Any]) -> str:
     lines.append(f"- UP günlerden PnL payı: **{up_share_txt}**")
     lines.append(f"- exit_reason=UNKNOWN oranı: **%{h['unknown_exit_share_pct']:.1f}**")
     lines.append(f"- Rejim gün sayısı: UP={rdc['UP']} FLAT={rdc['FLAT']} DOWN={rdc['DOWN']} ?={rdc['?']}")
+
+    if report.get("forensics") is not None:
+        lines.append("")
+        lines.append("## 5b) Etiket × sonuç (işlem adli kaydı, D21)")
+        lines.append(_render_md_table(_TABLE5_HEADERS, _forensics_rows(report)))
+        lines.append("")
+        lines.append(
+            "_Bir işlem birden çok etiket taşıyabilir — satır toplamı işlem "
+            "sayısını aşabilir._"
+        )
 
     lines.append("")
     lines.append("## 6) Soak kontrol listesi (`docs/MAINNET_PLAN.md` §2 madde 3)")
@@ -719,6 +900,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--strategy", default=None,
         help="yalnız bu strateji etiketli işlemler (ör. 'AP' = AlgoPro takipçi halkası, D20)",
+    )
+    parser.add_argument(
+        "--forensics", action="store_true",
+        help=(
+            "işlem adli kaydı (D21) etiket × sonuç bölümünü ekle "
+            "(scalp_trades.forensics sütunu; yoksa bölüm boş kalır)"
+        ),
     )
     parser.add_argument("--format", choices=["text", "md", "json"], default="text")
     parser.add_argument("--out", default=None, help="çıktı dosyası (varsayılan: stdout)")
@@ -780,7 +968,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not trades:
         notes.append("Bu tarih aralığında kapanmış (CLOSED) işlem yok.")
 
-    report = build_report(trades, daily_changes, since, until, days, notes)
+    forensics_table: Optional[List[Dict[str, Any]]] = None
+    if args.forensics:
+        forensics_rows, forensics_notes = load_forensics_rows(
+            args.db, since, until, strategy=args.strategy
+        )
+        notes.extend(forensics_notes)
+        forensics_table = build_forensics_table(forensics_rows)
+
+    report = build_report(
+        trades, daily_changes, since, until, days, notes,
+        forensics=forensics_table,
+    )
     output = RENDERERS[args.format](report)
 
     if args.out:
