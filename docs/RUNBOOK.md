@@ -213,6 +213,21 @@ scalper ile **AYNI süreçte** (`tradingbot_v2`, :9091), **AYNI testnet hesabın
 deftere** dayanır. Aşağıdaki ayrı halka (`/opt/tradingbot-ap`) desteği KALDIRILMADI
 ama artık gerekli değildir — yeni kurulumlarda **bunu** kullan.
 
+**0) ÖNCE ayrı halkayı kapat** (D20 `tradingbot_ap` çalışıyorsa **ZORUNLU**).
+Gömülü mod açıldığı an AlgoPro gövdeleri SÜREÇ İÇİNDE tüketilir ve HTTP köprüsü
+HİÇ çağrılmaz: ayrı halka tek bir giriş/çıkış/TP/SL alarmı almaz ve AÇIK
+pozisyonlarına EXIT/flip komutu ULAŞMAZ (sessizce kendi SL/TP merdiveniyle
+taşınır). Startup bu durumu CRITICAL loglar ama kendiliğinden düzeltmez.
+```bash
+# a) ayrı halkayı DÜZLEŞTİR (açık pozisyon kalmasın)
+curl -sS -X POST http://127.0.0.1:9093/risk-event -H 'Content-Type: application/json' \
+  -d '{"secret":"<AP_RISK_EVENT_SECRET>","action":"flatten","reason":"gomulu-moda-gecis"}'
+# b) durdur
+ssh awa 'supervisorctl stop tradingbot_ap'
+# c) ana bottaki köprüyü BOŞALT (dolu kalırsa startup CRITICAL uyarır)
+ssh awa 'cd /opt/tradingbot-v2 && sed -i "s|^FOLLOWER_FORWARD_URL=.*|FOLLOWER_FORWARD_URL=|" .env'
+```
+
 **1) `.env` (sunucuda, yedek + doğrulama ile):**
 ```ini
 FOLLOWER_EMBEDDED=true
@@ -234,13 +249,29 @@ FOLLOWER_MAX_LEVERAGE)`. `RISK_EVENT_SECRET` gömülü modda ZORUNLU değildir a
 boşsa `/risk-event` 503 döner ve startup WARNING loglar — **doldurulması şiddetle
 önerilir** (tek uzaktan `flatten` yolu odur).
 
+Reçete repo'nun **güvenli `.env` kalıbını** kullanır (satır VARSA değiştirir,
+YOKSA ekler). Körlemesine `>>` eklemek aynı anahtarı ikinci kez yazar ve
+dosyanın son satırında newline yoksa iki ayarı BİRLEŞTİRİR:
 ```bash
 ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date -u +%Y%m%d-%H%M%S)-embedded \
-  && printf "FOLLOWER_EMBEDDED=true\nFOLLOWER_VIRTUAL_CAPITAL_USDT=1000\nFOLLOWER_SYMBOLS=<SEÇİLEN>\n" >> .env \
+  && for kv in "FOLLOWER_EMBEDDED=true" "FOLLOWER_VIRTUAL_CAPITAL_USDT=1000" "FOLLOWER_SYMBOLS=<SEÇİLEN>"; do \
+       k="${kv%%=*}"; \
+       { grep -q "^$k=" .env && sed -i "s|^$k=.*|$kv|" .env || printf "\n%s\n" "$kv" >> .env; }; \
+     done \
   && ./.venv/bin/python -c "from src.core.config import settings as s; \
-     assert s.follower_embedded and s.follower_universe, \"GÖMÜLÜ MOD AÇILMADI\"; \
+     assert s.follower_embedded, \"GÖMÜLÜ MOD AÇILMADI\"; \
+     assert s.follower_reserved_symbols == [\"<SEÇİLEN>\"], s.follower_reserved_symbols; \
+     assert float(s.follower_virtual_capital_usdt) == 1000.0; \
      print(\"evren=\", s.follower_universe, \"ayrılmış=\", s.follower_reserved_symbols)"'
 ```
+> `follower_reserved_symbols` YALNIZ `FOLLOWER_EMBEDDED=true` **ve**
+> `FOLLOWER_SYMBOLS` dolu iken doludur — tek assert iki ayarı birden doğrular.
+> (Eski reçetedeki `assert s.follower_universe` FOLLOWER_SYMBOLS hiç
+> yazılmasa da GEÇİYORDU: evren 8 majöre düşer ve hiçbir sembol scalper'dan
+> çıkarılmazdı.) Kalan hatalı bileşimleri config zaten startup'ta reddeder:
+> `FOLLOWER_VIRTUAL_CAPITAL_USDT<=0`, `SCALPER_ENABLED=false`,
+> `BOT_MODE=follower` ile birlikte, ya da `FOLLOWER_SYMBOLS`'un scalper
+> evrenini TAMAMEN boşaltması.
 > ⚠️ Çıplak `supervisorctl restart` **YASAK** (D20a bulgu 4). Uygula:
 > `RESTART_LABEL=embedded-follower scripts/restart_safe.sh testnet`
 
@@ -284,6 +315,26 @@ Komisyon kapısı retleri: `/follower/status → reject_counters.fee_gate` ve
 `state/follower_levels.jsonl` (`rejected: "fee_gate"`). Gerçek bakiye yetmediği için
 atlanan girişler: `reject_counters.insufficient_balance` + `logs/bot.log`'ta
 `⛔ Takipçi girişi atlandı: hesabın kullanılabilir bakiyesi …`.
+Takipçi evreni dışında kalan AlgoPro alarmları:
+`reject_counters.symbol_not_in_follower_universe` + `⚠️ AlgoPro girişi işlenmedi: …`
+(o alarmlar ana botun oy yoluna DA düşmez — TV'de kapatılmaları gerekir).
+
+**Sahipsiz pozisyon uyarısı.** Gömülü modda hiçbir motorun izlemediği ve rezerve
+etmediği bir açık pozisyon (elle ya da Telegram botuyla açılmış olabilir)
+`/follower/status → unknown_positions` ve panoda **SAHİPSİZ POZİSYON** satırında
+görünür. Takipçi ona **DOKUNMAZ**, girişlerini **DURDURMAZ** ve `/risk-event
+flatten` onu **KAPATMAZ** (ayrı halkada davranış D20a'daki gibi entry-halt
+olmaya devam eder). Kapatmak isteniyorsa ilgili motorun kendi flatten'ı ya da
+elle kapatma gerekir.
+
+**Kapasite.** Her motorun tavanı KENDİ pozisyonlarını sayar: scalper
+`SCALPER_MAX_POSITIONS`, takipçi `FOLLOWER_MAX_POSITIONS`. Yani hesapta
+eşzamanlı en çok `SCALPER_MAX_POSITIONS + FOLLOWER_MAX_POSITIONS` pozisyon
+olabilir ve `MAX_POSITIONS` bunları TOPLAMAZ (takipçi scalper'ın/Telegram'ın
+slotunu yemez, tersi de olmaz). Marj rekabeti gerçektir: takipçinin açık marjı
+hesabın `availableBalance`'ından düşer ve scalper'ın boyutlama tabanını
+küçültür — teşhis `/scalper/status → sizing.follower_embedded` ve takipçinin
+`virtual_ledger.exchange_available_usdt` alanındadır.
 
 **5) Acil durdurma / geri alma:**
 ```bash
@@ -297,6 +348,11 @@ ssh awa 'cd /opt/tradingbot-v2 && sed -i "s/^FOLLOWER_EMBEDDED=.*/FOLLOWER_EMBED
 ```
 > ⚠️ Bayrağı kapatmak AÇIK pozisyonu KAPATMAZ — yalnız yöneticisini ortadan
 > kaldırır. Önce `flatten`, sonra kapat.
+
+Ayrı halkaya (D20) GERİ dönülecekse sıra simetriktir: gömülü modu kapat →
+`FOLLOWER_FORWARD_URL`/`FOLLOWER_FORWARD_SECRET`'i doldur →
+`supervisorctl start tradingbot_ap` → `restart_safe.sh testnet`. İkisi AYNI
+ANDA açık bırakılmaz (köprü çağrılmaz, ayrı halka alarmsız kalır).
 
 Takipçinin kendi fail-closed giriş kilidi `state/follower_entry_halt.json`'dur
 (scalper'ınkinden AYRI dosya): yetim pozisyon ya da korumasız pozisyon şüphesinde

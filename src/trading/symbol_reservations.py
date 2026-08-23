@@ -35,6 +35,7 @@ class SymbolReservationRegistry:
         *,
         capacity: Optional[int] = None,
         exchange_symbols: Iterable[str] = (),
+        capacity_owners: Optional[Iterable[str]] = None,
     ) -> bool:
         """Claim *symbol* if no other manager owns it and capacity permits.
 
@@ -42,6 +43,15 @@ class SymbolReservationRegistry:
         snapshot.  Combining it with reservations closes the common race where
         two managers both observe one free slot before either submits an order.
         Re-acquiring a symbol by the same owner is idempotent.
+
+        ``capacity_owners`` (D20b) restricts *which owners' reservations count
+        toward ``capacity``*.  ``None`` (the default) keeps the historical
+        account-wide semantics byte-for-byte.  The embedded AlgoPro follower
+        runs in the same process with its own position ceiling; without this
+        scoping its reservations silently consumed the scalper's (and the
+        Telegram orchestrator's) account-wide slots, while nothing constrained
+        the follower in return.  Callers pass the set of owners that share
+        their ceiling and filter ``exchange_symbols`` accordingly.
         """
 
         normalised_symbol = self._normalise(symbol)
@@ -58,7 +68,12 @@ class SymbolReservationRegistry:
             if current is not None:
                 return current == normalised_owner
 
-            occupied = set(self._owners) | external
+            if capacity_owners is None:
+                counted = set(self._owners)
+            else:
+                allowed = {str(o).strip() for o in capacity_owners if str(o).strip()}
+                counted = {s for s, o in self._owners.items() if o in allowed}
+            occupied = counted | external
             if capacity is not None and capacity > 0 and len(occupied) >= capacity:
                 return False
 
@@ -90,6 +105,10 @@ class SymbolReservationRegistry:
         with self._lock:
             self._owners.clear()
 
+
+#: Ownership label of the embedded AlgoPro follower (D20b).  Defined here so
+#: both engines agree on the string without importing each other.
+FOLLOWER_RESERVATION_OWNER = "follower"
 
 symbol_reservations = SymbolReservationRegistry()
 

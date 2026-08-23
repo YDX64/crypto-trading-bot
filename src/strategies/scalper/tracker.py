@@ -430,30 +430,48 @@ class ScalpTracker:
         )
         return float(snapshot["eligible_realized_pnl"])
 
+    async def realized_pnl_since(
+        self,
+        since: datetime,
+        *,
+        strategies: Optional[Sequence[str]] = None,
+        exclude_strategies: Optional[Sequence[str]] = None,
+    ) -> float:
+        """``since``den (naive UTC) sonra KAPANAN işlemlerin net PnL toplamı.
+
+        D20b: gömülü modda iki motor AYNI hesabı paylaşır ve
+        `/fapi/v1/income` iki defteri BİRLİKTE raporlar. Her motorun günlük
+        kesicisi bu yüzden KENDİ DEFTERİNDEN beslenir; ``realized_pnl``
+        komisyon düşülmüş nettir (`_CloseLedger.net_pnl_estimate`).
+        """
+        wanted = {str(s).strip().upper() for s in (strategies or ()) if str(s).strip()}
+        unwanted = {
+            str(s).strip().upper()
+            for s in (exclude_strategies or ())
+            if str(s).strip()
+        }
+        async with AsyncSessionLocal() as session:
+            stmt = select(
+                func.coalesce(func.sum(ScalpTradeModel.realized_pnl), 0.0)
+            ).where(
+                ScalpTradeModel.status == "CLOSED",
+                ScalpTradeModel.closed_at >= since,
+            )
+            if wanted:
+                stmt = stmt.where(ScalpTradeModel.strategy.in_(sorted(wanted)))
+            if unwanted:
+                stmt = stmt.where(ScalpTradeModel.strategy.notin_(sorted(unwanted)))
+            result = await session.execute(stmt)
+            return float(result.scalar() or 0.0)
+
     async def strategy_realized_pnl_since(
         self, strategy: str, since: datetime
     ) -> float:
-        """``since``den (naive UTC) sonra KAPANAN tek strateji PnL toplamı.
-
-        D20b: gömülü modda Binance income'ı iki motorun işlemlerini birlikte
-        raporlar. Takipçinin günlük kesicisi ve scalper'ın AP düzeltmesi bu
-        DEFTER toplamını kullanır — ``realized_pnl`` komisyon DÜŞÜLMÜŞ nettir
-        (bkz. ``_CloseLedger.net_pnl_estimate``).
-        """
+        """``realized_pnl_since`` için tek-strateji sarmalayıcı (geri uyum)."""
         wanted = str(strategy or "").strip().upper()
         if not wanted:
             return 0.0
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(
-                    func.coalesce(func.sum(ScalpTradeModel.realized_pnl), 0.0)
-                ).where(
-                    ScalpTradeModel.status == "CLOSED",
-                    ScalpTradeModel.strategy == wanted,
-                    ScalpTradeModel.closed_at >= since,
-                )
-            )
-            return float(result.scalar() or 0.0)
+        return await self.realized_pnl_since(since, strategies=(wanted,))
 
     async def stats(self) -> Dict[str, Dict[str, Any]]:
         """Strateji bazında kapanmış işlem istatistikleri.
@@ -507,12 +525,35 @@ class ScalpTracker:
             }
         return out
 
-    async def open_trades(self) -> List[ScalpTradeModel]:
-        """DB'de status=OPEN olan tüm scalp işlemleri (restart kurtarma için)."""
+    async def open_trades(
+        self,
+        *,
+        strategies: Optional[Sequence[str]] = None,
+        exclude_strategies: Optional[Sequence[str]] = None,
+    ) -> List[ScalpTradeModel]:
+        """DB'de status=OPEN olan scalp işlemleri (restart kurtarma için).
+
+        ``strategies`` / ``exclude_strategies`` (D20b düşmanca inceleme, KRİTİK
+        bulgu): gömülü modda scalper ve takipçi AYNI `scalp_trades` tablosunu
+        paylaşır. Filtre YOKKEN her iki motorun `recover()`'ı DİĞERİNİN açık
+        satırını kendi pozisyonu sanıp izlemeye alıyordu → aynı net pozisyonun
+        İKİ yöneticisi (iki stop taşıma, iki kapanış defteri, AlgoPro
+        pozisyonuna scalper'ın chandelier/reaper kuralları). İkisi de None
+        (varsayılan) = eski davranış birebir.
+        """
+        wanted = {str(s).strip().upper() for s in (strategies or ()) if str(s).strip()}
+        unwanted = {
+            str(s).strip().upper()
+            for s in (exclude_strategies or ())
+            if str(s).strip()
+        }
         async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(ScalpTradeModel).where(ScalpTradeModel.status == "OPEN")
-            )
+            stmt = select(ScalpTradeModel).where(ScalpTradeModel.status == "OPEN")
+            if wanted:
+                stmt = stmt.where(ScalpTradeModel.strategy.in_(sorted(wanted)))
+            if unwanted:
+                stmt = stmt.where(ScalpTradeModel.strategy.notin_(sorted(unwanted)))
+            result = await session.execute(stmt)
             return list(result.scalars().all())
 
     # ------------------------------------------------------------------
@@ -573,11 +614,30 @@ class ScalpTracker:
         self,
         since: Optional[datetime] = None,
         until: Optional[datetime] = None,
+        *,
+        strategies: Optional[Sequence[str]] = None,
+        exclude_strategies: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
-        """Etiket × sonuç tablosu — "neler etkiliyor" sorusunun cevabı."""
+        """Etiket × sonuç tablosu — "neler etkiliyor" sorusunun cevabı.
+
+        D20b: gömülü takipçi AYNI tabloya yazar ve onun etiketleri (kapılar
+        `off`, gösterge yok) scalper'ın etiket istatistiğini kirletir. Uç
+        nokta AP'yi VARSAYILAN olarak dışlar; `?strategy=AP` ile takipçinin
+        kendi tablosu ayrıca çekilebilir.
+        """
         from src.strategies.scalper.forensics import summarize
 
         filters = [ScalpTradeModel.status == "CLOSED"]
+        wanted = {str(x).strip().upper() for x in (strategies or ()) if str(x).strip()}
+        unwanted = {
+            str(x).strip().upper()
+            for x in (exclude_strategies or ())
+            if str(x).strip()
+        }
+        if wanted:
+            filters.append(ScalpTradeModel.strategy.in_(sorted(wanted)))
+        if unwanted:
+            filters.append(ScalpTradeModel.strategy.notin_(sorted(unwanted)))
         if since is not None:
             filters.append(ScalpTradeModel.closed_at >= since)
         if until is not None:

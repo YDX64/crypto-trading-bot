@@ -4,8 +4,10 @@ Tüm environment variables ve uygulama ayarları burada yönetilir.
 """
 
 import ipaddress
+import os
 import sys
 import warnings
+from pathlib import Path
 from typing import ClassVar, List, Optional
 from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -52,7 +54,12 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        case_sensitive=False
+        case_sensitive=False,
+        # `validation_alias` verilen alanlar (ör. follower_lev_max) ALAN ADIYLA
+        # da kurulabilsin: `Settings(follower_lev_max=50)` aksi hâlde yanıltıcı
+        # bir "Extra inputs are not permitted" hatası verirdi (D20b düşmanca
+        # inceleme). Diğer alanlar etkilenmez.
+        populate_by_name=True,
     )
 
     # Binance Configuration
@@ -775,6 +782,59 @@ class Settings(BaseSettings):
     FOLLOWER_SL_MARGIN_PCT_MIN: ClassVar[float] = 10.0
     FOLLOWER_SL_MARGIN_PCT_MAX: ClassVar[float] = 50.0
 
+    def _raw_env_value(self, key: str) -> Optional[str]:
+        """`key`in HAM değeri: önce süreç ortamı, sonra `.env` dosyası.
+
+        Pydantic bir alanı iki aliasla besleyebildiğinde HANGİSİNİN kazandığını
+        dışarı vermez; "sessiz galip yok" ilkesini uygulamak için kaynağa
+        doğrudan bakılır. Dosya okunamazsa None döner (kontrol atlanır —
+        bir teşhis kontrolü startup'ı düşürmemeli).
+        """
+        for name, value in os.environ.items():
+            if name.upper() == key.upper():
+                return value
+        try:
+            env_file = self.model_config.get("env_file")
+            if not env_file:
+                return None
+            path = Path(str(env_file))
+            if not path.exists():
+                return None
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                name, _, value = line.partition("=")
+                if name.strip().upper() == key.upper():
+                    return value.strip().strip('"').strip("'")
+        except Exception:  # pragma: no cover - teşhis kontrolü
+            return None
+        return None
+
+    @model_validator(mode="after")
+    def _reject_conflicting_leverage_aliases(self) -> "Settings":
+        """`FOLLOWER_LEV_MAX` ile `FOLLOWER_MAX_LEVERAGE` AYNI ayardır.
+
+        İkisi birden ve FARKLI verilirse alias sırası sessizce birini seçerdi;
+        kaldıraç tavanı gibi bir değerde bu kabul edilemez (SL_MARGIN_PCT ile
+        aynı ilke, düşmanca inceleme).
+        """
+        old_raw = self._raw_env_value("FOLLOWER_LEV_MAX")
+        new_raw = self._raw_env_value("FOLLOWER_MAX_LEVERAGE")
+        if old_raw is None or new_raw is None:
+            return self
+        try:
+            if int(float(old_raw)) == int(float(new_raw)):
+                return self
+        except (TypeError, ValueError):
+            pass
+        raise ValueError(
+            "AYAR ÇELİŞKİSİ: FOLLOWER_LEV_MAX="
+            f"{old_raw!r} ile FOLLOWER_MAX_LEVERAGE={new_raw!r} AYNI ayardır "
+            "ama farklı verildi. Yalnız birini yazın "
+            "(yeni ad: FOLLOWER_MAX_LEVERAGE)."
+        )
+
     @model_validator(mode="after")
     def _reconcile_follower_sl_margin(self) -> "Settings":
         """`FOLLOWER_SL_MARGIN_PCT` ↔ `FOLLOWER_SL_ROI_TARGET` eşitle + sınırla.
@@ -804,14 +864,29 @@ class Settings(BaseSettings):
             self.follower_sl_roi_target = float(self.follower_sl_margin_pct)
 
         value = float(self.follower_sl_margin_pct)
-        if not (
+        in_band = (
             self.FOLLOWER_SL_MARGIN_PCT_MIN <= value <= self.FOLLOWER_SL_MARGIN_PCT_MAX
-        ):
-            raise ValueError(
+        )
+        if not in_band:
+            message = (
                 f"FOLLOWER_SL_MARGIN_PCT geçersiz: {value} — "
                 f"{self.FOLLOWER_SL_MARGIN_PCT_MIN:g}–"
                 f"{self.FOLLOWER_SL_MARGIN_PCT_MAX:g} aralığında olmalı "
                 "(stop, marjın yüzde kaçı olsun?)."
+            )
+            # FAIL-FAST YALNIZ TAKİPÇİ KOŞACAKSA (düşmanca inceleme):
+            # `/opt/tradingbot-v2/.env`'de D20 döneminden kalmış bant dışı bir
+            # `FOLLOWER_SL_ROI_TARGET`, takipçiyi hiç çalıştırmayan ANA trading
+            # sürecini başlatamaz hâle getiriyordu (deploy → sağlık yoklaması
+            # başarısız → otomatik geri alma). Kapalı bir özelliğin ayarı
+            # çalışan botu düşüremez.
+            if self.follower_active:
+                raise ValueError(message)
+            import warnings
+
+            warnings.warn(
+                message + " (takipçi KAPALI olduğu için yalnız uyarı)",
+                stacklevel=2,
             )
         return self
 
@@ -1026,6 +1101,46 @@ class Settings(BaseSettings):
            TESTNET host'unu gösteremez -> ValueError. Gerçek para sahte
            mumlarla yönetilemez.
         """
+        if self.follower_embedded and not self.scalper_enabled:
+            # Gömülü takipçi scalper halkasının İÇİNDE koşar. SCALPER_ENABLED
+            # kapalıyken motor hiç kurulmaz ve her AlgoPro alarmı 503 alır —
+            # TradingView alarmı sessizce ölür (düşmanca inceleme).
+            raise ValueError(
+                "GÜVENLİK HATASI: FOLLOWER_EMBEDDED=true iken SCALPER_ENABLED "
+                "kapatılamaz. Gömülü takipçi scalper halkasının içinde başlar; "
+                "yalnız takipçi koşacaksa AYRI halkayı kullanın "
+                "(BOT_MODE=follower, docs/DECISIONS.md D20)."
+            )
+
+        if self.follower_embedded and float(
+            self.follower_virtual_capital_usdt or 0.0
+        ) <= 0:
+            # 0/eksi değer sanal defteri SESSİZCE kapatıp boyutlamayı GERÇEK
+            # hesap bakiyesine düşürüyordu: hedeflenen 100 USDT'lik marj yerine
+            # hesabın tamamının %10'u ile ≤100x kaldıraçlı pozisyon. Sessiz
+            # galip yok (düşmanca inceleme).
+            raise ValueError(
+                "GÜVENLİK HATASI: FOLLOWER_EMBEDDED=true iken "
+                "FOLLOWER_VIRTUAL_CAPITAL_USDT sıfırdan BÜYÜK olmalı "
+                f"(şu an: {self.follower_virtual_capital_usdt}). Gömülü modda "
+                "boyutlama SANAL deftere dayanır; 0 yazmak takipçiyi sessizce "
+                "gerçek hesap bakiyesiyle çalıştırırdı."
+            )
+
+        reserved = self.follower_reserved_symbols
+        if reserved:
+            scalper_universe = self._csv_symbols(self.scalper_symbol_allowlist)
+            if scalper_universe and not (set(scalper_universe) - set(reserved)):
+                # FOLLOWER_SYMBOLS scalper'ın TÜM evrenini yutarsa scalper
+                # sessizce hiç sembol taramaz (düşmanca inceleme).
+                raise ValueError(
+                    "GÜVENLİK HATASI: FOLLOWER_SYMBOLS "
+                    f"({', '.join(reserved)}) scalper'ın tarama evrenini "
+                    f"({', '.join(scalper_universe)}) TAMAMEN boşaltıyor. "
+                    "SCALPER_SYMBOL_ALLOWLIST'e takipçiye ayrılmamış en az bir "
+                    "sembol bırakın ya da FOLLOWER_SYMBOLS'u daraltın."
+                )
+
         if self.is_follower_mode and self.follower_embedded:
             # Ayrı halka ZATEN takipçidir; gömülü bayrak orada anlamsızdır ve
             # "iki takipçi mi koşuyor?" sorusunu doğurur. Sessiz yok saymak

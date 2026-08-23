@@ -863,7 +863,10 @@
   var STRAT_LABELS = {
     A: "A — Trend Kırılması",
     B: "B — Trend İçi Uç Avcısı",
-    C: "C — Saf Uç Avcısı"
+    C: "C — Saf Uç Avcısı",
+    // D20b: gömülü AlgoPro takipçisi AYNI tabloya yazar; kartı ayrı durur ve
+    // TOPLAM kartına GİRMEZ (bkz. /scalper/stats combined.scope).
+    AP: "AP — AlgoPro Takipçisi (sanal defter)"
   };
   var STRAT_ORDER = ["A","B","C"];
 
@@ -1227,7 +1230,13 @@
   // ---------------------------------------------------------------
 
   function strategyCardHtml(key, s, isLeader){
-    var title = STRAT_LABELS[key] || (key === "combined" ? "TOPLAM — Tüm Stratejiler" : key);
+    // D20b: `combined` gömülü takipçinin (AP) defterini DIŞLAR — iki ayrı
+    // defteri tek toplamda göstermek PF/PnL'i yanlış okutur. Kapsam
+    // sunucudan gelir (`combined.scope` = "!AP"); AP kendi kartında durur.
+    var combinedTitle = (s && String(s.scope || "").charAt(0) === "!")
+      ? "TOPLAM — Scalper defteri (AP hariç)"
+      : "TOPLAM — Tüm Stratejiler";
+    var title = STRAT_LABELS[key] || (key === "combined" ? combinedTitle : key);
     var hasData = s && isNum(s.trades) && s.trades > 0;
 
     var card = el("div", "strat-card" + (isLeader ? " leader" : ""));
@@ -1428,6 +1437,12 @@
     }
 
     var notes = [];
+    if (f.forward_bridge_conflict){
+      // Gömülü modda HTTP köprüsü çağrılmaz: FOLLOWER_FORWARD_URL doluysa
+      // ayrı halka (tradingbot_ap) hiçbir AlgoPro olayı ALMIYOR demektir.
+      notes.push('<span class="ap-warn">FOLLOWER_FORWARD_URL dolu — ayrı halka ' +
+        'alarmsız (RUNBOOK "Gömülü takipçiyi açma" adım 0)</span>');
+    }
     if (reserved) notes.push("takipçiye ayrılmış (scalper görmez): " + escapeHtml(reserved));
     if (f.daily_pnl_source === "ap_ledger") notes.push("günlük K/Z kaynağı: AP defteri");
     if (isNum(f.daily_loss_threshold_usdt)){
@@ -1443,6 +1458,13 @@
     } else if ((f.orphan_positions || []).length){
       warn = '<span class="ap-warn">YETİM POZİSYON: ' +
         escapeHtml((f.orphan_positions || []).join(", ")) + '</span>';
+    } else if ((f.unknown_positions || []).length){
+      // D20b: hiçbir motorun izlemediği CANLI pozisyon. YETİM DEĞİLDİR
+      // (elle/Telegram açılmış olabilir) — takipçi ona dokunmaz ve girişleri
+      // durdurmaz; yalnız görünür olmalıdır.
+      warn = '<span class="ap-warn">SAHİPSİZ POZİSYON: ' +
+        escapeHtml((f.unknown_positions || []).join(", ")) +
+        ' (takipçi dokunmuyor — elle/Telegram açılmış olabilir)</span>';
     } else if (!f.entries_ready && f.entry_block_reason){
       warn = '<span class="ap-warn">giriş kapalı: ' +
         escapeHtml(String(f.entry_block_reason)) + '</span>';

@@ -71,6 +71,20 @@ class FollowerExitManager(ExitManager):
         )
 
     # ------------------------------------------------------------------
+    # Defter izolasyonu (D20b düşmanca inceleme, KRİTİK bulgu)
+    # ------------------------------------------------------------------
+
+    def recovery_strategies(self):
+        """Takipçi YALNIZ kendi defter satırlarını (``strategy="AP"``) kurtarır.
+
+        Gömülü modda scalper ile AYNI `scalp_trades` tablosu paylaşılır. Bu
+        filtre olmadan takipçi restart'ta scalper'ın C pozisyonunu sahiplenip
+        ona AlgoPro çıkış kurallarını (3 parça TP, trailing YOK) uygular ve
+        aynı net pozisyonun ikinci yöneticisi olurdu.
+        """
+        return (FOLLOWER_STRATEGY,), None
+
+    # ------------------------------------------------------------------
     # Cooldown: takipçide HER çıkış cooldown başlatır
     # ------------------------------------------------------------------
 

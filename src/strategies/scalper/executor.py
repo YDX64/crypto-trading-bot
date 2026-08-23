@@ -800,6 +800,14 @@ class ScalpExecutor:
         effective = min(max(0.0, float(exchange_available)), virtual_capital)
         self._last_sizing_snapshot = {
             "mode": "virtual_compounding",
+            # D20b (düşmanca inceleme, teşhis): gömülü modda takipçinin AÇIK
+            # marjı hesabın `availableBalance`'ından DÜŞÜLMÜŞ olarak gelir —
+            # yani iki defter ayrı olsa da scalper'ın sizing tabanı takipçinin
+            # pozisyonlarından ETKİLENİR. Bu alan o etkiyi görünür kılar;
+            # hiçbir kapıya girmez.
+            "follower_embedded": bool(
+                getattr(self.cfg, "follower_embedded", False)
+            ),
             "exchange_available": float(exchange_available),
             "virtual_capital": virtual_capital,
             "eligible_realized_pnl": eligible_pnl,

@@ -83,7 +83,10 @@ from src.trading.binance_client_improved import (
     RestWeightBackoff,
 )
 from src.trading.position_manager import PositionManager, UnprotectedPositionError
-from src.trading.symbol_reservations import symbol_reservations
+from src.trading.symbol_reservations import (
+    FOLLOWER_RESERVATION_OWNER,
+    symbol_reservations,
+)
 from src.trading.user_stream import BinanceUserDataStream
 
 
@@ -1053,6 +1056,23 @@ class ScalperEngine:
         except Exception:  # savunmacı: teşhis alanı taramayı düşürmemeli
             return set()
 
+    def _follower_managed_symbols(self) -> Set[str]:
+        """Gömülü takipçinin YÖNETTİĞİ semboller (rezervasyon kaydından).
+
+        Boş küme = gömülü mod kapalı ya da takipçinin açık pozisyonu yok →
+        hesap-geneli kapasite hesabı bugünküyle BİREBİR aynı kalır.
+        """
+        if not bool(getattr(self.cfg, "follower_embedded", False)):
+            return set()
+        try:
+            return {
+                symbol
+                for symbol, owner in symbol_reservations.snapshot().items()
+                if owner == FOLLOWER_RESERVATION_OWNER
+            }
+        except Exception:  # pragma: no cover - kayıt taramayı düşürmez
+            return set()
+
     def _exclude_follower_symbols(self, universe: List[str]) -> List[str]:
         """Tarama evreninden takipçi sembollerini çıkar (bir kez loglar)."""
         reserved = self._follower_reserved_symbols()
@@ -1919,6 +1939,22 @@ class ScalperEngine:
                 }
                 if symbol in live_symbols:
                     return
+                # D20b (düşmanca inceleme): hesap-geneli tavan takipçiyi
+                # SAYMAZ. Takipçinin kendi tavanı (FOLLOWER_MAX_POSITIONS)
+                # vardır; onun 4 pozisyonu scalper'ı 3 yerine 1 slota
+                # düşürüyordu ve ters yönde hiçbir sınır yoktu. Gömülü mod
+                # kapalıyken iki küme de boştur → davranış birebir aynı.
+                follower_symbols = self._follower_managed_symbols()
+                if not follower_symbols:
+                    scoped_owners = None
+                    scoped_live = live_symbols
+                else:
+                    scoped_owners = tuple(
+                        o
+                        for o in symbol_reservations.snapshot().values()
+                        if o != FOLLOWER_RESERVATION_OWNER
+                    ) + (self._RESERVATION_OWNER,)
+                    scoped_live = live_symbols - follower_symbols
                 if not symbol_reservations.reserve(
                     symbol,
                     self._RESERVATION_OWNER,
@@ -1927,7 +1963,8 @@ class ScalperEngine:
                         "max_positions",
                         self.cfg.scalper_max_positions,
                     ),
-                    exchange_symbols=live_symbols,
+                    exchange_symbols=scoped_live,
+                    capacity_owners=scoped_owners,
                 ):
                     self.logger.info(
                         f"⏭️ {symbol}: sembol başka motorun yönetiminde veya hesap kapasitesi dolu"
@@ -4184,17 +4221,35 @@ class ScalperEngine:
             self._daily_loss_threshold_usdt = None
             return  # kesici kapalı
 
+        # D20b (düşmanca inceleme, KRİTİK): gömülü modda hesap PAYLAŞILIR ve
+        # `/fapi/v1/income` İKİ defteri birlikte raporlar. Eski çözüm income'dan
+        # AP'yi düşmekti; ama income 120 sn önbelleklidir ve AP kapanışları
+        # scalper'ın `close_seq`'ini artırmadığı için düzeltme çağrıların
+        # ~%98'inde ATLANIYORDU (kill switch bir LATCH'tir: tek kirli okuma
+        # scalper'ın tüm gününü kapatabilir). Ayrıca AP merdiveninin KISMİ TP
+        # dolumları hiç defter satırı yazmadığı için income'da düzeltmesiz
+        # kalıyor ve eşiği GEVŞETİYORDU.
+        # Kökten çözüm: gömülü modda her motor KENDİ DEFTERİNDEN beslenir.
+        # Bunun bilinçli bedeli: kısmi TP dolumları (iki motorda da) gün
+        # içinde sayılmaz, PnL yalnız KAPANAN işlemlerden oluşur.
+        # `FOLLOWER_EMBEDDED=false` → income yolu birebir korunur.
+        embedded = bool(getattr(self.cfg, "follower_embedded", False))
         try:
-            pnl = await self._get_account_daily_net_income(today)
+            if embedded:
+                pnl = await self._ledger_daily_pnl(today)
+            else:
+                pnl = await self._get_account_daily_net_income(today)
         except Exception as e:
             self._risk_ready = False
             self._daily_pnl_source = "unavailable"
             self.logger.error(
-                f"❌ Binance net günlük PNL doğrulanamadı; yeni girişler fail-closed kapalı: {e}"
+                f"❌ Net günlük PNL doğrulanamadı; yeni girişler fail-closed kapalı: {e}"
             )
             return
         self._daily_pnl = pnl
-        self._daily_pnl_source = "binance_account_income"
+        self._daily_pnl_source = (
+            "scalper_ledger" if embedded else "binance_account_income"
+        )
         self._risk_ready = True
 
         if self._kill_switch:
@@ -4287,45 +4342,27 @@ class ScalperEngine:
 
         self._daily_income_cache = (net, now_monotonic, today)
         self._income_cache_close_seq = getattr(self.tracker, "close_seq", 0)
-        return net - await self._follower_daily_pnl_offset(today)
+        return net
 
-    async def _follower_daily_pnl_offset(self, today: str) -> float:
-        """Gömülü takipçinin (strategy="AP") BUGÜNKÜ defter PnL'i (D20b).
+    async def _ledger_daily_pnl(self, today: str) -> float:
+        """Scalper'ın KENDİ defterinden bugünkü net PnL (gömülü mod, D20b).
 
-        NEDEN: gömülü modda iki motor AYNI Binance hesabındadır ve
-        `/fapi/v1/income` iki defteri BİRLİKTE raporlar. Scalper'ın günlük
-        kesicisi başkasının işlemleriyle tetiklenemez (ve tersi de olamaz),
-        bu yüzden AP satırlarının net PnL'i income'dan DÜŞÜLÜR.
-
-        Kapsam ve DÜRÜST sınırı: `realized_pnl` komisyon düşülmüş nettir
-        (`_CloseLedger.net_pnl_estimate`), fakat AÇIK bir AP pozisyonunun
-        FUNDING_FEE satırı ve HENÜZ kapanmamış işlemin komisyonu bu
-        düzeltmeye girmez — o kalıntı scalper'ın eşiğinde kalır (fail-closed
-        yön: eşiği daraltır, gevşetmez).
-
-        Önbellek DIŞINDA hesaplanır: scalper'ın `close_seq` sayacı KENDİ
-        tracker örneğinindir ve AP kapanışlarında artmaz; düzeltmeyi
-        önbelleğe almak 120 sn boyunca bayat bir eşik üretirdi.
-
-        `FOLLOWER_EMBEDDED=false` (varsayılan) → DAİMA 0.0, davranış birebir.
+        Kaynak `scalp_trades` (AP satırları HARİÇ); `realized_pnl` komisyon
+        düşülmüş nettir. Önbellek YOKTUR: tek `SUM()` sorgusudur ve income
+        önbelleğinin doğurduğu "aynı gün iki farklı PnL" sınıfını kökten
+        kapatır. Takipçinin eşleniği `FollowerEngine._ledger_daily_pnl`'dir —
+        aynı mekanizma, ters filtre.
         """
-        if not bool(getattr(self.cfg, "follower_embedded", False)):
-            return 0.0
-        getter = getattr(self.tracker, "strategy_realized_pnl_since", None)
-        if getter is None:
-            return 0.0
-        try:
-            day_start = datetime.strptime(today, "%Y-%m-%d")
-            return float(await getter(FOLLOWER_LEDGER_STRATEGY, day_start))
-        except Exception as exc:
-            # Fail-closed DEĞİL: düzeltme okunamazsa ham income kullanılır
-            # (eşik yalnız AP kârı kadar GEVŞER değil, AP zararı kadar
-            # DARALIR) — ama sessiz kalınmaz.
-            self.logger.warning(
-                f"⚠️ Takipçi (AP) günlük PnL düzeltmesi okunamadı ({exc}); "
-                f"scalper günlük eşiği ham hesap income'ıyla ölçülüyor"
+        getter = getattr(self.tracker, "realized_pnl_since", None)
+        if getter is None:  # pragma: no cover - eski tracker çifti
+            raise RuntimeError(
+                "tracker.realized_pnl_since yok — gömülü modda scalper günlük "
+                "PnL'i defterden okunamıyor"
             )
-            return 0.0
+        day_start = datetime.strptime(today, "%Y-%m-%d")
+        return float(
+            await getter(day_start, exclude_strategies=(FOLLOWER_LEDGER_STRATEGY,))
+        )
 
     async def _get_cached_balance(self) -> Optional[float]:
         balance, cached_at = self._balance_cache

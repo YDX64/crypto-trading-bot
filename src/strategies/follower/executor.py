@@ -690,6 +690,27 @@ class FollowerExecutor:
             )
             return None
 
+        # D21 defterinin GİRİŞ yarısı (düşmanca inceleme): `logs/trades.jsonl`
+        # takipçi girişlerini hiç görmüyordu, yalnız çıkışları. Kuyruğa koyar,
+        # yazmayı beklemez; hata girişi ASLA etkilemez.
+        if forensics_document:
+            try:
+                from src.strategies.scalper import forensics_log
+
+                forensics_log.append_soon(
+                    "entry",
+                    {
+                        "trade_id": int(trade_id),
+                        "symbol": str(symbol),
+                        "verdict": list(forensics_document.get("verdict") or []),
+                        "entry": forensics_document.get("entry"),
+                    },
+                )
+            except Exception as exc:  # pragma: no cover - savunma
+                self.logger.warning(
+                    f"⚠️ {symbol}: takipçi adli giriş satırı yazılamadı ({exc})"
+                )
+
         self.logger.info(
             f"✅ Takipçi pozisyon açıldı: {symbol} {direction.value} {filled_qty} @ "
             f"{entry_price} (lev={plan.leverage}x, SL={stop_price} [%{plan.sl_pct:.3f} "
@@ -703,6 +724,9 @@ class FollowerExecutor:
             position=position,
             plan=exit_plan,
             entry_candle_time=int(time.time() * 1000),
+            # Kapanış adli kaydı giriş belgesini burada bulur (scalper ile
+            # aynı alan) — aksi halde "çıkış" satırı bağlamsız kalırdı.
+            forensics_entry=(forensics_document or {}).get("entry"),
             meta={
                 "plan": {
                     **plan.as_dict(),

@@ -1033,17 +1033,22 @@ SABİT DEĞİLDİR** — seçim ayrı bir ölçümle belirlenir ve yalnız `.env
    scalper'ın açık marjı hesabı doldurmuş olabilir. Defter okunamazsa giriş
    fail-closed reddedilir (`virtual_equity`).
 
-3. **İki defter BİRBİRİNİ KİRLETMEZ.** Scalper'ın sanal kasası artık
+3. **İki defter BİRBİRİNİ KİRLETMEZ.** Scalper'ın sanal kasası
    `exclude_strategies=("AP",)` ile hesaplanır (ayrı halkada DB'de AP satırı
-   yoktur → davranış birebir aynı). Günlük kesiciler: gömülü modda Binance
-   `/fapi/v1/income` İKİ defteri birlikte raporlar, bu yüzden (a) takipçinin
-   günlük PnL'i **defterden** okunur (`scalp_trades`, `strategy='AP'`,
-   `realized_pnl` = komisyon düşülmüş net), (b) scalper'ın hesap income'ından
-   **AP'nin bugünkü net PnL'i DÜŞÜLÜR** (`_follower_daily_pnl_offset`; önbellek
-   DIŞINDA hesaplanır çünkü scalper'ın `close_seq` sayacı AP kapanışlarında
-   artmaz). *Dürüst sınır:* AÇIK bir AP pozisyonunun FUNDING_FEE'si ve henüz
-   kapanmamış işlemin komisyonu bu düzeltmeye girmez; kalıntı scalper'ın
-   eşiğinde kalır (fail-closed yön — eşiği daraltır).
+   yoktur → davranış birebir aynı). **Günlük kesiciler: gömülü modda HER MOTOR
+   KENDİ DEFTERİNDEN beslenir** — takipçi `strategy='AP'`, scalper AP HARİÇ
+   (`realized_pnl` komisyon düşülmüş nettir). Binance `/fapi/v1/income` iki
+   defteri birlikte raporladığı için o kaynak gömülü modda KULLANILMAZ.
+   `/scalper/status → daily_pnl_source` hangi kaynağın etkin olduğunu söyler
+   (`scalper_ledger` ↔ `binance_account_income`). *Bilinçli bedel:* defter
+   yalnız KAPANAN işlemleri sayar; kısmi TP dolumları gün içinde iki motorda da
+   görünmez. `FOLLOWER_EMBEDDED=false` → income yolu birebir korunur.
+   > İlk tasarım income'dan AP'yi DÜŞÜYORDU; düşmanca inceleme bunu
+   > çürüttü (aşağıdaki bölüm, KRİTİK-2): income 120 sn önbelleklidir ve AP
+   > kapanışları scalper'ın `close_seq`'ini artırmadığı için düzeltme
+   > çağrıların ~%98'inde ATLANIYORDU; ayrıca AP merdiveninin kısmi TP
+   > dolumları hiç defter satırı yazmadığı için eşiği DARALTMIYOR,
+   > GEVŞETİYORDU.
 
 4. **Çakışma: aynı sembolde tek motor.** Mevcut süreç-içi
    `symbol_reservations` kaydı (owner `"scalper"` / `"follower"` /
@@ -1054,10 +1059,18 @@ SABİT DEĞİLDİR** — seçim ayrı bir ölçümle belirlenir ve yalnız `.env
    tarama turunu değil) ve safety turunda izlenmeyen semboller bırakılır —
    ancak `_entry_halted` ya da `_entry_lock` tutuluyorken **hiçbir sahiplik
    bırakılmaz** (uçuşta giriş `track()` edilene kadar `tracked_symbols()`ta
-   görünmez). Kapasiteler AYRIDIR: `FOLLOWER_MAX_POSITIONS`=4, scalper'ınki
-   değişmedi. (Hesap-geneli `MAX_POSITIONS` kapısı zaten borsadaki AÇIK
-   pozisyonları sayıyordu; takipçinin pozisyonu da gerçek bir pozisyondur ve
-   oraya dahildir — bu yeni bir daralma değil, aynı hesabın gerçeğidir.)
+   görünmez). **Kapasiteler GERÇEKTEN AYRIDIR:** her motorun tavanı YALNIZ
+   kendi rezervasyonlarını sayar (`symbol_reservations.reserve(...,
+   capacity_owners=...)`); takipçinin 4 pozisyonu scalper'ın hesap-geneli
+   `MAX_POSITIONS` slotlarını YEMEZ ve takipçi de kendi tavanını (girişte
+   atomik olarak) AŞAMAZ.
+   > İlk metin bunu *"yeni bir daralma değil, aynı hesabın gerçeğidir"*
+   > diyerek geçiştiriyordu; düşmanca inceleme ÇÜRÜTTÜ (aşağıdaki bölüm,
+   > YÜKSEK-7): varsayılanlarla (MAX_POSITIONS=5, SCALPER_MAX_POSITIONS=3,
+   > FOLLOWER_MAX_POSITIONS=4) takipçi 4 pozisyon taşırken scalper 3 yerine
+   > 1 slota düşüyordu ve ters yönde HİÇBİR sınır yoktu. Bunun bilinçli
+   > sonucu: hesapta eşzamanlı `SCALPER_MAX_POSITIONS + FOLLOWER_MAX_POSITIONS`
+   > pozisyon olabilir; `MAX_POSITIONS` bu toplamı TEMSİL ETMEZ.
 
 5. **Yetim denetimi düzeltildi (D20a bulgu 8, not (iii)).** GERÇEK yetim =
    **hiçbir motorun izlemediği** pozisyon. `_check_orphans` artık
@@ -1126,29 +1139,181 @@ supervisor yolları vardır) ama boşsa startup'ta WARNING loglanır. Entry-halt
 dosyaları AYRIDIR (`state/scalper_entry_halt.json` ↔
 `state/follower_entry_halt.json`): biri diğerinin kilidini açmaz/kapatmaz.
 
-**Kanıt:** `python3 -m pytest tests -q` → **1899 passed, 1 skipped** (önceki:
-1844 passed, 1 skipped; **+55 test**, `tests/test_follower_embedded.py`). Aynı
-sonuç sunucu env'iyle de alındı
-(`SCALPER_MARKET_GATE=true SCALPER_MARKET_DATA_BASE_URL=https://fapi.binance.com`).
-Yeni testlerin düzeltme olmadan KIRMIZI olduğu `git stash push -- src static
-scripts` ile doğrulandı: **45 failed, 3 passed, 7 errors**. Kapsam: ayar katmanı
-(varsayılan kapalı, evren/dışlama, mod çelişkisi, mainnet yasağı, SL_MARGIN_PCT
-alias/band/çelişki, MAX_LEVERAGE eş adı, kaldıraç formülü), sanal defter (DB'den
-equity, kayıp, yetersiz bakiye, fail-closed, kapalı defter, risk equity, günlük
-PnL kaynağı, kesici eşiği), defter ayrışması (offset kapalı/açık/hata), sembol
-sahipliği (iki yön, bırakma, halt/uçuş koruması), yetim denetimi (iki yönlü),
-`FOLLOWER_SYMBOLS` (evren + scalper dışlama + TV oyu reddi + takipçi reddi),
-köprü yönlendirmesi (AlgoPro→takipçi, HIT, eski biçim→oy, kapalı bayrak,
-dry-run, 403, 503), pano şekli (kart alanları, bellekten ROI, `/api/status`
-bloğu, `/follower/status`, HTML işaretleri), `/risk-event` motor listesi ve
-`ledger_report` strateji bölümü. **Backtest harness'e DOKUNULMADI** (takipçi
-strateji C'yi hiç kullanmaz — CLAUDE.md kural 2 kapsamı dışında).
+**Düşmanca inceleme (çok-mercekli, 2026-08-23): 41 bulgu → 35 doğrulandı (iki
+bağımsız çürütücü) → TAMAMI DÜZELTİLDİ.** Mercekler: yetim-güvenlik,
+defter-ayrımı, köprü-güvenlik, rezervasyon-yarışı, pano/REST, config-deploy.
+Her düzeltme önce KIRMIZI testle kilitlendi. Bulgular tekilleştirilmiş
+başlıklarla:
+
+**KRİTİK-1 — Restart kurtarması iki defteri KARIŞTIRIYORDU.**
+`ExitManager.recover()` → `tracker.open_trades()` `strategy` sütununa hiç
+bakmıyordu; gömülü modda scalper takipçinin AP satırını, takipçi de scalper'ın
+C satırını KENDİ pozisyonu sanıp izlemeye alıyordu → aynı net pozisyonun İKİ
+yöneticisi (iki stop taşıma, iki `cancel_all_open_orders`, iki kapanış defteri)
+ve AlgoPro pozisyonuna scalper'ın chandelier/reaper/TP1-oranı kuralları.
+*Düzeltme:* `open_trades(strategies=…, exclude_strategies=…)` (aynı desen
+`compounding_snapshot`'taki gibi) + `ExitManager.recovery_strategies()`
+kancası (scalper AP hariç, `FollowerExitManager` yalnız AP) + `recover()`
+içinde satır bazlı İKİNCİ SAVUNMA (beklenen küme dışı satır atlanır + WARNING).
+Parite testi: iki motorun kurtardığı kümelerin kesişimi BOŞ.
+
+**KRİTİK-2 — Scalper'ın günlük PnL'i başkasının zararıyla kirleniyordu.**
+Ayrıntı yukarıda §3'te. *Düzeltme:* gömülü modda kaynak Binance income değil
+KENDİ DEFTERİ (`_ledger_daily_pnl`, önbeleksiz tek `SUM()`); önbellek-kirliliği
+ve kısmi-dolum sınıflarının İKİSİ de kökten kapandı.
+`/scalper/status → daily_pnl_source` yeni alan.
+
+**KRİTİK-3 — `FOLLOWER_EMBEDDED=true` deploy test kapısını KIRIYORDU.**
+`Settings` `env_file=".env"`i ÇALIŞMA DİZİNİNE göre okur; `server_deploy.sh`
+testleri `/opt/tradingbot-v2` içinde koşturur → pytest CANLI `.env`'i görür.
+Bayrak açıldığı an 5 test kırmızıya döner, `pytest -x` durur ve deploy KODU
+GERİ ALIP çalışan süreci yeniden başlatır: gömülü mod açıldıktan sonra hiçbir
+değişiklik canlıya giremezdi. *Düzeltme:* `tests/conftest.py`'de autouse
+izolasyon — süreç ortamındaki `FOLLOWER_*` değişkenleri silinir ve `settings`
+tekilinde gömülü mod KAPALI sabitlenir; pozitif testler onu kendi içinde açar.
+*Kanıt:* `.env`'e `FOLLOWER_EMBEDDED=true FOLLOWER_SYMBOLS=TUTUSDT` yazılıp tüm
+paket koşuldu — YEŞİL; izolasyon fixture'ı `git stash` ile kaldırıldığında
+5 KIRMIZI.
+
+**YÜKSEK-4 — Gömülü takipçi restart'ta KALICI entry-halt'a düşüyordu.**
+Lifespan takipçiyi scalper'dan sonra başlatıyordu; scalper kurtardığı sembolleri
+zaten rezerve ettiği için takipçinin sahiplik döngüsü ÇAKIŞIYOR ve
+`state/follower_entry_halt.json` yazılıyordu — hesapta bir açık pozisyon varsa
+DETERMİNİSTİK. `/health` bunu yakalamıyordu (`core_healthy` kasten takipçiden
+etkilenmiyor). *Düzeltme:* KRİTİK-1 ile kök neden kalktı; ayrıca sahiplik
+döngüsü `break` yerine `continue` ile TÜM sembolleri dener ve çakışmada artık
+KALICI DOSYA YAZMAZ — RAM'de girişleri kapatır + CRITICAL loglar.
+
+**YÜKSEK-5 — Yetim tanımı paylaşılan hesapta YANLIŞTI.**
+Gömülü modda Telegram orchestrator'ın, elle açılmış bir pozisyonun ya da
+scalper'ın uçuştaki girişinin "takipçinin izlemediği" olması MEŞRUDUR; eski
+tanım her birini kalıcı entry-halt'a çeviriyordu (üstelik takipçi
+`orchestrator.start()`'tan ÖNCE başlıyordu → her restart). *Düzeltme (kullanıcı
+kararı):* gömülü modda entry-halt YOK, flatten YOK — WARNING + sayaç
+(`unknown_position`) + `/follower/status → unknown_positions` + panoda
+"SAHİPSİZ POZİSYON" satırı. **Ayrı halka (`BOT_MODE=follower`) D20a davranışını
+AYNEN korur.** Takipçi artık `orchestrator.start()`'tan SONRA başlar.
+
+**YÜKSEK-6 — `/risk-event flatten` hesabın TAMAMINI kapatabiliyordu.**
+`_flatten_orphans` rezervasyonlara hiç bakmıyordu: gömülü modda operatörün
+"takipçiyi düzleştir" komutu Telegram'ın VIP pozisyonlarını da kapatırdı.
+*Düzeltme:* yabancı sahipli + sahipsiz semboller KORUNUR, atlananlar CRITICAL
+loglanır ("hesap TAMAMEN düz DEĞİLDİR").
+
+**YÜKSEK-7 — Kapasite asimetrikti.** Ayrıntı yukarıda §4'te.
+*Düzeltme:* `symbol_reservations.reserve(..., capacity_owners=…)` (varsayılan
+`None` = bugünkü hesap-geneli davranış birebir); scalper takipçiyi saymaz,
+takipçi girişte kendi tavanına atomik olarak takılır.
+
+**YÜKSEK-8 — Takipçi evreni dışındaki AlgoPro alarmları YUTULUYORDU.**
+`FOLLOWER_SYMBOLS=<tek coin>` iken diğer 7 sembolün AlgoPro girişleri
+takipçiye yönlenip "evrende değil" ile 200 alıyor, ana botun sağlamasına da
+hiç ulaşmıyordu — sinyal TAMAMEN kayboluyordu ve hiçbir sayaçta görünmüyordu.
+*Düzeltme (kullanıcı kararı):* giriş/oy yoluna DÜŞMEZ (ana bot değişmez) ama
+SESSİZ de kalmaz: 200 `{routed:"follower", accepted:false,
+reason:"symbol_not_in_follower_universe"}` + WARNING +
+`reject_counters.symbol_not_in_follower_universe`. ÇIKIŞ/HIT olayları evren
+kapısına TAKILMAZ (D20a bulgu 9 ilkesi).
+
+**YÜKSEK-9 — Gömülü mod, çalışan ayrı halkayı sessizce alarmsız bırakıyordu.**
+*Düzeltme:* `FOLLOWER_FORWARD_URL` doluyken startup CRITICAL uyarısı +
+`/follower/status → forward_bridge_conflict` bayrağı + panoda uyarı satırı +
+RUNBOOK'a "adım 0: ayrı halkayı flatten et, durdur, köprüyü boşalt" ve simetrik
+geri dönüş adımı.
+
+**YÜKSEK-10 — Gömülü takipçinin entry-halt kilidi deploy'da GÖRÜNMÜYORDU.**
+`RING=testnet` yalnız `state/scalper_entry_halt.json`e bakıyordu (CLAUDE.md
+yasak #3 ihlali). *Düzeltme:* `server_deploy.sh` + `restart_safe.sh`,
+`.env`'de `FOLLOWER_EMBEDDED=true` görünce `state/follower_entry_halt.json`i de
+kontrol eder.
+
+**YÜKSEK-11 — `FOLLOWER_VIRTUAL_CAPITAL_USDT<=0` sanal defteri SESSİZCE
+kapatıyordu** (boyutlama gerçek bakiyeye düşüyor, marj hesabın %10'u oluyordu).
+*Düzeltme:* gömülü modda startup HATASI.
+
+**ORTA/DÜŞÜK bulgular (hepsi düzeltildi):** ertelenmiş kurtarma yolunda
+sahiplik alınmıyordu (döngü `_attempt_recovery` İÇİNE taşındı); yetim denetimi
+patladığında rezervasyon senkronu sahipliği bırakıyordu (üçüncü fail-closed
+koşul); yetim tanımı yalnız rezervasyona dayanıyordu — scalper halt'ta
+rezervasyonlar DONAR, gerçek yetim görünmez olurdu (yeni `foreign_tracked_cb`
+ile diğer motorların GERÇEK izleme listesi birincil kaynak); yönlendirici ile
+yürütücü FARKLI ayrıştırıcı kullanıyordu (dry-run "entry" derken gerçek istek
+EXIT çalıştırabiliyordu → TEK `parse_follower_event`, dry-run artık
+symbol/direction da raporlar); `FOLLOWER_EMBEDDED=true` + `SCALPER_ENABLED=false`
+sessizce her alarmı 503'e düşürüyordu (startup HATASI);
+`FOLLOWER_SL_MARGIN_PCT` bandı takipçi KAPALIYKEN de fail-fast'ti — kapalı bir
+özelliğin ayarı ana süreci düşüremez (artık `follower_active` iken hata, aksi
+hâlde WARNING); `validation_alias` yüzünden `follower_lev_max` alan adıyla
+kurulamıyordu (`populate_by_name=True`; ayrıca `FOLLOWER_LEV_MAX` ile
+`FOLLOWER_MAX_LEVERAGE` birlikte ve FARKLI verilirse artık startup HATASI —
+sessiz galip yok); `FOLLOWER_SYMBOLS` scalper evrenini
+TAMAMEN boşaltabiliyordu (startup HATASI); `/scalper/stats combined` ve
+`/scalper/forensics/summary` AP satırlarını karıştırıyordu (varsayılan AP
+HARİÇ + `?strategy=` ile erişim, panoda "TOPLAM — Scalper defteri (AP hariç)"
+etiketi ve ayrı `AP` kartı); takipçinin safety turu her 2 sn'de önbeleksiz iki
+DB toplaması yapıyordu (30 sn TTL + `close_seq` geçersizleştirme); AP girişleri
+`logs/trades.jsonl`'e yazılmıyordu (adli defterin yarısı eksikti);
+`virtual_ledger.exchange_available_usdt` ilk girişe kadar null kalıyordu;
+scalper'ın sizing anlık görüntüsüne `follower_embedded` teşhis alanı eklendi
+(takipçinin marjı `availableBalance` üzerinden scalper'ın tabanını küçültür —
+bu ETKİ KALDIRILMADI, GÖRÜNÜR yapıldı); RUNBOOK reçetesi repo'nun güvenli
+`.env` kalıbına çevrildi ve doğrulama assert'i `FOLLOWER_SYMBOLS` +
+sanal sermaye değerini de doğruluyor.
+
+**Çürütülen 6 bulgu** (kayıt için, düzeltilmedi): iki bağımsız çürütücüden
+geçemedikleri için uygulanmadı; gerekçeleri inceleme çıktısındadır.
+
+**Kanıt:** `python3 -m pytest tests -q` → **1940 passed, 1 skipped**
+(D20b öncesi: 1844; ilk uygulama 1899; düşmanca inceleme düzeltmeleriyle
+**+96 test toplam**, çekirdeği `tests/test_follower_embedded.py` = 93 test).
+**DÖRT ortam varyantında da YEŞİL** (hepsi bu dalda koşuldu):
+1. temiz `.env` (`cp env.example .env`) → 1940 passed, 1 skipped;
+2. `.env` içinde `FOLLOWER_EMBEDDED=true` + `FOLLOWER_SYMBOLS=TUTUSDT`
+   (sunucudaki gömülü kurulumun birebir taklidi — KRİTİK-3'ün kapısı) →
+   1940 passed, 1 skipped;
+3. ortam değişkeniyle `FOLLOWER_EMBEDDED=true FOLLOWER_SYMBOLS=TUTUSDT
+   python3 -m pytest tests -q` → 1940 passed, 1 skipped;
+4. sunucu env'i `SCALPER_MARKET_GATE=true
+   SCALPER_MARKET_DATA_BASE_URL=https://fapi.binance.com` → 1935 passed,
+   1 skipped.
+
+Kırmızı doğrulaması: ilk uygulamanın testleri `git stash push -- src static
+scripts` ile **45 failed / 3 passed / 7 errors**; düşmanca inceleme
+düzeltmelerinin testleri aynı yöntemle **32 failed / 107 passed** (yeni
+`tests/test_deploy_scripts.py` vakaları dahil); test izolasyonu fixture'ı
+tek başına kaldırıldığında (gömülü `.env` ile) **5 failed**.
+
+Kapsam: ayar katmanı (varsayılan kapalı, evren/dışlama, mod çelişkisi, mainnet
+yasağı, SL_MARGIN_PCT alias/band/çelişki + koşullu fail-fast, MAX_LEVERAGE eş
+adı + `populate_by_name`, sanal sermaye>0, SCALPER_ENABLED, evren boşaltma),
+sanal defter (DB'den equity, kayıp, yetersiz bakiye, fail-closed, kapalı
+defter, risk equity, günlük PnL kaynağı, kesici eşiği, 30 sn önbellek +
+`close_seq` geçersizleştirme), defter ayrışması (kurtarma filtresi + parite +
+ikinci savunma + ertelenmiş kurtarma + çakışmada kalıcı dosya YAZILMAMASI,
+günlük PnL kaynağı üç yönde), sembol sahipliği (iki yön, bırakma,
+halt/uçuş/denetim-hatası koruması, kapasite iki yönde), yetim/sahipsiz
+ayrımı (gömülü vs ayrı halka, diğer motorun gerçek izleme listesi, flatten
+koruması), `FOLLOWER_SYMBOLS` (evren + scalper dışlama + TV oyu reddi +
+takipçi reddi), köprü (AlgoPro→takipçi, HIT, eski biçim→oy, kapalı bayrak,
+dry-run == gerçek yol, evren kapısı, 403, 503), pano/rapor (kart alanları,
+bellekten ROI, `/api/status` bloğu, `/follower/status`, HTML işaretleri,
+`combined` kapsamı, forensics filtresi), `/risk-event` motor listesi, deploy
+ön kontrolleri (gömülü halt dosyası: deploy + restart) ve `ledger_report`
+strateji bölümü. **Backtest harness'e DOKUNULMADI** (takipçi strateji C'yi hiç
+kullanmaz — CLAUDE.md kural 2 kapsamı dışında).
 
 **Değişen varsayılanlar:** `FOLLOWER_DAILY_LOSS_LIMIT_PCT` 15 → **10**
 (muhafazakâr yön). Yeni ayarlar: `FOLLOWER_EMBEDDED=false`,
 `FOLLOWER_VIRTUAL_CAPITAL_USDT=1000` (yalnız gömülü modda uygulanır),
 `FOLLOWER_SYMBOLS=` (boş), `FOLLOWER_SL_MARGIN_PCT=30`. Diğer tüm
 `FOLLOWER_*`/`SCALPER_*` varsayılanları AYNI.
+
+Düşmanca inceleme sonrası eklenen **fail-fast'ler** (hepsi YALNIZ
+`FOLLOWER_EMBEDDED=true` iken): `FOLLOWER_VIRTUAL_CAPITAL_USDT<=0`,
+`SCALPER_ENABLED=false`, `FOLLOWER_SYMBOLS` scalper evrenini tamamen
+boşaltıyorsa → startup HATASI. `FOLLOWER_FORWARD_URL` doluysa → startup
+CRITICAL (ayrı halka alarmsız kalır). `FOLLOWER_SL_MARGIN_PCT` bandı artık
+takipçi KAPALIYKEN yalnız WARNING üretir.
 
 ⚠️ **Mevcut `.env` uyarısı:** 10–50 bandı `FOLLOWER_SL_ROI_TARGET` üzerinden de
 zorlanır. Ayrı halkanın `.env`'inde bant DIŞINDA bir değer varsa (ör. 60) süreç
@@ -1160,7 +1325,11 @@ sınırla aynı mertebededir; 50 üstü bir pay sessizce kırpılıyordu.
 **Doğrulanamadı (dürüst kayıt):** (i) **Sunucuda çalıştırılmadı** — bu dalda
 deploy YAPILMADI, `.env`'e/canlıya dokunulmadı; gömülü modun canlı davranışı
 (iki motorun aynı hesapta REST ağırlığı, marj rekabeti, gerçek çakışma sıklığı)
-ÖLÇÜLMEDİ. (ii) `⚪ EXIT` gövdesi TV'de HÂLÂ ölçülmedi (D20a ile aynı kayıt).
+ÖLÇÜLMEDİ. (i-b) Gömülü modda günlük kesici artık **yalnız KAPANAN işlemleri**
+sayar; kısmi TP dolumlarının gün içi etkisi (eşiğin ne kadar geç tetikleneceği)
+ölçülmedi — bu, income kaynağının önbellek kirliliğine karşı bilinçli takastır.
+(i-c) Hesapta artık `SCALPER_MAX_POSITIONS + FOLLOWER_MAX_POSITIONS` pozisyon
+olabilir; toplam marj baskısının canlı etkisi ölçülmedi. (ii) `⚪ EXIT` gövdesi TV'de HÂLÂ ölçülmedi (D20a ile aynı kayıt).
 (iii) Takipçinin kenarı YOKTUR: bu halka hâlâ bir hipotez testidir; hakem canlı
 defterdir (`scripts/ledger_report.py --strategy AP`). (iv) Gerçek bakiye
 yetersizliği kapısının canlı sıklığı (scalper'ın marjı hesabı ne sıklıkla

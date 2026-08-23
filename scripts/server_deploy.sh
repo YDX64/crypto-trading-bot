@@ -98,6 +98,23 @@ fi
 # halkalarında dosya adı ve davranış DEĞİŞMEDİ.
 HALT_FILE="$RING_HALT_FILE"
 [ -f "$HALT_FILE" ] && die "entry-halt aktif ($HALT_FILE) — önce nedenini çöz (deploy iptal)"
+# D20b: GÖMÜLÜ takipçi (FOLLOWER_EMBEDDED=true) scalper halkasının İÇİNDE
+# koşar ve KENDİ fail-closed giriş kilidini AYNI dizinde tutar
+# (state/follower_entry_halt.json). O kilit varken deploy/restart serbest
+# bırakılırsa süreç yeniden başlar ve kilidin nedeni (yetim/korumasız
+# pozisyon) incelenmeden pozisyon devralınır — CLAUDE.md yasak #3.
+# Dosya yoksa maliyeti sıfırdır.
+ENV_FOLLOWER_EMBEDDED=""
+if [ -f .env ]; then
+  ENV_FOLLOWER_EMBEDDED="$(grep -E '^[[:space:]]*FOLLOWER_EMBEDDED[[:space:]]*=' .env | tail -1 | cut -d= -f2- | tr -d '[:space:]"'"'"'' | tr 'A-Z' 'a-z' || true)"
+fi
+case "$ENV_FOLLOWER_EMBEDDED" in
+  1|true|yes|on)
+    EMBEDDED_HALT_FILE="state/follower_entry_halt.json"
+    [ -f "$EMBEDDED_HALT_FILE" ] && die "gömülü takipçi entry-halt aktif ($EMBEDDED_HALT_FILE) — önce nedenini çöz (deploy iptal)"
+    ;;
+esac
+
 # Ban kilidi: son 15 dk'da `HTTP 418` ya da `banned` izi varsa deploy/restart YASAK.
 # ⚠️ ZAMAN DİLİMİ (düşmanca inceleme bulgusu): `logs/bot.log` damgaları loguru'nun
 # `{time:YYYY-MM-DD HH:mm:ss}` biçimidir ve SUNUCUNUN YEREL saatini kullanır
