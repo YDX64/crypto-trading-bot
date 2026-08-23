@@ -414,7 +414,10 @@ def _engine_cfg(**over: Any) -> SimpleNamespace:
 # AYNI anahtarları vermeli — test_status_shape_matches_the_engineless_contract).
 _MARKET_GATE_STATUS_KEYS = {
     "enabled", "gate_effective", "leader", "leader_ok", "leader_source_host",
-    "thresholds", "stale", "snapshot_age_sec",
+    # D22: "stale_reason" — bayatlığın nedeni ("entries_blocked" = tarama
+    # duruyor | "leader_stale" = veri gelmiyor). Panelde ikisi çok farklı
+    # okunur; sözleşmenin parçasıdır.
+    "thresholds", "stale", "stale_reason", "snapshot_age_sec",
     "day_drift_pct", "run_drift_pct", "day_open_source",
     "last_ok_at", "last_error", "last_failure_at",
     "consecutive_failures", "failures_total",

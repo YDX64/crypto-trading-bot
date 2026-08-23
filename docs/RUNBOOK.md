@@ -13,6 +13,12 @@
 | ⚠️ Tuzak | `systemctl` altındaki `live-bot.service` **futbol botudur**; `info-bot.service` Telegram info botu. Trading botu systemd'de değil. |
 
 ## Günlük kontrol (2 dk)
+En hızlı yol panonun üst şeridi: **Sistem durumu** (D22) — Kapı, Kline kaynağı, Günlük kesici,
+REST ağırlığı, TV olayları, Post-mortem kuyruğu tek satırda. Şerit MEVCUT `/scalper/status`
+çağrısından beslenir, yeni istek açmaz. Terminalden aynı bilgi:
+```bash
+curl -s localhost:9091/scalper/status | python3 -c 'import json,sys; d=json.load(sys.stdin); print({k:d.get(k) for k in ("entries_blocked_by","kill_switch_active","kline_source","scan_status")}, d.get("rest_weight"), d.get("market_gate",{}).get("stale_reason"))'
+```
 ```bash
 ssh awa 'supervisorctl status tradingbot_v2; tail -3 /opt/tradingbot-v2/logs/bot.log | cut -c1-160'
 ssh awa 'cd /opt/tradingbot-v2 && ./.venv/bin/python - <<PY
@@ -383,11 +389,58 @@ görünür (motor yok — bu bir arıza DEĞİL). Takipçinin durumu `/follower/
 - İki halkanın `.env` farkını (secret DEĞERLERİ maskeli) görmek için:
   `MAIN_ENV=/opt/tradingbot-ap/.env scripts/ring_env_diff.sh awa`
 
+## REST ağırlık bütçesi (D22) — `BINANCE_WEIGHT_SOFT_LIMIT` / `_HARD_LIMIT`
+Binance USDⓈ-M IP ağırlık sınırı **2400/dk** ve sayaç **IP GENELİDİR** (aynı çıkış IP'sindeki
+başka süreçler de tüketir). Bot artık yalnız uyarmıyor, davranış değiştiriyor:
+
+| Ağırlık | Kritik OLMAYAN istekler | Kritik istekler | Log |
+|---|---|---|---|
+| < 2000 | normal | normal | — |
+| ≥ 2000 (soft) | dakika penceresi dolana kadar GÖNDERİLMEZ; önbellek varsa BAYAT servis | geçer | ağırlık uyarısı ≤1/dk |
+| ≥ 2300 (hard) | tamamen durur | geçer | + CRITICAL ≤1/dk |
+
+- **Kritik** = emir, SL/TP, positionRisk koruma turu, kapanış doğrulaması, günlük risk income'ı.
+- **Kritik olmayan** = `/api/status` pano beslemesi, tarama turu (`_scan_tick` hiç başlamaz),
+  adli kayıt post-mortem turu.
+- Pencere **takvim dakikasının sonuna** kadardır (Binance 1M sayacı orada sıfırlanır).
+
+**Nereye bakılır:**
+```bash
+curl -s localhost:9091/scalper/status | python3 -m json.tool | grep -A 9 rest_weight
+# {"last":…, "max_1m":…, "soft_backoffs":…, "hard_backoffs":…, "backoff":"off|soft|hard", …}
+```
+Panoda üst şeritte **Sistem durumu → Ağırlık** (son/dk + tepe; sarı = soft, kırmızı = hard).
+
+**Ne zaman normal, ne zaman arıza:**
+- `backoff="soft"` ara ara → normal (IP paylaşımlı bütçe); tarama turu atlanır, koruma sürer.
+- `hard_backoffs` sürekli artıyor **veya** `max_1m` > 3000 → gerçek risk. Sırayla bak:
+  1. `/scalper/status.rest_weight.max_1m` ve ağırlık uyarısındaki endpoint dökümü
+     (`… | son uyarıdan beri istekler: /fapi/v2/positionRisk×N, …`) — kim yiyor?
+  2. Aynı IP'de başka bir bot/süreç var mı (`BINANCE_BIND_IP` ayrı IP'ye bind eder).
+  3. Panonun açık kalması artık maliyetli DEĞİL (`/api/status` ≥10 sn, `/scalper/status`
+     ≥5 sn sunucu-tarafı önbellek; pano yolundan `force_fresh` istenmez).
+- Tamamen kapatmak: `.env` → `BINANCE_WEIGHT_SOFT_LIMIT=0`, `BINANCE_WEIGHT_HARD_LIMIT=0`
+  (eski davranış: yalnız uyarı logu). Değişiklik `.env` yedeği + DECISIONS satırı ister.
+
 ## Arızalar
 **Binance 418 / ban:** `logs/bot.log`'da `HTTP 418|banned|devre kesici`. Ban aktifken restart
 **YASAK** (ban süresini uzatır). Kök nedenler ve çözümler: rate limiter kilidi (mevcut), dashboard
-force-fresh açlığı (düzeltildi), ağırlık başlığı testnet'te tutarsız (ortalama ~2.7k görünür,
-gerçek 429 yoksa gürültü). Bekle; ban bitince önce `wait_for_binance` loglarını izle.
+force-fresh açlığı (düzeltildi), ağırlık geri çekilmesi (D22, yukarıdaki bölüm), ağırlık başlığı
+testnet'te tutarsız (ortalama ~2.7k görünür, gerçek 429 yoksa gürültü). Bekle; ban bitince önce
+`wait_for_binance` loglarını izle.
+
+**`exit_reason=TRAIL_MARKET` gördüm (D22):** arıza DEĞİL, bilinçli bir çıkış. Trailing stop
+seviyesi gönderilmeden ÖNCE canlı fiyatın yanlış tarafında bulundu (ya da emir borsaya varmadan
+piyasa geçti) → koşullu emir yerine reduce-only MARKET ile çıkıldı. TRAIL ailesindendir, ayrı
+sayılır. **Sayısı artıyorsa** chandelier izi piyasa hızının gerisinde kalıyordur — parametre
+değişikliği CLAUDE.md yasak #1'e tabidir (3 rejim backtesti). `/scalper/status.trailing_skips`
+= `{price_space_skips, protective_gate_skips, stale_price_skips, market_exits}`.
+
+**"Kapı bayat / gate_effective=false" ama kapı sağlam (D22):** önce
+`/scalper/status.market_gate.stale_reason` bak. `"entries_blocked"` = tarama zaten durmuş
+(nedeni `/scalper/status.entries_blocked_by`: `entry_halt` | `kill_switch` | `risk_event` |
+`exchange_readiness`) — kapıyı kurcalama, önce girişleri kim durdurduysa onu çöz.
+`"leader_stale"` = lider verisi gerçekten gelmiyor (bkz. lider piyasa kapısı bölümü).
 
 **Entry-halt (`state/scalper_entry_halt.json`):** güvenlik kilidi, fail-closed. Açmak = nedeni
 anla → dosyayı `.cleared-<tarih>` diye yeniden adlandır → restart. Recover sonrası kapanış

@@ -12,6 +12,7 @@ GÜVENLİK İLKELERİ:
 """
 
 import asyncio
+from dataclasses import dataclass
 from typing import Optional, Dict, Any
 from datetime import datetime
 
@@ -24,6 +25,7 @@ from src.trading.binance_client_improved import (
     ImprovedBinanceClient as BinanceClient,
     BinanceAPIError,
     ERR_IMMEDIATE_TRIGGER,
+    is_benign_cancel_error,
 )
 from src.core.config import settings
 from src.core.logger import app_logger
@@ -31,6 +33,34 @@ from src.core.logger import app_logger
 
 class UnprotectedPositionError(Exception):
     """Pozisyon açıldı ama korunamadı ve kapatılamadı — insan müdahalesi gerekir."""
+
+
+@dataclass(frozen=True)
+class StopReplaceResult:
+    """SL değiştirme denemesinin YAPILANDIRILMIŞ sonucu (D22).
+
+    Neden gerekli: eski `bool` dönüş, birbirinden TAMAMEN farklı üç sonucu
+    aynı `False`'a katlıyordu ve çağıran (exits) hepsini "eski SL korunuyor"
+    diye logluyordu:
+
+      * ``replaced``        → yeni stop borsada (ok=True).
+      * ``emergency_closed``→ Binance -2021 verdi, `_emergency_close`
+        pozisyonu PİYASA emriyle KAPATTI. "Eski SL korunuyor" demek burada
+        DÜPEDÜZ YANLIŞTIR: pozisyon yok. (2026-08-23: DOGE/BNB/ETH.)
+      * ``no_position``     → borsada miktar kalmamış, emir gönderilmedi.
+      * ``failed``          → emir reddedildi/okunamadı; ESKİ SL yerinde,
+        pozisyon açık — tek "eski SL korunuyor" denilebilecek durum.
+
+    `__bool__` eski sözleşmeyi korur: `if ok:` yazan tüm çağıranlar ve test
+    çiftleri değişmeden çalışır.
+    """
+
+    ok: bool
+    outcome: str
+    error_code: Optional[int] = None
+
+    def __bool__(self) -> bool:  # eski `bool` sözleşmesi
+        return bool(self.ok)
 
 
 class PositionManager:
@@ -557,6 +587,12 @@ class PositionManager:
         return True
 
     async def _replace_stop_loss(self, position: PositionModel, new_stop: float) -> bool:
+        """`_replace_stop_loss_result`in bool sarmalayıcısı (eski sözleşme)."""
+        return bool(await self._replace_stop_loss_result(position, new_stop))
+
+    async def _replace_stop_loss_result(
+        self, position: PositionModel, new_stop: float
+    ) -> StopReplaceResult:
         """Stop-loss'u güvenli sırayla değiştir: önce yeni koy, sonra eskisini iptal et.
 
         Yeni emir reduceOnly + canlı pozisyon miktarı ile konur. Bunun nedeni
@@ -565,7 +601,10 @@ class PositionManager:
         arada ~1 saniyelik KORUMASIZ bir pencere oluşurdu. reduceOnly stoplar
         bir arada durabildiği için bu pencere tamamen ortadan kalkar.
 
-        Yeni emir konamazsa eski koruma yerinde kalır ve False dönülür.
+        Yeni emir konamazsa eski koruma yerinde kalır ve `ok=False` dönülür.
+        D22: dönüş artık YAPILANDIRILMIŞ (`StopReplaceResult`) — çağıran
+        "emir reddedildi" ile "pozisyon acil kapatıldı"yı ayırt edebilsin
+        (`bool()` eski sözleşmeyi aynen korur).
         """
         symbol = position.symbol
         sl_side = "SELL" if position.side == PositionSide.LONG else "BUY"
@@ -577,11 +616,11 @@ class PositionManager:
             live_qty = abs(float(live.get("positionAmt", 0))) if live else 0.0
         except Exception as e:
             self.logger.error(f"❌ {symbol}: canlı miktar okunamadı ({e}). Eski SL korunuyor.")
-            return False
+            return StopReplaceResult(False, "failed")
 
         if live_qty <= 0:
             self.logger.info(f"{symbol}: pozisyon kalmamış, SL güncellenmiyor")
-            return False
+            return StopReplaceResult(False, "no_position")
 
         # 1) Yeni korumayı kur (reduceOnly — eskisiyle bir arada durabilir)
         try:
@@ -606,15 +645,18 @@ class PositionManager:
                     raise UnprotectedPositionError(
                         f"{symbol}: stop seviyesi geçildi ve acil kapatma başarısız oldu"
                     ) from e
-                return False
+                # D22: çağıran bunu "eski SL korunuyor" sanmamalı — pozisyon
+                # PİYASA emriyle kapatıldı ve defterde `TRAIL_MARKET` olarak
+                # sonlandırılmalı.
+                return StopReplaceResult(False, "emergency_closed", e.code)
             self.logger.error(
                 f"❌ {symbol}: yeni SL konulamadı (kod={e.code}: {e.msg}). "
                 f"ESKİ SL YERİNDE KALDI — pozisyon korumasız değil."
             )
-            return False
+            return StopReplaceResult(False, "failed", e.code)
         except Exception as e:
             self.logger.error(f"❌ {symbol}: yeni SL konulamadı ({e}). Eski SL korunuyor.")
-            return False
+            return StopReplaceResult(False, "failed")
 
         new_id = new_order.get("algoId") or new_order.get("orderId")
         position.sl_order_id = str(new_id)
@@ -625,15 +667,20 @@ class PositionManager:
             try:
                 await self.binance.cancel_algo_order(int(old_sl_id), symbol=symbol)
             except Exception as e:
-                self.logger.warning(
-                    f"⚠️ {symbol}: eski SL #{old_sl_id} iptal edilemedi ({e}). "
-                    f"Fazladan stop emri var — closePosition sayesinde zararsız."
-                )
+                if is_benign_cancel_error(e):
+                    self.logger.debug(
+                        f"{symbol}: eski SL #{old_sl_id} zaten yok ({e})"
+                    )
+                else:
+                    self.logger.warning(
+                        f"⚠️ {symbol}: eski SL #{old_sl_id} iptal edilemedi ({e}). "
+                        f"Fazladan stop emri var — closePosition sayesinde zararsız."
+                    )
         else:
             # Kayıtta emir kimliği yoksa artık kalan eski stopları temizle
             await self._cancel_stale_stops(symbol, keep_order_id=new_id)
 
-        return True
+        return StopReplaceResult(True, "replaced")
 
     async def _cancel_stale_stops(self, symbol: str, keep_order_id: Any) -> None:
         """Belirtilen emir dışındaki koşullu STOP emirlerini iptal et.
@@ -659,9 +706,16 @@ class PositionManager:
                         int(order["algoId"]), symbol=symbol
                     )
                 except Exception as e:
-                    self.logger.warning(
-                        f"Eski stop iptal edilemedi algoId={order.get('algoId')}: {e}"
-                    )
+                    # -2011 = emir zaten yok (tetiklenmiş/iptal olmuş):
+                    # beklenen yarış, arıza değil (D22 madde 4).
+                    if is_benign_cancel_error(e):
+                        self.logger.debug(
+                            f"Eski stop zaten yok algoId={order.get('algoId')}: {e}"
+                        )
+                    else:
+                        self.logger.warning(
+                            f"Eski stop iptal edilemedi algoId={order.get('algoId')}: {e}"
+                        )
 
     @staticmethod
     def _track_extremes(position: PositionModel, current_price: float) -> None:
@@ -807,3 +861,16 @@ class PositionManager:
         arasında pozisyon bir an bile korumasız kalmaz.
         """
         return await self._replace_stop_loss(position, new_stop)
+
+    async def replace_stop_loss_result(
+        self, position: PositionModel, new_stop: float
+    ) -> StopReplaceResult:
+        """`replace_stop_loss`in YAPILANDIRILMIŞ sürümü (D22).
+
+        Emir yolu, sırası ve güvenlik kuralları BİREBİR aynıdır; tek fark
+        dönüşün `bool` yerine `StopReplaceResult` olmasıdır. Çağıran böylece
+        "emir reddedildi, eski SL yerinde" ile "-2021 → pozisyon PİYASA
+        emriyle kapatıldı" durumlarını ayırt eder ve deftere doğru
+        `exit_reason` yazar.
+        """
+        return await self._replace_stop_loss_result(position, new_stop)

@@ -18,6 +18,7 @@ ataması; faydası gelecekteki testlerin bu tuzağa hiç düşmemesi.
 import pytest
 
 from src.strategies.scalper.data import MarketDataGuard
+from src.trading.binance_client_improved import ImprovedBinanceClient
 
 
 @pytest.fixture(autouse=True)
@@ -25,3 +26,15 @@ def _reset_market_data_guard():
     MarketDataGuard.reset()
     yield
     MarketDataGuard.reset()
+
+
+@pytest.fixture(autouse=True)
+def _reset_rest_weight_state():
+    """D22: imzalı REST ağırlık geri çekilmesi de SINIF düzeyi durumdur.
+
+    Yukarıdakiyle aynı gerekçe: bir testte kurulan geri çekilme penceresi
+    sonraki testte ilgisiz bir "background" isteğini sessizce engellerdi.
+    """
+    ImprovedBinanceClient.reset_weight_state()
+    yield
+    ImprovedBinanceClient.reset_weight_state()

@@ -77,7 +77,10 @@ from src.strategies.scalper.types import (
     ScalpSignal,
     StrategyContext,
 )
-from src.trading.binance_client_improved import ImprovedBinanceClient
+from src.trading.binance_client_improved import (
+    ImprovedBinanceClient,
+    RestWeightBackoff,
+)
 from src.trading.position_manager import PositionManager, UnprotectedPositionError
 from src.trading.symbol_reservations import symbol_reservations
 from src.trading.user_stream import BinanceUserDataStream
@@ -240,6 +243,11 @@ class ScalperEngine:
             # sapması, BTC fiyatı). SENKRON ve önbellekten okunur — ek REST
             # çağrısı YOKTUR; yalnız adli kayda yazılır.
             forensics_context_cb=self._forensics_close_context,
+            # D22: trailing seviyesi piyasa tarafından GEÇİLMİŞSE koşullu emri
+            # hiç gönderme; reaper/flatten ile AYNI reduce-only MARKET yolunu
+            # kullan (force_fresh doğrulaması + tek-finalizer kilidi). Yeni bir
+            # emir yolu YAZILMADI — `_close_position_market`ın ta kendisi.
+            market_close_cb=self._close_position_market,
         )
 
         # _task eski iç kullanımlar için scan task alias'ı olarak korunur.
@@ -983,6 +991,46 @@ class ScalperEngine:
             and not risk_event_active
         )
 
+    def entries_blocked_by(self) -> Optional[str]:
+        """Yeni girişleri KİM durduruyor? (D22 — durum netliği)
+
+        `None` = hiçbir şey (tarama dönüyor). Aksi halde ilk uygulanan kapı:
+        `"entry_halt"` | `"kill_switch"` | `"risk_event"` |
+        `"exchange_readiness"`.
+
+        Neden gerekli: giriş kapalıyken `_scan_tick` lider anlık görüntüsünü
+        TAZELEMEZ; `/scalper/status.market_gate` bir süre sonra
+        `stale=true, gate_effective=false` gösterir. Bu, "kapı bozuldu" gibi
+        okunur ama gerçek neden bambaşkadır (2026-08-23 log incelemesi).
+
+        `object.__new__(ScalperEngine)` test çiftlerinde alanlar hiç
+        bulunmayabilir — teşhis alanı ASLA status'u düşürmez.
+        """
+        try:
+            if getattr(self, "_entry_halted", False):
+                return "entry_halt"
+            if getattr(self, "_kill_switch", False):
+                return "kill_switch"
+            if bool(self._risk_event_halt_snapshot().get("active")):
+                return "risk_event"
+            exchange_last = getattr(
+                self, "_exchange_last_success_monotonic", None
+            )
+            exchange_age = (
+                time.monotonic() - exchange_last
+                if exchange_last is not None
+                else float("inf")
+            )
+            ready = bool(
+                getattr(self, "_exchange_ready", False)
+                and exchange_age <= self._EXCHANGE_PROBE_INTERVAL * 3.0
+                and getattr(self, "_recovery_ready", False)
+                and getattr(self, "_risk_ready", False)
+            )
+            return None if ready else "exchange_readiness"
+        except Exception:  # pragma: no cover - teşhis alanı asla patlamamalı
+            return None
+
     def _sync_scalper_reservations(self) -> None:
         """Release normal closed/cancelled symbols, never an active safety hold."""
 
@@ -1408,6 +1456,22 @@ class ScalperEngine:
     async def _scan_tick(self) -> None:
         # Evren taraması ve sinyal üretimi safety döngüsünden tamamen
         # ayrıdır; yavaş bir sembol koruma izlemesini geciktiremez.
+        #
+        # D22: TARAMA kritik olmayan bir tüketicidir (evren taraması, hesap
+        # özeti, mumlar). Dakikalık REST ağırlık bütçesi yumuşak sınırı
+        # aştıysa tur HİÇ BAŞLAMAZ — bütçe koruma turuna (positionRisk,
+        # SL/TP, kapanış doğrulaması) bırakılır. Yeni pozisyon açmamak
+        # ucuzdur; açık pozisyonda körleşmek 2026-08-12'de saatlerce süren
+        # 418 ban döngüsünün ta kendisiydi.
+        backoff = self._rest_weight_backoff_level()
+        if backoff != "off":
+            self._mark_scan_degraded(
+                f"rest_weight: geri çekilme={backoff}, son ölçüm "
+                f"{self._rest_weight_snapshot().get('last')}/dk",
+                kind="rest_weight",
+            )
+            return
+
         allowlist_csv = str(
             getattr(self.cfg, "scalper_symbol_allowlist", "") or ""
         ).strip()
@@ -1442,6 +1506,9 @@ class ScalperEngine:
         # executor zaten yarışları yakalar.
         try:
             open_positions = await self.client.get_all_positions()
+        except RestWeightBackoff as e:
+            self._mark_scan_degraded(f"rest_weight: {e}", kind="rest_weight")
+            return
         except Exception as e:
             self.logger.warning(f"⛔ Tarama pozisyon özeti alınamadı, tur atlandı ({e})")
             return
@@ -1519,12 +1586,59 @@ class ScalperEngine:
         last = float(getattr(self, "_scan_degraded_log_at", 0.0) or 0.0)
         if last <= 0.0 or (now - last) >= self._SCAN_DEGRADED_LOG_INTERVAL:
             self._scan_degraded_log_at = now
+            label = (
+                "REST ağırlık bütçesi dolu"
+                if kind == "rest_weight"
+                else "Piyasa verisi kullanılamıyor"
+            )
             self.logger.warning(
-                f"⛔ Piyasa verisi kullanılamıyor ({reason}); tarama turu "
+                f"⛔ {label} ({reason}); tarama turu "
                 f"kesildi — tur DEGRADE sayıldı "
                 f"(scan_status=degraded:{kind}, toplam "
                 f"{self._scan_degraded_count})"
             )
+
+    def _rest_weight_backoff_level(self) -> str:
+        """"off" | "soft" | "hard" — kritik olmayan istekler için (D22).
+
+        Sınıf düzeyi durum okunur; `object.__new__` test çiftlerinde ve
+        istemci taklitlerinde güvenle "off" döner (fail-open: teşhis kapısı
+        taramayı kazara durdurmamalı).
+        """
+        try:
+            level = ImprovedBinanceClient.weight_backoff_level()
+        except Exception:  # pragma: no cover - teşhis kapısı asla patlamamalı
+            return "off"
+        return str(level or "off")
+
+    def _rest_weight_snapshot(self) -> Dict[str, Any]:
+        """İmzalı REST yolunun ağırlık telemetrisi (D22) — secret içermez."""
+        try:
+            snapshotter = getattr(
+                type(self.client), "rest_weight_snapshot", None
+            )
+            if not callable(snapshotter):
+                return {}
+            return dict(snapshotter())
+        except Exception as e:  # teşhis alanı asla status'u düşürmemeli
+            return {"error": f"{type(e).__name__}: {e}"}
+
+    def _forensics_queue_snapshot(self) -> Dict[str, Any]:
+        """Adli kayıt yazıcı kuyruğu + post-mortem turu (D21/D22 teşhis)."""
+        try:
+            from src.strategies.scalper import forensics_log
+
+            out: Dict[str, Any] = dict(forensics_log.queue_snapshot())
+        except Exception as e:  # teşhis alanı asla status'u düşürmemeli
+            return {"error": f"{type(e).__name__}: {e}"}
+        try:
+            task = getattr(self, "_forensics_postmortem_task", None)
+            out["postmortem_running"] = bool(task is not None and not task.done())
+            out["postmortem_blocked"] = self._forensics_postmortem_blocked()
+        except Exception as e:
+            out["postmortem_running"] = None
+            out["postmortem_blocked"] = f"{type(e).__name__}: {e}"
+        return out
 
     def _exits_trailing_skip_snapshot(self) -> Dict[str, int]:
         """ExitManager'ın atlanan trailing sayaçlarını geriye uyumlu oku."""
@@ -2054,13 +2168,16 @@ class ScalperEngine:
     def _forensics_postmortem_blocked(self) -> Optional[str]:
         """Tur atlanmalı mı? (atlanmalıysa neden metni, değilse None)
 
-        İki bağımsız sinyal:
+        Üç bağımsız sinyal:
 
         1. `exits._market_data_down_reason` — BU safety turunda host geneli bir
            piyasa-verisi kesintisi görüldü (trailing zaten atlandı).
         2. `MarketDataGuard.blocked_until` — kline host'u ban/kesici altında.
            (1) yalnız AÇIK POZİSYON varken dolar; ban sırasında hiç pozisyon
            yoksa tek uyarı budur.
+        3. D22: imzalı REST yolunda ağırlık geri çekilmesi aktif. Post-mortem
+           SAF TEŞHİSTİR; bütçenin son kırıntısını teşhise harcamak, aynı
+           dakikada bir koruma isteğini 418'e itmeye değmez.
 
         Kesinti sırasında teşhis isteği atmak ne veri getirir ne de ağırlık
         bütçesi bırakır: tur hiç başlatılmaz ve deneme sayacı HARCANMAZ —
@@ -2071,6 +2188,14 @@ class ScalperEngine:
         )
         if reason:
             return str(reason)
+        try:
+            if ImprovedBinanceClient.weight_backoff_active():
+                return (
+                    "REST ağırlık geri çekilmesi aktif "
+                    f"({ImprovedBinanceClient.weight_backoff_level()})"
+                )
+        except Exception:  # pragma: no cover - teşhis kapısı asla patlamamalı
+            pass
         try:
             base_url = str(getattr(self.fetcher, "base_url", "") or "")
             if base_url:
@@ -3941,6 +4066,15 @@ class ScalperEngine:
         active = any(
             (thresholds.get(k) or 0.0) > 0.0 for k in ("day_pct", "run_pct")
         )
+        # D22: BAYAT görüntünün İKİ farklı nedeni vardır ve ayırt edilmezse
+        # yanlış teşhis üretir. Giriş kapalıyken (`kill_switch`/`entry_halt`/
+        # `risk_event`/borsa hazır değil) `_scan_tick` lideri hiç tazelemez —
+        # kapı "bozuk" değil, tarama durmuştur.
+        stale_reason: Optional[str] = None
+        if stale:
+            stale_reason = (
+                "entries_blocked" if self.entries_blocked_by() else "leader_stale"
+            )
         return {
             "enabled": enabled,
             "gate_effective": bool(
@@ -3952,6 +4086,8 @@ class ScalperEngine:
             "leader_source_host": self._leader_source_host(),
             "thresholds": thresholds,
             "stale": bool(stale),
+            # "entries_blocked" (tarama duruyor) | "leader_stale" (veri gelmiyor)
+            "stale_reason": stale_reason,
             "snapshot_age_sec": None if age is None else round(age, 1),
             # Ölçülen büyüklükler. `run_drift_pct` adı bilerek eşikten
             # (`thresholds.run_pct`) FARKLI: ikisine de `run_pct` demek,
@@ -4239,6 +4375,13 @@ class ScalperEngine:
             "daily_loss_threshold_usdt": self._daily_loss_threshold_usdt,
             "daily_limit_pct": self.cfg.scalper_daily_loss_limit_pct,
             "kill_switch_active": self._kill_switch,
+            # D22: "kapı bayat" ile "tarama durdu" karışmasın — tek alanda
+            # yeni girişleri kimin durdurduğu.
+            "entries_blocked_by": self.entries_blocked_by(),
+            # D22: REST ağırlık bütçesi (son/tepe + geri çekilme sayaçları).
+            "rest_weight": self._rest_weight_snapshot(),
+            # D21/D22: adli kayıt yazıcı kuyruğu + post-mortem turu durumu.
+            "forensics_queue": self._forensics_queue_snapshot(),
             "entry_halted": self._entry_halted,
             "entry_halt_reason": self._entry_halt_reason,
             "entry_halted_at": self._entry_halted_at,

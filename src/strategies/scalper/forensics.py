@@ -146,6 +146,28 @@ def _direction_value(direction: Any) -> str:
     return str(getattr(direction, "value", direction) or "").upper()
 
 
+# D22: çıkış nedeni ailesi. `TRAIL_MARKET`, trailing kararının koşullu emir
+# yerine reduce-only MARKET ile uygulanmış hâlidir — AYRI SAYILIR (sayısı
+# izin piyasa hızının gerisinde kaldığını gösterir) ama TRAIL gibi raporlanır.
+_EXIT_REASON_FAMILY = {
+    "SL": "SL",
+    "TP_LADDER": "TP_LADDER",
+    "TRAIL": "TRAIL",
+    "TRAIL_MARKET": "TRAIL",
+    "RISK_EVENT": "MANUAL",
+    "TV_EVENT": "MANUAL",
+    "MANUAL": "MANUAL",
+}
+
+
+def exit_reason_family(reason: Any) -> str:
+    """Çıkış nedeninin ailesi; bilinmeyen değer kendisi olarak döner."""
+    text = str(reason or "").strip().upper()
+    if not text:
+        return "UNKNOWN"
+    return _EXIT_REASON_FAMILY.get(text, text)
+
+
 def source_family(source: Any) -> str:
     """TV kaynak etiketini "aile"sine indirger.
 
@@ -625,7 +647,10 @@ def postmortem_from_candles(
 
     reason = str(exit_.get("reason") or "").upper()
     net = _f(exit_.get("realized_pnl"))
-    losing = reason == "SL" or (net is not None and net < 0)
+    # D22: `TRAIL_MARKET` TRAIL ailesindendir (stop kararının piyasa emriyle
+    # uygulanmış hâli) — "stop yedi" sayılmaz; kayıplı olup olmadığına net
+    # PnL karar verir, tıpkı TRAIL gibi.
+    losing = exit_reason_family(reason) == "SL" or (net is not None and net < 0)
     if losing and returned_at is not None:
         out["tags"] = [TAG_NOISE_STOP]
     return out

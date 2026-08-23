@@ -2053,8 +2053,11 @@ class ScalpExecutor:
             # Kalan miktarı bekletmek, dolan miktarı süresiz SL'siz bırakır.
             # Görülür görülmez iptal et; terminal iptal yanıtındaki
             # executedQty _on_pending_filled ile derhal korumaya alınır.
-            self.logger.warning(
-                f"⚠️ {symbol}: maker giriş kısmen doldu; kalan miktar hemen iptal ediliyor"
+            # D22: kısmi dolum maker girişte BEKLENEN bir durumdur ve akış
+            # onu zaten doğru ele alıyor (kalan iptal + dolan miktar derhal
+            # korunuyor). WARNING seviyesi gerçek arızaları gömüyordu.
+            self.logger.info(
+                f"ℹ️ {symbol}: maker giriş kısmen doldu; kalan miktar hemen iptal ediliyor"
             )
             return await self._cancel_pending(
                 symbol, pending, observed_order=order, reason="partial_fill"
@@ -2081,8 +2084,8 @@ class ScalpExecutor:
 
         if status in ("CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED"):
             if self._executed_qty(order) > 0:
-                self.logger.warning(
-                    f"⚠️ {symbol}: maker giriş {status} ama kısmi dolum var; "
+                self.logger.info(
+                    f"ℹ️ {symbol}: maker giriş {status} ama kısmi dolum var; "
                     f"gerçekleşen miktar korunuyor"
                 )
                 return await self._on_pending_filled(symbol, pending, order)

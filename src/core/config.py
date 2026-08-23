@@ -153,6 +153,16 @@ class Settings(BaseSettings):
     binance_rate_limit_seconds: float = 0.5
     signal_queue_delay_seconds: float = 2.0
 
+    # --- REST ağırlık geri çekilmesi (D22) -----------------------------
+    # Binance USDⓈ-M IP ağırlık sınırı 2400/dk'dır ve sayaç IP GENELİNDEDİR
+    # (aynı çıkış IP'sindeki başka süreçler de tüketir). `X-MBX-USED-WEIGHT-1M`
+    # bu eşiklere ulaştığında KRİTİK OLMAYAN istekler (pano beslemeleri,
+    # periyodik hesap özeti, evren taraması, teşhis) dakika penceresi
+    # dolana kadar ağa ÇIKMAZ; emir/koruma/kapanış-doğrulama istekleri geçer.
+    # 0 = kapalı (eski davranış: yalnız uyarı logu).
+    binance_weight_soft_limit: int = 2000
+    binance_weight_hard_limit: int = 2300
+
     # Waiting Mode Configuration
     waiting_mode_enabled: bool = False
     waiting_mode_max_positions: int = 3

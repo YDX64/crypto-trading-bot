@@ -57,7 +57,24 @@ UP_THRESHOLD_PCT = 1.5
 DOWN_THRESHOLD_PCT = -1.5
 
 REGIME_ORDER = ["UP", "FLAT", "DOWN", "?"]
-EXIT_REASON_ORDER = ["SL", "TP_LADDER", "TRAIL", "MANUAL", "UNKNOWN"]
+# "TRAIL_MARKET" (D22): trailing kararı koşullu emirle uygulanamadığı için
+# reduce-only MARKET ile kapatılan işlem. TRAIL AİLESİNDENDİR ama AYRI
+# SAYILIR — sayısı artıyorsa iz, piyasa hızının gerisinde kalıyordur.
+EXIT_REASON_ORDER = ["SL", "TP_LADDER", "TRAIL", "TRAIL_MARKET", "MANUAL", "UNKNOWN"]
+EXIT_REASON_FAMILY = {
+    "SL": "SL",
+    "TP_LADDER": "TP_LADDER",
+    "TRAIL": "TRAIL",
+    "TRAIL_MARKET": "TRAIL",
+    "MANUAL": "MANUAL",
+    "RISK_EVENT": "MANUAL",
+    "TV_EVENT": "MANUAL",
+}
+
+
+def exit_reason_family(reason: str) -> str:
+    """Çıkış nedeninin AİLESİ (rapor gruplaması). Bilinmeyen = kendisi."""
+    return EXIT_REASON_FAMILY.get((reason or "").strip().upper(), reason or "UNKNOWN")
 
 # docs/MAINNET_PLAN.md §2 madde 3 — soak (B halkası) terfi ölçütleri.
 SOAK_MIN_DAYS = 5
@@ -458,7 +475,13 @@ def build_exit_reason_direction_table(trades: List[ClosedTrade]) -> List[Dict[st
     rows: List[Dict[str, Any]] = []
     for reason, direction in sorted(grouped.keys(), key=sort_key):
         stats = _group_stats(grouped[(reason, direction)])
-        rows.append({"exit_reason": reason, "direction": direction, **stats})
+        rows.append({
+            "exit_reason": reason,
+            # D22: TRAIL_MARKET kendi satırında sayılır ama ailesi TRAIL'dir.
+            "exit_family": exit_reason_family(reason),
+            "direction": direction,
+            **stats,
+        })
     return rows
 
 

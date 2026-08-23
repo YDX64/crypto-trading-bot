@@ -34,7 +34,10 @@ class ScalpTradeModel(Base):
     # Sonuç
     realized_pnl = Column(Float, default=0.0)
     roi_pct = Column(Float, default=0.0)
-    exit_reason = Column(String, nullable=True)               # "SL"|"TP_LADDER"|"TRAIL"|"MANUAL"|"UNKNOWN"
+    # "SL"|"TP_LADDER"|"TRAIL"|"TRAIL_MARKET"|"RISK_EVENT"|"TV_EVENT"|"MANUAL"|"UNKNOWN"
+    # TRAIL_MARKET (D22): trailing kararı koşullu emirle uygulanamadığı için
+    # reduce-only MARKET ile kapatıldı — TRAIL ailesi, AYRI sayılır.
+    exit_reason = Column(String, nullable=True)
 
     # Bağlam
     signal_reason = Column(String, nullable=False)

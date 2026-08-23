@@ -1635,6 +1635,147 @@ D21 ile ÇELİŞİRSE **D21-R3 bağlayıcıdır**. Beş bulgu, hepsi regresyon t
    görünüyordu); pano "okunamadı" ile "kayıt yok"u AYRI mesajla gösterir ve
    hatayı önbelleğe almaz; `ledger_report.build_report` tek gövdeye indi.
 
+### D22 — Trailing `-2021` yanıltıcı yolu + REST ağırlık geri çekilmesi + durum netliği · 2026-08-23 · **AKTİF**
+**Kanıt kaynağı:** 2026-08-23 canlı testnet logu (kod okumasıyla doğrulandı).
+Üç bağımsız kusur; ilki DEFTERİ YANLIŞ yazıyordu, ikincisi 418 ban riskiydi,
+üçüncüsü operatörü yanlış teşhise sürüklüyordu.
+
+---
+
+#### 1) Trailing `-2021` yanıltıcı yolu → `exit_reason=TRAIL_MARKET`
+
+**Kusur (bugün 3 olay: DOGE, BNB, ETH).** `exits._update_trailing`, chandelier
+seviyesini koruma-tarafı kontrolü YAPMADAN gönderiyordu (kontrol yalnız D17'nin
+ayrı market-data host'u yolunda vardı). Binance `-2021 Order would immediately
+trigger` dönüyor; `position_manager._replace_stop_loss` bunu bilinçli bir çıkış
+kararı sayıp `_emergency_close` ile pozisyonu reduce-only MARKET ile KAPATIYOR;
+ama fonksiyon `False` döndüğü için `_update_trailing` "trailing SL
+güncellenemedi, **eski SL korunuyor**" logluyordu — pozisyon YOKKEN. Bir
+sonraki safety turu kapanışı tespit edip deftere `exit_reason=TRAIL` yazıyordu.
+Sonuç: defter "iz tetiklendi" derken bot piyasa emriyle çıkmıştı; canlı defter
+NİHAİ HAKEM olduğu için (CLAUDE.md) bu, kanıt tabanını kirletir.
+
+**Düzeltme (üç parça):**
+- **(a) Göndermeden ÖNCE canlı fiyatla kontrol.** D17'nin koruma-tarafı mantığı
+  (`_is_protective_side`, pay %0.05) artık AYNI host'ta da uygulanır. LONG'da
+  `new_stop >= fiyat×(1−pay)` (SHORT'ta tersi) ise bu "trailing stop çoktan
+  tetiklenmiş" demektir: **başarısız olacağı bilinen algoOrder çağrısı
+  YAPILMAZ**, yerine BİLİNÇLİ reduce-only MARKET kapanış yapılır. Emir yolu
+  YENİ DEĞİLDİR: reaper ve risk-olayı `flatten`'ın kullandığı
+  `engine._close_position_market`'ın ta kendisi (tek-finalizer kilidi +
+  `force_fresh` doğrulaması + doğrulanamazsa koruma emirlerine DOKUNULMAZ).
+  Etiket: `exit_reason="TRAIL_MARKET"`.
+  *AYRIM:* ayrı market-data host'unda (D17) davranış DEĞİŞMEDİ — orada yanlış
+  taraf borsalar arası BAZ hatası olabilir, tur atlanır ve borsadaki SL kalır.
+- **(b) Yarış hâli.** Kapı geçse bile emir borsaya varana kadar fiyat stopu
+  geçebilir. `position_manager._replace_stop_loss` artık YAPILANDIRILMIŞ sonuç
+  döner (`StopReplaceResult`: `replaced` | `emergency_closed` | `no_position` |
+  `failed`; `__bool__` eski sözleşmeyi korur, tüm çağıranlar değişmeden
+  çalışır). `emergency_closed` gelirse exits doğru loglar ve kapanışı
+  `TRAIL_MARKET` ile sonlandırır. **"Eski SL korunuyor" YALNIZ `failed`
+  durumunda yazılır** — yani pozisyon gerçekten açık ve eski koruma yerindeyken.
+- **(c) Bayat fiyat.** İşlem fiyatı >30 sn eskiyse (ya da yoksa) NE emir
+  gönderilir NE kapanış yapılır; tur atlanır ve `trailing_skips.stale_price_skips`
+  artar. Geri alınamaz bir kapanış kararı bayat fiyatla verilemez (D10 dersi #2).
+
+**`TRAIL_MARKET` TRAIL AİLESİNDENDİR ama AYRI SAYILIR.**
+`forensics.exit_reason_family("TRAIL_MARKET") == "TRAIL"`;
+`scripts/ledger_report.py` onu kendi satırında sayar (`EXIT_REASON_ORDER`) ve
+satıra `exit_family` alanını ekler; pano aynı TRAIL rengini kullanır. Sayısının
+artması ANLAMLIDIR: chandelier izi piyasa hızının gerisinde kalıyor demektir.
+
+**Nerede:** `src/strategies/scalper/exits.py` (`_update_trailing`,
+`_trailing_market_exit`, `_finalize_market_exit`, `_apply_stop`,
+`trailing_skip_snapshot`), `src/trading/position_manager.py`
+(`StopReplaceResult`, `_replace_stop_loss_result`, `replace_stop_loss_result`),
+`engine.__init__` (`market_close_cb=self._close_position_market`),
+`scripts/ledger_report.py`, `src/strategies/scalper/forensics.py`.
+**Test:** `tests/test_trailing_market_exit.py` (23 test).
+**Geri alma:** `market_close_cb`'yi bağlamamak yeterlidir — kapı yine emri
+göndermez ama kapanış da denemez (eski davranışın güvenli yarısı); tam geri
+alma için commit'i revert et.
+
+---
+
+#### 2) REST ağırlık geri çekilmesi (`BINANCE_WEIGHT_SOFT_LIMIT`/`HARD_LIMIT`)
+
+**Kusur.** `X-MBX-USED-WEIGHT-1M` ≥ 1800 için YALNIZ bir WARNING vardı ve
+davranış hiç değişmiyordu. Bugün 276 uyarı satırı, tepe **4059/dk** (sınır
+2400). Sayaç **IP GENELİDİR** — aynı çıkış IP'sindeki başka süreçler de
+tüketir, yani bütçe bizim isteklerimizden bağımsız da dolabilir. 418 = koruma
+turunun körleşmesi; repodaki en pahalı arıza sınıfı (2026-08-12, 2026-08-15).
+
+**Düzeltme.** İstemci katmanında kademeli geri çekilme
+(`ImprovedBinanceClient._weight_gate`, `priority` parametresi):
+- **≥ soft (vars. 2000):** KRİTİK OLMAYAN istekler dakika penceresi (takvim
+  dakikasının sonu — Binance sayacı orada sıfırlanır) dolana kadar ağa
+  ÇIKMAZ. Önbelleği olan okumalar **bayat servis edilir** (`_get_account`,
+  `get_current_price`): bayat bakiye göstermek, bütçeyi 418'e taşımaktan iyidir.
+- **≥ hard (vars. 2300):** aynısı + **dakikada BİR CRITICAL** satır.
+- **KRİTİK istekler HER ZAMAN geçer:** emir, SL/TP, positionRisk koruma turu,
+  kapanış doğrulaması, günlük risk income'ı. Varsayılan `priority="critical"`
+  — yani bir çağrı yolu unutulursa güvenli tarafta kalır.
+
+**Kritik olmayan sayılanlar:** `/api/status` (pano beslemesi: bakiye, BTC
+fiyatı, pozisyon sayısı), tarama turu (`_scan_tick` geri çekilmede HİÇ
+başlamaz → `scan_status="degraded:rest_weight"`), adli kayıt post-mortem turu
+(`_forensics_postmortem_blocked`).
+
+**Pano açlığı (2026-08-18 dersi) bir kez daha kapatıldı:** `/api/status`
+yanıtı sunucu tarafında **≥10 sn**, `/scalper/status` **≥5 sn**
+önbelleklenir; pano yolundan `force_fresh` İSTENMEZ. Motor YOKKEN
+`/scalper/status` önbelleklenmez (o yol REST yapmaz ve olay defteri taze
+olmalıdır). Ağırlık uyarı satırı **dakikada en fazla bir**.
+
+**Telemetri:** `/scalper/status.rest_weight` =
+`{last, max_1m, soft_backoffs, hard_backoffs, soft_limit, hard_limit, backoff,
+backoff_seconds_left}`.
+
+**Nerede:** `src/trading/binance_client_improved.py`, `src/core/config.py`,
+`env.example`, `src/main.py`, `src/strategies/scalper/engine.py`.
+**Test:** `tests/test_rest_weight_backoff.py`.
+**Geri alma:** `.env`'de `BINANCE_WEIGHT_SOFT_LIMIT=0` ve
+`BINANCE_WEIGHT_HARD_LIMIT=0` → eski davranış (yalnız uyarı logu). Pano
+önbellekleri kodda sabittir.
+
+---
+
+#### 3) Durum netliği: `entries_blocked_by` + `market_gate.stale_reason`
+
+**Kusur.** Kill switch/entry-halt açıkken `_scan_tick` lider anlık görüntüsünü
+TAZELEMEZ; `/scalper/status.market_gate` bir süre sonra `stale=true,
+gate_effective=false` gösterir. Bu, "lider piyasa kapısı bozuldu" gibi okunur —
+gerçek neden ise "tarama zaten durmuş"tur.
+
+**Düzeltme.**
+- `/scalper/status.entries_blocked_by` = `null` | `"entry_halt"` |
+  `"kill_switch"` | `"risk_event"` | `"exchange_readiness"` (bu öncelik
+  sırasıyla).
+- `market_gate.stale_reason` = `"entries_blocked"` (tarama durdu) vs
+  `"leader_stale"` (veri gelmiyor).
+- Pano üst şeridinde tek satır **"Sistem durumu"**: Kapı (etkin/bayat+neden/
+  kapalı), Kline kaynağı (mainnet/testnet), Günlük kesici (aktif → "00:00
+  UTC'de sıfırlanır"), Ağırlık (son/dk + tepe), TV olayları (mod + olay
+  sayısı), Post-mortem kuyruğu. **YENİ İSTEK AÇMAZ** — verisi zaten çekilen
+  `/scalper/status` gövdesinden okunur (pano-açlığı dersi).
+- `/scalper/status.forensics_queue` (yazıcı kuyruğu + post-mortem durumu) da
+  yayımlanır; `_EMPTY_SCALPER_STATUS` ile şekil paritesi test edilir.
+
+---
+
+#### 4) Küçük: beklenen durumlar ERROR/WARNING olarak loglanmaz
+`-2011 Order does not exist` (zaten dolmuş/iptal edilmiş emrin iptali) beklenen
+bir yarıştır → DEBUG (`is_benign_cancel_error`; `cancel_all_open_orders`,
+`position_manager._cancel_stale_stops`, eski SL iptali). Maker kısmi dolum
+uyarıları WARNING → INFO (akış onları zaten doğru ele alıyor: kalan iptal,
+dolan miktar derhal korunur).
+
+**Kapsam sınırı (bağlayıcı):** hiçbir `SCALPER_*` strateji parametresi
+değişmedi; giriş kuralları, boyutlama, TP/stop seviyeleri ve backtest harness'ı
+BİREBİR aynıdır (CLAUDE.md yasak #1 ve #2 kapsamı dışında). Davranış
+değişikliği yalnız (i) trailing kararının uygulanma BİÇİMİ, (ii) kritik olmayan
+REST isteklerinin zamanlaması, (iii) log seviyeleri ve durum alanlarıdır.
+
 ## Reddedilen kararlar (kanıtla)
 
 | Fikir | Tarih | Sonuç | Neden reddedildi |
