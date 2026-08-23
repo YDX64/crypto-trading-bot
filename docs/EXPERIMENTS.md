@@ -247,6 +247,9 @@ Loglar: `logs/market_gate/<varyant>_<pencere>.log` (24 dosya, sıralı koşuldu)
 | **V1b** | gün-içi %1.5 | AYI | 158 | 86.1 | +1832 | 1.17 | 3348 | +1247 | 162 | 0 |
 | V1b | | YATAY | 138 | 87.7 | +2962 | 1.41 | 2840 | +570 | 30 | 0 |
 | V1b | | BOĞA | 90 | 93.3 | +3902 | 2.43 | 735 | 0 (tetik yok) | 0 | 0 |
+| **V1c** | gün-içi %1.3 (E8 önerisi) | AYI | 158 | 88.0 | **+3812** | **1.43** | 2956 | **+3228** | 179 | 0 |
+| V1c | | YATAY | 137 | 87.6 | **+2791** | **1.38** | 2840 | **+399** | 32 | 0 |
+| V1c | | BOĞA | 89 | 93.3 | **+3798** | 2.39 | 735 | **−104 (−%2.7)** | 3 | 0 |
 | **V2** | uzama %15 / 3g | AYI | 196 | 87.2 | +2909 | 1.24 | 3083 | +2324 | 0 | 60 |
 | V2 | | YATAY | 145 | 86.9 | +2392 | 1.29 | 3229 | 0 (tetik yok) | 0 | 0 |
 | V2 | | BOĞA | 90 | 93.3 | +3902 | 2.43 | 735 | 0 (tetik yok) | 0 | 0 |
@@ -268,6 +271,7 @@ engelleniyor (V3'te `market_gate_run` sayacı üç pencerede de **0**) — iki a
 | V1 (gün-içi %1.0) | 1.33 ✓ | ✓ (+2415 / +201) | −%4.5 ✓ | **GEÇTİ** (her iki kol) |
 | V1a (%0.7) | 1.52 ✓ | ✗ (YATAY −%63.5) | −%13.3 ✓ | GEÇTİ ama YATAY'ı yıkıyor → red |
 | V1b (%1.5) | 1.17 ✓ | ✓ (+1247 / +570) | %0 ✓ | GEÇTİ (daha muhafazakâr) |
+| **V1c (%1.3)** | **1.43 ✓** | **✓ (+3228 / +399)** | **−%2.7 ✓** | **GEÇTİ — üç pencerede de V1'i domine ediyor** |
 | V2 (%15/3g) | 1.24 ✓ | ✗ (YATAY değişmedi) | %0 ✓ | GEÇTİ ama kanıt tek olaya dayanıyor |
 | V2a (%10/3g) | 1.21 ✓ | ✗ | **−%24.6 ✗** | **KALDI** |
 | V2b (%20/3g) | 1.24 ✓ | ✗ | %0 ✓ | V2 ile birebir aynı |
@@ -307,3 +311,54 @@ iki yön de tetiklenebilir — bu yüzden tetik sayısı gün sayısından çok 
   faydası yok; tek başına açmanın da (V2) faydası tek olaya dayanıyor.
 - Simülatörün mutlak sayıları rejime duyarlıdır (P3); yukarıdaki hüküm **göreli** farklara
   dayanır ve canlı defter nihai hakemdir.
+
+### E8 (sinyal otopsisi) ile çapraz kontrol — 2026-08-23
+E8 ajanı kapıyı BAĞIMSIZ olarak, harness JSON'u üzerinde **post-hoc** ölçtü (her işlemi giriş
+zamanıyla zenginleştirip filtreleyerek). İki yöntem farklı şeyler ölçüyor ve bu fark önemli:
+
+| | E7 (bu bölüm) | E8 (post-hoc) |
+|---|---|---|
+| Kapı nerede | Motor-içi, gerçek `simulate_symbol` kapısı | İşlem listesi üzerinde filtre |
+| Kapasite | Engellenen sinyal slotu SERBEST bırakır (P1 kapasite paritesi) | Bırakmaz → **alt sınır** |
+| YATAY %1.0 sonucu | **+201** | **−487** |
+İşaret farkının kaynağı kapasite yeniden tahsisi: gerçek motorda engellenen bir sinyal slotu
+boşaltır ve sonraki (çoğu kez daha iyi) sinyal girebilir. E8 bunu kendisi de "gerçek motor-içi
+kapının ALT SINIRI" diye işaretledi — iki ölçüm çelişmiyor, E8 muhafazakâr taraftan bakıyor.
+
+**E8'in eşik önerisi (%1.3) motor-içi kapıyla DOĞRULANDI ve benimsendi:** V1c üç pencerede de
+V1'i (%1.0) domine ediyor — AYI +2999→**+3812** (PF 1.33→1.43), YATAY +2593→**+2791**
+(1.36→1.38), BOĞA kaybı −%4.5→**−%2.7**; maxDD hiçbir pencerede kötüleşmiyor.
+V1c AYI yön kırılımı: LONG 64/**+180** (PF 1.04), SHORT 94/**+3632** (1.84), SL 17 (V0: 29).
+E8'in "kazancın tamamına yakını SHORT bacağından" gözlemi burada da görünüyor; ancak E7'de LONG
+bacağı da tabana göre iyileşiyor (V0 79/−956 → V1c 64/+180), yani E7 LONG bacağını E8'den daha
+değerli buluyor — yine kapasite etkisi. **Bacak-ayrık eşik (SHORT %1.0 / LONG %1.3) uygulanmadı:**
+ayrı bir tasarım kararı, kendi spec'i ve onayı gerekir; E7 verisi LONG bacağının işe yaramadığı
+iddiasını DESTEKLEMİYOR.
+
+**Uzama alt-kapısı — ikinci bağımsız RED.** E8 canlı defterde net **negatif** ölçtü (−152.7;
+LONG eşiği %12'de −382.9, 50 kazanan engelleniyor) ve spec'in hipotezinin İŞARETİNİ ters buldu
+(kazananların `align_btc_run_3d` ort. 7.50 / kaybedenlerin 2.28; AUC 0.292, p<0.001 — yani koşuyla
+AYNI yönde açılan işlemler kazanıyor). E7'de zaten "n=1 olay, gün-içinin üstüne katkı yok"
+demiştik. İki bağımsız kanıt aynı yöne işaret ediyor → **`SCALPER_MARKET_GATE_RUN_PCT=0` kalmalı.**
+Varsayılan spec'te 15 onaylandığı için sessizce değiştirilmedi; bunun yerine motor açılışta
+uyarıyor (`ScalperEngine._maybe_log_market_gate_banner`).
+
+### "Gün açılışı" tanımı — ölçülmüş eşdeğerlik ve testnet uyarısı
+E8 ölçümünü gerçek `1d` mumu **open**'ı ile yaptı; bu uygulama son tamamlanmış günlük
+**close**'u vekil kullanıyor (gerekçe: `KlineFetcher._drop_unclosed` oluşmakta olan günlük mumu
+her zaman atar → canlıda "bugünün open'ı" ELDE EDİLEMEZ; bkz. D15). İki tanım arasındaki fark
+ÖLÇÜLDÜ (BTCUSDT, üç pencere, 70 gün, mainnet — harness'ın veri kaynağı):
+
+| Kaynak | Ortalama \|open−önceki close\| | Maksimum | Eşiğin (%1.0) kaçta kaçı |
+|---|---|---|---|
+| **Mainnet** (harness) | %0.000082 | %0.000597 | %0.06 |
+| **Testnet** (canlı motor) | %0.013 | %0.152 | **%15.2** |
+
+Mainnet'te iki tanım pratikte AYNI (fark eşiğin binde 6'sı) → E7 tablosu E8'in tanımıyla da
+geçerlidir. Testnet'te fark ~200× büyük: en kötü günde eşiğin %15'i kadar. **Bilinen sapma:**
+testnet soak'unda kapı, harness'ın ölçtüğünden marjinal günlerde farklı karar verebilir. Gerçek
+open'a geçmek için ucuz ve parite-korur bir yol bulunamadı (`1h` mumu da 00:00-01:00 UTC arası
+kapanmamış olduğu için düşer → saat başında referans değiştiren, harness'ın taklit edemeyeceği
+canlı-only bir süreksizlik doğardı; `_drop_unclosed`'ı gevşetmek ise tüm motorun paylaştığı
+repaint korumasını zayıflatır). Mainnet'te — gerçek paranın çalışacağı yer — sapma ihmal
+edilebilir olduğu için mevcut vekil bilinçle korundu.

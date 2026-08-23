@@ -883,3 +883,51 @@ class TestMarketGateSettings:
         )
         assert evaluate_market_gate(Direction.LONG, 100.0, 99.4, None, s) == REASON_DAY
         assert evaluate_market_gate(Direction.LONG, 100.0, 99.6, None, s) is None
+
+
+# ==========================================================================
+# Ek 2) Başlangıç bannerı — uzama alt-kapısı için operatör uyarısı
+# ==========================================================================
+
+class TestMarketGateStartupBanner:
+    """`SCALPER_MARKET_GATE_RUN_PCT` varsayılanı 15 (spec §C'de onaylandı) ama
+    iki bağımsız ölçüm (E7 harness + E8 canlı defter) uzama alt-kapısını
+    desteklemiyor. Varsayılanı sessizce değiştirmek yerine kapıyı açan
+    operatörü AÇIKÇA uyarıyoruz — sessiz tuzak bırakmamak için."""
+
+    @staticmethod
+    def _engine(cfg: Any):
+        engine = ScalperEngine.__new__(ScalperEngine)
+        engine.cfg = cfg
+        warnings: List[str] = []
+        engine.logger = SimpleNamespace(
+            info=lambda *a, **kw: None,
+            warning=lambda msg, *a, **kw: warnings.append(msg),
+            error=lambda *a, **kw: None,
+        )
+        return engine, warnings
+
+    def test_no_banner_when_gate_disabled(self):
+        engine, warnings = self._engine(_engine_cfg(scalper_market_gate=False))
+        engine._maybe_log_market_gate_banner()
+        assert warnings == []
+
+    def test_banner_when_gate_enabled_day_only(self):
+        engine, warnings = self._engine(
+            _engine_cfg(scalper_market_gate_day_pct=1.3, scalper_market_gate_run_pct=0)
+        )
+        engine._maybe_log_market_gate_banner()
+        assert len(warnings) == 1
+        assert "PİYASA KAPISI AÇIK" in warnings[0] and "BTCUSDT" in warnings[0]
+
+    def test_extra_warning_when_run_sub_gate_active(self):
+        engine, warnings = self._engine(_engine_cfg(scalper_market_gate_run_pct=15.0))
+        engine._maybe_log_market_gate_banner()
+        assert len(warnings) == 2
+        assert "UZAMA alt-kapısı açık" in warnings[1]
+        assert "SCALPER_MARKET_GATE_RUN_PCT=0" in warnings[1]
+
+    def test_missing_config_fields_do_not_raise(self):
+        engine, warnings = self._engine(SimpleNamespace())
+        engine._maybe_log_market_gate_banner()
+        assert warnings == []

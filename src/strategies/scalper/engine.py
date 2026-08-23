@@ -276,6 +276,7 @@ class ScalperEngine:
 
         self.logger.info("⚡ Scalper motoru başlatılıyor...")
         self._maybe_log_shadow_mode_banner()
+        self._maybe_log_market_gate_banner()
         self.logger.info(
             f"🎯 Evren={self.cfg.scalper_top_n} sembol, tarama={self.cfg.scalper_scan_interval_seconds}sn, "
             f"safety={self._safety_interval_seconds():g}sn, "
@@ -1400,6 +1401,41 @@ class ScalperEngine:
         """
         if bool(getattr(self.cfg, "scalper_shadow_mode", False)):
             self.logger.warning("⚠️ GÖLGE MODU AÇIK — emir gönderilmez")
+
+    def _maybe_log_market_gate_banner(self) -> None:
+        """Lider piyasa kapısı (D15) açıksa başlangıçta durumunu bildir.
+
+        Uzama alt-kapısı için AYRI ve daha sert bir uyarı var: iki BAĞIMSIZ
+        ölçüm onu desteklemiyor — (1) harness'ta yalnız AYI penceresinde ve
+        TEK bir lider olayında tetikleniyor, gün-içi alt-kapısının üstüne
+        hiçbir şey eklemiyor (E7: V3 ≡ V1); (2) canlı defterde net NEGATİF
+        (E8: −152.7). Varsayılan `SCALPER_MARKET_GATE_RUN_PCT=15` bu yüzden
+        bir tuzak: kapıyı açan operatör istemeden uzama alt-kapısını da
+        açar. Sessizce değiştirmek yerine (spec'te 15 onaylanmıştı) açıkça
+        uyarıyoruz — bkz. docs/DECISIONS.md D15.
+        """
+        if not bool(getattr(self.cfg, "scalper_market_gate", False)):
+            return
+        leader = self._market_gate_leader()
+        day_pct = getattr(self.cfg, "scalper_market_gate_day_pct", 0.0)
+        run_pct = getattr(self.cfg, "scalper_market_gate_run_pct", 0.0)
+        run_days = getattr(self.cfg, "scalper_market_gate_run_days", 0)
+        self.logger.warning(
+            f"🧭 PİYASA KAPISI AÇIK — lider {leader}, gün-içi %{day_pct}, "
+            f"uzama %{run_pct}/{run_days}g"
+        )
+        try:
+            run_active = float(run_pct or 0.0) > 0.0
+        except (TypeError, ValueError):
+            run_active = False
+        if run_active:
+            self.logger.warning(
+                "⚠️ Piyasa kapısının UZAMA alt-kapısı açık "
+                "(SCALPER_MARKET_GATE_RUN_PCT>0) — iki bağımsız ölçüm bunu "
+                "DESTEKLEMİYOR (E7: gün-içi kapısının üstüne katkısı yok; "
+                "E8: canlı defterde net negatif). Kapatmak için "
+                "SCALPER_MARKET_GATE_RUN_PCT=0 (bkz. docs/DECISIONS.md D15)"
+            )
 
     def _executor_entry_blocked(self, symbol: str) -> bool:
         """Executor'ın sembol cooldown kapısını güvenli/geriye uyumlu oku."""

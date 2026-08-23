@@ -179,6 +179,8 @@ tüm evrene uygular. Saf kural `src/strategies/scalper/market_gate.py`
 - **uzama** (`scalper_market_gate_run_pct` / `_run_days`): lider son N
   **tamamlanmış** günde ≥+%Y koştuysa LONG, ≤−%Y düştüyse SHORT açılmaz
   (koşu = `kapanış[-1]/kapanış[-1-N] − 1`, yani N+1 kapanış gerekir).
+  **Kullanılmamalı:** iki bağımsız ölçüm (E7 harness + E8 canlı defter) bu alt-kapıyı
+  desteklemiyor; `RUN_PCT>0` ile açılırsa motor başlangıçta WARNING basar (D15).
 
 "Gün açılışı" iki tarafta da **son tamamlanmış günlük kapanış**tır
 (`day_open_from_daily_closes`): `KlineFetcher._drop_unclosed` oluşmakta olan

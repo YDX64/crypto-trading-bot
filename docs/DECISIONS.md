@@ -325,13 +325,49 @@ loglar `logs/market_gate/<varyant>_<pencere>.log`. V0 (kapı kapalı) mevcut tab
   LONG'ları vetoluyor, LONG 60→46) — uzama eşiği gevşetilmemeli.
 - **V1a (%0.7) reddedildi**: AYI en iyi (1.52) ama YATAY +2392→+873 (−%63.5) — tek pencerede parlıyor.
 - **V1b (%1.5)** muhafazakâr alternatif: AYI 1.17, YATAY +570, BOĞA hiç tetiklenmiyor (%0 kayıp).
+- **V1c (gün-içi %1.3) — TERCİH EDİLEN EŞİK** (E8 ajanının bağımsız post-hoc taramasının önerisi,
+  motor-içi kapıyla doğrulandı): AYI 1.04→**1.43** (+584→+3812, DD 3683→2956) · YATAY 1.29→**1.38**
+  (+2392→+2791) · BOĞA 2.43→2.39 (−%2.7). Üç pencerede de V1'i (%1.0) DOMİNE ediyor, maxDD hiçbir
+  yerde kötüleşmiyor. AYI yön kırılımı: LONG 79/−956 → 64/**+180**, SHORT 134/+1541 → 94/**+3632**,
+  SL 29→17.
+
+**Çapraz kontrol (E8 sinyal otopsisi, aynı gün):** E8 kapıyı bağımsız olarak harness JSON'u
+üzerinde POST-HOC ölçtü. Yöntem farkı önemli: E8'de engellenen sinyal kapasiteyi serbest
+BIRAKMIYOR, bu yüzden sayıları motor-içi kapının ALT SINIRI (E8 bunu kendi de işaretledi).
+YATAY %1.0'da işaret bile farklı (E7 +201 / E8 −487) — fark tam olarak kapasite yeniden
+tahsisinden geliyor. İki ölçüm ÇELİŞMİYOR; E8 muhafazakâr taraftan bakıyor ve eşik önerisi (%1.3)
+motor-içi kapıyla doğrulandı → benimsendi. Bacak-ayrık eşik (SHORT %1.0 / LONG %1.3) E8'in
+önerisiydi ama UYGULANMADI: ayrı bir tasarım kararıdır (kendi spec'i + onayı gerekir) ve E7 verisi
+"LONG bacağı işe yaramıyor" iddiasını desteklemiyor (LONG bacağı tabana göre −956→+180 iyileşiyor).
 
 **Neden UYGULANMADI:** (1) CLAUDE.md kural 1 zinciri backtest → testnet ≥5 gün → onay ister ve
 D6'nın soak'u sürüyor — üst üste binen değişiklik atfı kirletir. (2) Kanıt tek lider (BTCUSDT) ve
 tek 21 günlük ayı penceresinden geliyor; AYI kazancının büyük kısmı 02-05/02-06 çöküş-toparlanma
-çiftinden. (3) Uzama alt-kapısı için kanıt açıkça yetersiz (n=1 olay). Açılacaksa önce YALNIZ
-gün-içi alt-kapısı (`SCALPER_MARKET_GATE=true`, `DAY_PCT=1.0`, `RUN_PCT=0`) ve tercihen önce
-gölge modunda (D14) gözlemlenmeli.
+çiftinden. (3) Uzama alt-kapısı için kanıt açıkça yetersiz (n=1 olay) ve E8 tarafından
+BAĞIMSIZ olarak ÇÜRÜTÜLDÜ (aşağı). Açılacaksa YALNIZ gün-içi alt-kapısı
+(`SCALPER_MARKET_GATE=true`, `DAY_PCT=1.3`, `RUN_PCT=0`) ve tercihen önce gölge modunda (D14).
+
+**Uzama alt-kapısı — İKİ BAĞIMSIZ RED, kullanılmamalı.** (1) E7: yalnız AYI penceresinde ve TEK
+lider olayında (2026-02-06) tetikleniyor; %15 ile %20 birebir aynı sonucu veriyor; gün-içi
+alt-kapısının üstüne HİÇBİR katkısı yok (V3 ≡ V1). (2) E8 canlı defterde net **NEGATİF** ölçtü
+(−152.7; LONG eşiği %12'de −382.9, 50 kazanan engelleniyor) ve spec'in hipotezinin İŞARETİNİ ters
+buldu: kazananların `align_btc_run_3d` ortalaması 7.50, kaybedenlerin 2.28 (AUC 0.292, p<0.001) —
+yani lider koşusuyla AYNI yönde açılan işlemler KAZANIYOR, kapının varsaydığının tersi.
+Varsayılan `SCALPER_MARKET_GATE_RUN_PCT=15` spec §C'de onaylandığı için **sessizce
+değiştirilmedi**; bunun yerine motor açılışta AÇIKÇA uyarıyor
+(`ScalperEngine._maybe_log_market_gate_banner` — kapı açık + `RUN_PCT>0` ise ikinci bir WARNING).
+Varsayılanı 0'a çekmek kullanıcı kararıdır.
+
+**Bilinen sapma — "gün açılışı" vekili ve testnet.** Fark ÖLÇÜLDÜ (BTCUSDT, 70 gün): mainnet'te
+(harness veri kaynağı) gerçek `1d` open ile önceki close arasındaki fark ort. %0.000082 / maks
+%0.0006 — eşiğin binde 6'sı, yani E7 sonuçları E8'in "gerçek open" tanımıyla da geçerli.
+TESTNET'te (canlı motorun kaynağı, `data.py` → `settings.binance_base_url`) fark ~200× büyük:
+ort. %0.013 / maks %0.152 = eşiğin %15'i. Yani testnet soak'unda kapı, harness'ın ölçtüğünden
+MARJİNAL günlerde farklı karar verebilir. Gerçek open'a geçmenin ucuz ve parite-korur bir yolu
+bulunamadı: `1h` mumu da 00:00-01:00 UTC arasında kapanmamış olduğu için düşer (saat başında
+referans değiştiren, harness'ın taklit edemeyeceği canlı-only süreksizlik) ve `_drop_unclosed`'ı
+gevşetmek tüm motorun paylaştığı repaint korumasını zayıflatır. Mainnet'te — gerçek paranın
+çalışacağı yer — sapma ihmal edilebilir olduğu için vekil bilinçle korundu.
 
 **Kanıt (kod):** `tests/test_market_gate.py` — 67 test (saf fonksiyon: her alt-kapı/yön/eşik
 sınırı/eksik-geçersiz veri; motor: önbellek, fail-open+WARNING, ret sayaçları, `/scalper/status`
