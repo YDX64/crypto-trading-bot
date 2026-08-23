@@ -464,7 +464,18 @@ def parse_follower_event(raw: str) -> FollowerEvent:
     if not text:
         raise FollowerParseError("Boş gövde")
 
+    # SIRA ÖNEMLİ (doğrulayıcı bulgusu): gövde KATI AlgoPro V1.6 biçimindeyse
+    # şablon yolu HİÇ denenmez. Eskiden gövdenin HERHANGİ bir yerindeki bir
+    # `kind=` belirteci şablon yolunu kazandırıyordu: köprünün katı tanıyıcısı
+    # (`algopro_alert_kind` → yalnız `_parse_algopro_message`) "entry" derken
+    # yürütme EXIT olabiliyordu — sınıflandırma kapıyla bire bir OLMALI.
+    try:
+        return _parse_algopro_message(text)
+    except FollowerParseError:
+        pass
     templated = _parse_key_value_template(text)
     if templated is not None:
         return templated
+    # Katı biçim de şablon da tutmadı: ASIL hatayı (AlgoPro çözücüsünün
+    # gerekçesi) yükselt — operatör hangi alanın eksik olduğunu görmeli.
     return _parse_algopro_message(text)

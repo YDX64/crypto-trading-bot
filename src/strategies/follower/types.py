@@ -17,6 +17,10 @@ from src.strategies.scalper.types import Direction
 
 # AlgoPro alarm türleri. TV koşul adlarıyla eşleme docs/RUNBOOK.md
 # "AlgoPro takipçi halkası" bölümündeki tablodadır.
+#: Takipçi evreni DIŞINDAKİ AlgoPro girişinin TEK ret adı (D20b).
+#: Gömülü köprü ve `/follower/event` yolu AYNI adı kullanır.
+ROUTE_REJECT_OUTSIDE_UNIVERSE = "symbol_not_in_follower_universe"
+
 KIND_ENTRY = "entry"
 KIND_EXIT = "exit"
 KIND_TP1 = "tp1"

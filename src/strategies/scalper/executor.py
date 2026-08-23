@@ -2517,7 +2517,14 @@ class ScalpExecutor:
             return []
 
         try:
-            open_rows = await self.tracker.open_trades()
+            # D20b (doğrulayıcı bulgusu Y5): gömülü modda AP satırları da
+            # status='OPEN'dır; filtresiz okuma onları "bu sembol DB'de açık"
+            # sayıp scalper'ın maker journal'ını temizletiyordu — oysa exits
+            # recovery AP'yi artık dışlıyor, yani scalper'ın GERÇEK maker
+            # dolumu YÖNETİCİSİZ kalabilirdi.
+            open_rows = await self.tracker.open_trades(
+                exclude_strategies=(FOLLOWER_LEDGER_STRATEGY,)
+            )
         except Exception as e:
             raise PendingRecoveryError(
                 f"Maker recovery DB OPEN kayıtlarını okuyamadı: {e}"

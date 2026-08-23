@@ -45,6 +45,9 @@ logs/
 
 # Database
 *.db
+# sqlite WAL/SHM artıkları (test koşuları üretir)
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
 

@@ -268,10 +268,15 @@ ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date -u +%Y%m%d-%H%M
 > `FOLLOWER_SYMBOLS` dolu iken doludur — tek assert iki ayarı birden doğrular.
 > (Eski reçetedeki `assert s.follower_universe` FOLLOWER_SYMBOLS hiç
 > yazılmasa da GEÇİYORDU: evren 8 majöre düşer ve hiçbir sembol scalper'dan
-> çıkarılmazdı.) Kalan hatalı bileşimleri config zaten startup'ta reddeder:
+> çıkarılmazdı.) Şu hatalı bileşimleri config startup'ta REDDEDER:
 > `FOLLOWER_VIRTUAL_CAPITAL_USDT<=0`, `SCALPER_ENABLED=false`,
-> `BOT_MODE=follower` ile birlikte, ya da `FOLLOWER_SYMBOLS`'un scalper
-> evrenini TAMAMEN boşaltması.
+> `BOT_MODE=follower` ile birlikte, ve `SCALPER_SYMBOL_ALLOWLIST` DOLUYKEN
+> `FOLLOWER_SYMBOLS`'un o listeyi tamamen yutması.
+> ⚠️ `SCALPER_SYMBOL_ALLOWLIST` BOŞSA (canlı `.env`'de varsayılan durum) evren
+> `scanner`dan gelir ve config bunu göremez — o durumda kontrol **motor
+> başlangıcında** GERÇEK evrenle yapılır ve boşalma startup HATASI verir
+> (evren o an okunamazsa kontrol atlanır + WARNING; tarama turunda
+> `/scalper/status → scan_status=degraded:universe_empty` ile görünür).
 > ⚠️ Çıplak `supervisorctl restart` **YASAK** (D20a bulgu 4). Uygula:
 > `RESTART_LABEL=embedded-follower scripts/restart_safe.sh testnet`
 
@@ -318,6 +323,14 @@ atlanan girişler: `reject_counters.insufficient_balance` + `logs/bot.log`'ta
 Takipçi evreni dışında kalan AlgoPro alarmları:
 `reject_counters.symbol_not_in_follower_universe` + `⚠️ AlgoPro girişi işlenmedi: …`
 (o alarmlar ana botun oy yoluna DA düşmez — TV'de kapatılmaları gerekir).
+Panoda **"Evren dışı alarm"** sayacı olarak görünür ve "Alarm olayı"/"Son olay"
+satırlarını da hareket ettirir.
+
+**Günlük kesici iki sayı gösterir (gömülü mod).** `/scalper/status →
+daily_pnl` KENDİ defterinden gelir (`daily_pnl_source="scalper_ledger"`);
+`daily_income_account` ise hesabın HAM günlük income'ıdır ve YALNIZ BİLGİDİR.
+İkisi arasındaki fark açık pozisyonların funding/komisyonu ve takipçinin
+işlemleridir — kesici o farkı GÖRMEZ (D20b sınırlılık i-d).
 
 **Sahipsiz pozisyon uyarısı.** Gömülü modda hiçbir motorun izlemediği ve rezerve
 etmediği bir açık pozisyon (elle ya da Telegram botuyla açılmış olabilir)
@@ -353,6 +366,31 @@ Ayrı halkaya (D20) GERİ dönülecekse sıra simetriktir: gömülü modu kapat 
 `FOLLOWER_FORWARD_URL`/`FOLLOWER_FORWARD_SECRET`'i doldur →
 `supervisorctl start tradingbot_ap` → `restart_safe.sh testnet`. İkisi AYNI
 ANDA açık bırakılmaz (köprü çağrılmaz, ayrı halka alarmsız kalır).
+
+#### Gömülü takipçiyi kapatma (SIRA ÖNEMLİ)
+`FOLLOWER_EMBEDDED=false` yapıp restart etmek AÇIK AP pozisyonunu **yönetimsiz**
+bırakır: takipçi hiç başlamaz, scalper da defter filtresi yüzünden `strategy=AP`
+satırını KURTARMAZ. Borsadaki SL/TP emirleri durur ama TP1→BE, EXIT/flip ve
+kapanış defteri ÇALIŞMAZ. Doğru sıra:
+```bash
+# 1) AP pozisyonlarını KAPAT (bayrak hâlâ AÇIKKEN)
+curl -sS -X POST http://127.0.0.1:9091/risk-event -H 'Content-Type: application/json' \
+  -d '{"secret":"<RISK_EVENT_SECRET>","action":"flatten","reason":"gomulu-kapatma"}'
+# 2) defterde açık AP satırı KALMADIĞINI doğrula
+ssh awa 'cd /opt/tradingbot-v2 && ./.venv/bin/python -c "
+import asyncio; from src.strategies.scalper.tracker import ScalpTracker
+rows = asyncio.run(ScalpTracker().open_trades(strategies=(\"AP\",)))
+print(\"acik AP:\", [(r.id, r.symbol) for r in rows]); assert not rows"'
+# 3) bayrağı kapat + korumalı restart
+ssh awa 'cd /opt/tradingbot-v2 && sed -i "s/^FOLLOWER_EMBEDDED=.*/FOLLOWER_EMBEDDED=false/" .env && \
+  RESTART_LABEL=embedded-off scripts/restart_safe.sh testnet'
+```
+Adım 2 atlanırsa startup CRITICAL loglar ve `/health` gövdesinde
+`follower="disabled_with_open_trades"` + `follower_details.open_trades` görünür
+(süreç KASTEN düşürülmez — hard fail pozisyonu kapatmaz, yalnız restart
+döngüsü doğururdu). O hâlde çözüm: `FOLLOWER_EMBEDDED=true` ile yeniden
+başlatıp adım 1'i uygulamak, ya da pozisyonları elle kapatıp `scalp_trades`
+satırlarını kapanmış işaretlemek.
 
 Takipçinin kendi fail-closed giriş kilidi `state/follower_entry_halt.json`'dur
 (scalper'ınkinden AYRI dosya): yetim pozisyon ya da korumasız pozisyon şüphesinde

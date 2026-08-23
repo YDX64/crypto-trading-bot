@@ -22,6 +22,7 @@ deseni), tracker/client sahtedir.
 from __future__ import annotations
 
 import asyncio
+import json
 import pathlib
 import time
 from collections import deque
@@ -43,6 +44,20 @@ from src.strategies.follower.types import FollowerRejected
 from src.trading.symbol_reservations import symbol_reservations
 
 from test_follower_engine import _cfg as _base_cfg, _fake_position
+
+#: `Settings(_env_file=None, …)` için zorunlu alanlar (tests/test_follower_mode.py
+#: ile aynı desen): dosya okunmadığı için tümü açıkça verilmelidir.
+_REQUIRED_SETTINGS = dict(
+    binance_api_key="x",
+    binance_api_secret="x",
+    telegram_bot_token="x",
+    telegram_chat_id="x",
+    openai_api_key="x",
+    gemini_api_key="x",
+    deepseek_api_key="x",
+    jwt_secret="x",
+    binance_base_url="https://testnet.binancefuture.com",
+)
 
 TV_SECRET = "tv-s3cr3t"
 
@@ -308,12 +323,46 @@ class TestEmbeddedSettings:
         assert cfg.follower_lev_max == 42
 
     def test_conflicting_leverage_aliases_fail_fast(self, monkeypatch):
-        """İki ad AYNI ayardır; farklı verilirse SESSİZ GALİP olmaz."""
+        """İki ad AYNI ayardır; takipçi AKTİFKEN sessiz galip olmaz."""
         with pytest.raises(Exception) as exc:
             self._settings(
-                monkeypatch, FOLLOWER_LEV_MAX="50", FOLLOWER_MAX_LEVERAGE="100"
+                monkeypatch,
+                FOLLOWER_EMBEDDED="true",
+                FOLLOWER_LEV_MAX="50",
+                FOLLOWER_MAX_LEVERAGE="100",
             )
         assert "AYAR ÇELİŞKİSİ" in str(exc.value)
+
+    def test_conflicting_aliases_only_warn_when_follower_off(self, monkeypatch):
+        """Takipçi kapalıyken ikilik ANA süreci başlatamaz hâle GETİRMEZ."""
+        with pytest.warns(UserWarning):
+            cfg = self._settings(
+                monkeypatch, FOLLOWER_LEV_MAX="50", FOLLOWER_MAX_LEVERAGE="100"
+            )
+        assert cfg.follower_active is False
+
+    def test_env_file_none_does_not_read_any_file(self, tmp_path, monkeypatch):
+        """`_env_file=None` → HİÇBİR dosya okunmaz (doğrulayıcı bulgusu Y2).
+
+        Sunucunun canlı `.env`'inde iki ad birden varken, izole bir
+        `Settings(_env_file=None)` kurulumu bundan ETKİLENMEMELİDİR — aksi
+        halde bir ayar dosyası deploy test kapısını kırar (bulgu 29 sınıfı).
+        """
+        env_file = tmp_path / ".env"
+        env_file.write_text(
+            "FOLLOWER_LEV_MAX=50\nFOLLOWER_MAX_LEVERAGE=25\n", encoding="utf-8"
+        )
+        monkeypatch.chdir(tmp_path)
+        cfg = Settings(_env_file=None, **_REQUIRED_SETTINGS)
+        assert cfg.follower_lev_max == 100  # dosya OKUNMADI → varsayılan
+
+    def test_given_env_file_is_honoured(self, tmp_path, monkeypatch):
+        """Örneğe VERİLEN dosya okunur (sınıf varsayılanı değil)."""
+        env_file = tmp_path / "custom.env"
+        env_file.write_text("FOLLOWER_MAX_LEVERAGE=37\n", encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+        cfg = Settings(_env_file=str(env_file), **_REQUIRED_SETTINGS)
+        assert cfg.follower_lev_max == 37
 
     def test_matching_leverage_aliases_are_accepted(self, monkeypatch):
         cfg = self._settings(
@@ -488,7 +537,9 @@ class TestScalperLedgerSeparation:
         assert engine._daily_pnl_source == "scalper_ledger"
         # Takipçinin zararı scalper'ın kesicisini TETİKLEMEZ.
         assert engine._kill_switch is False
-        engine._get_account_daily_net_income.assert_not_awaited()
+        # Hesap income'ı YALNIZ BİLGİ amaçlı okunur (D20b/Y8): kesiciyi
+        # beslemez ama iki sayının farkı `/scalper/status`ta görünür.
+        assert engine._daily_income_account == pytest.approx(-520.0)
 
     async def test_income_path_is_unchanged_when_embedded_off(self):
         tracker = _tracker()
@@ -719,8 +770,10 @@ class TestReservedSymbols:
         engine = _make_engine(tmp_path, cfg)
         result = await engine.handle_event(parse_follower_event(REAL_SELL))
         assert result["accepted"] is False
-        assert "evren" in result["reason"]
-        assert engine._reject_counters.get("symbol_allowlist") == 1
+        # TEK AD: köprü yolu ile motor yolu AYNI reason/sayaç adını kullanır.
+        assert result["reason"] == "symbol_not_in_follower_universe"
+        assert "evren" in result["detail"]
+        assert engine._reject_counters.get("symbol_not_in_follower_universe") == 1
         engine.executor.open_position.assert_not_called()
 
     def test_engine_universe_follows_follower_symbols(self, tmp_path):
@@ -1142,7 +1195,7 @@ class TestRoutingUniverseGate:
         wired.scalper.external_signal.assert_not_called()
         # Sessiz KALMAZ: sayaç + WARNING.
         wired.follower.note_route_reject.assert_called_once_with(
-            "symbol_not_in_follower_universe"
+            "symbol_not_in_follower_universe", kind="entry"
         )
 
     async def test_exit_events_are_never_gated_by_the_universe(self, wired):
@@ -1394,3 +1447,250 @@ class TestOwnOrphanVsUnknown:
         closed = [c.args[0] for c in engine._submit_reduce_only_market_close.await_args_list]
         assert closed == ["ADAUSDT"]
         assert engine.logger.critical.called  # ETHUSDT atlandı, raporlandı
+
+
+# ==========================================================================
+# 18) Doğrulayıcı turu — regresyon ve kalıntı düzeltmeleri
+# ==========================================================================
+
+class TestRecoveryReservationOnFailurePaths:
+    """`_attempt_recovery` İSTİSNA yollarında da sahiplik ALIR.
+
+    Doğrulayıcı bulgusu (YÜKSEK regresyon): `exits.recover()` bir satırı
+    izlemeye ALIP sonraki satırda patlarsa, erken `return` o sembolü
+    "izleniyor ama rezerve DEĞİL" bırakıyordu ve scalper aynı net pozisyona
+    girebiliyordu.
+    """
+
+    async def test_unprotected_error_still_reserves_tracked_symbols(self, tmp_path):
+        from src.trading.position_manager import UnprotectedPositionError
+
+        engine = _make_engine(tmp_path, positions={"BTCUSDT": _fake_position()})
+        engine.exits.recover = AsyncMock(
+            side_effect=UnprotectedPositionError("korumasız")
+        )
+        assert await engine._attempt_recovery() is False
+        assert symbol_reservations.owner("BTCUSDT") == "follower"
+        assert engine._entry_halted is True
+
+    async def test_generic_error_still_reserves_tracked_symbols(self, tmp_path):
+        engine = _make_engine(tmp_path, positions={"BTCUSDT": _fake_position()})
+        engine.exits.recover = AsyncMock(side_effect=RuntimeError("db yok"))
+        assert await engine._attempt_recovery() is False
+        assert symbol_reservations.owner("BTCUSDT") == "follower"
+
+    async def test_scalper_cannot_take_a_symbol_reserved_on_the_failure_path(
+        self, tmp_path
+    ):
+        engine = _make_engine(tmp_path, positions={"BTCUSDT": _fake_position()})
+        engine.exits.recover = AsyncMock(side_effect=RuntimeError("yarım kurtarma"))
+        await engine._attempt_recovery()
+        assert (
+            symbol_reservations.reserve("BTCUSDT", "scalper") is False
+        ), "scalper aynı net pozisyona giremez"
+
+
+class TestUniverseEmptyGuardUsesRealUniverse:
+    """`FOLLOWER_SYMBOLS` gerçek tarama evrenini boşaltıyorsa startup HATASI.
+
+    Doğrulayıcı bulgusu Y1: config kontrolü yalnız `SCALPER_SYMBOL_ALLOWLIST`
+    doluyken çalışabiliyordu; canlı `.env`'de o satır YOK ve evren
+    `scanner.get_universe()`ten geliyor → koruma ÖLÜYDÜ.
+    """
+
+    def _engine(self, reserved, allowlist="", universe=None, boom=False):
+        from src.strategies.scalper.engine import ScalperEngine
+
+        engine = object.__new__(ScalperEngine)
+        engine.cfg = SimpleNamespace(
+            follower_reserved_symbols=reserved,
+            scalper_symbol_allowlist=allowlist,
+            follower_embedded=True,
+        )
+        engine.logger = MagicMock()
+        getter = (
+            AsyncMock(side_effect=RuntimeError("ağ"))
+            if boom
+            else AsyncMock(return_value=list(universe or []))
+        )
+        engine.scanner = SimpleNamespace(get_universe=getter)
+        return engine
+
+    async def test_scanner_universe_fully_reserved_raises(self):
+        engine = self._engine(["BTCUSDT", "ETHUSDT"], universe=["BTCUSDT", "ETHUSDT"])
+        with pytest.raises(RuntimeError) as exc:
+            await engine._assert_universe_survives_follower_reservation()
+        assert "boşaltıyor" in str(exc.value)
+
+    async def test_partial_overlap_is_fine(self):
+        engine = self._engine(["BTCUSDT"], universe=["BTCUSDT", "ETHUSDT"])
+        await engine._assert_universe_survives_follower_reservation()
+
+    async def test_unreadable_universe_only_warns(self):
+        """Borsa erişimi yokken bot BAŞLAMAMAZLIK ETMEZ (418 dersi)."""
+        engine = self._engine(["BTCUSDT"], boom=True)
+        await engine._assert_universe_survives_follower_reservation()
+        assert engine.logger.warning.called
+
+    async def test_no_reserved_symbols_skips_the_check(self):
+        engine = self._engine([], universe=[])
+        await engine._assert_universe_survives_follower_reservation()
+        engine.scanner.get_universe.assert_not_awaited()
+
+    def test_scan_tick_marks_degraded_when_universe_empties(self):
+        from src.strategies.scalper.engine import ScalperEngine
+
+        engine = object.__new__(ScalperEngine)
+        engine.cfg = SimpleNamespace(follower_reserved_symbols=["BTCUSDT"])
+        engine.logger = MagicMock()
+        engine._mark_scan_degraded = MagicMock()
+        assert engine._exclude_follower_symbols(["BTCUSDT"]) == []
+        engine._mark_scan_degraded.assert_called_once()
+        assert engine._mark_scan_degraded.call_args.kwargs["kind"] == "universe_empty"
+
+
+class TestParserClassificationMatchesGate:
+    """Katı AlgoPro gövdesinde gövde ORTASINDAKİ `kind=` YOK SAYILIR.
+
+    Doğrulayıcı bulgusu: köprünün katı tanıyıcısı "entry" derken yürütücü
+    şablon yolunu seçip EXIT çalıştırabiliyordu (pozisyonu kapatırdı).
+    """
+
+    def test_mid_body_kind_does_not_flip_a_strict_entry(self):
+        from src.strategies.follower.parser import (
+            algopro_alert_kind,
+            parse_follower_event,
+        )
+
+        body = (
+            "🟢 BUY | BINANCE:BTCUSDT | TF: 1 | Price: 77126.08 | SL: 77084.39 "
+            "| TP1: 77146.93 | TP2: 77167.77 | TP3: 77188.62 | note kind=exit"
+        )
+        assert algopro_alert_kind(body) == "entry"
+        assert parse_follower_event(body).kind == "entry"
+
+    def test_explicit_template_still_works(self):
+        from src.strategies.follower.parser import parse_follower_event
+
+        event = parse_follower_event("src=algopro kind=exit BTCUSDT tf=1")
+        assert event.kind == "exit"
+
+
+class TestRouteRejectTelemetry:
+    def test_bridge_reject_moves_event_counters(self, tmp_path):
+        engine = _make_engine(tmp_path)
+        engine.note_route_reject("symbol_not_in_follower_universe")
+        snap = engine.dashboard_snapshot()
+        assert snap["events_total"] == 1
+        assert snap["last_event_at"] is not None
+        assert snap["reject_counters"]["symbol_not_in_follower_universe"] == 1
+
+    async def test_unknown_position_counter_is_per_event(self, tmp_path):
+        engine = _make_engine(
+            tmp_path, all_positions=[{"symbol": "ETHUSDT", "positionAmt": "1.5"}]
+        )
+        for _ in range(3):
+            await engine._check_orphans()
+        # Sembol kümesi DEĞİŞMEDİ → sayaç 3 tur boyunca 1 kalır.
+        assert engine._reject_counters["unknown_position"] == 1
+        engine.client.get_all_positions = AsyncMock(
+            return_value=[{"symbol": "SOLUSDT", "positionAmt": "2"}]
+        )
+        await engine._check_orphans()
+        assert engine._reject_counters["unknown_position"] == 2
+
+
+class TestRiskEventResumeCoversBothEngines:
+    async def test_resume_reports_not_ok_when_follower_stays_halted(
+        self, monkeypatch
+    ):
+        scalper = MagicMock()
+        scalper.risk_event_resume = MagicMock(return_value={"active": False})
+        follower = MagicMock()
+        follower.risk_event_resume = MagicMock(
+            return_value={"active": True, "reason": "dosya silinemedi"}
+        )
+        monkeypatch.setattr(main_module, "scalper_engine", scalper)
+        monkeypatch.setattr(main_module, "follower_engine", follower)
+        monkeypatch.setattr(main_module.settings, "risk_event_secret", "s" * 20)
+
+        request = _FakeRequest(
+            json.dumps({"secret": "s" * 20, "action": "resume"}).encode()
+        )
+        result = await main_module.risk_event(request)
+        assert result["ok"] is False
+        follower.risk_event_resume.assert_called_once()
+
+
+class TestScalperRecoveryConflictWithFollower:
+    def test_follower_owned_symbol_is_skipped_not_latched(self):
+        """Gömülü modda takipçi sahipli sembol KALICI kilit YAZDIRMAZ."""
+        source = (
+            pathlib.Path(__file__).resolve().parents[1]
+            / "src/strategies/scalper/engine.py"
+        ).read_text(encoding="utf-8")
+        block = source[source.index("| self.executor.pending_symbols():"):]
+        block = block[: block.index("if not self._recovery_ready")]
+        assert "FOLLOWER_RESERVATION_OWNER" in block
+        assert "continue" in block
+        # Diğer sahipler için eski davranış (latch + break) DURUYOR.
+        assert "_latch_entry_halt" in block
+        assert "break" in block
+
+
+class TestDisabledFollowerOpenTrades:
+    async def test_open_ap_rows_are_reported_when_flag_is_off(self, monkeypatch):
+        rows = [SimpleNamespace(id=7, symbol="ADAUSDT", direction="LONG")]
+        monkeypatch.setattr(main_module.settings, "follower_embedded", False)
+        monkeypatch.setattr(main_module.settings, "bot_mode", "scalper")
+        monkeypatch.setattr(
+            main_module.ScalpTracker,
+            "open_trades",
+            AsyncMock(return_value=rows),
+        )
+        found = await main_module._check_disabled_follower_open_trades()
+        assert found == [{"id": 7, "symbol": "ADAUSDT", "direction": "LONG"}]
+
+    async def test_nothing_reported_when_follower_is_active(self, monkeypatch):
+        monkeypatch.setattr(main_module.settings, "follower_embedded", True)
+        getter = AsyncMock(return_value=[])
+        monkeypatch.setattr(main_module.ScalpTracker, "open_trades", getter)
+        assert await main_module._check_disabled_follower_open_trades() == []
+        getter.assert_not_awaited()
+
+
+class TestDayStartApproximationExcludesAp:
+    async def test_wallet_mode_subtracts_ap_ledger(self):
+        from src.strategies.scalper.engine import ScalperEngine
+
+        engine = object.__new__(ScalperEngine)
+        engine.cfg = SimpleNamespace(
+            follower_embedded=True,
+            scalper_daily_loss_limit_pct=10.0,
+            scalper_virtual_capital_usdt=0.0,
+        )
+        engine.logger = MagicMock()
+        engine._kill_switch = False
+        engine._kill_switch_day = None
+        engine._signals_today = 0
+        engine._daily_pnl = 0.0
+        engine._daily_pnl_source = "unavailable"
+        engine._daily_income_account = None
+        engine._risk_ready = False
+        engine._risk_equity_usdt = None
+        engine._risk_equity_source = "disabled"
+        engine._daily_loss_threshold_usdt = None
+        engine.tracker = SimpleNamespace(
+            realized_pnl_since=AsyncMock(return_value=-20.0), close_seq=0
+        )
+        engine._get_cached_balance = AsyncMock(return_value=1000.0)
+        engine._get_account_daily_net_income = AsyncMock(return_value=-500.0)
+        engine._ledger_daily_pnl = AsyncMock(
+            side_effect=lambda today, strategies=None: (
+                -480.0 if strategies else -20.0
+            )
+        )
+        await engine._update_kill_switch()
+        # Gün başı = 1000 − (−20 + −480) = 1500 → eşik −150 (AP'nin −480'i
+        # scalper'ın eşiğini ŞİŞİRMEZ; cüzdandan düşülür).
+        assert engine._daily_loss_threshold_usdt == pytest.approx(-150.0)

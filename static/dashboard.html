@@ -1319,6 +1319,12 @@
     STRAT_ORDER.forEach(function(k){
       container.appendChild(strategyCardHtml(k, strategies[k], k === leaderKey));
     });
+    // D20b: gömülü AlgoPro takipçisinin defteri (AP) TOPLAM'a girmez ama
+    // kendi kartında görünür — winrate/PF panoda başka hiçbir yerde yok.
+    var apStats = stats.data.AP || null;
+    if (apStats && isNum(apStats.trades) && apStats.trades > 0){
+      container.appendChild(strategyCardHtml("AP", apStats, false));
+    }
     container.appendChild(strategyCardHtml("combined", combined, false));
   }
 
@@ -1401,6 +1407,12 @@
     grid += apKv("Açık pozisyon", positions.length + " / " + (f.max_positions || "?"));
     grid += apKv("Komisyon kapısı reddi", String(f.fee_gate_rejects || 0),
       (f.fee_gate_rejects || 0) > 0 ? "ap-warn" : "");
+    // D20b: takipçi evreni DIŞINDA kalan AlgoPro alarmları. Sıfırdan büyükse
+    // TV'de kapatılmamış alarmlar var demektir (o sinyaller ana bota da
+    // gitmez — bilinçli).
+    var outsideRejects = (f.reject_counters || {})["symbol_not_in_follower_universe"] || 0;
+    grid += apKv("Evren dışı alarm", String(outsideRejects),
+      outsideRejects > 0 ? "ap-warn" : "");
     grid += apKv("Alarm olayı", String(f.events_total || 0));
     grid += apKv("Son olay", f.last_event_at ? fmtClock(f.last_event_at) : "—");
     qs("ap-grid").innerHTML = grid;
@@ -1437,6 +1449,15 @@
     }
 
     var notes = [];
+    // D20b: hiçbir motorun izlemediği CANLI pozisyon. YETİM DEĞİLDİR
+    // (elle/Telegram açılmış olabilir) — takipçi dokunmaz, girişleri
+    // durdurmaz. BAĞIMSIZ satır: else-if zincirinde `entry_halted`/
+    // `kill_switch`/`orphan_positions` aktifken gizlenirdi.
+    if ((f.unknown_positions || []).length){
+      notes.push('<span class="ap-warn">SAHİPSİZ POZİSYON: ' +
+        escapeHtml((f.unknown_positions || []).join(", ")) +
+        ' (takipçi dokunmuyor — elle/Telegram açılmış olabilir)</span>');
+    }
     if (f.forward_bridge_conflict){
       // Gömülü modda HTTP köprüsü çağrılmaz: FOLLOWER_FORWARD_URL doluysa
       // ayrı halka (tradingbot_ap) hiçbir AlgoPro olayı ALMIYOR demektir.
@@ -1458,13 +1479,6 @@
     } else if ((f.orphan_positions || []).length){
       warn = '<span class="ap-warn">YETİM POZİSYON: ' +
         escapeHtml((f.orphan_positions || []).join(", ")) + '</span>';
-    } else if ((f.unknown_positions || []).length){
-      // D20b: hiçbir motorun izlemediği CANLI pozisyon. YETİM DEĞİLDİR
-      // (elle/Telegram açılmış olabilir) — takipçi ona dokunmaz ve girişleri
-      // durdurmaz; yalnız görünür olmalıdır.
-      warn = '<span class="ap-warn">SAHİPSİZ POZİSYON: ' +
-        escapeHtml((f.unknown_positions || []).join(", ")) +
-        ' (takipçi dokunmuyor — elle/Telegram açılmış olabilir)</span>';
     } else if (!f.entries_ready && f.entry_block_reason){
       warn = '<span class="ap-warn">giriş kapalı: ' +
         escapeHtml(String(f.entry_block_reason)) + '</span>';

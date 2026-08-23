@@ -311,6 +311,9 @@ class ScalperEngine:
         self._balance_cache: Tuple[Optional[float], float] = (None, 0.0)
         self._daily_pnl: float = 0.0
         self._daily_pnl_source: str = "unavailable"
+        # Yalnız BİLGİ (D20b/Y8): gömülü modda hesabın ham günlük income'ı;
+        # kesici bunu KULLANMAZ, iki sayının farkı operatöre gösterilir.
+        self._daily_income_account: Optional[float] = None
         self._risk_equity_usdt: Optional[float] = None
         self._risk_equity_source: str = "unavailable"
         self._daily_loss_threshold_usdt: Optional[float] = None
@@ -425,6 +428,7 @@ class ScalperEngine:
             return
 
         self.logger.info("⚡ Scalper motoru başlatılıyor...")
+        await self._assert_universe_survives_follower_reservation()
         self._maybe_log_shadow_mode_banner()
         self._maybe_log_market_gate_banner()
         self._log_kline_source()
@@ -921,6 +925,23 @@ class ScalperEngine:
         # korunur; restart asla bu sınırı temizlemez.
         for symbol in self.exits.tracked_symbols() | self.executor.pending_symbols():
             if not symbol_reservations.reserve(symbol, self._RESERVATION_OWNER):
+                # D20b (doğrulayıcı bulgusu Y6): gömülü modda çakışan sembolün
+                # sahibi TAKİPÇİYSE bu bir veri tutarsızlığı değil, iki motorun
+                # aynı hesabı paylaşmasının olağan sonucudur (defter filtresi
+                # zaten aynı satırı iki kez kurtarmayı imkânsız kılar). Kalıcı
+                # halt dosyası YAZMA ve döngüyü KIRMA — atla, uyar, devam et.
+                # Ayrı halka ve diğer TÜM sahipler AYNEN eski davranışta.
+                if (
+                    bool(getattr(self.cfg, "follower_embedded", False))
+                    and symbol_reservations.owner(symbol)
+                    == FOLLOWER_RESERVATION_OWNER
+                ):
+                    self.logger.warning(
+                        f"⚠️ {symbol}: sembol gömülü AlgoPro takipçisinin "
+                        f"yönetiminde — scalper kurtarmasında ATLANDI "
+                        f"(kalıcı kilit yazılmadı)."
+                    )
+                    continue
                 await self._latch_entry_halt(
                     UnprotectedPositionError(
                         f"{symbol}: restart recovery sırasında başka motor sahipliği bulundu"
@@ -1073,6 +1094,53 @@ class ScalperEngine:
         except Exception:  # pragma: no cover - kayıt taramayı düşürmez
             return set()
 
+    async def _assert_universe_survives_follower_reservation(self) -> None:
+        """`FOLLOWER_SYMBOLS` scalper'ın GERÇEK evrenini boşaltıyor mu? (D20b)
+
+        NEDEN BURADA (doğrulayıcı bulgusu Y1): `config.py`'deki startup kontrolü
+        yalnız `SCALPER_SYMBOL_ALLOWLIST` DOLUYKEN çalışabilir — canlı `.env`'de
+        o satır YOKTUR (varsayılan boş) ve gerçek evren `scanner.get_universe()`
+        ten gelir. Yani koruma canlı yapılandırmada ÖLÜYDÜ: 8 sembolün hepsini
+        `FOLLOWER_SYMBOLS`a yazmak scalper'ı sessizce hiç tarama yapmaz hâle
+        getiriyordu.
+
+        Evren okunamazsa (ağ/ban) kontrol ATLANIR + WARNING: bir teşhis
+        kontrolü, borsa erişimi yokken botu başlatmamazlık etmemeli
+        (2026-08-12 ban dersi). O hâlde ikinci katman tarama turundadır
+        (`_exclude_follower_symbols` → `_mark_scan_degraded`).
+        """
+        reserved = self._follower_reserved_symbols()
+        if not reserved:
+            return
+        allowlist_csv = str(
+            getattr(self.cfg, "scalper_symbol_allowlist", "") or ""
+        ).strip()
+        if allowlist_csv:
+            universe = [s.strip().upper() for s in allowlist_csv.split(",") if s.strip()]
+            source = "SCALPER_SYMBOL_ALLOWLIST"
+        else:
+            try:
+                universe = [
+                    str(s).upper() for s in (await self.scanner.get_universe() or [])
+                ]
+            except Exception as exc:
+                self.logger.warning(
+                    f"⚠️ Takipçi evren kontrolü yapılamadı (tarama evreni "
+                    f"okunamadı: {exc}); tarama turunda tekrar denenecek"
+                )
+                return
+            source = "scanner"
+        if not universe:
+            return
+        if set(universe) - reserved:
+            return
+        raise RuntimeError(
+            f"AYAR HATASI: FOLLOWER_SYMBOLS ({', '.join(sorted(reserved))}) "
+            f"scalper'ın tarama evrenini ({source}: {', '.join(universe)}) "
+            f"TAMAMEN boşaltıyor — scalper hiçbir sembolü tarayamaz. "
+            f"Takipçiye ayrılmamış en az bir sembol bırakın."
+        )
+
     def _exclude_follower_symbols(self, universe: List[str]) -> List[str]:
         """Tarama evreninden takipçi sembollerini çıkar (bir kez loglar)."""
         reserved = self._follower_reserved_symbols()
@@ -1085,6 +1153,14 @@ class ScalperEngine:
             self.logger.info(
                 f"🤖 Tarama evreninden çıkarıldı — AlgoPro takipçisine ayrılmış: "
                 f"{', '.join(dropped)}"
+            )
+        if universe and not kept:
+            # Startup kontrolü ATLANMIŞ olabilir (evren o an okunamadı) ya da
+            # evren sonradan daralmış olabilir: tur SESSİZ geçmesin.
+            self._mark_scan_degraded(
+                f"tarama evreni FOLLOWER_SYMBOLS ({', '.join(sorted(reserved))}) "
+                f"tarafından tamamen boşaltıldı",
+                kind="universe_empty",
             )
         return kept
 
@@ -3618,6 +3694,9 @@ class ScalperEngine:
             "recovery_ready": self._recovery_ready,
             "risk_ready": self._risk_ready,
             "daily_pnl_source": self._daily_pnl_source,
+            # Yalnız BİLGİ: gömülü modda hesabın ham günlük income'ı (kesici
+            # bunu KULLANMAZ). None = okunamadı ya da gömülü mod kapalı.
+            "daily_income_account": getattr(self, "_daily_income_account", None),
             "last_success_at": self._exchange_last_success_at,
             "last_success_age_seconds": (
                 round(exchange_age, 3) if exchange_age is not None else None
@@ -4252,6 +4331,19 @@ class ScalperEngine:
         )
         self._risk_ready = True
 
+        # BİLGİ AMAÇLI (davranış DEĞİŞMEZ, doğrulayıcı bulgusu Y8): gömülü modda
+        # kesici defterden beslenir ve AÇIK pozisyonların FUNDING_FEE/COMMISSION
+        # kalemlerini GÖRMEZ (ölçüm: defter −50 iken hesap income −380). Hesabın
+        # ham günlük income'ı burada raporlanır ki operatör iki sayı arasındaki
+        # farkı görebilsin. Okuma başarısızlığı kesiciyi ETKİLEMEZ.
+        if embedded:
+            try:
+                self._daily_income_account = await self._get_account_daily_net_income(
+                    today
+                )
+            except Exception:
+                self._daily_income_account = None
+
         if self._kill_switch:
             return  # zaten tetiklenmiş — gün UTC değişene kadar kapalı kalır
 
@@ -4284,7 +4376,23 @@ class ScalperEngine:
 
         self._risk_equity_usdt = balance
 
-        approximate_day_start_balance = max(balance - pnl, 0.0)
+        # D20b (doğrulayıcı bulgusu Y9): `balance` PAYLAŞILAN cüzdandır (AP
+        # kâr/zararı dahil), `pnl` ise yalnız scalper defteridir. Gömülü modda
+        # GERÇEK cüzdan kullanılıyorsa (sanal kasa kapalı) günün AÇILIŞ
+        # sermayesi AP'nin bugünkü defter PnL'i de düşülerek yaklaşıklanır —
+        # aksi halde takipçinin kârı/zararı scalper'ın eşiğini kaydırırdı.
+        day_start_offset = pnl
+        if embedded and self._risk_equity_source == "exchange_wallet":
+            try:
+                day_start_offset = pnl + await self._ledger_daily_pnl(
+                    today, strategies=(FOLLOWER_LEDGER_STRATEGY,)
+                )
+            except Exception as exc:  # teşhis; eşik hesabı düşmemeli
+                self.logger.warning(
+                    f"⚠️ Gün-başı sermaye yaklaşıklığında AP defteri okunamadı "
+                    f"({exc}); eşik yalnız scalper PnL'iyle ölçüldü"
+                )
+        approximate_day_start_balance = max(balance - day_start_offset, 0.0)
         threshold = (
             -approximate_day_start_balance
             * self.cfg.scalper_daily_loss_limit_pct
@@ -4344,7 +4452,9 @@ class ScalperEngine:
         self._income_cache_close_seq = getattr(self.tracker, "close_seq", 0)
         return net
 
-    async def _ledger_daily_pnl(self, today: str) -> float:
+    async def _ledger_daily_pnl(
+        self, today: str, *, strategies=None
+    ) -> float:
         """Scalper'ın KENDİ defterinden bugünkü net PnL (gömülü mod, D20b).
 
         Kaynak `scalp_trades` (AP satırları HARİÇ); `realized_pnl` komisyon
@@ -4360,6 +4470,8 @@ class ScalperEngine:
                 "PnL'i defterden okunamıyor"
             )
         day_start = datetime.strptime(today, "%Y-%m-%d")
+        if strategies:
+            return float(await getter(day_start, strategies=tuple(strategies)))
         return float(
             await getter(day_start, exclude_strategies=(FOLLOWER_LEDGER_STRATEGY,))
         )
@@ -4491,6 +4603,9 @@ class ScalperEngine:
             "market_gate": self._market_gate_status(),
             "daily_pnl": self._daily_pnl,
             "daily_pnl_source": self._daily_pnl_source,
+            # Yalnız BİLGİ: gömülü modda hesabın ham günlük income'ı (kesici
+            # bunu KULLANMAZ). None = okunamadı ya da gömülü mod kapalı.
+            "daily_income_account": getattr(self, "_daily_income_account", None),
             "risk_ready": self._risk_ready,
             "risk_equity_usdt": self._risk_equity_usdt,
             "risk_equity_source": self._risk_equity_source,

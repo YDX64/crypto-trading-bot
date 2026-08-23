@@ -121,6 +121,56 @@ def _risk_engine():
     return scalper_engine or follower_engine
 
 
+#: Gömülü takipçi KAPALIYKEN defterde açık kalmış AP satırları (D20b).
+#: `/health` bunu ayrı bir alan olarak raporlar; hard fail YOKTUR (418/ban
+#: kuralı: teşhis bir restart döngüsü doğurmamalı).
+_orphaned_follower_trades: list = []
+
+
+async def _check_disabled_follower_open_trades() -> list:
+    """`FOLLOWER_EMBEDDED=false` iken DB'de OPEN AP satırı var mı? (D20b)
+
+    NEDEN (doğrulayıcı bulgusu Y10): gömülü mod açıkken pozisyon açıp bayrağı
+    kapatmak, o pozisyonu HİÇBİR motorun yönetmediği bir hâle sokar — takipçi
+    hiç başlamaz, scalper da defter filtresi yüzünden AP satırını almaz.
+    Borsada SL/TP emirleri durur ama TP1→BE, EXIT/flip ve kapanış defteri
+    çalışmaz.
+
+    KASTEN hard fail DEĞİL: startup'ı düşürmek ban/deploy döngüsü doğurur ve
+    pozisyonu KAPATMAZ. CRITICAL log + `/health` alanı + RUNBOOK reçetesi.
+    """
+    global _orphaned_follower_trades
+    _orphaned_follower_trades = []
+    if settings.follower_active:
+        return []
+    try:
+        rows = await ScalpTracker().open_trades(
+            strategies=(FOLLOWER_LEDGER_STRATEGY,)
+        )
+    except Exception as exc:  # pragma: no cover - teşhis startup'ı düşürmez
+        app_logger.warning(
+            f"⚠️ Açık AP işlemleri kontrol edilemedi ({exc}); "
+            f"gömülü takipçi kapalıyken yönetimsiz pozisyon olabilir"
+        )
+        return []
+    if not rows:
+        return []
+    _orphaned_follower_trades = [
+        {"id": r.id, "symbol": r.symbol, "direction": r.direction} for r in rows
+    ]
+    symbols = sorted({str(r.symbol) for r in rows})
+    app_logger.bind(trade=True).critical(
+        f"🚨 FOLLOWER_EMBEDDED KAPALI ama defterde AÇIK AlgoPro işlemi var: "
+        f"{symbols}. Bu pozisyonları HİÇBİR motor yönetmiyor (TP1→BE, EXIT ve "
+        f"kapanış defteri ÇALIŞMAZ; borsadaki SL/TP emirleri durur). Çözüm: "
+        f"FOLLOWER_EMBEDDED=true ile yeniden başlatıp /risk-event flatten ile "
+        f"kapatın, ya da pozisyonları elle kapatıp scalp_trades satırlarını "
+        f"kapanmış olarak işaretleyin (docs/RUNBOOK.md 'Gömülü takipçiyi "
+        f"kapatma')."
+    )
+    return _orphaned_follower_trades
+
+
 def _foreign_tracked_symbols() -> set:
     """Takipçi DIŞINDAKİ motorların GERÇEKTEN yönettiği semboller (D20b).
 
@@ -129,9 +179,10 @@ def _foreign_tracked_symbols() -> set:
     düştüğünde DONAR (`_sync_scalper_reservations` ilk satırda döner), o
     yüzden tek başına ne yanlış-pozitifi ne yanlış-negatifi engeller.
 
-    Hata hâlinde boş küme DÖNMEZ — istisna çağırana bırakılır ve orada
-    loglanır (sessiz bir boş küme, Telegram'ın pozisyonlarını "sahipsiz"
-    gösterirdi).
+    Hata hâlinde istisna YUTULMAZ: çağıran (`FollowerEngine._foreign_tracked_
+    symbols`) onu yakalar, WARNING loglar ve o tur için boş küme kullanır —
+    yani denetim rezervasyon kaydına düşer, SESSİZ kalmaz. Burada yakalamamak
+    bilinçlidir: hatanın kaynağı çağıranın log satırında görünmelidir.
     """
     symbols: set = set()
     if scalper_engine is not None:
@@ -356,6 +407,11 @@ async def lifespan(app: FastAPI):
                     extra={"trade": True},
                 )
 
+        # Bayrak kapalıyken defterde açık AP satırı kaldıysa SESSİZ kalma.
+        # Telegram supervisor'ından ÖNCE: `await`, supervisor task'ına sıra
+        # verirdi ve lifespan başlatma sırası testleri kırılırdı.
+        await _check_disabled_follower_open_trades()
+
         # Telegram ağ/409 hatası scalper safety döngülerini öldürmemeli.
         # Supervisor tam yaşam döngüsünü await eder ve bounded backoff ile
         # yeniden dener; health Telegram'ı ayrı bir bileşen olarak raporlar.
@@ -563,6 +619,16 @@ async def health_check():
             "running" if follower_health.get("healthy") else "degraded"
         )
         body["follower_details"] = follower_health
+    elif _orphaned_follower_trades:
+        # D20b: bayrak KAPALI ama defterde açık AP satırı var → o pozisyonlar
+        # YÖNETİMSİZ. `core_healthy` KASTEN etkilenmez (hard fail bir restart
+        # döngüsü doğurur ve pozisyonu kapatmaz); operatör burada görür.
+        body["follower"] = "disabled_with_open_trades"
+        body["follower_details"] = {
+            "healthy": False,
+            "reason": "follower_disabled_but_open_ap_trades",
+            "open_trades": list(_orphaned_follower_trades),
+        }
     # Telegram has its own retry supervisor.  Its outage is reported as
     # degraded but does not provoke a process restart while the trading core
     # and protection loops remain healthy.
@@ -1213,7 +1279,11 @@ async def _maybe_route_embedded_follower(raw: str, *, dry_run: bool):
             algopro_alert_kind,
             parse_follower_event,
         )
-        from src.strategies.follower.types import KIND_ENTRY, FollowerParseError
+        from src.strategies.follower.types import (
+            KIND_ENTRY,
+            ROUTE_REJECT_OUTSIDE_UNIVERSE,
+            FollowerParseError,
+        )
     except Exception as exc:  # pragma: no cover - savunmacı
         app_logger.warning(f"⚠️ Gömülü takipçi tanıyıcısı yüklenemedi ({exc})")
         return None
@@ -1255,13 +1325,15 @@ async def _maybe_route_embedded_follower(raw: str, *, dry_run: bool):
                     event.direction.value if event.direction is not None else None
                 ),
                 "accepted": not outside,
-                "reason": "symbol_not_in_follower_universe" if outside else None,
+                "reason": ROUTE_REJECT_OUTSIDE_UNIVERSE if outside else None,
             },
         }
 
     if outside:
         if follower_engine is not None:
-            follower_engine.note_route_reject("symbol_not_in_follower_universe")
+            follower_engine.note_route_reject(
+                ROUTE_REJECT_OUTSIDE_UNIVERSE, kind=event.kind
+            )
         app_logger.warning(
             f"⚠️ AlgoPro girişi işlenmedi: {event.symbol} takipçi evreninde "
             f"({sorted(universe)}) DEĞİL. Gömülü modda AlgoPro alert() gövdeleri "
@@ -1275,7 +1347,7 @@ async def _maybe_route_embedded_follower(raw: str, *, dry_run: bool):
             "kind": event.kind,
             "symbol": event.symbol,
             "accepted": False,
-            "reason": "symbol_not_in_follower_universe",
+            "reason": ROUTE_REJECT_OUTSIDE_UNIVERSE,
         }
 
     if not follower_engine:
@@ -2185,14 +2257,25 @@ async def risk_event(request: Request):
         }
 
     if action == "resume":
-        for extra_engine in engines[1:]:
-            extra_engine.risk_event_resume()
+        # Çapraz kontrol (doğrulayıcı bulgusu): `halt` dalındaki simetrik
+        # kontrol `resume`'da YOKTU — takipçinin halt dosyası silinemezse yanıt
+        # `ok:true` derken takipçi HALT'ta kalırdı.
+        extra_resumes = [e.risk_event_resume() for e in engines[1:]]
         snap = engine.risk_event_resume()
+        if any(bool(x.get("active")) for x in extra_resumes):
+            app_logger.bind(trade=True).critical(
+                "🚨 /risk-event resume: takipçi motorunda halt HÂLÂ AKTİF "
+                "(dosya silinemedi?) — gömülü halkada AlgoPro girişleri kapalı "
+                "kalır. state/ dizinini ve disk iznini kontrol edin."
+            )
         # ok=False: dosya silinemediyse (OSError) halt file-derived olarak
         # AKTİF kalır (bkz. risk_event_resume) — yanıt bunu "başarılı resume"
         # gibi göstermemeli (I).
         return {
-            "ok": not snap.get("active"),
+            # `ok` ARTIK iki motoru da kapsar: biri halt'ta kaldıysa "resume
+            # başarılı" demek operatörü yanıltır.
+            "ok": not snap.get("active")
+            and not any(bool(x.get("active")) for x in extra_resumes),
             "action": action,
             "halted_until": snap.get("until_ts"),
             "reason": snap.get("reason"),
@@ -2599,6 +2682,9 @@ _EMPTY_SCALPER_STATUS = {
     "virtual_capital_current_usdt": None,
     "virtual_capital_start_trade_id": 0,
     "symbol_reservations": {},
+    # D20b/Y8: gömülü modda hesabın ham günlük income'ı — YALNIZ BİLGİ
+    # (kesici defterden beslenir). Motor yokken de anahtar bulunmalı.
+    "daily_income_account": None,
 }
 
 

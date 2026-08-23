@@ -782,31 +782,58 @@ class Settings(BaseSettings):
     FOLLOWER_SL_MARGIN_PCT_MIN: ClassVar[float] = 10.0
     FOLLOWER_SL_MARGIN_PCT_MAX: ClassVar[float] = 50.0
 
+    #: `__init__` bağlamı — doğrulayıcılar ÖRNEĞE verilen `_env_file`i buradan
+    #: okur. Sınıf düzeyindeki `model_config["env_file"]` (".env") KULLANILMAZ:
+    #: `Settings(_env_file=None)` diyen bir test, dosyayı OKUMAMIŞ olmalıdır —
+    #: aksi halde sunucunun canlı `.env`'i test paketine sızar ve deploy
+    #: kapısını kırar (bulgu 29'un aynı sınıfı, doğrulayıcı bulgusu Y2).
+    #: Bağlam yalnız `super().__init__` süresince doludur ve tek iş parçacığında
+    #: kurulur/temizlenir.
+    _CTOR_ENV_FILE_UNSET: ClassVar[object] = object()
+    _CTOR_CONTEXT: ClassVar[dict] = {}
+
+    def __init__(self, **values):
+        type(self)._CTOR_CONTEXT = {
+            "env_file": values.get("_env_file", self._CTOR_ENV_FILE_UNSET),
+        }
+        try:
+            super().__init__(**values)
+        finally:
+            type(self)._CTOR_CONTEXT = {}
+
     def _raw_env_value(self, key: str) -> Optional[str]:
-        """`key`in HAM değeri: önce süreç ortamı, sonra `.env` dosyası.
+        """`key`in HAM değeri: önce süreç ortamı, sonra BU ÖRNEĞİN env dosyası.
 
         Pydantic bir alanı iki aliasla besleyebildiğinde HANGİSİNİN kazandığını
         dışarı vermez; "sessiz galip yok" ilkesini uygulamak için kaynağa
-        doğrudan bakılır. Dosya okunamazsa None döner (kontrol atlanır —
-        bir teşhis kontrolü startup'ı düşürmemeli).
+        doğrudan bakılır — ama YALNIZ bu örneğin gerçekten kullandığı
+        kaynaklara: `_env_file=None` verilmişse hiçbir dosya OKUNMAZ.
+        Dosya okunamazsa None döner (teşhis kontrolü startup'ı düşürmemeli).
         """
         for name, value in os.environ.items():
             if name.upper() == key.upper():
                 return value
-        try:
+        env_file = type(self)._CTOR_CONTEXT.get(
+            "env_file", self._CTOR_ENV_FILE_UNSET
+        )
+        if env_file is self._CTOR_ENV_FILE_UNSET:
+            # `_env_file` hiç verilmedi → sınıf varsayılanı geçerlidir.
             env_file = self.model_config.get("env_file")
-            if not env_file:
-                return None
-            path = Path(str(env_file))
-            if not path.exists():
-                return None
-            for line in path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
+        if not env_file:
+            return None
+        try:
+            candidates = env_file if isinstance(env_file, (list, tuple)) else [env_file]
+            for candidate in candidates:
+                path = Path(str(candidate))
+                if not path.exists():
                     continue
-                name, _, value = line.partition("=")
-                if name.strip().upper() == key.upper():
-                    return value.strip().strip('"').strip("'")
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    name, _, value = line.partition("=")
+                    if name.strip().upper() == key.upper():
+                        return value.strip().strip('"').strip("'")
         except Exception:  # pragma: no cover - teşhis kontrolü
             return None
         return None
@@ -828,12 +855,23 @@ class Settings(BaseSettings):
                 return self
         except (TypeError, ValueError):
             pass
-        raise ValueError(
+        message = (
             "AYAR ÇELİŞKİSİ: FOLLOWER_LEV_MAX="
             f"{old_raw!r} ile FOLLOWER_MAX_LEVERAGE={new_raw!r} AYNI ayardır "
             "ama farklı verildi. Yalnız birini yazın "
             "(yeni ad: FOLLOWER_MAX_LEVERAGE)."
         )
+        # FAIL-FAST YALNIZ TAKİPÇİ KOŞACAKSA (SL_MARGIN_PCT bandıyla AYNI
+        # ilke): takipçiyi hiç çalıştırmayan bir süreçte bu ikilik inerttir ve
+        # ANA botu başlatamaz hâle getirmesi kabul edilemez (deploy → sağlık
+        # yoklaması başarısız → otomatik geri alma). Takipçi aktifken kaldıraç
+        # tavanı gerçekten belirsizdir → sessiz galip YOK.
+        if self.follower_active:
+            raise ValueError(message)
+        warnings.warn(
+            message + " (takipçi KAPALI olduğu için yalnız uyarı)", stacklevel=2
+        )
+        return self
 
     @model_validator(mode="after")
     def _reconcile_follower_sl_margin(self) -> "Settings":

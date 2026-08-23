@@ -40,6 +40,7 @@ from src.strategies.follower.levels import (
 from src.strategies.follower.risk_halt import RiskEventHaltStore
 from src.strategies.follower.types import (
     KIND_ENTRY,
+    ROUTE_REJECT_OUTSIDE_UNIVERSE,
     KIND_EXIT,
     KIND_SL,
     KIND_TP3,
@@ -350,24 +351,35 @@ class FollowerEngine:
         return True
 
     async def _attempt_recovery(self) -> bool:
+        """Restart kurtarması + kurtarılan sembollerin SAHİPLENİLMESİ.
+
+        SAHİPLİK DÖNGÜSÜ İSTİSNA YOLLARINDA DA KOŞAR (doğrulayıcı bulgusu,
+        YÜKSEK regresyon): `exits.recover()` bir satırı izlemeye ALIP sonraki
+        satırda `UnprotectedPositionError` yükseltebilir. Erken `return`
+        edilirse o sembol "izleniyor ama rezerve DEĞİL" kalır ve scalper aynı
+        net pozisyona girebilir — yeniden deneme 30 sn'de bir, kalıcı hatada
+        pencere SÜRESİZ açık. Scalper aynı işi TÜM yollarda yapar
+        (`scalper/engine.py`: "Başarısız/yarım recovery'de de …"); iki motor
+        ancak böyle simetriktir.
+
+        Sahiplik BURADA alınır, `start()`'ta değil: ilk borsa probu başarısız
+        olursa kurtarma `_exchange_loop`'ta GEÇ çalışır ve `start()`'taki bir
+        döngü o yolu hiç görmezdi.
+        """
         try:
             recovered = await self.exits.recover()
         except UnprotectedPositionError as exc:
             self._recovery_ready = False
             self._latch_entry_halt(exc, source="restart recovery")
-            return False
         except Exception as exc:
             self._recovery_ready = False
             self.logger.error(
                 f"❌ Takipçi restart kurtarması başarısız: {exc}", exc_info=True
             )
-            return False
-        self._recovery_ready = bool(recovered)
-        # SEMBOL SAHİPLİĞİ BURADA alınır — start()'ta DEĞİL (düşmanca inceleme):
-        # ilk borsa probu başarısız olursa kurtarma `_exchange_loop`'ta GEÇ
-        # çalışır ve start()'taki döngü o yolu hiç görmezdi; kurtarılan
-        # pozisyonlar süreç ömrü boyunca SAHİPSİZ kalırdı. Scalper aynı işi
-        # `_attempt_recovery` içinde yapar — iki motor artık simetriktir.
+        else:
+            self._recovery_ready = bool(recovered)
+        # KOŞULSUZ: yarım kalmış kurtarmada izlemeye ALINMIŞ semboller de
+        # sahiplenilir (fail-closed yön — sahipsiz izlenen sembol bırakmaz).
         self._reserve_recovered_symbols()
         if not self._recovery_ready:
             self.logger.error(
@@ -622,9 +634,14 @@ class FollowerEngine:
         if self._embedded() and not mine:
             # Gömülü mod: SAHİPSİZ ama MEŞRU olabilir → yalnız GÖRÜNÜRLÜK.
             self._orphans = []
+            # Sayaç TUR başına değil OLAY başına artar (doğrulayıcı bulgusu):
+            # safety turu 2 sn'de bir koştuğu için eski hâli "kaç tur geçti"yi
+            # ölçüyordu ve diğer `reject_counters` anahtarlarıyla anlamı
+            # uyuşmuyordu. Sembol kümesi DEĞİŞTİĞİNDE bir kez artar.
             first_time = found != self._unknown_positions
             self._unknown_positions = found
-            self._count_reject("unknown_position")
+            if first_time:
+                self._count_reject("unknown_position")
             if first_time:
                 self.logger.warning(
                     f"⚠️ Hesapta SAHİPSİZ açık pozisyon(lar): {found} — hiçbir "
@@ -976,15 +993,29 @@ class FollowerEngine:
     def _count_reject(self, reason: str) -> None:
         self._reject_counters[reason] = self._reject_counters.get(reason, 0) + 1
 
-    def note_route_reject(self, reason: str) -> None:
+    def note_route_reject(self, reason: str, *, kind: str = KIND_ENTRY) -> None:
         """Köprü katmanında (motora HİÇ ulaşmadan) reddedilen olayı say.
 
         D20b: takipçi evreni dışındaki AlgoPro girişleri motora verilmez ama
-        SESSİZ de kalmaz — `/follower/status → reject_counters` üzerinden
-        ölçülebilir olmalıdır ("kaç alarm boşa gitti?").
+        SESSİZ de kalmaz. Doğrulayıcı bulgusu: yalnız `reject_counters`
+        artırmak YETMİYORDU — panonun "Alarm olayı"/"Son olay" satırları
+        `event_counters`/`last_event_at`ten beslendiği için o alarmlar panoda
+        HİÇ görünmüyordu. Artık olay sayacı da artar ve olay geçmişine
+        (`events`) bir satır düşer.
         """
         self._count_reject(reason)
+        self._count_event(kind)
         self._last_event_at = _utcnow_iso()
+        self._events.append(
+            {
+                "at": self._last_event_at,
+                "kind": kind,
+                "symbol": None,
+                "accepted": False,
+                "reason": reason,
+                "routed": "bridge",
+            }
+        )
 
     def _record_event(self, event: FollowerEvent, result: Dict[str, Any]) -> None:
         self._last_event_at = _utcnow_iso()
@@ -1049,8 +1080,16 @@ class FollowerEngine:
         if event.kind == KIND_ENTRY:
             allowlist = self.symbol_allowlist()
             if allowlist and symbol not in allowlist:
-                self._count_reject("symbol_allowlist")
-                return {"accepted": False, "reason": "sembol takipçi evreninde değil"}
+                # TEK AD (doğrulayıcı bulgusu): gömülü köprü ile ayrı halkanın
+                # `/follower/event` yolu AYNI reddi AYNI adla raporlar; aksi
+                # halde "kaç alarm evren dışında kaldı?" sorusu iki farklı
+                # sayaçtan toplanmak zorunda kalırdı.
+                self._count_reject(ROUTE_REJECT_OUTSIDE_UNIVERSE)
+                return {
+                    "accepted": False,
+                    "reason": ROUTE_REJECT_OUTSIDE_UNIVERSE,
+                    "detail": "sembol takipçi evreninde değil",
+                }
 
             configured_tf = str(getattr(self.cfg, "follower_timeframe", "1") or "1")
             tf = str(event.timeframe or "")

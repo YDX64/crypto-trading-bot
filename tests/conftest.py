@@ -43,39 +43,62 @@ def _reset_rest_weight_state():
     ImprovedBinanceClient.reset_weight_state()
 
 
-#: Gömülü takipçi (D20b) ayarlarının TEST İZOLASYONU.
+#: Takipçi/mod ayarlarının TEST İZOLASYONU (D20b).
 #:
-#: NEDEN (düşmanca inceleme bulgu 29 — KRİTİK): `Settings.model_config`
-#: `env_file=".env"` kullanır ve yol ÇALIŞMA DİZİNİNE görelidir. Sunucuda
-#: `scripts/server_deploy.sh` testleri `/opt/tradingbot-v2` içinde koşturur →
-#: pytest CANLI `.env`'i okur. Operatör `FOLLOWER_EMBEDDED=true` yazdığı an
-#: gömülü mod TÜM testlerde açılır, `/tv-signal` testleri takipçiye yönlenir,
-#: ilk kırmızı testte `pytest -x` durur ve deploy KODU GERİ ALIP çalışan
-#: süreci yeniden başlatır. Yani bir AYAR dosyası kod kapısını kırar ve
-#: gömülü mod açıldıktan sonra hiçbir değişiklik canlıya giremez.
+#: NEDEN (düşmanca inceleme bulgu 29 + doğrulayıcı bulguları Y2/Y3/Y4 — KRİTİK):
+#: `Settings.model_config` `env_file=".env"` kullanır ve yol ÇALIŞMA DİZİNİNE
+#: görelidir. `scripts/server_deploy.sh` testleri halkanın KENDİ dizininde
+#: koşturur → pytest CANLI `.env`'i okur. Üç ölçülmüş kırılma:
+#:   * `FOLLOWER_EMBEDDED=true` → `/tv-signal` testleri takipçiye yönlenir;
+#:   * `BOT_MODE=follower` (takipçi halkasının ZORUNLU ayarı) → lifespan erken
+#:     dala girer, `/health` testleri kırmızıya döner;
+#:   * herhangi bir `FOLLOWER_*` ayarı (ör. `FOLLOWER_MAX_POSITIONS=9`) tekile
+#:     sızar.
+#: İlk kırmızıda `pytest -x` durur ve deploy KODU GERİ ALIP çalışan süreci
+#: yeniden başlatır: bir AYAR dosyası kod kapısını kırar.
 #:
 #: Çözüm iki katmanlıdır (ikisi de gerekli):
-#:   1. süreç ortamındaki `FOLLOWER_*` değişkenlerini SİL — testlerin kurduğu
+#:   1. süreç ortamındaki ilgili değişkenleri SİL — testlerin kurduğu
 #:      `Settings(...)` örnekleri sunucu ortamından etkilenmesin;
-#:   2. süreç-geneli `settings` tekilinde gömülü modu KAPALI sabitle — gömülü
-#:      davranışın pozitif testleri onu kendi içinde açıkça açar
-#:      (tests/test_follower_embedded.py).
+#:   2. süreç-geneli `settings` tekilinde TÜM `follower_*` alanlarını ve
+#:      `bot_mode`u SINIF VARSAYILANINA sabitle — gömülü/ayrı halka davranışının
+#:      pozitif testleri onları kendi içinde açıkça açar
+#:      (tests/test_follower_embedded.py, tests/test_follower_mode.py).
 #:
 #: `.env` DOSYASINDAN gelen sızıntıyı yalnız (2) durdurur; ortam değişkeni
 #: sızıntısını yalnız (1). Bu yüzden ikisi birlikte durur.
-_FOLLOWER_SETTINGS_ISOLATION = {
-    "follower_embedded": False,
-    "follower_symbols": "",
-    "follower_forward_url": "",
-    "follower_forward_secret": "",
-}
+_ISOLATED_ENV_PREFIXES = ("FOLLOWER_",)
+_ISOLATED_ENV_NAMES = ("BOT_MODE",)
+
+
+def _isolated_settings_fields():
+    """`follower_*` alanlarının TAMAMI + `bot_mode` → sınıf varsayılanları.
+
+    Tek tek listelemek yerine model alanlarından TÜRETİLİR: ileride eklenen
+    bir `FOLLOWER_*` ayarı otomatik olarak izolasyona dahil olur (doğrulayıcı
+    bulgusu Y4: "koruma tek assert uzaklıkta").
+    """
+    from pydantic_core import PydanticUndefined
+
+    pinned = {}
+    for name, field in type(settings).model_fields.items():
+        if not (name.startswith("follower_") or name == "bot_mode"):
+            continue
+        default = field.default
+        if default is PydanticUndefined:
+            continue
+        pinned[name] = default
+    return pinned
 
 
 @pytest.fixture(autouse=True)
 def _isolate_follower_settings(monkeypatch):
     for key in list(os.environ):
-        if key.upper().startswith("FOLLOWER_"):
+        upper = key.upper()
+        if upper in _ISOLATED_ENV_NAMES or any(
+            upper.startswith(prefix) for prefix in _ISOLATED_ENV_PREFIXES
+        ):
             monkeypatch.delenv(key, raising=False)
-    for field, value in _FOLLOWER_SETTINGS_ISOLATION.items():
-        monkeypatch.setattr(settings, field, value, raising=False)
+    for field, value in _isolated_settings_fields().items():
+        monkeypatch.setattr(settings, field, value, raising=True)
     yield
