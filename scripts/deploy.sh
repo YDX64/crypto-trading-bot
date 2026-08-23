@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
-# Yerelden deploy: push edilmiş GitHub kodunu sunucuya uygular (iki halka: testnet | mainnet).
-# Kullanım: scripts/deploy.sh [ssh-host] [hedef-ref] [--ring testnet|mainnet]
-#   scripts/deploy.sh                          → awa, origin/main, testnet halkası (varsayılan)
-#   scripts/deploy.sh awa v1.2.0                → belirli etiket/commit, testnet halkası
-#   scripts/deploy.sh awa v1.2.0 --ring mainnet → mainnet halkası (bkz. aşağı)
+# Yerelden deploy: push edilmiş GitHub kodunu sunucuya uygular
+# (üç halka: testnet | follower | mainnet).
+# Kullanım: scripts/deploy.sh [ssh-host] [hedef-ref] [--ring testnet|follower|mainnet]
+#   scripts/deploy.sh                            → awa, origin/main, testnet halkası (varsayılan)
+#   scripts/deploy.sh awa v1.2.0                  → belirli etiket/commit, testnet halkası
+#   scripts/deploy.sh awa --ring follower         → AlgoPro takipçi halkası (D20, TESTNET)
+#   scripts/deploy.sh awa v1.2.0 --ring mainnet   → mainnet halkası (bkz. aşağı)
 # Geri alma: scripts/deploy.sh awa <önceki-commit>   (backups/commit.prev-* dosyalarında)
+#
+# Takipçi halkası (D20, docs/RUNBOOK.md "AlgoPro takipçi halkası"):
+#   - REPO_DIR=/opt/tradingbot-ap, PROGRAM=tradingbot_ap,
+#     HEALTH_URL=http://127.0.0.1:9093/api/status
+#   - hedef kuralları testnet ile AYNI (origin/main serbest); ayrı Binance
+#     testnet hesabı, ayrı .env/DB/state/log. Mainnet onayı GEREKMEZ — takipçi
+#     halkası mainnet'e çıkamaz (config.py fail-fast, docs/MAINNET_PLAN.md §6).
 #
 # Mainnet halkası (bkz. docs/MAINNET_PLAN.md §1, §5):
 #   - hedef MUTLAKA "vX.Y.Z" biçiminde bir git TAG olmalı — `origin/main` ya da çıplak commit RED edilir
@@ -20,7 +29,7 @@ ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --ring)
-      if [ $# -lt 2 ]; then echo "--ring bir değer bekliyor (testnet|mainnet)" >&2; exit 1; fi
+      if [ $# -lt 2 ]; then echo "--ring bir değer bekliyor (testnet|follower|mainnet)" >&2; exit 1; fi
       RING="$2"
       shift 2
       ;;
@@ -36,8 +45,8 @@ while [ $# -gt 0 ]; do
 done
 
 case "$RING" in
-  testnet|mainnet) ;;
-  *) echo "geçersiz --ring: '$RING' (testnet|mainnet olmalı)" >&2; exit 1 ;;
+  testnet|follower|mainnet) ;;
+  *) echo "geçersiz --ring: '$RING' (testnet|follower|mainnet olmalı)" >&2; exit 1 ;;
 esac
 
 HOST="${ARGS[0]:-awa}"
@@ -47,6 +56,10 @@ if [ "$RING" = "mainnet" ]; then
   REPO_DIR="${REPO_DIR:-/opt/tradingbot-main}"
   PROGRAM="${PROGRAM:-tradingbot_main}"
   HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:9092/api/status}"
+elif [ "$RING" = "follower" ]; then
+  REPO_DIR="${REPO_DIR:-/opt/tradingbot-ap}"
+  PROGRAM="${PROGRAM:-tradingbot_ap}"
+  HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:9093/api/status}"
 else
   REPO_DIR="${REPO_DIR:-/opt/tradingbot-v2}"
 fi
@@ -92,11 +105,11 @@ fi
 
 FLAGS="DEPLOY_SKIP_TESTS=${DEPLOY_SKIP_TESTS:-0} DEPLOY_NO_RESTART=${DEPLOY_NO_RESTART:-0}"
 
-if [ "$RING" = "mainnet" ]; then
-  FLAGS="REPO_DIR=$REPO_DIR PROGRAM=$PROGRAM HEALTH_URL=$HEALTH_URL RING=mainnet $FLAGS"
-  echo "→ $HOST:$REPO_DIR deploy ($TARGET) [ring=mainnet] [$FLAGS]"
-else
+if [ "$RING" = "testnet" ]; then
   echo "→ $HOST:$REPO_DIR deploy ($TARGET) [$FLAGS]"
+else
+  FLAGS="REPO_DIR=$REPO_DIR PROGRAM=$PROGRAM HEALTH_URL=$HEALTH_URL RING=$RING $FLAGS"
+  echo "→ $HOST:$REPO_DIR deploy ($TARGET) [ring=$RING] [$FLAGS]"
 fi
 # Not: server_deploy.sh önce GitHub'dan çekilir ki script'in kendisi de güncel olsun.
 ssh -o BatchMode=yes "$HOST" "cd $REPO_DIR && git fetch -q origin && git show origin/main:scripts/server_deploy.sh > /tmp/server_deploy.sh && env $FLAGS bash /tmp/server_deploy.sh '$TARGET'"

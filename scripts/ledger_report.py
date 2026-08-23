@@ -135,12 +135,20 @@ def iter_days(since: datetime, until: datetime) -> List[str]:
 # --------------------------------------------------------------------------
 
 def load_closed_trades(
-    db_path: str, since: datetime, until: datetime,
+    db_path: str,
+    since: datetime,
+    until: datetime,
+    strategy: Optional[str] = None,
 ) -> Tuple[List[ClosedTrade], int]:
     """`status='CLOSED'` (SHADOW/OPEN hariç) işlemleri `closed_at` aralığına
     göre yükler. `closed_at` ayrıştırılamayan (bozuk/NULL) kayıtlar atlanır;
     dönen ikinci değer atlanan kayıt sayısıdır (rapora not olarak düşer).
+
+    `strategy` verilirse (ör. `AP` = AlgoPro takipçi halkası, D20) yalnız o
+    strateji etiketli işlemler alınır — iki halka aynı şemayı kullandığı için
+    (ayrı DB dosyaları olsa da) rapor tek bir kaynağa daraltılabilmelidir.
     """
+    wanted_strategy = (strategy or "").strip().upper() or None
     con = sqlite3.connect(db_path)
     try:
         con.row_factory = sqlite3.Row
@@ -155,6 +163,9 @@ def load_closed_trades(
     trades: List[ClosedTrade] = []
     skipped = 0
     for row in rows:
+        if wanted_strategy is not None:
+            if str(row["strategy"] or "").strip().upper() != wanted_strategy:
+                continue
         closed_dt = _parse_db_timestamp(row["closed_at"])
         if closed_dt is None:
             skipped += 1
@@ -705,6 +716,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="çevrimdışı BTCUSDT 1d kline JSON'u (Binance kline dizisi biçimi); verilmezse ağdan çekilir",
     )
     parser.add_argument("--symbol", default=DEFAULT_SYMBOL, help=f"rejim referans sembolü (varsayılan: {DEFAULT_SYMBOL})")
+    parser.add_argument(
+        "--strategy", default=None,
+        help="yalnız bu strateji etiketli işlemler (ör. 'AP' = AlgoPro takipçi halkası, D20)",
+    )
     parser.add_argument("--format", choices=["text", "md", "json"], default="text")
     parser.add_argument("--out", default=None, help="çıktı dosyası (varsayılan: stdout)")
     return parser.parse_args(argv)
@@ -730,7 +745,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     notes: List[str] = []
-    trades, skipped = load_closed_trades(args.db, since, until)
+    trades, skipped = load_closed_trades(
+        args.db, since, until, strategy=args.strategy
+    )
+    if args.strategy:
+        notes.append(f"Rapor yalnız strategy='{args.strategy.strip().upper()}' işlemlerini kapsıyor.")
     if skipped:
         notes.append(f"{skipped} CLOSED kayıt closed_at ayrıştırılamadığı için atlandı.")
 

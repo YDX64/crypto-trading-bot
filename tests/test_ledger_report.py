@@ -599,3 +599,42 @@ class TestCli:
         assert rc == 0
         out = capsys.readouterr().out
         assert "okunamadı" in out or "?" in out
+
+# --------------------------------------------------------------------------
+# --strategy filtresi (D20: AlgoPro takipçi halkası defterini ayırmak için)
+# --------------------------------------------------------------------------
+
+
+class TestStrategyFilter:
+    def _db(self, tmp_path):
+        return _make_db(tmp_path, [
+            {"id": 1, "strategy": "C", "status": "CLOSED",
+             "realized_pnl": 10.0, "closed_at": "2026-08-20 10:00:00.000000"},
+            {"id": 2, "strategy": "AP", "status": "CLOSED",
+             "realized_pnl": -5.0, "closed_at": "2026-08-20 11:00:00.000000"},
+            {"id": 3, "strategy": "AP", "status": "CLOSED",
+             "realized_pnl": 7.0, "closed_at": "2026-08-20 12:00:00.000000"},
+        ], name="strategy.db")
+
+    def test_no_filter_returns_all(self, tmp_path):
+        db = self._db(tmp_path)
+        since, until = lr.parse_dt("2026-08-20"), lr.parse_dt("2026-08-21")
+        trades, _ = lr.load_closed_trades(db, since, until)
+        assert len(trades) == 3
+
+    def test_filter_selects_only_follower_rows(self, tmp_path):
+        db = self._db(tmp_path)
+        since, until = lr.parse_dt("2026-08-20"), lr.parse_dt("2026-08-21")
+        trades, _ = lr.load_closed_trades(db, since, until, strategy="AP")
+        assert [t.id for t in trades] == [2, 3]
+        assert {t.strategy for t in trades} == {"AP"}
+
+    def test_filter_is_case_insensitive(self, tmp_path):
+        db = self._db(tmp_path)
+        since, until = lr.parse_dt("2026-08-20"), lr.parse_dt("2026-08-21")
+        trades, _ = lr.load_closed_trades(db, since, until, strategy=" ap ")
+        assert len(trades) == 2
+
+    def test_cli_flag_exists(self):
+        args = lr.parse_args(["--strategy", "AP"])
+        assert args.strategy == "AP"

@@ -19,6 +19,11 @@ Yeni sinyal kaynağı (haber botu vb.) eklemek: `docs/INTEGRATIONS.md`. Otomatik
 - **Canlı süreç (TESTNET):** supervisord programı `tradingbot_v2`
   (`/opt/tradingbot-v2/.venv/bin/python -m uvicorn src.main:app :9091`).
   `systemctl`'deki `live-bot.service` **trading botu DEĞİLDİR** (futbol botu).
+- **İkinci halka (D20, TESTNET):** `BOT_MODE=follower` — AlgoPro takipçisi,
+  `/opt/tradingbot-ap`, supervisord `tradingbot_ap`, port 9093, AYRI Binance testnet
+  hesabı/DB/state/log. Scanner ve strateji C KAPALI; giriş/çıkış yalnız AlgoPro V1.6
+  alarmlarından. Deploy: `scripts/deploy.sh awa --ring follower`. Mainnet'e ÇIKAMAZ
+  (config fail-fast). Ayrıntı: `docs/RUNBOOK.md` "AlgoPro takipçi halkası", D20.
 - **Ayarlar:** `/opt/tradingbot-v2/.env` (commit'lenmez; her değişiklikte
   `backups/env.bak-<tarih>-<etiket>` yedeği). Varsayılanlar `src/core/config.py`.
   Kapalı duran kanallar: `RISK_EVENT_SECRET` (boş = /risk-event 503), `SCALPER_SHADOW_MODE=false`.

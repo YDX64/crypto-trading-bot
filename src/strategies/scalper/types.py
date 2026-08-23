@@ -120,6 +120,12 @@ class ExitPlan:
     runner_floor_price: float = 0.0
     tp1_algo_id: Optional[str] = None
     tp2_algo_id: Optional[str] = None
+    # --- Yalnız AlgoPro takipçi halkası (D20, 3 parça çıkış) doldurur ---
+    # Scalper (TP1/TP2 + chandelier runner) bu alanları HİÇ kullanmaz;
+    # varsayılanlar bugünkü davranışı birebir korur.
+    tp3_price: float = 0.0
+    tp3_quantity: float = 0.0
+    tp3_algo_id: Optional[str] = None
 
 
 class StrategyProtocol:

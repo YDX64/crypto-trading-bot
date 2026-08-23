@@ -500,7 +500,15 @@ class ExitManager:
             )
         finally:
             closing.discard(symbol)
-            self._positions.pop(symbol, None)
+            # KİMLİK kontrolü: `_finalize_close` saniyeler sürer (cancel_all +
+            # userTrades + income merdiveni). O sırada başka bir yol AYNI sembol
+            # için YENİ bir pozisyon izlemeye almış olabilir (takipçi halkasının
+            # flip yolu: AlgoPro ters sinyali eski pozisyonu kapatıp yenisini
+            # açar). Koşulsuz pop, yeni ve GERÇEK pozisyonu izleme listesinden
+            # düşürür → TP1→BE hiç taşınmaz, kapanış defteri hiç yazılmaz,
+            # kapasite sayacı boş slot gösterir. Yalnız KENDİ nesnesini düşür.
+            if self._positions.get(symbol) is sp:
+                self._positions.pop(symbol, None)
 
     async def _finalize_close(
         self,
@@ -530,6 +538,9 @@ class ExitManager:
             sl_order_id=getattr(sp.position, "sl_order_id", None),
             tp1_algo_id=getattr(sp.plan, "tp1_algo_id", None),
             tp2_algo_id=getattr(sp.plan, "tp2_algo_id", None),
+            # Yalnız AlgoPro takipçi halkası (D20) doldurur; scalper'da DAİMA
+            # None olduğu için aday listesi ve davranış birebir aynıdır.
+            tp3_algo_id=getattr(sp.plan, "tp3_algo_id", None),
             trailing_active=sp.trailing_active,
             entry_fee_rate=float(getattr(sp.plan, "entry_fee_rate", 0.0) or 0.0),
         )
@@ -621,6 +632,7 @@ class ExitManager:
         tp2_algo_id: Optional[str],
         trailing_active: bool,
         entry_fee_rate: float,
+        tp3_algo_id: Optional[str] = None,
     ) -> Optional[_CloseLedger]:
         """Kapanışı borsa userTrades satırlarıyla doğrula.
 
@@ -650,7 +662,14 @@ class ExitManager:
 
         candidates: List[Tuple[str, int]] = []
         seen_ids: Set[int] = set()
-        for kind, raw_id in (("SL", sl_order_id), ("TP1", tp1_algo_id), ("TP2", tp2_algo_id)):
+        # TP3 yalnız takipçi halkasında (D20) doludur; scalper'da None geçer ve
+        # aday listesi bugünküyle BİREBİR aynı kalır.
+        for kind, raw_id in (
+            ("SL", sl_order_id),
+            ("TP1", tp1_algo_id),
+            ("TP2", tp2_algo_id),
+            ("TP3", tp3_algo_id),
+        ):
             if not raw_id:
                 continue
             try:
@@ -773,7 +792,7 @@ class ExitManager:
             return row_time, row_id
 
         closing_kind, closing_row = max(fills, key=_fill_sort_key)
-        if closing_kind in ("TP1", "TP2"):
+        if closing_kind in ("TP1", "TP2", "TP3"):
             exit_reason = "TP_LADDER"
         else:
             exit_reason = "TRAIL" if trailing_active else "SL"

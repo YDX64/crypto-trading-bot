@@ -40,8 +40,13 @@ class ScalpTracker:
         tp1_algo_id: Optional[str],
         tp2_algo_id: Optional[str],
         entry_order_id: Optional[str] = None,
+        tp3_algo_id: Optional[str] = None,
     ) -> int:
-        """Yeni scalp işlemini OPEN durumunda kaydet; satır id'sini döner."""
+        """Yeni scalp işlemini OPEN durumunda kaydet; satır id'sini döner.
+
+        ``tp3_algo_id`` yalnız AlgoPro takipçi halkası (D20, 3 parça çıkış)
+        tarafından verilir; scalper çağrılarında None kalır — davranış aynı.
+        """
         async with AsyncSessionLocal() as session:
             trade = ScalpTradeModel(
                 strategy=signal.strategy,
@@ -57,6 +62,7 @@ class ScalpTracker:
                 sl_algo_id=sl_algo_id,
                 tp1_algo_id=tp1_algo_id,
                 tp2_algo_id=tp2_algo_id,
+                tp3_algo_id=tp3_algo_id,
                 entry_order_id=entry_order_id or None,
             )
             session.add(trade)

@@ -1,0 +1,1165 @@
+"""FollowerEngine — AlgoPro takipçi halkasının orkestrasyonu (D20).
+
+Scalper motorundan FARKI: tarama YOK, strateji YOK, sağlama (confluence) YOK.
+Tek giriş kaynağı ``POST /follower/event``'e düşen AlgoPro alarmlarıdır.
+
+İki arka plan döngüsü:
+  * safety (varsayılan 2 sn): ``exits.step()`` (TP1→BE, kapanış defteri) +
+    günlük zarar kesici.
+  * exchange readiness (30 sn): imzalı hesap erişimi + restart kurtarması.
+
+KAPILAR (hepsi ``_entries_ready()``de toplanır — scalper'daki tek-kapı
+ilkesiyle aynı): imzalı borsa erişimi tazeliği, restart kurtarması,
+günlük risk kapısı, ``UnprotectedPositionError`` latch'i, kill switch ve
+risk-olayı halt'ı (``POST /risk-event``, D10 semantiği).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import time
+import uuid
+from collections import deque
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+
+from src.core.config import settings
+from src.core.logger import app_logger
+from src.strategies.follower.brackets import LeverageBracketCache
+from src.strategies.follower.exits import FollowerExitManager
+from src.strategies.follower.executor import FOLLOWER_STRATEGY, FollowerExecutor
+from src.strategies.follower.levels import calibration_record, resolve_levels
+from src.strategies.follower.risk_halt import RiskEventHaltStore
+from src.strategies.follower.types import (
+    KIND_ENTRY,
+    KIND_EXIT,
+    KIND_SL,
+    KIND_TP3,
+    FollowerEvent,
+    FollowerRejected,
+)
+from src.strategies.scalper.data import KlineFetcher
+from src.strategies.scalper.indicators import atr as compute_atr
+from src.strategies.scalper.tracker import ScalpTracker
+from src.strategies.scalper.types import Direction
+from src.trading.binance_client_improved import ImprovedBinanceClient
+from src.trading.position_manager import PositionManager, UnprotectedPositionError
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _norm_timeframe(value: str) -> str:
+    """TV ``{{interval}}`` ("1") ile insan yazımını ("1m") aynı kefeye koy."""
+    text = str(value or "").strip().lower()
+    return text[:-1] if text.endswith("m") and text[:-1].isdigit() else text
+
+
+def _fmt(value: Any, spec: str = ".4f") -> str:
+    """None-güvenli sayı biçimleyici (log satırları bir girişi düşüremez)."""
+    try:
+        return format(float(value), spec)
+    except (TypeError, ValueError):
+        return "?"
+
+
+class FollowerEngine:
+    """AlgoPro olaylarını korumalı pozisyonlara çeviren motor."""
+
+    _EXCHANGE_PROBE_INTERVAL = 30.0
+    # Reduce-only kapanışın borsada doğrulanması için sınırlı bekleme
+    # merdiveni (toplam ~3.9 sn). Testler bu tuple'ı (0.0,) yaparak gerçek
+    # uyku olmadan çalışır — scalper'ın INCOME_RETRY_DELAYS deseniyle aynı.
+    _CLOSE_VERIFY_DELAYS = (0.0, 0.3, 0.6, 1.0, 2.0)
+    _INCOME_CACHE_TTL = 120.0
+    _BALANCE_CACHE_TTL = 300.0
+    _EVENT_HISTORY = 50
+
+    def __init__(self) -> None:
+        self.cfg = settings
+        self.logger = app_logger
+
+        self.client = ImprovedBinanceClient()
+        self.pm = PositionManager(self.client)
+        self.tracker = ScalpTracker()
+        self.brackets = LeverageBracketCache(self.client, self.cfg)
+        self.executor = FollowerExecutor(
+            self.client, self.pm, self.tracker, self.cfg, self.brackets
+        )
+        self.exits = FollowerExitManager(
+            self.client,
+            self.pm,
+            self.tracker,
+            self.cfg,
+            exit_cooldown_cb=self.executor.start_cooldown,
+        )
+        # ATR YEDEK kuralı için 1m mumları (yalnız mesajda SL yoksa çekilir).
+        # SCALPER_MARKET_DATA_BASE_URL tanımlıysa (ayrı bir çalışmada
+        # eklenmektedir) o kullanılır; yoksa trading host'u.
+        self.fetcher = KlineFetcher(
+            base_url=str(getattr(self.cfg, "scalper_market_data_base_url", "") or "")
+            or None
+        )
+
+        self.halt = RiskEventHaltStore(
+            getattr(self.cfg, "risk_event_halt_path", None), logger=self.logger
+        )
+
+        self.running = False
+        self._safety_task: Optional[asyncio.Task] = None
+        self._exchange_task: Optional[asyncio.Task] = None
+        self._entry_lock = asyncio.Lock()
+
+        self._exchange_ready = False
+        self._exchange_last_success_monotonic: Optional[float] = None
+        self._exchange_last_success_at: Optional[str] = None
+        self._exchange_last_error: Optional[str] = None
+        self._recovery_ready = False
+
+        self._entry_halted = False
+        self._entry_halt_reason: Optional[str] = None
+        self._entry_halted_at: Optional[str] = None
+        halt_path = getattr(self.cfg, "follower_entry_halt_path", None)
+        self._entry_halt_path: Optional[Path] = (
+            Path(halt_path).expanduser() if halt_path else None
+        )
+        self._load_entry_halt()
+
+        self._risk_ready = False
+        self._kill_switch = False
+        self._kill_switch_day: Optional[str] = None
+        self._daily_pnl = 0.0
+        self._daily_loss_threshold_usdt: Optional[float] = None
+        self._risk_equity_usdt: Optional[float] = None
+        self._income_cache: Tuple[Optional[float], float, Optional[str]] = (
+            None,
+            0.0,
+            None,
+        )
+        self._income_cache_close_seq = -1
+        self._balance_cache: Tuple[Optional[float], float] = (None, 0.0)
+
+        self._events: Deque[Dict[str, Any]] = deque(maxlen=self._EVENT_HISTORY)
+        self._event_counters: Dict[str, int] = {}
+        self._reject_counters: Dict[str, int] = {}
+        self._last_event_at: Optional[str] = None
+        self._safety_last_success_monotonic: Optional[float] = None
+        self._safety_last_error: Optional[str] = None
+        self._safety_consecutive_errors = 0
+
+    # ------------------------------------------------------------------
+    # Yaşam döngüsü
+    # ------------------------------------------------------------------
+
+    async def start(self) -> None:
+        self.logger.info("🤖 AlgoPro takipçi motoru başlatılıyor...")
+        self.logger.info(
+            f"🎯 Evren={sorted(self.symbol_allowlist())} tf={self.cfg.follower_timeframe} "
+            f"marj=%{self.cfg.follower_margin_pct} kaldıraç="
+            f"[{self.cfg.follower_lev_min}-{self.cfg.follower_lev_max}]x "
+            f"hedef SL ROI=%{self.cfg.follower_sl_roi_target} "
+            f"azami pozisyon={self.cfg.follower_max_positions}"
+        )
+        if await self._probe_exchange():
+            await self._attempt_recovery()
+            await self.brackets.warm(sorted(self.symbol_allowlist()))
+            await self._update_kill_switch()
+
+        self.running = True
+        if not self._safety_task or self._safety_task.done():
+            self._safety_task = asyncio.create_task(
+                self._safety_loop(), name="follower-safety-loop"
+            )
+        if not self._exchange_task or self._exchange_task.done():
+            self._exchange_task = asyncio.create_task(
+                self._exchange_loop(), name="follower-exchange-loop"
+            )
+        self.logger.info("✅ Takipçi motoru hazır")
+
+    async def stop(self) -> None:
+        self.logger.info("🛑 Takipçi motoru durduruluyor...")
+        self.running = False
+        tasks = [t for t in (self._safety_task, self._exchange_task) if t is not None]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for closer in (self.fetcher.close, self.client.close):
+            try:
+                await closer()
+            except Exception as exc:
+                self.logger.warning(f"⚠️ Takipçi kaynak temizleme hatası: {exc}")
+        self.logger.info("✅ Takipçi motoru durduruldu")
+
+    # ------------------------------------------------------------------
+    # Kalıcı giriş kilidi (fail-closed)
+    # ------------------------------------------------------------------
+
+    def _load_entry_halt(self) -> None:
+        path = self._entry_halt_path
+        if path is None or not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            reason = str((payload or {}).get("reason") or "bilinmiyor")
+            halted_at = str((payload or {}).get("halted_at") or "")
+        except Exception as exc:
+            reason = f"halt dosyası okunamadı: {type(exc).__name__}: {exc}"
+            halted_at = ""
+        self._entry_halted = True
+        self._entry_halt_reason = reason
+        self._entry_halted_at = halted_at or _utcnow_iso()
+        self.logger.critical(
+            f"🚨 Takipçi giriş kilidi AKTİF (diskten yüklendi): {reason}. "
+            f"Açmak için dosyayı incele ve yeniden adlandır: {path}",
+            extra={"trade": True},
+        )
+
+    def _persist_entry_halt(self) -> None:
+        path = self._entry_halt_path
+        if path is None:
+            return
+        tmp_path: Optional[Path] = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_name(
+                f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+            )
+            payload = {
+                "version": 1,
+                "reason": self._entry_halt_reason,
+                "halted_at": self._entry_halted_at,
+            }
+            with tmp_path.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, path)
+        except Exception as exc:
+            self.logger.critical(
+                f"🚨 Takipçi giriş kilidi diske yazılamadı ({path}): {exc}. "
+                f"Kilit RAM'de aktif, restart'ta KAYBOLUR.",
+                extra={"trade": True},
+            )
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _latch_entry_halt(self, error: Exception, *, source: str) -> None:
+        if self._entry_halted:
+            return
+        self._entry_halted = True
+        self._entry_halt_reason = f"{type(error).__name__}: {error}"
+        self._entry_halted_at = _utcnow_iso()
+        self.logger.critical(
+            f"🚨 Takipçi YENİ GİRİŞLERİ DURDURULDU ({source}): {error}. "
+            f"İzleme sürüyor; manuel kontrol + restart gerekli.",
+            extra={"trade": True},
+        )
+        self._persist_entry_halt()
+
+    # ------------------------------------------------------------------
+    # Borsa hazırlığı / kurtarma
+    # ------------------------------------------------------------------
+
+    async def _probe_exchange(self) -> bool:
+        try:
+            await self.client.get_all_positions()
+        except Exception as exc:
+            self._exchange_ready = False
+            self._exchange_last_error = f"{type(exc).__name__}: {exc}"
+            self.logger.error(
+                f"❌ Takipçi imzalı Binance erişimi başarısız; girişler kapalı: {exc}"
+            )
+            return False
+        self._exchange_ready = True
+        self._exchange_last_success_monotonic = time.monotonic()
+        self._exchange_last_success_at = _utcnow_iso()
+        self._exchange_last_error = None
+        return True
+
+    async def _attempt_recovery(self) -> bool:
+        try:
+            recovered = await self.exits.recover()
+        except UnprotectedPositionError as exc:
+            self._recovery_ready = False
+            self._latch_entry_halt(exc, source="restart recovery")
+            return False
+        except Exception as exc:
+            self._recovery_ready = False
+            self.logger.error(
+                f"❌ Takipçi restart kurtarması başarısız: {exc}", exc_info=True
+            )
+            return False
+        self._recovery_ready = bool(recovered)
+        if not self._recovery_ready:
+            self.logger.error(
+                "⛔ Takipçi kurtarma güvenliği kanıtlanamadı; izleme sürüyor, "
+                "yeni girişler kapalı"
+            )
+        return self._recovery_ready
+
+    async def _exchange_loop(self) -> None:
+        while self.running:
+            try:
+                ready = await self._probe_exchange()
+                if ready and not self._recovery_ready:
+                    await self._attempt_recovery()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._exchange_ready = False
+                self._exchange_last_error = f"{type(exc).__name__}: {exc}"
+                self.logger.error(f"❌ Takipçi readiness döngüsü hatası: {exc}")
+            await asyncio.sleep(self._EXCHANGE_PROBE_INTERVAL)
+
+    async def _safety_loop(self) -> None:
+        self.logger.info("🛡️ Takipçi safety döngüsü başladı")
+        while self.running:
+            failure: Optional[str] = None
+            try:
+                await self.exits.step()
+            except asyncio.CancelledError:
+                raise
+            except UnprotectedPositionError as exc:
+                self._latch_entry_halt(exc, source="safety")
+                failure = f"{type(exc).__name__}: {exc}"
+            except Exception as exc:
+                failure = f"{type(exc).__name__}: {exc}"
+                self.logger.error(f"❌ Takipçi safety hatası: {exc}", exc_info=True)
+
+            # Kill switch AYRI try'da: `exits.step()` patlarsa günlük zarar
+            # kapısı bayat `_risk_ready=True` ile açık kalırdı. Risk kapısı,
+            # çıkış turunun sağlığına BAĞLI OLMAMALIDIR.
+            try:
+                await self._update_kill_switch()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                failure = failure or f"{type(exc).__name__}: {exc}"
+                self.logger.error(
+                    f"❌ Takipçi kill switch güncellenemedi: {exc}", exc_info=True
+                )
+
+            if failure is None:
+                self._safety_last_success_monotonic = time.monotonic()
+                self._safety_consecutive_errors = 0
+                self._safety_last_error = None
+            else:
+                self._safety_consecutive_errors += 1
+                self._safety_last_error = failure
+            await asyncio.sleep(self._safety_interval_seconds())
+
+    def _safety_interval_seconds(self) -> float:
+        try:
+            return max(
+                0.5, float(getattr(self.cfg, "follower_safety_interval_seconds", 2.0))
+            )
+        except (TypeError, ValueError):
+            return 2.0
+
+    # ------------------------------------------------------------------
+    # Günlük zarar kesici (SCALPER_DAILY_LOSS_LIMIT_PCT mantığı)
+    # ------------------------------------------------------------------
+
+    async def _update_kill_switch(self) -> None:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self._kill_switch_day != today:
+            self._kill_switch_day = today
+            self._kill_switch = False
+
+        limit_pct = float(
+            getattr(self.cfg, "follower_daily_loss_limit_pct", 0.0) or 0.0
+        )
+        if limit_pct <= 0:
+            self._risk_ready = True
+            self._daily_loss_threshold_usdt = None
+            return
+
+        try:
+            pnl = await self._daily_net_income(today)
+        except Exception as exc:
+            # Fail-closed: günlük riski doğrulayamıyorsak yeni giriş YOK.
+            self._risk_ready = False
+            self.logger.error(
+                f"❌ Takipçi günlük net PNL doğrulanamadı; girişler kapalı: {exc}"
+            )
+            return
+        self._daily_pnl = pnl
+        self._risk_ready = True
+        if self._kill_switch:
+            return
+
+        balance = await self._cached_balance()
+        if balance is None or balance <= 0:
+            self._risk_ready = False
+            self._risk_equity_usdt = None
+            self._daily_loss_threshold_usdt = None
+            return
+        self._risk_equity_usdt = balance
+
+        day_start_balance = max(balance - pnl, 0.0)
+        threshold = -day_start_balance * limit_pct / 100.0
+        self._daily_loss_threshold_usdt = threshold
+        if pnl <= threshold:
+            self._kill_switch = True
+            self.logger.warning(
+                f"⛔ Takipçi kill switch TETİKLENDİ: günlük PNL={pnl:.2f} <= "
+                f"eşik={threshold:.2f} (sermaye={balance:.2f}, limit=%{limit_pct}). "
+                f"Yeni giriş yok; açık pozisyonların çıkış takibi sürüyor.",
+                extra={"trade": True},
+            )
+
+    async def _daily_net_income(self, today: str) -> float:
+        cached_value, cached_at, cached_day = self._income_cache
+        now_monotonic = time.monotonic()
+        if (
+            cached_value is not None
+            and cached_day == today
+            and now_monotonic - cached_at < self._INCOME_CACHE_TTL
+            and self._income_cache_close_seq == getattr(self.tracker, "close_seq", 0)
+        ):
+            return cached_value
+
+        start = datetime.strptime(today, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        start_ms = int(start.timestamp() * 1000)
+        end_ms = int(datetime.now(timezone.utc).timestamp() * 1000) + 1000
+        rows = await self.client.get_income_history(
+            start_time_ms=start_ms, end_time_ms=end_ms, limit=1000
+        )
+        if len(rows) >= 1000:
+            raise RuntimeError(
+                "Günlük income sonucu 1000 satır sınırına ulaştı; eksik PNL riski"
+            )
+        allowed = {"REALIZED_PNL", "COMMISSION", "FUNDING_FEE"}
+        net = 0.0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("incomeType") or "") not in allowed:
+                continue
+            try:
+                net += float(row.get("income") or 0.0)
+            except (TypeError, ValueError):
+                raise RuntimeError(f"Geçersiz Binance income satırı: {row!r}")
+        self._income_cache = (net, now_monotonic, today)
+        self._income_cache_close_seq = getattr(self.tracker, "close_seq", 0)
+        return net
+
+    async def _cached_balance(self) -> Optional[float]:
+        balance, cached_at = self._balance_cache
+        now = time.monotonic()
+        if balance is not None and (now - cached_at) < self._BALANCE_CACHE_TTL:
+            return balance
+        try:
+            fresh = await self.client.get_wallet_balance()
+        except Exception as exc:
+            self.logger.error(f"❌ Takipçi bakiye sorgusu hatası: {exc}")
+            return balance
+        self._balance_cache = (fresh, now)
+        return fresh
+
+    # ------------------------------------------------------------------
+    # Kapılar
+    # ------------------------------------------------------------------
+
+    def symbol_allowlist(self) -> Set[str]:
+        raw = str(getattr(self.cfg, "follower_symbol_allowlist", "") or "")
+        return {s.strip().upper() for s in raw.split(",") if s.strip()}
+
+    def _safety_stale_limit(self) -> float:
+        """Safety turunun bayat sayılacağı yaş (health_snapshot ile AYNI eşik)."""
+        return max(15.0, self._safety_interval_seconds() * 10.0)
+
+    def _safety_fresh(self) -> bool:
+        """Çıkış/BE/kapanış turu canlı mı? Bayatsa YENİ GİRİŞ YOK (fail-closed).
+
+        Takipçide safety turu TEK risk kapısıdır: TP1→BE, kapanış defteri ve
+        günlük zarar kesici hep oradan işler. Tur sürekli hata veriyorsa
+        `_risk_ready` bayat kalabilir; o hâlde giriş açmak, kapısı çalışmayan
+        bir sisteme pozisyon eklemektir.
+        """
+        if self._safety_last_success_monotonic is None:
+            return False
+        return (
+            time.monotonic() - self._safety_last_success_monotonic
+        ) <= self._safety_stale_limit()
+
+    def _entries_ready(self) -> bool:
+        exchange_age = (
+            time.monotonic() - self._exchange_last_success_monotonic
+            if self._exchange_last_success_monotonic is not None
+            else float("inf")
+        )
+        return bool(
+            self._exchange_ready
+            and exchange_age <= self._EXCHANGE_PROBE_INTERVAL * 3.0
+            and self._recovery_ready
+            and self._risk_ready
+            and self._safety_fresh()
+            and not self._entry_halted
+            and not self._kill_switch
+            and not self.halt.active
+        )
+
+    def _entry_block_reason(self) -> Optional[str]:
+        if self._entry_halted:
+            return f"giriş kilidi aktif ({self._entry_halt_reason})"
+        if self._kill_switch:
+            return "kill switch (günlük zarar limiti)"
+        snapshot = self.halt.snapshot()
+        if snapshot.get("active"):
+            return f"risk-event halt ({snapshot.get('reason')})"
+        if not self._risk_ready:
+            return "günlük risk kapısı doğrulanamadı"
+        if not self._exchange_ready or not self._recovery_ready:
+            return "borsa/kurtarma hazır değil"
+        if not self._safety_fresh():
+            return (
+                f"safety turu bayat (>{self._safety_stale_limit():.0f} sn): "
+                f"{self._safety_last_error or 'henüz başarılı tur yok'}"
+            )
+        return None
+
+    def _count_event(self, kind: str) -> None:
+        self._event_counters[kind] = self._event_counters.get(kind, 0) + 1
+
+    def _count_reject(self, reason: str) -> None:
+        self._reject_counters[reason] = self._reject_counters.get(reason, 0) + 1
+
+    def _record_event(self, event: FollowerEvent, result: Dict[str, Any]) -> None:
+        self._last_event_at = _utcnow_iso()
+        self._events.append(
+            {
+                "at": self._last_event_at,
+                **event.as_dict(),
+                "accepted": bool(result.get("accepted")),
+                "reason": result.get("reason"),
+            }
+        )
+
+    # ------------------------------------------------------------------
+    # Olay işleme
+    # ------------------------------------------------------------------
+
+    async def handle_event(self, event: FollowerEvent) -> Dict[str, Any]:
+        """AlgoPro olayını işle. ASLA istisna yükseltmez (yanıt sözleşmesi)."""
+        self._count_event(event.kind)
+        try:
+            result = await self._dispatch(event)
+        except UnprotectedPositionError as exc:
+            self._latch_entry_halt(exc, source="olay işleme")
+            result = {"accepted": False, "reason": f"korumasız pozisyon: {exc}"}
+        except FollowerRejected as exc:
+            self._count_reject(exc.code)
+            result = {"accepted": False, "reason": exc.reason}
+        except Exception as exc:
+            self.logger.error(
+                f"❌ {event.symbol}: takipçi olayı işlenemedi ({exc})", exc_info=True
+            )
+            result = {"accepted": False, "reason": f"beklenmeyen hata: {exc}"}
+        result.setdefault("kind", event.kind)
+        result.setdefault("symbol", event.symbol)
+        self._record_event(event, result)
+        if not result.get("accepted"):
+            self.logger.info(
+                f"🚫 Takipçi olayı işlenmedi: {event.symbol} {event.kind} — "
+                f"{result.get('reason')}"
+            )
+        return result
+
+    async def _dispatch(self, event: FollowerEvent) -> Dict[str, Any]:
+        symbol = event.symbol
+        allowlist = self.symbol_allowlist()
+        if allowlist and symbol not in allowlist:
+            self._count_reject("symbol_allowlist")
+            return {"accepted": False, "reason": "sembol takipçi evreninde değil"}
+
+        configured_tf = str(getattr(self.cfg, "follower_timeframe", "1") or "1")
+        tf = str(event.timeframe or "")
+        # TradingView {{interval}} 1 dakikada "1" döner; elle yazılan şablonda
+        # "1m" görülebilir — ikisi AYNI dilimdir. Boş tf filtreye takılmaz.
+        if tf and _norm_timeframe(tf) != _norm_timeframe(configured_tf):
+            self._count_reject("timeframe")
+            return {
+                "accepted": False,
+                "reason": f"zaman dilimi eşleşmiyor (tf={tf}, beklenen {configured_tf})",
+            }
+
+        if event.kind == KIND_ENTRY:
+            return await self._handle_entry(event)
+        if event.kind == KIND_EXIT:
+            return await self._handle_exit(event)
+        return await self._handle_hit(event)
+
+    # -- giriş ---------------------------------------------------------
+
+    async def _handle_entry(self, event: FollowerEvent) -> Dict[str, Any]:
+        symbol = event.symbol
+        direction = event.direction
+        if direction is None:
+            return {"accepted": False, "reason": "giriş olayında yön yok"}
+
+        min_score = float(getattr(self.cfg, "follower_min_score", 0.0) or 0.0)
+        if min_score > 0 and event.score is not None and event.score < min_score:
+            self._count_reject("min_score")
+            return {
+                "accepted": False,
+                "reason": f"AlgoPro skoru düşük ({event.score} < {min_score})",
+            }
+
+        async with self._entry_lock:
+            existing = self.exits._positions.get(symbol)
+            flipped = False
+            if existing is not None:
+                if existing.signal.direction == direction:
+                    self._count_reject("already_open")
+                    return {
+                        "accepted": False,
+                        "reason": "sembolde aynı yönde açık pozisyon var",
+                    }
+                if not bool(getattr(self.cfg, "follower_flip", True)):
+                    self._count_reject("flip_disabled")
+                    return {
+                        "accepted": False,
+                        "reason": "ters sinyal — FOLLOWER_FLIP kapalı, pozisyon korunuyor",
+                    }
+                closed = await self._close_tracked(
+                    symbol, existing, reason="AP_REVERSE"
+                )
+                if not closed:
+                    self._count_reject("flip_close_failed")
+                    return {
+                        "accepted": False,
+                        "reason": "ters sinyal — mevcut pozisyon kapatılamadı, "
+                        "yeni giriş yapılmadı",
+                    }
+                flipped = True
+
+            # Kapılar KAPANIŞTAN SONRA kontrol edilir — bilinçli: kill switch /
+            # risk-olayı halt'ı / giriş kilidi "YENİ GİRİŞ YOK" demektir, "açık
+            # pozisyonu tut" demez. AlgoPro'nun ters sinyali bir ÇIKIŞ
+            # kararıdır; kapı kapalıysa sonuç FLAT kalmaktır (en güvenli hâl).
+            blocked = self._entry_block_reason()
+            if blocked is not None or not self._entries_ready():
+                self._count_reject("gate")
+                return {
+                    "accepted": False,
+                    "reason": blocked or "girişler hazır değil",
+                }
+
+            # Ters sinyalde cooldown BİLİNÇLİ olarak atlanır: AlgoPro'nun açık
+            # dönüş komutudur, aksi halde FOLLOWER_FLIP fiilen ölü olurdu.
+            if not flipped and self.executor.is_entry_blocked(symbol):
+                self._count_reject("cooldown")
+                return {"accepted": False, "reason": "sembol cooldown'da"}
+
+            tracked = self.exits.tracked_symbols()
+            max_positions = int(getattr(self.cfg, "follower_max_positions", 4) or 4)
+            if symbol not in tracked and len(tracked) >= max_positions:
+                self._count_reject("capacity")
+                return {
+                    "accepted": False,
+                    "reason": f"kapasite dolu ({len(tracked)}/{max_positions})",
+                }
+
+            # Borsa gerçeği son kapıdır: izlenmeyen ama AÇIK bir pozisyon
+            # (ör. record_open DB hatası, elle açılmış pozisyon) üstüne ikinci
+            # bir giriş yapmak pozisyonu İKİYE KATLAR. Scalper'ın
+            # `_evaluate_symbol`'daki `live_symbols` kapısının eşleniği;
+            # okuma başarısızsa fail-closed.
+            try:
+                live_info = await self.client.get_position_risk(
+                    symbol, force_fresh=True
+                )
+                live_amt = (
+                    abs(float(live_info.get("positionAmt", 0) or 0))
+                    if live_info
+                    else 0.0
+                )
+            except Exception as exc:
+                self._count_reject("position_check")
+                return {
+                    "accepted": False,
+                    "reason": f"borsa pozisyonu doğrulanamadı ({exc})",
+                }
+            if live_amt != 0:
+                self._count_reject("live_position")
+                return {
+                    "accepted": False,
+                    "reason": f"borsada izlenmeyen açık pozisyon var ({live_amt}) — "
+                    f"giriş yapılmadı",
+                }
+
+            entry_price = event.price
+            if entry_price is None or entry_price <= 0:
+                try:
+                    entry_price = await self.client.get_current_price(symbol)
+                except Exception as exc:
+                    self._count_reject("price")
+                    return {
+                        "accepted": False,
+                        "reason": f"giriş fiyatı okunamadı ({exc})",
+                    }
+            if not entry_price or entry_price <= 0:
+                self._count_reject("price")
+                return {"accepted": False, "reason": "giriş fiyatı çözülemedi"}
+
+            atr_value = None
+            if not event.levels.has_sl:
+                atr_value = await self._atr_fallback(symbol)
+
+            levels = resolve_levels(
+                entry=float(entry_price),
+                direction=direction,
+                message=event.levels,
+                atr_value=atr_value,
+                cfg=self.cfg,
+            )
+            for warning in levels.warnings:
+                self.logger.warning(f"⚠️ {symbol}: seviye uyarısı — {warning}")
+            self._log_calibration(event, levels, direction)
+
+            equity = await self._entry_equity()
+            if equity is None:
+                self._count_reject("equity")
+                return {"accepted": False, "reason": "hesap bakiyesi okunamadı"}
+
+            # SON kapı: aynı sembol için bir kapanış defteri HÂLÂ işleniyorsa
+            # yeni pozisyon AÇMA. `_finalize_close`'un ilk işi
+            # `cancel_all_open_orders(symbol)`'dır ve saniyeler sürebilir
+            # (userTrades + income merdiveni); bu pencerede açılan pozisyonun
+            # SL/TP emirleri o iptal turuna yakalanabilir → KORUMASIZ pozisyon.
+            # (Kapanış defterinin izleme listesinden düşürmesi artık kimlik
+            # kontrollüdür — bkz. scalper/exits.py `_handle_closed` — ama emir
+            # iptali yarışını yalnız bu kapı kapatır.)
+            if symbol in getattr(self.exits, "_closing", ()):
+                self._count_reject("close_in_flight")
+                return {
+                    "accepted": False,
+                    "reason": "aynı sembolde kapanış defteri işleniyor — "
+                    "yeni giriş yapılmadı",
+                    "flipped": flipped,
+                }
+
+            try:
+                position = await self.executor.open_position(
+                    event=event, levels=levels, equity_usdt=equity
+                )
+            except UnprotectedPositionError:
+                raise
+            if position is None:
+                return {
+                    "accepted": False,
+                    "reason": "emir yolu başarısız (log'a bakın)",
+                    "flipped": flipped,
+                }
+            self.exits.track(position)
+
+        plan_meta = position.meta.get("plan", {})
+        self.logger.info(
+            f"🎯 {symbol}: AlgoPro {direction.value} girişi açıldı "
+            f"(lev={plan_meta.get('leverage')}x, sl_pct=%{_fmt(plan_meta.get('sl_pct'))}, "
+            f"sl_roi=%{_fmt(plan_meta.get('sl_roi_pct'), '.2f')}, "
+            f"marj={_fmt(plan_meta.get('margin_usdt'), '.2f')} USDT, "
+            f"skor={event.score}, tqi={event.tqi})",
+            extra={"trade": True},
+        )
+        return {
+            "accepted": True,
+            "reason": "pozisyon açıldı",
+            "flipped": flipped,
+            "trade_id": position.trade_id,
+            "plan": plan_meta,
+        }
+
+    async def _atr_fallback(self, symbol: str) -> Optional[float]:
+        """Mesajda SL yoksa 1m mumlarından ATR — yalnız YEDEK yol."""
+        period = int(getattr(self.cfg, "follower_atr_len", 14) or 14)
+        try:
+            candles = await self.fetcher.get_klines(symbol, "1m", max(period * 6, 100))
+        except Exception as exc:
+            self.logger.error(f"❌ {symbol}: ATR için 1m mumları alınamadı ({exc})")
+            return None
+        value = compute_atr(candles, period)
+        return value if value > 0 else None
+
+    async def _entry_equity(self) -> Optional[float]:
+        try:
+            balance = await self.client.get_account_balance()
+        except Exception as exc:
+            self.logger.error(f"❌ Takipçi bakiye sorgusunda hata ({exc})")
+            return None
+        if balance is None or float(balance) <= 0:
+            return None
+        return float(balance)
+
+    def _log_calibration(
+        self, event: FollowerEvent, levels: Any, direction: Direction
+    ) -> None:
+        """Kalibrasyon defteri (JSONL) — yazma hatası girişi ASLA bozmaz."""
+        path_value = getattr(self.cfg, "follower_levels_log_path", "") or ""
+        if not path_value:
+            return
+        try:
+            record = calibration_record(
+                symbol=event.symbol,
+                direction=direction,
+                kind=event.kind,
+                ts=event.ts or _utcnow_iso(),
+                levels=levels,
+                cfg=self.cfg,
+            )
+            record["score"] = event.score
+            record["tqi"] = event.tqi
+            path = Path(path_value).expanduser()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            self.logger.warning(f"⚠️ Kalibrasyon defteri yazılamadı ({exc})")
+
+    # -- çıkış ---------------------------------------------------------
+
+    async def _handle_exit(self, event: FollowerEvent) -> Dict[str, Any]:
+        symbol = event.symbol
+        async with self._entry_lock:
+            sp = self.exits._positions.get(symbol)
+            if sp is None:
+                return {"accepted": False, "reason": "izlenen pozisyon yok"}
+            closed = await self._close_tracked(symbol, sp, reason="AP_EXIT")
+        if not closed:
+            return {
+                "accepted": False,
+                "reason": "kapanış borsa üzerinde doğrulanamadı (izleme sürüyor)",
+            }
+        return {"accepted": True, "reason": "pozisyon kapatıldı"}
+
+    async def _handle_hit(self, event: FollowerEvent) -> Dict[str, Any]:
+        """TP/SL HIT olayları: telemetri + borsa çapraz doğrulaması.
+
+        AlgoPro "vuruldu" diyor ama borsada pozisyon hâlâ AÇIKSA bu, seviye
+        sapması ya da emir kaybı demektir — WARNING loglanır (sessiz kalmaz).
+        Terminal olaylarda (SL, TP3) pozisyon borsada kapanmışsa kapanış
+        defteri HEMEN işletilir (safety turunu beklemeden).
+        """
+        symbol = event.symbol
+        sp = self.exits._positions.get(symbol)
+        if sp is None:
+            return {"accepted": False, "reason": "izlenen pozisyon yok (telemetri)"}
+
+        try:
+            pos_info = await self.client.get_position_risk(symbol, force_fresh=True)
+            amt = abs(float(pos_info.get("positionAmt", 0) or 0)) if pos_info else 0.0
+        except Exception as exc:
+            self.logger.warning(
+                f"⚠️ {symbol}: {event.kind} çapraz doğrulaması yapılamadı ({exc})"
+            )
+            return {"accepted": False, "reason": f"borsa okunamadı ({exc})"}
+
+        terminal = event.kind in (KIND_SL, KIND_TP3)
+        if amt == 0:
+            if self.exits._positions.get(symbol) is sp:
+                await self.exits._handle_closed(symbol, sp)
+            return {"accepted": True, "reason": "kapanış deftere işlendi"}
+
+        if terminal:
+            self.logger.warning(
+                f"⚠️ {symbol}: AlgoPro {event.kind.upper()} bildirdi ama borsada "
+                f"pozisyon AÇIK (miktar={amt}) — seviye sapması ya da emir kaybı "
+                f"olabilir; SL/TP emirleri kontrol edilmeli",
+                extra={"trade": True},
+            )
+            return {
+                "accepted": False,
+                "reason": "AlgoPro kapanış bildirdi ama borsada pozisyon açık",
+            }
+        self.logger.info(
+            f"📌 {symbol}: AlgoPro {event.kind.upper()} bildirdi (kalan miktar={amt})"
+        )
+        return {"accepted": True, "reason": "telemetri kaydedildi"}
+
+    # -- ortak kapanış yolu -------------------------------------------
+
+    async def _submit_reduce_only_market_close(
+        self, symbol: str, close_side: str, qty: float
+    ) -> None:
+        """Reduce-only MARKET kapanış — takipçinin TEK emir yolu.
+
+        AlgoPro çıkışı, ters sinyal (flip) ve risk-olayı ``flatten`` AYNI
+        çağrıyı kullanır (scalper motorundaki desenin birebir eşleniği).
+        """
+        await self.client._request_with_retry(
+            "POST",
+            "/fapi/v1/order",
+            params={
+                "symbol": symbol,
+                "side": close_side,
+                "type": "MARKET",
+                "quantity": qty,
+                "reduceOnly": "true",
+                "newOrderRespType": "RESULT",
+            },
+            signed=True,
+        )
+
+    async def _close_tracked(self, symbol: str, sp: Any, *, reason: str) -> bool:
+        """Pozisyonu reduce-only MARKET ile kapat ve borsada DOĞRULA.
+
+        Doğrulanamazsa ``exits._handle_closed`` ASLA çağrılmaz (fail-closed —
+        aksi halde SL/TP iptal edilip pozisyon korumasız kalabilirdi). Miktar
+        CANLI ``positionAmt``'tan alınır; ``sp.position.quantity`` giriş
+        dolumudur ve kısmi TP'lerden sonra güncellenmez.
+        """
+        try:
+            pos_info = await self.client.get_position_risk(symbol, force_fresh=True)
+        except Exception as exc:
+            self.logger.error(f"❌ {symbol}: kapanış için pozisyon okunamadı ({exc})")
+            return False
+        amt = float(pos_info.get("positionAmt", 0) or 0) if pos_info else 0.0
+        if amt == 0:
+            await self.exits._handle_closed(symbol, sp, forced_exit_reason=reason)
+            return True
+
+        close_side = "SELL" if amt > 0 else "BUY"
+        try:
+            qty = await self.client.quantize_quantity(symbol, abs(amt))
+            await self._submit_reduce_only_market_close(symbol, close_side, qty)
+        except Exception as exc:
+            # Emir reddi "pozisyon hâlâ açık" DEMEK DEĞİLDİR: TP3/SL aynı anda
+            # dolduysa Binance reduce-only emri -2022 ile reddeder, oysa
+            # pozisyon KAPANMIŞTIR. Bir kez taze okuyup gerçeği sor; hâlâ
+            # açıksa fail-closed (False) — safety turu izlemeyi sürdürür.
+            self.logger.error(f"❌ {symbol}: reduce-only kapanış gönderilemedi ({exc})")
+            try:
+                after = await self.client.get_position_risk(symbol, force_fresh=True)
+                after_amt = (
+                    abs(float(after.get("positionAmt", 0) or 0)) if after else 0.0
+                )
+            except Exception:
+                return False
+            if after_amt != 0:
+                return False
+            self.logger.warning(
+                f"⚠️ {symbol}: kapanış emri reddedildi ama pozisyon zaten kapalı "
+                f"(eşzamanlı TP/SL dolumu) — defter işleniyor"
+            )
+            await self.exits._handle_closed(symbol, sp, forced_exit_reason=reason)
+            return True
+
+        for delay in self._CLOSE_VERIFY_DELAYS:
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                pos_info = await self.client.get_position_risk(symbol, force_fresh=True)
+            except Exception:
+                continue
+            amt2 = abs(float(pos_info.get("positionAmt", 0) or 0)) if pos_info else 0.0
+            if amt2 == 0:
+                await self.exits._handle_closed(
+                    symbol, sp, forced_exit_reason=reason
+                )
+                self.logger.info(
+                    f"🏁 {symbol}: {reason} — pozisyon reduce-only kapatıldı",
+                    extra={"trade": True},
+                )
+                return True
+        self.logger.error(
+            f"❌ {symbol}: kapanış borsa üzerinde DOĞRULANAMADI ({reason}); "
+            f"izleme sürüyor, SL/TP dokunulmadı"
+        )
+        return False
+
+    # ------------------------------------------------------------------
+    # Risk-olayı kanalı (D10 semantiği)
+    # ------------------------------------------------------------------
+
+    async def risk_event_halt(
+        self, *, reason: str, source: Optional[str], ttl_minutes: int
+    ) -> Dict[str, Any]:
+        return self.halt.halt(reason=reason, source=source, ttl_minutes=ttl_minutes)
+
+    def risk_event_resume(self) -> Dict[str, Any]:
+        return self.halt.resume()
+
+    def risk_event_status(self) -> Dict[str, Any]:
+        snapshot = dict(self.halt.snapshot())
+        snapshot["open_positions"] = len(self.exits.tracked_symbols())
+        return snapshot
+
+    async def risk_event_flatten(
+        self, *, reason: str, source: Optional[str], ttl_minutes: int
+    ) -> Dict[str, Any]:
+        """Halt'ı ÖNCE kur, sonra tüm izlenen pozisyonları düzleştir (D10)."""
+        halt_snapshot = self.halt.halt(
+            reason=reason, source=source, ttl_minutes=ttl_minutes
+        )
+        flattened: List[str] = []
+        errors: List[str] = []
+        seen: Set[str] = set()
+        # `_entry_lock` ZORUNLU: halt kurulduğu anda `_handle_entry` içinde
+        # UÇUŞTA olan bir giriş (MARKET + SL + 3×TP, saniyeler sürer) HENÜZ
+        # `tracked_symbols()`'a girmemiştir. Kilit alınmazsa flatten "hiç
+        # pozisyon yok" raporu döner ve saniyeler sonra AKTİF HALT ALTINDA
+        # açık bir pozisyon kalır (halt yalnız yeni girişi engeller, açığı
+        # kapatmaz). Kilit `_close_tracked` tarafından ALINMADIĞI için
+        # kilitlenme (deadlock) yoktur.
+        async with self._entry_lock:
+            for _ in range(2):  # 2. tur: savunma amaçlı (kilit altında boş kalır)
+                remaining = sorted(self.exits.tracked_symbols() - seen)
+                if not remaining:
+                    break
+                for symbol in remaining:
+                    seen.add(symbol)
+                    sp = self.exits._positions.get(symbol)
+                    if sp is None:
+                        continue
+                    try:
+                        closed = await self._close_tracked(
+                            symbol, sp, reason="RISK_EVENT"
+                        )
+                    except Exception as exc:
+                        message = f"{symbol}: {type(exc).__name__}: {exc}"
+                        errors.append(message)
+                        self.logger.error(
+                            f"❌ takipçi flatten: {message}", exc_info=True
+                        )
+                        continue
+                    if closed:
+                        flattened.append(symbol)
+                    else:
+                        errors.append(
+                            f"{symbol}: kapanış borsa üzerinde doğrulanamadı"
+                        )
+        return {
+            "flattened": flattened,
+            "errors": errors,
+            "halt": {**self.halt.snapshot(force=True),
+                     "persisted": halt_snapshot.get("persisted", True)},
+        }
+
+    # ------------------------------------------------------------------
+    # Durum / sağlık
+    # ------------------------------------------------------------------
+
+    def health_snapshot(self) -> Dict[str, Any]:
+        safety_age = (
+            time.monotonic() - self._safety_last_success_monotonic
+            if self._safety_last_success_monotonic is not None
+            else None
+        )
+        safety_limit = max(15.0, self._safety_interval_seconds() * 10.0)
+        safety_healthy = safety_age is not None and safety_age <= safety_limit
+        healthy = bool(
+            self.running
+            and safety_healthy
+            and self._safety_task is not None
+            and not self._safety_task.done()
+        )
+        return {
+            "healthy": healthy,
+            "running": self.running,
+            "mode": "follower",
+            "exchange_ready": self._exchange_ready,
+            "recovery_ready": self._recovery_ready,
+            "risk_ready": self._risk_ready,
+            "entry_halted": self._entry_halted,
+            "kill_switch": self._kill_switch,
+            "safety_age_seconds": round(safety_age, 2) if safety_age else None,
+            "safety_last_error": self._safety_last_error,
+            "exchange_last_error": self._exchange_last_error,
+        }
+
+    def snapshot(self) -> Dict[str, Any]:
+        positions: List[Dict[str, Any]] = []
+        for symbol, sp in self.exits._positions.items():
+            plan_meta = getattr(sp, "meta", {}).get("plan", {}) if hasattr(sp, "meta") else {}
+            positions.append(
+                {
+                    "symbol": symbol,
+                    "direction": sp.signal.direction.value,
+                    "entry_price": sp.position.entry_price,
+                    "quantity": sp.position.quantity,
+                    "leverage": sp.position.leverage,
+                    "stop_loss": sp.position.current_stoploss,
+                    "tp1": sp.plan.tp1_price,
+                    "tp2": sp.plan.tp2_price,
+                    "tp3": getattr(sp.plan, "tp3_price", 0.0),
+                    "tp1_done": sp.tp1_done,
+                    "tp2_done": sp.tp2_done,
+                    "tp3_done": bool(getattr(sp, "tp3_done", False)),
+                    "sl_pct": plan_meta.get("sl_pct"),
+                    "sl_pct_fill": plan_meta.get("sl_pct_fill"),
+                    "sl_roi_pct": plan_meta.get("sl_roi_pct"),
+                    "tp1_roi_pct": (plan_meta.get("tp_roi_pct") or [None])[0],
+                    # Ücret eşiği (D20): TP1 ROI'si gidiş-dönüş komisyonu
+                    # karşılıyor mu? False = yapısal negatif beklenti adayı.
+                    "fee_roi_pct": plan_meta.get("fee_roi_real_pct"),
+                    "tp1_covers_fees": plan_meta.get("tp1_covers_fees_real"),
+                    "margin_usdt": plan_meta.get("margin_usdt"),
+                    "levels_source": (plan_meta.get("levels") or {}).get("source"),
+                    "trade_id": sp.trade_id,
+                    "opened_at": sp.position.opened_at.isoformat()
+                    if sp.position.opened_at
+                    else None,
+                }
+            )
+
+        halt_snapshot = self.halt.snapshot()
+        return {
+            "mode": "follower",
+            "strategy": FOLLOWER_STRATEGY,
+            "running": self.running,
+            "health": self.health_snapshot(),
+            "entries_ready": self._entries_ready(),
+            "entry_block_reason": self._entry_block_reason(),
+            "universe": sorted(self.symbol_allowlist()),
+            "timeframe": str(getattr(self.cfg, "follower_timeframe", "1")),
+            "max_positions": int(getattr(self.cfg, "follower_max_positions", 4)),
+            "positions": positions,
+            "cooldowns": self.executor.cooldown_snapshot(),
+            "kill_switch_active": self._kill_switch,
+            "daily_pnl": self._daily_pnl,
+            "daily_loss_threshold_usdt": self._daily_loss_threshold_usdt,
+            "risk_equity_usdt": self._risk_equity_usdt,
+            "risk_event_halt": {
+                "active": halt_snapshot.get("active"),
+                "reason": halt_snapshot.get("reason"),
+                "until_ts": halt_snapshot.get("until_ts"),
+            },
+            "entry_halted": self._entry_halted,
+            "entry_halt_reason": self._entry_halt_reason,
+            "sizing": {
+                "margin_pct": float(getattr(self.cfg, "follower_margin_pct", 10.0)),
+                "sl_roi_target": float(
+                    getattr(self.cfg, "follower_sl_roi_target", 30.0)
+                ),
+                "lev_min": int(getattr(self.cfg, "follower_lev_min", 3)),
+                "lev_max": int(getattr(self.cfg, "follower_lev_max", 100)),
+                "liq_guard_pct": float(
+                    getattr(self.cfg, "follower_lev_liq_guard_pct", 50.0)
+                ),
+                "tp_rr": [
+                    float(getattr(self.cfg, "follower_tp_rr1", 0.5)),
+                    float(getattr(self.cfg, "follower_tp_rr2", 1.0)),
+                    float(getattr(self.cfg, "follower_tp_rr3", 1.5)),
+                ],
+                # 0 = ücret eşiği kapısı KAPALI (varsayılan, kullanıcı kararı).
+                "min_tp1_fee_ratio": float(
+                    getattr(self.cfg, "follower_min_tp1_fee_ratio", 0.0)
+                ),
+            },
+            "brackets": self.brackets.snapshot(),
+            "events": list(self._events),
+            "event_counters": dict(self._event_counters),
+            "reject_counters": {
+                **self._reject_counters,
+                **self.executor.reject_snapshot(),
+            },
+            "last_event_at": self._last_event_at,
+        }

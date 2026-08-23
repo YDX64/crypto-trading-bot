@@ -444,6 +444,56 @@ pencere tarihleri ve karar kuralı `docs/DECISIONS.md` P2'de.
   safety turunu şişirip watchdog restart tetiklediği 2026-08-14 olayından
   sonra eklendi (`engine.py:661` yorum + `return`).
 
+## 9b. İkinci çalışma modu: AlgoPro takipçi halkası (D20)
+
+`BOT_MODE=follower` (varsayılan `scalper`) AYNI kod tabanını AYRI bir süreç/hesap
+olarak çalıştırır: **scanner, strateji C ve TV sağlaması KAPALIDIR**; giriş ve çıkış
+yalnız AlgoPro V1.6 alarmlarından gelir. `src/main.py` lifespan'ında erken bir dal
+(`settings.is_follower_mode`) ScalperEngine/TradingOrchestrator/Telegram-VIP akışını
+HİÇ kurmaz — orchestrator açık pozisyonları sahiplendiği için takipçiyle çakışırdı.
+
+```mermaid
+flowchart TD
+    TV["TradingView\nAlgoPro V1.6 alert()"] --> W["ana bot :9091\n/tv-signal (secret)"]
+    W -->|"src=algopro"| F["follower_forwarder\nfire-and-forget, 2sn"]
+    W -->|"BUY/SELL"| SC["scalper: TvConfluence → external_signal\n(BUGÜNKÜ davranış)"]
+    F --> E["takipçi :9093\n/follower/event (ayrı secret)"]
+    E --> P["parser.parse_follower_event"]
+    P --> L["levels.resolve_levels\n(mesaj > k×ATR)"]
+    L --> PL["plan.build_plan\nmarj %10 + dinamik kaldıraç"]
+    PL --> X["FollowerExecutor\nMARKET → SL → 3× TP"]
+    X --> XM["FollowerExitManager\nTP1→BE, kapanış defteri"]
+    XM --> DB["scalp_trades (strategy=AP)\ntradingbot_ap.db"]
+```
+
+| Dosya | Sorumluluk |
+|---|---|
+| `src/strategies/follower/types.py` | veri sözleşmesi (`FollowerEvent`, `FollowerLevels`, `FollowerPlan`, `LeverageBracket`) |
+| `src/strategies/follower/parser.py` | AlgoPro alert gövdesi → olay (saf); birincil biçim `\|` ayraçlı `Anahtar: değer`, ikincil `kind=…` şablonu |
+| `src/strategies/follower/levels.py` | SL/TP çözümü (saf): **birincil** mesaj seviyeleri, **yedek** `k×ATR` + RR katları |
+| `src/strategies/follower/plan.py` | marj/kaldıraç/miktar (saf) + borsa dilimi & likidasyon kapıları |
+| `src/strategies/follower/brackets.py` | `/fapi/v1/leverageBracket` TTL önbelleği (fail-closed) |
+| `src/strategies/follower/executor.py` | korumalı açılış: MARKET → `pm.place_stop_loss_or_close` → 3× reduce-only TP → defter |
+| `src/strategies/follower/exits.py` | `ExitManager` alt sınıfı: TP1→BE, TP2/TP3 telemetri, kapanış defteri, restart kurtarma |
+| `src/strategies/follower/risk_halt.py` | D10 risk-olayı halt'ının takipçi kopyası (TTL, fail-closed, RAM latch) |
+| `src/strategies/follower/engine.py` | kapılar, kill switch, safety/readiness döngüleri, `/follower/status` |
+| `src/services/follower_forwarder.py` | ana bottaki köprü (yalnız `src=algopro`, secret başlıkta) |
+
+**Yeniden kullanılanlar (yeniden YAZILMADI):** `ImprovedBinanceClient`,
+`PositionManager` (SL kurulamazsa acil kapatma), `ScalpTracker`/`scalp_trades`,
+`ExitManager`'ın kapanış doğrulama merdiveni (income → userTrades → tahmini),
+`_confirmed_algo_fill` fill kanıtı, `fee_aware_breakeven_price`, `/risk-event` kanalı.
+
+**Boyutlama (scalper'dan FARKLI, kullanıcı kararı 2026-08-23):** marj = bakiyenin
+`%FOLLOWER_MARGIN_PCT`'i; kaldıraç `clamp(round(FOLLOWER_SL_ROI_TARGET / sl_pct),
+LEV_MIN, LEV_MAX)` — yani stop DAİMA marjın ~%30'u. Üstüne borsa kaldıraç dilimi,
+`lev × sl_pct ≤ 50` ve `1/lev − mmr > 2 × sl_pct/100` kapıları (hepsi yalnız DÜŞÜRÜR).
+
+**Scalper halkasına dokunulan yerler (davranış NÖTR):** `ExitPlan`'a varsayılanı
+0/None olan `tp3_*` alanları; `_verified_close_ledger`'a opsiyonel `tp3_algo_id`
+adayı; `ScalpTradeModel.tp3_algo_id` sütunu (idempotent migration) ve
+`record_open(tp3_algo_id=None)`. Scalper bu alanları HİÇ doldurmaz.
+
 ## 10. Sözlük
 
 | Terim | Anlam |

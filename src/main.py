@@ -32,6 +32,7 @@ from src.models.waiting_signal import WaitingSignalModel, WaitingStatus
 from src.models.scalp_trade import ScalpTradeModel
 from src.services.telegram_bot import TelegramBotService
 from src.services.orchestrator import TradingOrchestrator
+from src.services.follower_forwarder import maybe_forward_algopro_event
 from src.strategies.scalper.engine import ScalperEngine
 from src.strategies.scalper.tracker import ScalpTracker
 
@@ -94,6 +95,19 @@ telegram_bot: Optional[TelegramBotService] = None
 orchestrator: Optional[TradingOrchestrator] = None
 scalper_engine: Optional[ScalperEngine] = None
 telegram_supervisor_task: Optional[asyncio.Task] = None
+# AlgoPro takipçi halkası (D20, BOT_MODE=follower). Scalper modunda DAİMA
+# None kalır — bu dosyadaki her takipçi dalı o modda ölü koddur.
+follower_engine = None
+
+
+def _risk_engine():
+    """`/risk-event` hangi motora gidecek? (halkaya göre)
+
+    Scalper modunda BUGÜNKÜ davranış birebir: `scalper_engine`. Takipçi
+    modunda aynı sözleşmeyi (halt/resume/flatten/status) uygulayan
+    `FollowerEngine` döner — D10 semantiği iki halkada da aynıdır.
+    """
+    return scalper_engine or follower_engine
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +195,7 @@ async def _telegram_supervisor(service: TelegramBotService) -> None:
 async def lifespan(app: FastAPI):
     """Uygulama yaşam döngüsü"""
     global telegram_bot, orchestrator, scalper_engine, telegram_supervisor_task
+    global follower_engine
 
     app_logger.info("=" * 80)
     app_logger.info("🚀 TRADING BOT BAŞLATILIYOR")
@@ -191,6 +206,28 @@ async def lifespan(app: FastAPI):
         await init_db()
         db_ready = True
         app_logger.info("✅ Veritabanı hazır")
+
+        # --- AlgoPro takipçi halkası (D20): scanner/strateji/TV sağlaması
+        #     ve Telegram VIP akışı YOKTUR; orchestrator da BAŞLATILMAZ
+        #     (açık pozisyonları sahiplenip takipçiyle çakışırdı). ---
+        if settings.is_follower_mode:
+            from src.strategies.follower.engine import FollowerEngine
+
+            follower_engine = FollowerEngine()
+            await follower_engine.start()
+            app_logger.info("=" * 80)
+            app_logger.info(f"✅ ALGOPRO TAKİPÇİ HALKASI HAZIR - {settings.app_env.upper()}")
+            app_logger.info(
+                f"🌐 Ortam: {'TESTNET' if settings.is_testnet else '⚠️ MAINNET (GERÇEK PARA)'}"
+            )
+            app_logger.info(f"📊 API Server: http://{settings.api_host}:{settings.api_port}")
+            app_logger.info(
+                f"🔒 /follower/event: "
+                f"{'korumalı' if (settings.follower_forward_secret or '').strip() else 'DEVRE DIŞI (secret yok)'}"
+            )
+            app_logger.info("=" * 80)
+            yield
+            return
 
         # TEK orchestrator oluştur ve Telegram servisine PAYLAŞTIR.
         # İki ayrı örnek olursa sinyali işleyen örneğin izleme döngüsü çalışmaz.
@@ -246,6 +283,8 @@ async def lifespan(app: FastAPI):
             ("Telegram bot", telegram_bot.stop if telegram_bot else None),
             ("Scalper motoru", scalper_engine.stop if scalper_engine else None),
             ("Trading Orchestrator", orchestrator.close if orchestrator else None),
+            # Scalper modunda DAİMA None → bu satır davranışı değiştirmez.
+            ("AlgoPro takipçisi", follower_engine.stop if follower_engine else None),
         ):
             if closer is None:
                 continue
@@ -262,6 +301,7 @@ async def lifespan(app: FastAPI):
         telegram_bot = None
         scalper_engine = None
         orchestrator = None
+        follower_engine = None
         app_logger.info("✅ Uygulama kapatıldı")
 
 
@@ -316,6 +356,29 @@ async def root():
 @app.get("/health")
 async def health_check():
     """Sağlık kontrolü — gerçek durumu yansıtır."""
+    # AlgoPro takipçi halkası (D20): orchestrator/Telegram/scalper YOKTUR;
+    # sağlık yalnız takipçi motorundan okunur. Scalper modunda bu dal hiç
+    # çalışmaz (bugünkü davranış birebir korunur).
+    if settings.is_follower_mode:
+        follower_health = (
+            follower_engine.health_snapshot()
+            if follower_engine
+            else {"healthy": False, "running": False, "reason": "engine_not_created"}
+        )
+        core_healthy = bool(follower_health.get("healthy"))
+        return JSONResponse(
+            status_code=200 if core_healthy else 503,
+            content={
+                "status": "healthy" if core_healthy else "degraded",
+                "core_healthy": core_healthy,
+                "timestamp": _utcnow_iso(),
+                "mode": "follower",
+                "follower": "running" if core_healthy else "degraded",
+                "follower_details": follower_health,
+                "network": "testnet" if settings.is_testnet else "mainnet",
+            },
+        )
+
     if orchestrator and hasattr(orchestrator, "health_snapshot"):
         orchestrator_health = orchestrator.health_snapshot()
     elif orchestrator:
@@ -387,6 +450,41 @@ async def api_status():
     """Sistem durumu — Binance hataları gizlenmez."""
     account = {"balance": None, "btc_price": None, "open_positions": None}
     errors = []
+
+    # Takipçi halkasında orchestrator YOKTUR; hesap özeti takipçi motorunun
+    # istemcisinden okunur (deploy sağlık yoklaması bu uç noktayı kullanır).
+    # Scalper modunda `orchestrator` her zaman doludur → davranış aynı.
+    if orchestrator is None and follower_engine is not None:
+        client = follower_engine.client
+        try:
+            account["balance"] = await client.get_account_balance()
+        except Exception as e:
+            errors.append(f"balance: {e}")
+        try:
+            account["btc_price"] = await client.get_current_price("BTCUSDT")
+        except Exception as e:
+            errors.append(f"price: {e}")
+        try:
+            account["open_positions"] = len(
+                await client.get_all_positions(force_fresh=False)
+            )
+        except Exception as e:
+            errors.append(f"positions: {e}")
+        return {
+            "status": "running" if not errors else "degraded",
+            "bot_active": bool(follower_engine.running),
+            "orchestrator_active": False,
+            "mode": "follower",
+            "account": account,
+            "errors": errors,
+            "config": {
+                "margin_pct": settings.follower_margin_pct,
+                "max_positions": settings.follower_max_positions,
+                "lev_bounds": [settings.follower_lev_min, settings.follower_lev_max],
+                "sl_roi_target": settings.follower_sl_roi_target,
+            },
+            "timestamp": _utcnow_iso(),
+        }
 
     if orchestrator:
         client = orchestrator.binance
@@ -625,6 +723,25 @@ def resolve_tv_source(raw_src_param: Optional[str], raw_body: str):
     return source, False
 
 
+def _maybe_forward_to_follower(request: Request, raw: str) -> None:
+    """AlgoPro kaynaklı TV olayını takipçi halkasına ilet (fire-and-forget).
+
+    Ana motorun akışını ETKİLEMEZ: ayrı task, 2 sn timeout, her hata loglanır
+    ve yutulur (bkz. `src/services/follower_forwarder.py`). Kaynak tespiti
+    mevcut `resolve_tv_source` ile AYNIDIR — yeni bir parmak izi mantığı
+    yazılmadı; yalnız "algopro" olarak çözülen olaylar iletilir.
+
+    Bu fonksiyon BİLİNÇLİ olarak ayrı tutulmuştur: `/tv-signal`'a paralel
+    çalışan başka bir değişiklik (gövde-yönlendirme) ile çakışma yüzeyini tek
+    satıra indirir.
+    """
+    try:
+        source, _ = resolve_tv_source(request.query_params.get("src"), raw)
+        maybe_forward_algopro_event(raw, source)
+    except Exception as exc:  # savunmacı: köprü ana akışı ASLA düşürmez
+        app_logger.warning(f"⚠️ Takipçi köprüsü çağrılamadı ({exc})")
+
+
 def resolve_tv_signal(raw: str, configured_secret: str, url_secret: str = ""):
     """TradingView alert gövdesini (JSON veya düz metin) çöz ve doğrula.
 
@@ -712,9 +829,23 @@ async def tradingview_webhook(request: Request):
     if not raw or len(raw) > 8192:
         raise HTTPException(status_code=422, detail="Geçersiz gövde")
 
-    symbol, direction = resolve_tv_signal(
-        raw, configured, url_secret=request.query_params.get("secret") or ""
-    )
+    try:
+        symbol, direction = resolve_tv_signal(
+            raw, configured, url_secret=request.query_params.get("secret") or ""
+        )
+    except HTTPException as exc:
+        # 422 = secret DOĞRU ama yön/sembol çözülemedi. AlgoPro'nun
+        # "⚪ EXIT | …", "🎯 TP1 HIT | …", "🛑 SL HIT | …" mesajları yön
+        # kelimesi taşımaz ve burada 422 alır — takipçi halkası için bunlar
+        # KRİTİK olaylardır, o yüzden iletim 422'den ÖNCE yapılır.
+        # 403'te (secret yanlış) HİÇBİR ŞEY iletilmez: kimliği doğrulanmamış
+        # bir gövde takipçiye enjekte edilemez (resolve_tv_signal secret'ı
+        # sembol/yön çözümünden ÖNCE doğrular).
+        if exc.status_code == 422:
+            _maybe_forward_to_follower(request, raw)
+        raise
+
+    _maybe_forward_to_follower(request, raw)
 
     if not scalper_engine:
         raise HTTPException(status_code=503, detail="Scalper hazır değil")
@@ -862,7 +993,11 @@ async def risk_event(request: Request):
             detail=f"'ttl_minutes' 1..{_RISK_EVENT_MAX_TTL_MINUTES} aralığında olmalı",
         )
 
-    if not scalper_engine:
+    # Halkaya göre motor: scalper modunda `scalper_engine` (bugünkü davranış),
+    # takipçi modunda aynı halt/resume/flatten/status sözleşmesini uygulayan
+    # `FollowerEngine` (D10 semantiği iki halkada da aynı).
+    engine = _risk_engine()
+    if not engine:
         raise HTTPException(status_code=503, detail="Scalper hazır değil")
 
     if action in ("halt", "flatten") and not reason:
@@ -880,7 +1015,7 @@ async def risk_event(request: Request):
     )
 
     if action == "status":
-        snap = scalper_engine.risk_event_status()
+        snap = engine.risk_event_status()
         return {
             "ok": True,
             "action": action,
@@ -893,7 +1028,7 @@ async def risk_event(request: Request):
         }
 
     if action == "resume":
-        snap = scalper_engine.risk_event_resume()
+        snap = engine.risk_event_resume()
         # ok=False: dosya silinemediyse (OSError) halt file-derived olarak
         # AKTİF kalır (bkz. risk_event_resume) — yanıt bunu "başarılı resume"
         # gibi göstermemeli (I).
@@ -907,7 +1042,7 @@ async def risk_event(request: Request):
         }
 
     if action == "halt":
-        snap = await scalper_engine.risk_event_halt(
+        snap = await engine.risk_event_halt(
             reason=reason, source=source, ttl_minutes=ttl_minutes
         )
         # ok=snapshot.active: RAM latch sayesinde persist başarısız olsa
@@ -927,7 +1062,7 @@ async def risk_event(request: Request):
         }
 
     # action == "flatten"
-    result = await scalper_engine.risk_event_flatten(
+    result = await engine.risk_event_flatten(
         reason=reason, source=source, ttl_minutes=ttl_minutes
     )
     halt_snap = result.get("halt") or {}
@@ -943,6 +1078,96 @@ async def risk_event(request: Request):
         "errors": result.get("errors", []),
         "persisted": bool(halt_snap.get("persisted", True)),
     }
+
+
+# ---------------------------------------------------------------------------
+# AlgoPro takipçi halkası (D20) — `BOT_MODE=follower`
+# ---------------------------------------------------------------------------
+# Ana bot (scalper halkası) AlgoPro kaynaklı TV olaylarını buraya İLETİR;
+# TV alarm URL'leri ve secret'ları DEĞİŞMEZ. Kanal TV webhook'undan ve
+# risk-olayı kanalından AYRI bir secret ister (`FOLLOWER_FORWARD_SECRET`,
+# boş = 503 ile kapalı — aynı fail-closed desen).
+
+_FOLLOWER_EVENT_MAX_BODY_BYTES = 4096
+_FOLLOWER_SECRET_HEADER = "X-Follower-Secret"
+_FOLLOWER_BODY_SECRET_RE = re.compile(r"(?:^|\s)secret=([^\s]+)")
+
+_EMPTY_FOLLOWER_STATUS = {
+    "mode": "follower",
+    "running": False,
+    "health": {"healthy": False, "running": False, "reason": "engine_not_created"},
+    "entries_ready": False,
+    "positions": [],
+    "events": [],
+}
+
+
+@app.post("/follower/event")
+async def follower_event(request: Request):
+    """AlgoPro olay köprüsü: giriş/çıkış/TP/SL olaylarını takipçi motoruna ver.
+
+    Gövde AlgoPro'nun KENDİ alert mesajıdır (``🔴 SELL | BINANCE:BTCUSDT |
+    TF: 1 | Price: … | SL: … | TP1: … | TP2: … | TP3: …``) ya da açık
+    ``kind=…`` şablonudur; ayrıştırma `src/strategies/follower/parser.py`'de.
+
+    403 = secret yanlış · 422 = gövde çözülemedi/çok büyük · 503 = kanal
+    kapalı (secret yok) ya da takipçi motoru hazır değil.
+    """
+    configured = (settings.follower_forward_secret or "").strip()
+    if not configured:
+        raise HTTPException(
+            status_code=503,
+            detail="Takipçi kanalı devre dışı — .env'e FOLLOWER_FORWARD_SECRET ekleyin",
+        )
+
+    raw_bytes = await request.body()
+    if len(raw_bytes) > _FOLLOWER_EVENT_MAX_BODY_BYTES:
+        raise HTTPException(status_code=422, detail="Gövde çok büyük (>4KB)")
+    raw = raw_bytes.decode("utf-8", errors="replace").strip()
+
+    # Secret YALNIZ başlıkta ya da gövdede taşınır. `?secret=` BİLİNÇLİ olarak
+    # DESTEKLENMEZ: uvicorn erişim logu (logs/supervisor.log) query string'i
+    # düz metin yazar ve rotasyonla yedeklere yayılır (CLAUDE.md kural 5).
+    # Köprü zaten `X-Follower-Secret` başlığını kullanır; elle test için
+    # `-H 'X-Follower-Secret: …'` ya da gövdede `secret=…`.
+    provided = str(request.headers.get(_FOLLOWER_SECRET_HEADER) or "")
+    if not provided:
+        match = _FOLLOWER_BODY_SECRET_RE.search(raw)
+        provided = match.group(1) if match else ""
+    if not _constant_time_equals(provided, configured):
+        raise HTTPException(status_code=403, detail="Geçersiz takipçi secret")
+
+    if not raw:
+        raise HTTPException(status_code=422, detail="Boş gövde")
+
+    from src.strategies.follower.parser import parse_follower_event
+    from src.strategies.follower.types import FollowerParseError
+
+    try:
+        event = parse_follower_event(raw)
+    except FollowerParseError as exc:
+        app_logger.warning(f"⚠️ Takipçi olayı ayrıştırılamadı: {exc}")
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    if not follower_engine:
+        raise HTTPException(status_code=503, detail="Takipçi motoru hazır değil")
+
+    result = await follower_engine.handle_event(event)
+    return {
+        "ok": True,
+        "kind": event.kind,
+        "symbol": event.symbol,
+        "direction": event.direction.value if event.direction else None,
+        **result,
+    }
+
+
+@app.get("/follower/status")
+async def follower_status():
+    """Takipçi motorunun anlık durumu (pozisyonlar, boyutlama, son olaylar)."""
+    if not follower_engine:
+        return dict(_EMPTY_FOLLOWER_STATUS)
+    return follower_engine.snapshot()
 
 
 @app.post("/signal", dependencies=[Depends(require_api_key)])

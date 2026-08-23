@@ -327,6 +327,53 @@ class TestDeployConfirmBypass:
         assert _ssh_call_count(ssh_log) == 0
 
 
+class TestFollowerRing:
+    """AlgoPro takipçi halkası (D20): ayrı dizin/program/port, mainnet onayı YOK."""
+
+    def test_follower_ring_targets_ap_directory(self, tmp_path):
+        proc, ssh_log = _run_deploy(tmp_path, ["awa", "--ring", "follower"])
+        assert proc.returncode == 0, proc.stderr
+        assert _ssh_call_count(ssh_log) == 1
+        log = ssh_log.read_text()
+        assert "cd /opt/tradingbot-ap &&" in log
+        assert "RING=follower" in log
+        assert "PROGRAM=tradingbot_ap" in log
+        assert "HEALTH_URL=http://127.0.0.1:9093/api/status" in log
+        assert "bash /tmp/server_deploy.sh 'origin/main'" in log
+
+    def test_follower_ring_accepts_origin_main_without_confirmation(self, tmp_path):
+        """Takipçi halkası TESTNET'tir: 'MAINNET' onay istemi SORULMAZ."""
+        proc, ssh_log = _run_deploy(
+            tmp_path, ["awa", "--ring", "follower"], stdin_text=""
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert "MAİNNET DEPLOY ONAYI" not in proc.stdout
+        assert _ssh_call_count(ssh_log) == 1
+
+    def test_follower_ring_accepts_explicit_target(self, tmp_path):
+        proc, ssh_log = _run_deploy(tmp_path, ["awa", "abc1234", "--ring", "follower"])
+        assert proc.returncode == 0, proc.stderr
+        assert "bash /tmp/server_deploy.sh 'abc1234'" in ssh_log.read_text()
+
+    def test_follower_ring_refuses_dirty_tree(self, tmp_path):
+        proc, ssh_log = _run_deploy(
+            tmp_path, ["awa", "--ring", "follower"], fake_git_dirty=True
+        )
+        assert proc.returncode != 0
+        assert _ssh_call_count(ssh_log) == 0
+
+    def test_env_overrides_win_over_ring_defaults(self, tmp_path):
+        proc, ssh_log = _run_deploy(
+            tmp_path,
+            ["awa", "--ring", "follower"],
+            env_extra={"REPO_DIR": "/opt/custom-ap", "PROGRAM": "custom_ap"},
+        )
+        assert proc.returncode == 0, proc.stderr
+        log = ssh_log.read_text()
+        assert "cd /opt/custom-ap &&" in log
+        assert "PROGRAM=custom_ap" in log
+
+
 class TestInvalidRingValue:
     def test_unknown_ring_refused(self, tmp_path):
         proc, ssh_log = _run_deploy(tmp_path, ["awa", "v1.2.0", "--ring", "prod"])
@@ -336,6 +383,15 @@ class TestInvalidRingValue:
 
 
 # ── server_deploy.sh: mainnet .env ön kontrolü (statik/metin doğrulaması) ───
+
+
+def test_server_deploy_supports_follower_ring():
+    """RING=follower kabul edilmeli ve takipçinin AYRI entry-halt dosyasını
+    kontrol etmeli (scalper/mainnet yolları DEĞİŞMEDEN)."""
+    text = SERVER_DEPLOY_SH.read_text()
+    assert "testnet|follower|mainnet" in text
+    assert "state/follower_entry_halt.json" in text
+    assert 'HALT_FILE="state/scalper_entry_halt.json"' in text
 
 
 def test_server_deploy_mentions_mainnet_precheck_keys():
