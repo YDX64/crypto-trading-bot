@@ -581,6 +581,61 @@ class TestExitManagerBreakEven:
         await manager._step_one("BTCUSDT", sp)
         manager._handle_closed.assert_awaited_once()
 
+    async def test_open_tp1_breakeven_exit_end_to_end(self, tmp_path):
+        """TAM AKIŞ: AlgoPro girişi → TP1 dolumu → BE → AlgoPro EXIT → kapanış.
+
+        Motor GERÇEK `FollowerExitManager` ile çalışır (yalnız executor ve
+        borsa/DB sahte). Zincirin her halkası tek testte doğrulanır.
+        """
+        client = _ExitFakeClient(live_qty=0.12)
+        pm = SimpleNamespace(replace_stop_loss=AsyncMock(return_value=True))
+        tracker = SimpleNamespace(record_close=AsyncMock(), close_seq=0)
+        cooldowns: list = []
+        manager = FollowerExitManager(
+            client, pm, tracker, _cfg(), exit_cooldown_cb=cooldowns.append
+        )
+        manager.logger = MagicMock()
+        manager._finalize_close = AsyncMock()  # kapanış defteri ayrıca test edildi
+
+        engine = _make_engine(tmp_path)
+        engine.exits = manager
+        engine.client.get_position_risk = AsyncMock(
+            return_value={"positionAmt": 0.0}
+        )
+        engine.executor.open_position = AsyncMock(return_value=_fake_position(qty=0.12))
+
+        # 1) Giriş
+        result = await engine.handle_event(parse_follower_event(SELL_ENTRY))
+        assert result["accepted"] is True
+        assert manager.tracked_symbols() == {"BTCUSDT"}
+        sp = manager._positions["BTCUSDT"]
+
+        # 2) TP1 dolumu → break-even (safety turu)
+        client.live_qty = 0.08
+        await manager.step()
+        assert sp.tp1_done is True
+        assert sp.position.current_stoploss == pytest.approx(77080.0)
+        assert sp.trailing_active is False  # takipçide trailing YOK
+
+        # 3) AlgoPro EXIT → reduce-only kapanış + borsa doğrulaması
+        engine.client.get_position_risk = AsyncMock(
+            side_effect=[{"positionAmt": -0.08}, {"positionAmt": 0.0}]
+        )
+        exit_result = await engine.handle_event(parse_follower_event(EXIT_EVENT))
+        assert exit_result["accepted"] is True
+        engine.client._request_with_retry.assert_awaited()
+        order = engine.client._request_with_retry.await_args.kwargs["params"]
+        assert order["reduceOnly"] == "true"
+        assert order["side"] == "BUY"  # SHORT'u kapatır
+        assert order["quantity"] == pytest.approx(0.08)  # CANLI miktar
+        assert manager.tracked_symbols() == set()
+        # Kapanış defteri AP_EXIT etiketiyle işletildi (cooldown ve PnL
+        # doğrulaması `_finalize_close` içinde — ayrıca test edilir).
+        assert (
+            manager._finalize_close.await_args.kwargs["forced_exit_reason"]
+            == "AP_EXIT"
+        )
+
     async def test_every_exit_starts_cooldown(self):
         """Scalper yalnız KAYIPTA cooldown başlatır; takipçi HER çıkışta."""
         cooldowns: list = []
