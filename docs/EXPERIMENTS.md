@@ -442,10 +442,40 @@ YATAY 145 +2392.3 / 1.29 · BOĞA 90 +3901.7 / 2.43.
 >
 > Artık kalan yok (LONG 1136.1−76.1 = 1060.0; SHORT 2091.8−1934.3 = 157.5, ikisi de tam),
 > ortak işlemlerin PnL'i iki koşuda aynı. Yani: **post-hoc filtre = saf kapı etkisi; motor-içi
-> koşu = kapı + kapasite yeniden tahsisi; fark = kapasite terimi.** Bu, E8.5'teki defter-üstü
-> simülasyonların da nasıl okunacağını belirler (onlar da saf kapı etkisidir) ve gelecekteki
-> kapı adayları için ucuz bir ön-eleme verir: post-hoc terim negatifse kapının KENDİSİ
-> zararlıdır, pozitifse motor-içi koşu bunu kapasite kazancıyla ancak BÜYÜTÜR.
+> koşu = kapı + ikinci-derece etkiler; fark = ikinci-derece terim.** Bu, E8.5'teki defter-üstü
+> simülasyonların da nasıl okunacağını belirler — onlar da saf kapı etkisidir.
+>
+> **İkinci-derece terim ikiye ayrılır** (ikisi de "bir işlemi kaldırmanın yan etkisi", kapı
+> etkisi DEĞİL): (a) semboller-arası **kapasite yeniden tahsisi** (`_apply_capacity_gate`;
+> boşalan slota sonraki aday girer), (b) sembol-içi **kayıp-cooldown serbest kalması**
+> (`backtest.py:849-850` — engellenen işlem SL olmadığı için cooldown kurulmaz ve o sembolde
+> bastırılmış sonraki girişler açılabilir hale gelir).
+>
+> **ÖN-ELEME KURALI — ilk yazdığım hâli YANLIŞTI, D15 ajanının çürütmesiyle düzeltildi.**
+> "Post-hoc negatifse aday elenir" GÜVENLİ DEĞİL: ikinci-derece terim saf kapı etkisinden
+> bağımsızdır ve onu rahatlıkla domine eder. Karşı-örnek bizim kendi verimiz — LONG bacağında
+> saf etki +76.1 (gürültü), ikinci-derece +1060.0; saf etki **−76.1 olsaydı bile** motor-içi
+> sonuç +983.9 çıkardı ve iyi bir aday koşulmadan elenirdi. Doğru, asimetrik hâli:
+>
+> | Post-hoc terim | Hüküm |
+> |---|---|
+> | GÜÇLÜ POZİTİF | motor-içi koşu bunu genelde büyütür — aday güçlü |
+> | ≈ SIFIR veya HAFİF NEGATİF | **hüküm verilemez**, motor-içi koşu ŞART |
+> | GÜÇLÜ NEGATİF | muhtemelen kötü; ama eşik "sıfır" değil, büyüklüğü makul bir ikinci-derece kazançla kıyaslanmalı |
+>
+> Pozitif kol da bir GARANTİ değil: ikinci-derece terim ilkesel olarak negatif de olabilir
+> (boşalan slota daha kötü işlemler girerse). Ölçtüğümüz üç pencerede ≥0 çıktı (eşik %1.3
+> iki yönlü: AYI +1217.5, YATAY +585.7, BOĞA ≈0 — BOĞA'da zaten yalnız 1 işlem engelleniyor).
+> Pozitif çıkma EĞİLİMİNİN yapısal nedeni: yerine geçen işlemler de kapıdan geçiyor, yani
+> tabandan değil FİLTRELENMİŞ dağılımdan çekiliyorlar.
+>
+> **Ayrışmanın geçerlilik koşulu:** "kalan = 0" bir ÖZDEŞLİK DEĞİL, bu koşu çiftinde çıkan
+> ampirik bir sonuçtur. Burada tutmasının nedeni: harness boyutlaması sabit `initial_balance`
+> kullanıyor (işlem başına compounding YOK — `backtest.py:763,842`; değişken döngü içinde hiç
+> yeniden atanmıyor) ve ortak adayların hiçbiri kapasite kapısında sıra değiştirmemiş, hiçbir
+> cooldown penceresi kaymamış. Başka bir adayda bunlardan biri bozulursa kalan ≠ 0 olur ve üç
+> terim birbirine karışır. **Kural: ayrışmayı kullanmadan önce kalanı hesapla; ≈0 değilse
+> ayrışma geçersizdir.**
 >
 > **Bacak hükmü (çözüldü):** aşağıdaki "kazancın tamamına yakını SHORT bacağından" okuması
 > motor-içi veriyle DOĞRULANDI (SHORT ~%92 kapı / LONG ~%7 kapı). D15 ajanının "LONG bacağı da
@@ -490,12 +520,6 @@ SHORT-ağırlıklı. Bağlam-TF kuralı "üst TF'ye karşı işlem açma" demek 
 kârının ters-trend dip alımından geldiği pencerelerde (YATAY: `RSI(15m)<50` 54 LONG'un
 50'si kazanan) doğrudan kârı kesiyor. **Hüküm: kanıt yetersiz — uygulanmaz.**
 
-> **Ön-eleme kuralına ÇEKİNCE (D15 ajanı, 2026-08-23):** "post-hoc terim negatifse motor-içi koşuya girmeye değmez"
-> kuralı güvenli DEĞİL — LONG bacağında saf kapı etkisi +76 (gürültü) iken kapasite terimi +1060; saf etki −76 olsaydı
-> motor-içi sonuç yine ≈ +984 olurdu. Savunulabilir biçim ASİMETRİK: güçlü pozitif post-hoc → güvenli aday; sıfır civarı
-> ya da hafif negatif → hüküm verilemez, motor-içi koşu ŞART. Ayrıca "kalıntı = 0" bir özdeşlik değil, bu koşu çiftine
-> özgü ampirik sonuç (sabit `initial_balance`, kapasite kapısında ortak adayların sırası değişmedi); başka adaylarda
-> kapasite kapısı/kayıp-cooldown ortak işlemleri kaydırırsa ayrışma temiz çıkmaz — kural uygulanmadan önce kalıntı kontrol edilmeli.
 
 ### E8.7 — TV SHORT kaynak kalitesi (15 işlem, PF 0.15)
 Kaynak eşlemesi `bot.log` "Sağlama tamam" satırlarından. Sunucudaki log tutma penceresi
