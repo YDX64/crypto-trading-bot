@@ -341,6 +341,78 @@ class Settings(BaseSettings):
     # anda birden çok işleme yer kalır ve likidasyon mesafesi hep uzak olur.
     scalper_max_margin_pct: float = 10.0
 
+    # ------------------------------------------------------------------
+    # Çalışma modu (D20) — AlgoPro takipçi halkası
+    # ------------------------------------------------------------------
+    # "scalper" (varsayılan) = BUGÜNKÜ davranış: scanner + strateji C + TV
+    # sağlaması + orchestrator. "follower" = AYRI süreç/halka: scanner ve
+    # strateji YOK, giriş yalnız AlgoPro olaylarından (`POST /follower/event`).
+    # Aynı kod tabanı, ayrı .env/DB/state/log/port/Binance hesabı.
+    bot_mode: str = "scalper"
+
+    # Ana bot (scalper halkası) AlgoPro kaynaklı TV olaylarını bu adrese
+    # İLETİR (fire-and-forget). Boş = iletim KAPALI (bugünkü davranış).
+    # TV alarm URL'leri DEĞİŞMEZ — tek TV girişi /tv-signal'da kalır.
+    follower_forward_url: str = ""
+    # Takipçi kanalının secret'ı — TV_WEBHOOK_SECRET ve RISK_EVENT_SECRET'tan
+    # AYRI. Boş = `/follower/event` 503 ile kapalı (aynı fail-closed desen).
+    follower_forward_secret: str = Field(default="", repr=False)
+    follower_forward_timeout_seconds: float = 2.0
+
+    # Takipçi evreni ve olay filtreleri.
+    follower_symbol_allowlist: str = (
+        "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,BNBUSDT,ADAUSDT,LTCUSDT"
+    )
+    # TradingView {{interval}} 1 dakikalık grafikte "1" döner; "1m" de kabul.
+    follower_timeframe: str = "1"
+    follower_max_positions: int = 4
+    follower_cooldown_sec: float = 60.0
+    # AlgoPro mesajındaki `Score: 8` alanı için alt sınır. 0 = filtre KAPALI
+    # (bugünkü karar: "AlgoPro ne diyorsa"). Skoru olmayan mesaj filtreye
+    # TAKILMAZ (alan opsiyoneldir), yalnız skor VARSA ve altındaysa reddedilir.
+    follower_min_score: float = 0.0
+    # Ters AlgoPro sinyalinde mevcut pozisyonu kapatıp yeni yöne gir.
+    follower_flip: bool = True
+    follower_daily_loss_limit_pct: float = 15.0  # SCALPER_DAILY_LOSS_LIMIT_PCT mantığı
+
+    # --- Boyutlama (KULLANICI KARARI 2026-08-23) ---
+    # Marj = bakiyenin %'si; kaldıraç VOLATİLİTEYE göre dinamik:
+    #   lev = clamp(round(SL_ROI_TARGET / sl_pct), LEV_MIN, LEV_MAX)
+    # yani stop, marjın ~%SL_ROI_TARGET'i olacak şekilde seçilir.
+    follower_margin_pct: float = 10.0
+    follower_sl_roi_target: float = 30.0
+    follower_lev_min: int = 3
+    follower_lev_max: int = 100
+    # Likidasyon koruması: lev × sl_pct bu değeri aşamaz (stop marjın %'si).
+    follower_lev_liq_guard_pct: float = 50.0
+    # mmr payı: (1/lev − mmr) > mult × sl_pct/100 değilse kaldıraç düşürülür.
+    follower_mmr_safety_mult: float = 2.0
+    # Borsa kaldıraç dilimi (/fapi/v1/leverageBracket) önbellek ömrü.
+    follower_bracket_cache_ttl_seconds: float = 21600.0
+
+    # --- Seviye motoru ---
+    # Öncelik: (a) AlgoPro mesajındaki sl/tp1/tp2/tp3, (b) hesaplanan kural.
+    follower_sl_atr_mult: float = 3.0
+    follower_atr_len: int = 14
+    follower_tp_rr1: float = 0.5
+    follower_tp_rr2: float = 1.0
+    follower_tp_rr3: float = 1.5
+    # Stop mesafesi bandı (fiyat %). Bant dışı = giriş YOK (fail-closed):
+    # sl_pct kaldıraç formülünün paydasıdır, sıfıra yaklaşması yasak.
+    follower_min_sl_pct: float = 0.02
+    follower_max_sl_pct: float = 5.0
+    # Kalibrasyon kancası: her girişte hesaplanan + (varsa) mesaj seviyeleri.
+    follower_levels_log_path: str = "state/follower_levels.jsonl"
+
+    # --- Takipçi işletim ---
+    # Açık pozisyon izleme (TP/BE/kapanış) turu — scalper'ın safety döngüsüyle
+    # aynı mertebe; dolan bir girişin korumasız kalma penceresini kısa tutar.
+    follower_safety_interval_seconds: float = 2.0
+    # Fail-closed giriş kilidi (UnprotectedPositionError latch'i). Scalper'ın
+    # `scalper_entry_halt_path`'inden AYRI dosya; takipçi halkasında bu kilit
+    # KAPATILAMAZ (bayrak yoktur — ayrı hesap, ayrı süreç).
+    follower_entry_halt_path: str = "state/follower_entry_halt.json"
+
     @property
     def is_production(self) -> bool:
         """Production ortamında mı?"""
@@ -374,6 +446,28 @@ class Settings(BaseSettings):
                     f"BINANCE_BIND_IP geçersiz IP adresi: {value!r}"
                 ) from e
         return value
+
+    @field_validator("bot_mode")
+    @classmethod
+    def _validate_bot_mode(cls, value: str) -> str:
+        """Bilinmeyen BOT_MODE sessizce 'scalper' gibi davranmamalı.
+
+        Yazım hatası (`BOT_MODE=folower`) takipçi halkasını sessizce scalper
+        olarak başlatır ve İKİ motor aynı hesapta işlem açar — startup'ta
+        fail-fast.
+        """
+        normalized = str(value or "").strip().lower()
+        if normalized not in ("scalper", "follower"):
+            raise ValueError(
+                f"BOT_MODE geçersiz: {value!r} — 'scalper' (varsayılan) veya "
+                "'follower' olmalı (bkz. docs/DECISIONS.md D20)."
+            )
+        return normalized
+
+    @property
+    def is_follower_mode(self) -> bool:
+        """AlgoPro takipçi halkası mı? (BOT_MODE=follower)"""
+        return str(self.bot_mode or "").strip().lower() == "follower"
 
     @model_validator(mode="after")
     def _validate_fixed_roi_stop_consistency(self) -> "Settings":
@@ -451,6 +545,20 @@ class Settings(BaseSettings):
                     "olarak onaylanmadı. Gerçek parayla işlem için ALLOW_MAINNET=true "
                     "ayarlayın. Testnet kullanmak istiyorsanız BINANCE_BASE_URL="
                     "https://testnet.binancefuture.com olarak ayarlayın."
+                )
+
+            if self.is_follower_mode:
+                # docs/MAINNET_PLAN.md §6: takipçi halkası (D20) mainnet'e
+                # KENDİ BAŞINA terfi ETMEZ. Ölçülmüş bir kenarı yoktur (kanıt:
+                # yok — testnet ölçümü kanıt olacak) ve boyutlaması scalper'ın
+                # risk-tabanlı boyutlamasından farklıdır (marj %10 + dinamik
+                # kaldıraç ≤100x). Testnet .env'i mainnet'e kopyalanınca bu
+                # sessizce gerçek parayla çalışamaz.
+                raise ValueError(
+                    "GÜVENLİK HATASI: BOT_MODE=follower yalnız TESTNET'te "
+                    "çalıştırılabilir. AlgoPro takipçi halkası mainnet'e kendi "
+                    "başına terfi etmez (docs/MAINNET_PLAN.md §6, D20) — "
+                    "BINANCE_BASE_URL'i testnet'e çevirin."
                 )
 
             if not self.scalper_entry_halt_enabled:

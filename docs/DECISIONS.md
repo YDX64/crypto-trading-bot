@@ -310,6 +310,100 @@ PF > 1.4 ama boğada toplam PnL tabanın ~%42'si (bilinçli tercih: "her rejimde
 "2026-08-23 02:57"`; değerlendirme ≥28 Ağu + ≥1 DOWN günü.
 **Geri alma:** `cp backups/env.bak-20260823-025623-riskpaketi .env && supervisorctl restart tradingbot_v2`.
 
+### D20 — AlgoPro takipçi halkası (`BOT_MODE=follower`, ayrı testnet hesabı) · 2026-08-23 · AKTİF (kanıt: YOK — testnet ölçümü kanıt olacak)
+**Ne:** İKİNCİ ve BAĞIMSIZ bir testnet sistemi. Aynı kod tabanı, `BOT_MODE=follower`
+ile AYRI süreç (`/opt/tradingbot-ap`, supervisord `tradingbot_ap`, port 9093, ayrı
+`.env`/DB/state/log/Telegram ve **ayrı Binance testnet hesabı** — anahtarları KULLANICI
+girer). Bu modda scanner, strateji C ve TV sağlaması KAPALIDIR; giriş/çıkış **yalnız
+AlgoPro V1.6** alarmlarından gelir:
+- **Giriş:** `BUY`/`SELL` → MARKET (1m sinyalde maker beklemek sinyali kaçırır).
+- **Çıkış:** `EXIT` ya da ters sinyal → kalan miktar reduce-only MARKET; `FOLLOWER_FLIP=true`
+  (varsayılan) ise ters sinyalde kapat + yeni yöne gir (flip cooldown'u BİLİNÇLİ atlar,
+  aksi halde özellik ölü olurdu).
+- **Seviyeler:** AlgoPro'nun kendi mesajındaki `SL/TP1/TP2/TP3` — **birincil kaynak**.
+  Yedek (mesajda seviye yoksa): `SL = giriş ∓ FOLLOWER_SL_ATR_MULT×ATR(14)` 1m'den,
+  `TPk = giriş ± RRk × SL_mesafesi` (0.5/1.0/1.5); yedek yola düşmek WARNING loglar.
+- **3 parça çıkış:** TP1/TP2/TP3 reduce-only `TAKE_PROFIT_MARKET`, 1/3'er (yuvarlama
+  artığı SON parçada); TP1 doğrulanınca SL ücret-farkında break-even'e çekilir.
+  Chandelier trailing YOKTUR — koşucuyu AlgoPro yönetir.
+- **Evren:** 8 majör × **1 dakika**; sembol başına tek pozisyon, azami 4 eşzamanlı.
+
+**Boyutlama (KULLANICI KARARI, gün içinde "risk %2"nin YERİNE geçti):** marj =
+bakiyenin `%FOLLOWER_MARGIN_PCT`'i (vars. %10); kaldıraç volatiliteye göre
+`lev = clamp(round(FOLLOWER_SL_ROI_TARGET / sl_pct), 3, 100)` (vars. hedef %30) →
+stop DAİMA marjın ~%30'u. ZORUNLU güvenlik kapıları (yalnız DÜŞÜRÜR):
+(a) borsa kaldıraç dilimi `/fapi/v1/leverageBracket` (gerçek değer okunur, 6 sa
+önbellek; **okunamazsa giriş YOK** — fail-closed); (b) `lev × sl_pct ≤ 50` ve
+`1/lev − mmr > 2 × sl_pct/100`; (c) nominal = marj × lev, qty borsa filtreleriyle
+doğrulanır, 3 parçaya bölünemeyen pozisyon AÇILMAZ; (d) TP ROI'leri SL ROI'sinin RR
+katıdır. Her işlemin `lev`, `sl_pct`, `sl_roi`, `margin` değerleri deftere
+(`signal_reason`) ve `/follower/status`'a yazılır.
+Doğrulanan örnekler (tests/test_follower_plan.py): SL %0.08 → 100x → SL = marjın %8'i,
+TP1 %4 · SL %0.30 → 100x → %30 / %15 · SL %0.60 → 50x → %30 / %15.
+
+**Sinyal yolu (TV alarm URL'leri DEĞİŞMEZ):** ana bot (`tradingbot_v2`, :9091) TEK TV
+girişi olarak kalır; `resolve_tv_source` "algopro" derse gövde
+`FOLLOWER_FORWARD_URL`'e İLETİLİR (fire-and-forget, 2 sn timeout, ayrı
+`FOLLOWER_FORWARD_SECRET`, secret `X-Follower-Secret` BAŞLIĞINDA — URL'de değil).
+Köprü `/tv-signal`'ın **422'sinden ÖNCE** çalışır (AlgoPro'nun EXIT/TP HIT/SL HIT
+mesajları yön kelimesi taşımaz ve ana botta 422 alır) ama **403'te asla iletmez**
+(`resolve_tv_signal` secret'ı sembol/yön çözümünden ÖNCE doğrular — kimliği
+doğrulanmamış gövde takipçiye enjekte edilemez).
+
+**AlgoPro mesaj gerçeği (TV Desktop sondasıyla ÖLÇÜLDÜ, 2026-08-23):** "Any alert()
+function call" modunda mesajı script üretir ve seviyeleri İÇERİR:
+`🔴 SELL | BINANCE:BTCUSDT | TF: 1 | Price: 77126.08 | TQI: .45 | Score: 8 | SL: 77167.77
+| TP1: 77105.23 | TP2: 77084.39 | TP3: 77063.54 | TP: fixed ×1.00`; `🎯 TP1 HIT | … | Price: …`;
+`🛑 SL HIT | … | Price: …`. TP'ler SL mesafesinin 0.5/1.0/1.5 katıdır (fiyat
+hassasiyetine yuvarlanmış, ölçülen fark ≤ yarım tick). Bu yüzden sembol başına TEK
+alarm yeter (mesaj şablonu yazılmaz) ve ayrıştırma emoji'ye DEĞİL anahtar kelimelere
+(`BUY/SELL/EXIT/TPn HIT/SL HIT`) ve `Anahtar: değer` çiftlerine dayanır. `TQI`/`Score`
+telemetriye yazılır; opsiyonel `FOLLOWER_MIN_SCORE` (vars. 0 = kapalı).
+
+**Neden AYRI halka:** takipçinin ölçülmüş bir kenarı YOKTUR ve boyutlaması scalper'ın
+risk-tabanlı boyutlamasından tamamen farklıdır (marj %10 + ≤100x). Aynı süreçte
+çalıştırmak scalper'ın soak'unu kirletir ve iki motor aynı hesapta çakışırdı. Bu yüzden
+ayrı hesap/DB/süreç ve `config.py`'de fail-fast: **`BOT_MODE=follower` + mainnet =
+startup HATASI** (docs/MAINNET_PLAN.md §6).
+
+**Scalper halkasına etkisi (byte-for-byte korunması gereken taraf):** varsayılan
+`BOT_MODE=scalper`; köprü yalnız `FOLLOWER_FORWARD_URL`+`SECRET` doluyken çalışır ve
+`src=algopro` DIŞINDAKİ hiçbir olayı iletmez. Kod tarafında yalnız NÖTR eklemeler:
+`ExitPlan.tp3_*` (varsayılan 0/None), `_verified_close_ledger`'a opsiyonel
+`tp3_algo_id` adayı (scalper'da DAİMA None → aday listesi aynı),
+`ScalpTradeModel.tp3_algo_id` sütunu (idempotent migration, scalper'da NULL),
+`record_open(tp3_algo_id=None)`, `/risk-event`'in aktif motora yönlendirilmesi
+(scalper modunda `scalper_engine` — aynı yol), `/health` ve `/api/status`'a yalnız
+takipçi modunda çalışan erken dallar.
+
+**Kanıt:** `tests/test_follower_parser.py` (33 — TV'den alınan GERÇEK gövdeler),
+`test_follower_levels.py` (16), `test_follower_plan.py` (27 — kullanıcının üç örneği
+birebir), `test_follower_executor.py` (14 — korumalı açılış disiplini),
+`test_follower_engine.py` (35 — kapılar/flip/exit/HIT çapraz doğrulaması + gerçek
+`FollowerExitManager` ile TP1→BE), `test_follower_forwarder.py` (19),
+`test_follower_endpoint.py` (19 — 403/422/503 + köprü çağrı yeri),
+`test_follower_mode.py` (13 — BOT_MODE fail-fast, mainnet yasağı, scalper nötrlüğü),
+`tests/test_deploy_scripts.py` (+6 follower halkası). `python3 -m pytest tests -q`
+→ **862 passed, 1 skipped** (önceki: 676 passed, 1 skipped). Backtest harness'e
+DOKUNULMADI — takipçi yalnız canlı olay hattında çalışır ve strateji C'yi hiç
+kullanmaz (CLAUDE.md kural 2 kapsamı dışında).
+
+**Beklenti:** YOK. Bu halka bir hipotez testidir: "AlgoPro'nun kendi seviyeleriyle,
+kendi giriş/çıkış komutlarıyla, 1m'de kâr edilebilir mi?" Kanıt canlı defterden
+gelecek: `scripts/ledger_report.py --db tradingbot_ap.db --strategy AP`. Terfi kuralı
+scalper'ınkiyle AYNI değildir — takipçi mainnet'e KENDİ BAŞINA ÇIKMAZ (D20 config
+kapısı), ancak ayrı bir kullanıcı kararıyla ve ayrı bir kanıt setiyle değerlendirilir.
+
+**Geri alma:** ana bottan `FOLLOWER_FORWARD_URL`'i boşalt + `supervisorctl restart
+tradingbot_v2` → köprü kapanır, takipçi sinyal ALMAZ (açık pozisyonlarını yönetmeye
+devam eder). Takipçiyi tamamen durdurmak: `supervisorctl stop tradingbot_ap`
+(önce `POST /risk-event {"action":"flatten"}` ile düzleştir). Kod geri alması
+gerekirse: bu commit'teki `src/strategies/follower/*`, `src/services/follower_forwarder.py`,
+`src/main.py` (takipçi dalları + köprü satırı), `src/core/config.py` (`bot_mode` +
+`FOLLOWER_*`), `src/models/scalp_trade.py` + `src/core/database.py` (`tp3_algo_id`),
+`src/strategies/scalper/{types,exits,tracker}.py` (nötr eklemeler),
+`scripts/{deploy.sh,server_deploy.sh,ledger_report.py}` değişikliklerini revert et.
+
 ## Reddedilen kararlar (kanıtla)
 
 | Fikir | Tarih | Sonuç | Neden reddedildi |

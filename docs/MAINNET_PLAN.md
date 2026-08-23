@@ -79,3 +79,12 @@ ve mainnet defteri 2 hafta sonra aynı rejim-bölünmüş tabloyla testnet'le ka
 ## 6. Asla
 - Mainnet'e `origin/main` ucu deploy etmek; `.env`'i testnet'ten kopyalamak (anahtarlar ayrı);
   gölge modu olmadan yeni parametre; kill-switch secret'sız mainnet; tek oturumda iki halkayı birden değiştirmek.
+- **AlgoPro takipçi halkasını (D20, `BOT_MODE=follower`) mainnet'e almak.** Bu halka
+  mainnet'e **KENDİ BAŞINA TERFİ ETMEZ**: ölçülmüş bir kenarı yoktur (kanıt: yok —
+  testnet defteri kanıt olacak) ve boyutlaması scalper'ınkinden tamamen farklıdır
+  (marj %10 + volatiliteye göre ≤100x kaldıraç). Kural kodda ZORLANIR:
+  `Settings._validate_binance_environment` `BOT_MODE=follower` + testnet-olmayan
+  `BINANCE_BASE_URL` gördüğünde startup'ta `ValueError` fırlatır (bkz. D20,
+  `tests/test_follower_mode.py::TestFollowerNeverOnMainnet`). Bu halkanın mainnet'e
+  çıkması, §2'deki 5 maddenin takipçi için AYRI AYRI karşılanmasını, AYRI bir kullanıcı
+  kararını ve bu kapının bilinçli olarak kaldırılmasını gerektirir.

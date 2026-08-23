@@ -50,6 +50,9 @@ class ScalpTradeModel(Base):
     sl_algo_id = Column(String, nullable=True)
     tp1_algo_id = Column(String, nullable=True)
     tp2_algo_id = Column(String, nullable=True)
+    # Üçüncü TP yalnız AlgoPro takipçi halkasında (D20, 3 parça çıkış)
+    # kullanılır; scalper (TP1/TP2 + runner) bu sütunu NULL bırakır.
+    tp3_algo_id = Column(String, nullable=True)
 
     # Giriş emri kimliği — kapanışta Binance income/userTrades doğrulaması
     # restart sonrası da çalışabilsin diye kalıcıdır.

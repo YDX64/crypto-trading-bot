@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Sunucu tarafı deploy: /opt/tradingbot-v2 içinde çalışır (supervisord program: tradingbot_v2).
-# İki halka destekler (bkz. docs/MAINNET_PLAN.md §1): RING=testnet (varsayılan, davranış DEĞİŞMEDİ)
-# ve RING=mainnet (yalnız log satırlarında ve aşağıdaki ekstra ön kontrolde etkili).
+# Üç halka destekler (bkz. docs/MAINNET_PLAN.md §1, docs/RUNBOOK.md "AlgoPro takipçi halkası"):
+# RING=testnet (varsayılan, davranış DEĞİŞMEDİ), RING=follower (/opt/tradingbot-ap,
+# tradingbot_ap, port 9093) ve RING=mainnet (ek .env ön kontrolü).
 # Akış: ön kontroller → .env yedeği → hedef commit'e geç → testler → restart → sağlık → başarısızsa GERİ AL.
 # Kullanım: scripts/server_deploy.sh [hedef-ref]   (varsayılan: origin/main)
 #   DEPLOY_SKIP_TESTS=1   testleri atla (acil geri alma için)
 #   DEPLOY_NO_RESTART=1   yalnız kodu güncelle, süreci yeniden başlatma
 #   REPO_DIR / PROGRAM / HEALTH_URL   halka için dizin/program/sağlık uç noktası (deploy.sh --ring mainnet ayarlar)
-#   RING=testnet|mainnet   yalnız log satırları + mainnet'e özel .env ön kontrolü için (rollback mantığı ortak)
+#   RING=testnet|follower|mainnet   yalnız log satırları, halka-özel entry-halt dosyası ve
+#                                   mainnet'e özel .env ön kontrolü için (rollback mantığı ORTAK)
 set -euo pipefail
 
 REPO_DIR="${REPO_DIR:-/opt/tradingbot-v2}"
@@ -23,15 +25,19 @@ log() { echo "[$(date -u '+%F %T')] $*" | tee -a "$LOG"; }
 die() { log "HATA: $*"; exit 1; }
 
 case "$RING" in
-  testnet|mainnet) ;;
-  *) die "geçersiz RING: '$RING' (testnet|mainnet olmalı)" ;;
+  testnet|follower|mainnet) ;;
+  *) die "geçersiz RING: '$RING' (testnet|follower|mainnet olmalı)" ;;
 esac
 
 cd "$REPO_DIR" || die "repo dizini yok: $REPO_DIR"
 mkdir -p backups logs
 
 # ── Ön kontroller ──────────────────────────────────────────────────────────
-[ -f state/scalper_entry_halt.json ] && die "entry-halt aktif — önce nedenini çöz (deploy iptal)"
+# Takipçi halkasının (D20) giriş kilidi AYRI dosyadadır; scalper/mainnet
+# halkalarında dosya adı ve davranış DEĞİŞMEDİ.
+HALT_FILE="state/scalper_entry_halt.json"
+[ "$RING" = "follower" ] && HALT_FILE="state/follower_entry_halt.json"
+[ -f "$HALT_FILE" ] && die "entry-halt aktif ($HALT_FILE) — önce nedenini çöz (deploy iptal)"
 if grep -qE 'HTTP 418|banned' <(tail -n 2000 logs/bot.log 2>/dev/null | awk -v s="$(date -u -d '15 minutes ago' '+%Y-%m-%d %H:%M')" '($1" "substr($2,1,5))>=s'); then
   die "son 15 dk'da Binance ban izi var — ban aktifken restart YASAK"
 fi
@@ -53,10 +59,10 @@ if [ "$RING" = "mainnet" ]; then
 fi
 
 PREV="$(git rev-parse HEAD)"
-if [ "$RING" = "mainnet" ]; then
-  log "deploy başlıyor [ring=mainnet, repo=$REPO_DIR, program=$PROGRAM]: $PREV → $TARGET"
-else
+if [ "$RING" = "testnet" ]; then
   log "deploy başlıyor: $PREV → $TARGET"
+else
+  log "deploy başlıyor [ring=$RING, repo=$REPO_DIR, program=$PROGRAM]: $PREV → $TARGET"
 fi
 
 # ── Yedekler ───────────────────────────────────────────────────────────────
@@ -108,8 +114,8 @@ while [ "$waited" -lt "$HEALTH_TIMEOUT" ]; do
 done
 if [ "$healthy" != "1" ]; then log "sağlık uç noktası ${HEALTH_TIMEOUT}s içinde cevap vermedi: $HEALTH_URL"; rollback; fi
 PID="$(supervisorctl pid "$PROGRAM")"
-if [ "$RING" = "mainnet" ]; then
-  log "TAMAM [ring=mainnet]: $PROGRAM RUNNING pid=$PID commit=$NEW (sağlık ${waited}s sonra)"
-else
+if [ "$RING" = "testnet" ]; then
   log "TAMAM: $PROGRAM RUNNING pid=$PID commit=$NEW (sağlık ${waited}s sonra)"
+else
+  log "TAMAM [ring=$RING]: $PROGRAM RUNNING pid=$PID commit=$NEW (sağlık ${waited}s sonra)"
 fi

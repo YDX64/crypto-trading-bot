@@ -100,6 +100,35 @@ kanalın kapsamı dışındadır (bkz. D10, `docs/DECISIONS.md`).
 3. Testnet: allowlist'e ekle → ≥5 gün → canlı defterde kaynak bazlı PF (`signal_reason`/`src`).
 4. Mainnet: yalnız etiketli sürümle (bkz. CLAUDE.md terfi kuralı).
 
+## 4b. AlgoPro takipçi kanalı (`POST /follower/event`) — D20, 2026-08-23'ten beri AKTİF
+Yukarıdaki sözleşme "motor tektir" der; takipçi halkası bunun İSTİSNASI DEĞİL,
+**ikinci bir motorun ayrı bir süreçte** çalıştırılmasıdır (`BOT_MODE=follower`,
+`/opt/tradingbot-ap`, port 9093, AYRI Binance testnet hesabı). Scalper halkasının
+motoru, kapıları ve `.env`'i DEĞİŞMEZ.
+
+```
+POST http://127.0.0.1:9093/follower/event
+X-Follower-Secret: <FOLLOWER_FORWARD_SECRET>
+Content-Type: text/plain; charset=utf-8
+
+🔴 SELL | BINANCE:BTCUSDT | TF: 1 | Price: 77126.08 | TQI: .45 | Score: 8 | SL: 77167.77 | TP1: 77105.23 | TP2: 77084.39 | TP3: 77063.54
+```
+- Secret: `X-Follower-Secret` başlığı (tercih) · gövdede `secret=…` · `?secret=`.
+  `TV_WEBHOOK_SECRET`/`RISK_EVENT_SECRET`'tan AYRIDIR; boş = 503 (fail-closed).
+- Olay türü gövdeden çözülür: `BUY`/`SELL` → giriş, `EXIT` → çıkış,
+  `TP1|TP2|TP3 HIT`, `SL HIT` → telemetri + borsa çapraz doğrulaması.
+  Alternatif açık şablon: `src=algopro kind=entry buy BTCUSDT tf=1 px=… sl=… tp1=…`.
+- Yanıt: `{ok, kind, symbol, direction, accepted, reason, ...}`. `accepted=false`
+  bir HATA DEĞİLDİR (kapasite/cooldown/kapı reddi) — HTTP 200 döner.
+- 403 = secret yanlış · 422 = gövde çözülemedi/>4KB · 503 = kanal kapalı ya da motor
+  hazır değil (`/risk-event` ile AYNI semantik).
+- **Kaynak:** olaylar ana bottan (`/tv-signal`) İLETİLİR; TV alarm URL'leri ve
+  secret'ları DEĞİŞMEZ. Köprü yalnız `resolve_tv_source` "algopro" derse çalışır,
+  fire-and-forget'tir (2 sn timeout) ve ana motoru ASLA etkilemez. Kimliği
+  doğrulanmamış gövde (403) İLETİLMEZ.
+- **Backtest paritesi:** takipçi harness'ta modellenmez (strateji C'yi hiç kullanmaz);
+  `backtest.py`'ye DOKUNULMADI.
+
 ## 5. Değiştirilmeyecekler (bir bot eklerken dokunma)
 `engine.py` kapıları, `exits.py`, `executor.py`, `config.py` varsayılanları, `tv_confluence.py`
 oy kuralı. Bunlardan birini değiştirmek "yeni bot" değil "motor değişikliği"dir: backtest +

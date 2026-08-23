@@ -83,6 +83,11 @@ def _ensure_schema_migrations(sync_conn) -> None:
     if "entry_order_id" not in columns:
         sync_conn.execute(text("ALTER TABLE scalp_trades ADD COLUMN entry_order_id VARCHAR"))
         app_logger.info("🔧 scalp_trades.entry_order_id sütunu eklendi (migration)")
+    if "tp3_algo_id" not in columns:
+        # AlgoPro takipçi halkası (D20) 3 parça çıkış kullanır. Scalper
+        # halkasında NULL kalır — davranışı etkilemez, yalnız şema tamamlanır.
+        sync_conn.execute(text("ALTER TABLE scalp_trades ADD COLUMN tp3_algo_id VARCHAR"))
+        app_logger.info("🔧 scalp_trades.tp3_algo_id sütunu eklendi (migration)")
 
 
 async def init_db():

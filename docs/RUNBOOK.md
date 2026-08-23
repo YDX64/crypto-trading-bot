@@ -104,6 +104,113 @@ redirect_stderr=true
 Uygulamanın kendi log dosyası (`logs/bot.log`, testnet'teki gibi) çalışma dizini `/opt/tradingbot-main`
 olduğu için otomatik olarak ayrı olur — testnet'in `logs/`'ıyla KARIŞMAZ.
 
+### AlgoPro takipçi halkası (D20, `BOT_MODE=follower`)
+İKİNCİ ve BAĞIMSIZ bir testnet sistemi: **yalnız AlgoPro V1.6 sinyallerini** izler
+(scanner yok, strateji yok, TV sağlaması yok). Scalper halkası (`tradingbot_v2`) bundan
+HİÇ etkilenmez — ayrı dizin, ayrı süreç, ayrı Binance testnet hesabı, ayrı DB/state/log.
+
+| | |
+|---|---|
+| Dizin | `/opt/tradingbot-ap` |
+| Süreç | supervisord `tradingbot_ap` → `.venv/bin/python -m uvicorn src.main:app --host 127.0.0.1 --port 9093` |
+| Ağ | Binance Futures **TESTNET** (ayrı hesap/anahtar; mainnet startup'ta REDDEDİLİR) |
+| Deploy | `scripts/deploy.sh awa --ring follower` |
+| Durum | `curl -sS http://127.0.0.1:9093/follower/status \| python3 -m json.tool` |
+| Defter | `tradingbot_ap.db` → `scalp_trades`, `strategy="AP"` |
+| Rapor | `python3 scripts/ledger_report.py --db tradingbot_ap.db --strategy AP --since "<başlangıç>" --format md` |
+| Kalibrasyon | `state/follower_levels.jsonl` (AlgoPro seviyeleri vs k×ATR kuralı sapması) |
+
+**Kurulum (bir kez, insan yapar):**
+1. `/opt/tradingbot-ap` dizinini oluştur, repo'yu klonla, `.venv` kur
+   (`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`).
+2. `.env` yaz — **anahtarları KULLANICI girer** (scalper'ın `.env`'i KOPYALANMAZ):
+   ```ini
+   BOT_MODE=follower
+   BINANCE_API_KEY=<İKİNCİ testnet hesabının anahtarı>
+   BINANCE_API_SECRET=<İKİNCİ testnet hesabının secret'ı>
+   BINANCE_BASE_URL=https://testnet.binancefuture.com
+   DATABASE_URL=sqlite:///./tradingbot_ap.db
+   API_PORT=9093
+   FOLLOWER_FORWARD_SECRET=<ana bottakiyle AYNI güçlü rastgele değer>
+   TELEGRAM_BOT_TOKEN=<ayrı bot>      ; TELEGRAM_CHAT_ID=<ayrı kanal>
+   ```
+   (Diğer `FOLLOWER_*` varsayılanları `env.example`'da; hepsi opsiyoneldir.)
+3. supervisord program tanımı:
+   ```ini
+   [program:tradingbot_ap]
+   directory=/opt/tradingbot-ap
+   command=/opt/tradingbot-ap/.venv/bin/python -m uvicorn src.main:app --host 127.0.0.1 --port 9093
+   autostart=true
+   autorestart=true
+   stopsignal=TERM
+   stopasgroup=true
+   killasgroup=true
+   user=<sunucu-kullanıcısı>
+   environment=PYTHONUNBUFFERED="1"
+   stdout_logfile=/opt/tradingbot-ap/logs/supervisor.log
+   stdout_logfile_maxbytes=10MB
+   stdout_logfile_backups=5
+   redirect_stderr=true
+   ```
+4. **Ana bota köprüyü aç** (scalper halkasının `.env`'i — deploy'dan AYRI adım):
+   ```bash
+   ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date +%Y%m%d)-follower && { grep -q "^FOLLOWER_FORWARD_URL=" .env && sed -i "s|^FOLLOWER_FORWARD_URL=.*|FOLLOWER_FORWARD_URL=http://127.0.0.1:9093/follower/event|" .env || echo "FOLLOWER_FORWARD_URL=http://127.0.0.1:9093/follower/event" >> .env; } && { grep -q "^FOLLOWER_FORWARD_SECRET=" .env && sed -i "s|^FOLLOWER_FORWARD_SECRET=.*|FOLLOWER_FORWARD_SECRET=<SECRET>|" .env || echo "FOLLOWER_FORWARD_SECRET=<SECRET>" >> .env; } && ./.venv/bin/python -c "from src.core.config import settings as s; assert s.follower_forward_url and s.follower_forward_secret, \"KÖPRÜ AÇILMADI\"; print(\"forward_url=\", s.follower_forward_url)" && supervisorctl restart tradingbot_v2'
+   ```
+   ⚠️ `sed -i` eşleşme bulamazsa 0 ile çıkar — bu yüzden `{ grep -q … && sed … || echo …; }`
+   grubu ve restart'tan ÖNCE `assert`'li geri-okuma ZORUNLUDUR (bkz. "Gölge modu" uyarısı).
+
+**TradingView alarmları (kullanıcı yapar, 8 alarm):**
+AlgoPro V1.6 "Herhangi bir alert() fonksiyonu çağrısı" ("Any alert() function call")
+modunda mesajı KENDİSİ üretir ve **seviyeleri içerir** — mesaj şablonu YAZILMAZ.
+Bu yüzden sembol başına TEK alarm yeter; Buy/Sell/Exit/TP/SL olaylarının HEPSİ aynı
+kanaldan gelir. 8 sembol (BTC, ETH, SOL, XRP, DOGE, BNB, ADA, LTC) × **1 dakika**:
+
+| Alan | Değer |
+|---|---|
+| Koşul | AlgoPro V1.6 → **Herhangi bir alert() fonksiyonu çağrısı** |
+| Grafik | ilgili sembol, **1 dakika** |
+| Webhook URL | `http://<sunucu>:9091/tv-signal?secret=<TV_WEBHOOK_SECRET>&src=algopro` (BUGÜNKÜ URL — DEĞİŞMEZ) |
+| Mesaj | boş bırak (script üretir) |
+
+2026-08-23'te TV Desktop sondasıyla doğrulanan gerçek gövdeler:
+```
+🔴 SELL | BINANCE:BTCUSDT | TF: 1 | Price: 77126.08 | TQI: .45 | Score: 8 | SL: 77167.77 | TP1: 77105.23 | TP2: 77084.39 | TP3: 77063.54 | TP: fixed ×1.00
+🎯 TP1 HIT | BINANCE:BTCUSDT | TF: 1 | Price: 77037.49
+🛑 SL HIT | BINANCE:BTCUSDT | TF: 1 | Price: 77167.77
+```
+Ayrıştırma emoji'ye DEĞİL anahtar kelimeye dayanır: `BUY`/`SELL` → giriş,
+`EXIT` → çıkış, `TP1|TP2|TP3 HIT` ve `SL HIT` → telemetri/çapraz doğrulama.
+
+⚠️ **Sıralama uyarısı:** bu alarmlar ana bota da düşer. `BUY`/`SELL` mesajları
+BUGÜNKÜ gibi TV sağlamasına oy verir (davranış değişmedi); `EXIT`/`TP HIT`/`SL HIT`
+mesajları yön kelimesi taşımadığı için ana botta **422** alır (işlem AÇTIRMAZ) — köprü
+bu 422'den ÖNCE çalıştığı için takipçi olayı yine de alır. Ana botta `kind` bazlı
+gövde-yönlendirme ayrı bir çalışmadadır; o merge edilmeden alarm sayısını artırma.
+
+**Akış:** TV → ana bot `/tv-signal` (secret doğrulanır) → `src=algopro` ise gövde
+`FOLLOWER_FORWARD_URL`'e İLETİLİR (ayrı task, 2 sn timeout, hata yalnız loglanır) →
+takipçi `/follower/event` (secret `X-Follower-Secret` başlığında) → `FollowerEngine`.
+
+**Ne görürsün:**
+- `logs/bot.log`: `🤖 AlgoPro takipçi motoru başlatılıyor`, her girişte
+  `🎯 <SEMBOL>: AlgoPro <YÖN> girişi açıldı (lev=..x, sl_pct=%.., sl_roi=%.., marj=..)`.
+- `GET /follower/status` → izlenen pozisyonlar (lev/sl_pct/sl_roi/marj/TP1-2-3 durumu),
+  cooldown'lar, kill switch, risk-olayı halt'ı, son 50 olay ve ret sayaçları.
+- Defter: `sqlite3 tradingbot_ap.db "SELECT symbol,direction,leverage,signal_reason,exit_reason,realized_pnl FROM scalp_trades ORDER BY id DESC LIMIT 20"`
+  (`signal_reason` boyutlamayı taşır: `algopro:entry;...;lev=100;sl_pct=..;sl_roi=..;margin=..`).
+- Kalibrasyon: `tail state/follower_levels.jsonl` — AlgoPro seviyeleri ile k×ATR
+  kuralının sapması (`sl_distance_deviation_pct`).
+
+**Arıza/durdurma:**
+- Girişleri durdur / her şeyi kapat: `POST http://127.0.0.1:9093/risk-event`
+  (D10 ile AYNI sözleşme, `RISK_EVENT_SECRET` takipçinin kendi `.env`'inden).
+- Köprüyü kapat (takipçi sinyal ALMASIN): ana bottan `FOLLOWER_FORWARD_URL`'i boşalt +
+  `supervisorctl restart tradingbot_v2`. Takipçi süreci açık kalır, açık pozisyonları
+  yönetmeye devam eder.
+- Takipçi giriş kilidi: `state/follower_entry_halt.json` (fail-closed, `scalper_entry_halt`
+  ile KARIŞTIRMA). Açmak = nedeni anla → dosyayı `.cleared-<tarih>` yap → restart.
+- Deploy ön koşulu: bu dosya varken `scripts/deploy.sh awa --ring follower` REDDEDİLİR.
+
 ## Arızalar
 **Binance 418 / ban:** `logs/bot.log`'da `HTTP 418|banned|devre kesici`. Ban aktifken restart
 **YASAK** (ban süresini uzatır). Kök nedenler ve çözümler: rate limiter kilidi (mevcut), dashboard
