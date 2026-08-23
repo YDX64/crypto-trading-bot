@@ -127,6 +127,9 @@ _COUNTER_KEYS = (
     "exits_skipped_losing",
     "exits_closed_losing",
     "rejected_entry_from_event_source",
+    # `src=` YOK ama gövdede `kind=<olay kind>` VAR ve gövde tanınan bir
+    # GİRİŞ biçimi DEĞİL → 422 (bütünleşme incelemesi, 2026-08-23).
+    "rejected_entry_kind_mention",
     "rejected_symbol_allowlist",
 )
 

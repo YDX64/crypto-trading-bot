@@ -199,10 +199,22 @@ gövdesi** değişiyor. Bu yüzden yönlendirme gövdeden okunur:
   Gerekçe: TradingView'in `{{strategy.order.alert_message}}` gibi alanları kullanıcı
   metnini gövdenin ortasına basar; serbest metin taransaydı o metin mevcut bir
   alarmın kimliğini (`src`) ya da yolunu (`kind`) değiştirebilirdi.
-  🔒 **Belirteçler ortada kalırsa istek SESSİZCE giriş oyuna DÖNÜŞMEZ** (D19a-2 R1-1):
-  gövdenin tamamı ayrıca `src=<olay kaynağı>` için taranır ve bulunursa istek **422**
-  alır ("mesajın BAŞINDA değil" ipucuyla). Yani yanlış yerleştirilmiş bir olay alarmı
-  ya doğru yola gider ya GÖRÜNÜR biçimde ölür; asla pozisyon açmaz.
+  🔒 **Belirteçler ortada kalırsa istek SESSİZCE giriş oyuna DÖNÜŞMEZ** (D19a-2 R1-1
+  + bütünleşme incelemesi 2026-08-23). Gövdenin tamamı **iki** kanıt için taranır:
+  (a) `src=<olay kaynağı>` adı, (b) `kind[=:]<exit|choch|trend|tp1>` belirteci. (a)
+  bulunursa istek **422**'dir. (b) bulunursa istek **yalnız gövde tanınan bir GİRİŞ
+  biçimi DEĞİLSE** 422'dir — tanınan giriş biçimleri: JSON giriş gövdesi
+  (`symbol`/`side`), AlgoPro/BotV3 tek satır biçimi (`| TF:` / `| Price:`) ve
+  `{{ticker}} BUY|SELL`. Bu asimetri bilinçlidir: AlgoPro'nun serbest metin alanında
+  (`msg: … kind=exit`) tesadüfen geçen bir belirteç meşru bir girişi 422'ye
+  düşürmemeli. Yani yanlış yerleştirilmiş bir olay alarmı ya doğru yola gider ya
+  GÖRÜNÜR biçimde ölür; pozisyon açmaz.
+  ⚠️ **Kapsam sınırı (kodda doğrulandı):** her iki tarama da DÜZ METİN
+  belirteçlerine bakar. **JSON** gövdede `"kind": "choch"` biçimi (anahtarla ayraç
+  arasında tırnak var) hiçbir taramaya takılmaz — bu yüzden `data`'dan DAHA DERİN
+  bir JSON alanına yazılmış `kind` bugün de okunmaz ve 422 üretmez; o gövde
+  bugünkü gibi GİRİŞ yolunda kalır. Derin iç içe JSON kullanma; `src`/`kind`i
+  üst düzeye ya da `data` altına yaz.
   ⚠️ **`=` ile `:` aynı sertlikte DEĞİLDİR** (D19a-2 R1-2): `=` kasıtlı bir
   belirteçtir, tanınmayan değeri 422'dir. `:` düz yazı noktalamasıdır ("Kind: Bullish
   Reversal") — bu yüzden `:` ile gelen `src`/`kind` YALNIZ tanınan bir değer
@@ -261,6 +273,15 @@ alarm diyaloğundan okunmuştur; mevcut alarmlar 5 dakikalık grafiklerdedir.
 ⚠️ **Belirteçler mesajın BAŞINDA olmalı** (D19a G1): `src=` ve `kind=` satırın ilk
 belirteçleri olacak, `{{ticker}}` ve serbest metin SONRA gelecek. Aşağıdaki
 şablonlar bu kurala uyar; kendi metnini eklerken sıralamayı bozma.
+
+🔒 **`src=` ASLA DÜŞÜRÜLMEZ.** "Zaten `?src=` var" ya da "kaynak belli" diye
+gövdedeki `src=`'i atma. `src=` iki işe birden yarar: kaynak kimliği (kapı/çıkış
+`SCALPER_TV_EVENTS_GATE_SOURCES` ile bunu eşler) **ve** yanlış yerleştirilmiş bir
+belirteçte devreye giren birinci kalkan (§7.1, D19a-2 R1-1). `src=` düşerse ikinci
+kalkan (`kind=` taraması) devreye girer, ama o **yalnız gövde tanınan bir giriş
+biçimi değilse** koruma sağlar — yani `src=`'siz bir olay alarmının kaza yüzeyi
+daha geniştir. `kind=` de düşerse hiçbir kalkan kalmaz ve alarm bugünkü gibi bir
+GİRİŞ OYU olur (D19a bulgu A'nın senaryosu).
 
 **LuxAlgo® — Signals & Overlays™ [7.3.1]**
 

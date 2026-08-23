@@ -77,6 +77,34 @@ _KLINES_ENDPOINT = "/fapi/v1/klines"
 _MAX_RETRIES = 3
 _RETRY_BASE_DELAY = 1.0  # saniye; deneme başına 2^n ile büyür (1s, 2s, 4s)
 
+# --- Veri host'unun CANLI fiyatı (D17-R3) ------------------------------
+# `/fapi/v1/ticker/price` public'tir, imza gerektirmez ve TEK sembolde
+# AĞIRLIĞI 1'dir (sembolsüz çağrı 2'dir — ASLA sembolsüz çağırma).
+# Kullanım amacı TEKTİR: ayrı market-data host'unda borsa-arası bazı
+# LIKE-FOR-LIKE ölçmek (iki host'un da CANLI fiyatı). Mum kapanışı bu iş
+# için kullanılamaz — bkz. `exits._to_trading_price_space`.
+_TICKER_PRICE_ENDPOINT = "/fapi/v1/ticker/price"
+_TICKER_PRICE_WEIGHT = 1
+# Önbellek ömrü safety turundan (varsayılan 2.0 sn) KISA olmamalı: sembol
+# başına tur başına EN FAZLA bir istek. Daha uzun bir TTL bazı bayatlatır
+# (baz mum-içi kayar), daha kısası ağırlık israfıdır.
+_TICKER_PRICE_TTL_SECONDS = 2.0  # alt sınır; gerçek TTL = max(bu, safety turu) — bkz. ticker_price_ttl_seconds()
+
+
+def ticker_price_ttl_seconds() -> float:
+    """Ticker önbellek ömrü: safety turundan KISA OLMAMALI (tur başına ≤ 1 istek).
+
+    Canlı `SCALPER_SAFETY_INTERVAL_SECONDS` (sunucuda 8 sn, kod varsayılanı 2 sn)
+    okunur; ayar okunamazsa alt sınır. ARCHITECTURE ağırlık tablosu bu sözleşmeye
+    dayanır (sembol başına tur başına en fazla bir ağırlık-1 istek).
+    """
+    try:
+        from src.core.config import settings  # geç import: data.py ayar katmanına bağımlı olmasın
+        interval = float(getattr(settings, "scalper_safety_interval_seconds", 0.0) or 0.0)
+    except Exception:
+        interval = 0.0
+    return max(_TICKER_PRICE_TTL_SECONDS, interval)
+
 # --- Public market-data koruması (D17) ---------------------------------
 # Binance USDⓈ-M Futures IP ağırlık sınırı 2400/dk'dır (mainnet dokümante;
 # testnet başlığı edge-bazlı ve tutarsız — bkz. ARCHITECTURE §9). Public
@@ -671,9 +699,60 @@ class KlineFetcher:
         # gerçekçi kılar (emir host'u sağlamken veri host'u yavaşlayabilir).
         self._cache_locks: Dict[Tuple[str, str, int], asyncio.Lock] = {}
 
+        # D17-R3: sembol -> (canlı fiyat, monotonic damga). Ayrı market-data
+        # host'unda borsa-arası bazın veri-tarafı referansı.
+        self._price_cache: Dict[str, Tuple[float, float]] = {}
+
     @staticmethod
     def _ttl_for(interval: str) -> float:
         return _TTL_BY_INTERVAL.get(interval, _DEFAULT_TTL)
+
+    async def get_price(self, symbol: str) -> float:
+        """Bu host'un CANLI son fiyatı (public `/fapi/v1/ticker/price`, ağırlık 1).
+
+        Neden var (D17-R3, bütünleşme incelemesi): `exits` chandelier
+        seviyesini işlem borsasının fiyat uzayına taşırken bazı
+        `işlem_host_CANLI − veri_host_SON_KAPANIŞ` olarak ölçüyordu. Bu iki
+        büyüklük AYNI TÜRDEN DEĞİLDİR: fark, borsa-arası bazın ÜSTÜNE
+        mum-içi sürüklenmeyi de bindirir. Baz artık iki host'un da CANLI
+        fiyatıyla LIKE-FOR-LIKE ölçülür.
+
+        Sözleşme:
+          * `MarketDataGuard`'dan geçer (ban/bütçe/aralık) — banlıyken istek
+            AĞA ÇIKMAZ, `MarketDataUnavailable` yükselir.
+          * Sembol başına `ticker_price_ttl_seconds()` önbellek (= max(2 sn,
+            safety turu); safety turu başına en fazla bir istek).
+          * TEKRAR DENEMEZ (kline yolundan farkı bilinçli): bu bir tur
+            içi teşhis okumasıdır, bir sonraki safety turu zaten yeniden
+            dener; 3 deneme × üstel bekleme safety turunu bayatlatırdı.
+          * Hata durumunda ASLA 0 dönmez — istisna yükseltir; çağıran
+            (`exits._data_host_price`) turu atlar (fail-closed).
+        """
+        cached = self._price_cache.get(symbol)
+        now = time.monotonic()
+        if cached is not None and (now - cached[1]) < ticker_price_ttl_seconds():
+            return cached[0]
+
+        await MarketDataGuard.acquire(
+            self.base_url, _TICKER_PRICE_WEIGHT, self.guard_mode
+        )
+        response = await self._client.get(
+            f"{self.base_url}{_TICKER_PRICE_ENDPOINT}", params={"symbol": symbol}
+        )
+        MarketDataGuard.note_response(self.base_url, response.headers)
+        if response.status_code >= 400:
+            self._raise_if_banned(response)
+            self._raise_if_permanent(response, symbol, "ticker")
+        response.raise_for_status()
+        payload = response.json()
+        price = float((payload or {}).get("price") or 0.0)
+        if price <= 0:
+            raise MarketDataHostError(
+                f"Ticker fiyatı çözülemedi ({symbol}, {self.host}): {payload!r}",
+                self.host,
+            )
+        self._price_cache[symbol] = (price, now)
+        return price
 
     async def get_klines(
         self,

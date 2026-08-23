@@ -192,6 +192,9 @@ class _RecordingKlineFetcher:
     async def get_klines(self, *a, **kw):  # pragma: no cover - çağrılmaz
         raise AssertionError("bu testte kline çekilmemeli")
 
+    async def get_price(self, *a, **kw):  # pragma: no cover - çağrılmaz
+        raise AssertionError("bu testte ticker fiyatı çekilmemeli")
+
     async def close(self) -> None:
         return None
 
@@ -420,6 +423,77 @@ class TestDiagnostics:
         assert snap["kline_source"] == "separate"
 
 
+def _snapshot_ready_engine(monkeypatch, market_data_url: str = MAINNET) -> ScalperEngine:
+    """`snapshot()` çağrılabilir en küçük motor (ağ yok, __init__ atlanır)."""
+    engine = _bare_engine(market_data_url)
+    engine.cfg = SimpleNamespace(
+        scalper_enabled=True, scalper_shadow_mode=False,
+        scalper_scan_interval_seconds=30, scalper_safety_interval_seconds=2.0,
+        scalper_daily_loss_limit_pct=10.0, scalper_stop_mode="fixed_roi",
+        scalper_virtual_capital_usdt=0.0, scalper_virtual_capital_start_trade_id=0,
+    )
+    engine.running = True
+    engine.exits = SimpleNamespace(_positions={})
+    engine.executor = SimpleNamespace(
+        pending_snapshot=lambda: [], cooldown_snapshot=lambda: [],
+        sizing_snapshot=lambda: {}, reject_snapshot=lambda: {},
+        last_sizing_equity=None,
+    )
+    engine._universe = []
+    engine._regimes = {}
+    engine._daily_pnl = 0.0
+    engine._daily_pnl_source = "unavailable"
+    engine._risk_ready = True
+    engine._risk_equity_usdt = None
+    engine._risk_equity_source = "unavailable"
+    engine._daily_loss_threshold_usdt = None
+    engine._kill_switch = False
+    engine._entry_halted = False
+    engine._entry_halt_reason = None
+    engine._entry_halted_at = None
+    engine._signals_today = 0
+    engine._last_scan_at = None
+    monkeypatch.setattr(
+        ScalperEngine, "health_snapshot", lambda self: {"healthy": True}
+    )
+    monkeypatch.setattr(
+        ScalperEngine, "risk_event_status", lambda self: {"active": False}
+    )
+    monkeypatch.setattr(
+        ScalperEngine, "_tv_events_snapshot", lambda self: {}
+    )
+    return engine
+
+
+class TestStatusPayloadShape:
+    """Bütünleşme incelemesi (2026-08-23) — `/scalper/status` TEK bir ŞEKLE sahip.
+
+    `_EMPTY_SCALPER_STATUS` (motor kurulmadan) ile `engine.snapshot()` farklı
+    anahtar kümeleri döndürüyordu: `market_data_guard`, `risk_event`,
+    `tv_events`, `entry_rejects`, `stop_mode`, `symbol_reservations` yalnız
+    motorlu payload'da vardı. Panelde "alan yok" sessizce "kanal yok" gibi
+    okunur — özellikle `market_data_guard` (ban durumu) için tehlikeli.
+    """
+
+    def test_key_sets_are_identical(self, monkeypatch):
+        from src.main import _EMPTY_SCALPER_STATUS
+
+        engine = _snapshot_ready_engine(monkeypatch)
+        assert set(_EMPTY_SCALPER_STATUS) == set(engine.snapshot())
+
+    async def test_endpoint_refreshes_the_dynamic_fields(self, monkeypatch):
+        """Motor yokken de ban durumu/olay defteri GERÇEK değerle döner."""
+        import src.main as main_module
+
+        monkeypatch.setattr(main_module, "scalper_engine", None)
+        payload = await main_module.scalper_status()
+        assert set(payload) == set(main_module._EMPTY_SCALPER_STATUS)
+        assert payload["market_data_guard"]["host"] == host_of(
+            main_module.settings.market_data_base_url
+        )
+        assert "mode" in payload["tv_events"]
+
+
 # ---------------------------------------------------------------------------
 # 4) Ağırlık / oran sınırlayıcı / ban semantiği
 # ---------------------------------------------------------------------------
@@ -431,12 +505,17 @@ class _FakeHttpClient:
     def __init__(self, responses: List[httpx.Response]):
         self._responses = list(responses)
         self.calls: List[str] = []
+        self.params: List[Optional[Dict[str, Any]]] = []
 
     async def get(self, url: str, params: Optional[Dict[str, Any]] = None):
         self.calls.append(url)
+        self.params.append(params)
         if not self._responses:
             raise AssertionError(f"beklenmeyen ek istek: {url}")
-        return self._responses.pop(0)
+        nxt = self._responses.pop(0)
+        if isinstance(nxt, BaseException):   # ağ hatası senaryosu
+            raise nxt
+        return nxt
 
     async def aclose(self) -> None:
         return None
@@ -1025,7 +1104,19 @@ class TestTrailingRoundIntegration:
             )
         return out
 
-    def _mgr(self, market_url: str, candles: List[Any], replaced: List[float]) -> Any:
+    def _mgr(
+        self,
+        market_url: str,
+        candles: List[Any],
+        replaced: List[float],
+        data_price: Any = None,
+    ) -> Any:
+        """`data_price`: veri host'unun CANLI fiyatı (D17-R3 baz referansı).
+
+        `None` = fetcher HİÇ bağlı değil (ayrı host'ta baz ölçülemez → tur
+        atlanır); sayı = sabit fiyat; çağrılabilir/istisna = özel senaryo.
+        Aynı host'ta bu fetcher ÇAĞRILMAMALIDIR (test: `_calls`).
+        """
         from src.strategies.scalper.exits import ExitManager
 
         mgr = ExitManager.__new__(ExitManager)
@@ -1046,11 +1137,26 @@ class TestTrailingRoundIntegration:
         mgr._trailing_space_skips = 0
         mgr._trailing_gate_skips = 0
         mgr._trailing_skip_log_at = {}
+        mgr._data_price_error_log_at = {}
 
         async def fetch(symbol, tf, limit):
             return candles
 
         mgr.kline_fetch = fetch
+
+        mgr.data_price_calls: List[str] = []
+        if data_price is None:
+            mgr.data_price_fetch = None
+        else:
+            async def price_fetch(symbol):
+                mgr.data_price_calls.append(symbol)
+                if isinstance(data_price, BaseException):
+                    raise data_price
+                if callable(data_price):
+                    return data_price(symbol)
+                return data_price
+
+            mgr.data_price_fetch = price_fetch
 
         async def replace(position, new_stop):
             replaced.append(new_stop)
@@ -1095,18 +1201,20 @@ class TestTrailingRoundIntegration:
         )
         expected = max(100.1, raw)
         assert same_host == [expected]
+        # Aynı host: veri host'u fiyatı HİÇ istenmez (ek ağırlık yok).
+        assert mgr.data_price_calls == []
 
     async def test_separate_host_shifts_and_still_sends(self):
-        """Ayrı host: veri kapanışı 100.0'ken işlem fiyatı 106.4 ise stop
-        (106.4 − son_kapanış) kadar ötelenir ve emir GİDER."""
+        """Ayrı host: veri host'unun CANLI fiyatı 100.0'ken işlem fiyatı 100.4
+        ise stop +0.4 ötelenir ve emir GİDER. Baz artık mum kapanışına DEĞİL,
+        iki host'un CANLI fiyatına bakar (D17-R3)."""
         closes = [100.0 + i * 0.1 for i in range(60)]
         candles = self._candles(closes)
-        last_close = candles[-1].close
+        data_live = candles[-1].close       # veri host'u canlı fiyatı
 
         sent: List[float] = []
-        mgr = self._mgr(MAINNET, candles, sent)
-        trading_price = last_close + 0.4
-        await mgr._update_trailing("BTCUSDT", self._sp(trading_price))
+        mgr = self._mgr(MAINNET, candles, sent, data_price=data_live)
+        await mgr._update_trailing("BTCUSDT", self._sp(data_live + 0.4))
 
         from src.strategies.scalper.indicators import chandelier_stop
         from src.strategies.scalper.types import resolve_trail_mult
@@ -1116,6 +1224,7 @@ class TestTrailingRoundIntegration:
             atr_mult=resolve_trail_mult(mgr.cfg, 1.0), atr_period=14, since_index=0,
         )
         assert sent == [pytest.approx(max(100.1, raw + 0.4))]
+        assert mgr.data_price_calls == ["BTCUSDT"]
 
     async def test_separate_host_wrong_side_is_not_sent(self):
         """İşlem host'u çok daha düşükse ötelenmiş stop güncel fiyatın ÜSTÜNE
@@ -1123,10 +1232,11 @@ class TestTrailingRoundIntegration:
         closes = [100.0 + i * 0.1 for i in range(60)]
         candles = self._candles(closes)
         sent: List[float] = []
-        mgr = self._mgr(MAINNET, candles, sent)
+        data_live = candles[-1].close
+        mgr = self._mgr(MAINNET, candles, sent, data_price=data_live)
         # İşlem host'u veri host'unun %1.5 altında (baz negatif ama %2 tavanının
         # içinde) → ötelenmiş chandelier hâlâ güncel fiyatın üstünde kalır.
-        sp = self._sp(candles[-1].close * 0.985)
+        sp = self._sp(data_live * 0.985)
         sp.plan.breakeven_price = sp.position.current_price * 1.01
         await mgr._update_trailing("BTCUSDT", sp)
 
@@ -1139,7 +1249,9 @@ class TestTrailingRoundIntegration:
         closes = [100.0 + i * 0.1 for i in range(60)]
         candles = self._candles(closes)
         sent: List[float] = []
-        mgr = self._mgr(MAINNET, candles, sent)
+        mgr = self._mgr(
+            MAINNET, candles, sent, data_price=candles[-1].close
+        )
         mgr._trading_price_seen_at = {}          # hiç taze fiyat yok
         await mgr._update_trailing("BTCUSDT", self._sp(candles[-1].close + 0.4))
 
@@ -1152,7 +1264,9 @@ class TestTrailingRoundIntegration:
         closes = [100.0 + i * 0.1 for i in range(60)]
         candles = self._candles(closes)
         sent: List[float] = []
-        mgr = self._mgr(MAINNET, candles, sent)
+        mgr = self._mgr(
+            MAINNET, candles, sent, data_price=candles[-1].close
+        )
         mgr._trading_price_seen_at = {}
         warnings: List[str] = []
         mgr.logger = SimpleNamespace(
@@ -1164,6 +1278,208 @@ class TestTrailingRoundIntegration:
             await mgr._update_trailing("BTCUSDT", self._sp(candles[-1].close + 0.4))
         assert len(warnings) == 1
         assert mgr.trailing_skip_snapshot()["price_space_skips"] == 5
+
+
+class TestLikeForLikeBasis:
+    """D17-R3 (bütünleşme incelemesi, medium) — baz İKİ CANLI fiyatın farkıdır.
+
+    Eski biçim `işlem_host_CANLI − veri_host_son_KAPANIŞ` iki farklı türü
+    çıkarıyordu: fark, borsa-arası bazın ÜSTÜNE MUM-İÇİ sürüklenmeyi de
+    bindiriyordu. Etki sistematiktir — fiyat pozisyonun lehine gittikçe
+    sürüklenme büyür, chandelier mandalı (`new_stop > current_sl`) her turda
+    biraz daha sıkışır ve stop fiilen CANLI FİYATI izler, chandelier
+    MESAFESİNİ değil.
+    """
+
+    _candles = staticmethod(TestTrailingRoundIntegration._candles)
+    _sp = staticmethod(TestTrailingRoundIntegration._sp)
+    _mgr = TestTrailingRoundIntegration._mgr
+
+    @staticmethod
+    def _chandelier(mgr, candles) -> float:
+        from src.strategies.scalper.indicators import chandelier_stop
+        from src.strategies.scalper.types import resolve_trail_mult
+
+        return chandelier_stop(
+            candles, direction=Direction.LONG,
+            atr_mult=resolve_trail_mult(mgr.cfg, 1.0), atr_period=14, since_index=0,
+        )
+
+    async def test_intra_candle_drift_does_not_tighten_the_stop(self):
+        """İki host AYNI fiyatta (baz 0) ama mum kapanışı geride: stop
+        ÖTELENMEZ. Eski biçimde sürüklenme kadar (+%1) yukarı kilitlenirdi."""
+        closes = [100.0 + i * 0.1 for i in range(60)]
+        candles = self._candles(closes)
+        last_close = candles[-1].close
+        live = last_close * 1.01          # mum kapandıktan sonra %1 yükseldi
+
+        sent: List[float] = []
+        mgr = self._mgr(MAINNET, candles, sent, data_price=live)
+        await mgr._update_trailing("BTCUSDT", self._sp(live))
+
+        raw = self._chandelier(mgr, candles)
+        assert sent == [pytest.approx(max(100.1, raw))]
+        # Eski (mum kapanışlı) biçim bu turda sürüklenmeyi de eklerdi:
+        assert sent[0] < max(100.1, raw + (live - last_close))
+
+    async def test_basis_is_the_difference_of_two_live_prices(self):
+        """Sürüklenme VARKEN bile öteleme yalnız borsa-arası bazdır."""
+        closes = [100.0 + i * 0.1 for i in range(60)]
+        candles = self._candles(closes)
+        last_close = candles[-1].close
+        data_live = last_close * 1.005        # veri host'u mum-içi yükseldi
+        basis = 0.25                          # gerçek borsa-arası baz
+
+        sent: List[float] = []
+        mgr = self._mgr(MAINNET, candles, sent, data_price=data_live)
+        await mgr._update_trailing("BTCUSDT", self._sp(data_live + basis))
+
+        raw = self._chandelier(mgr, candles)
+        assert sent == [pytest.approx(max(100.1, raw + basis))]
+
+    async def test_unreadable_data_price_skips_the_round(self):
+        """Veri host'u fiyatı okunamazsa çeviri None → tur atlanır (fail-safe)."""
+        closes = [100.0 + i * 0.1 for i in range(60)]
+        candles = self._candles(closes)
+        sent: List[float] = []
+        mgr = self._mgr(
+            MAINNET, candles, sent, data_price=RuntimeError("ticker 500")
+        )
+        await mgr._update_trailing("BTCUSDT", self._sp(candles[-1].close + 0.4))
+
+        assert sent == []
+        assert mgr.trailing_skip_snapshot()["price_space_skips"] == 1
+
+    async def test_host_wide_outage_silences_the_rest_of_the_round(self):
+        """Ban/bütçe (`MarketDataUnavailable`) tur genelinde susturur —
+        kline yolundaki davranışın AYNISI."""
+        closes = [100.0 + i * 0.1 for i in range(60)]
+        candles = self._candles(closes)
+        sent: List[float] = []
+        mgr = self._mgr(
+            MAINNET, candles, sent,
+            data_price=MarketDataBanError("418 ban", "fapi.binance.com", 60.0),
+        )
+        await mgr._update_trailing("BTCUSDT", self._sp(candles[-1].close + 0.4))
+
+        assert sent == []
+        assert mgr._market_data_down_reason is not None
+
+    async def test_missing_price_fetcher_is_fail_closed(self):
+        """Fetcher hiç bağlı değilse ayrı host'ta emir GÖNDERİLMEZ."""
+        closes = [100.0 + i * 0.1 for i in range(60)]
+        candles = self._candles(closes)
+        sent: List[float] = []
+        mgr = self._mgr(MAINNET, candles, sent, data_price=None)
+        await mgr._update_trailing("BTCUSDT", self._sp(candles[-1].close + 0.4))
+
+        assert sent == []
+        assert mgr.trailing_skip_snapshot()["price_space_skips"] == 1
+
+    async def test_data_price_error_warning_is_rate_limited(self):
+        closes = [100.0 + i * 0.1 for i in range(60)]
+        candles = self._candles(closes)
+        sent: List[float] = []
+        mgr = self._mgr(
+            MAINNET, candles, sent, data_price=RuntimeError("ticker 500")
+        )
+        warnings: List[str] = []
+        mgr.logger = SimpleNamespace(
+            info=lambda *a, **kw: None, debug=lambda *a, **kw: None,
+            warning=lambda msg, *a, **kw: warnings.append(msg),
+            error=lambda *a, **kw: None,
+        )
+        for _ in range(5):
+            await mgr._update_trailing("BTCUSDT", self._sp(candles[-1].close + 0.4))
+        # Bir "fiyat okunamadı" + bir "baz ölçülemedi" satırı; ikisi de
+        # sembol başına 60 sn'de bir.
+        assert len(warnings) == 2
+        assert mgr.trailing_skip_snapshot()["price_space_skips"] == 5
+
+    def test_engine_wires_the_same_fetcher_for_prices(self):
+        """Baz referansı, mumlarla AYNI host/ağırlık bütçesi/kesiciden gelmeli."""
+        import inspect
+
+        from src.strategies.scalper.engine import ScalperEngine
+
+        source = inspect.getsource(ScalperEngine.__init__)
+        assert "data_price_fetch=self.fetcher.get_price" in source
+
+
+def _price_response(payload: dict, used_weight: str = "12") -> httpx.Response:
+    return httpx.Response(
+        status_code=200,
+        json=payload,
+        headers={"X-MBX-USED-WEIGHT-1M": used_weight},
+        request=httpx.Request("GET", "https://example.invalid/fapi/v1/ticker/price"),
+    )
+
+
+class TestDataHostPriceFetch:
+    """`KlineFetcher.get_price` sözleşmesi — ağırlık 1, guard'dan geçer, TTL."""
+
+    async def test_price_goes_through_the_guard_with_weight_one(self):
+        fetcher = _fetcher(
+            MAINNET, [_price_response({"symbol": "BTCUSDT", "price": "100.5"})]
+        )
+        try:
+            assert await fetcher.get_price("BTCUSDT") == 100.5
+            assert fetcher._client.calls[0].endswith("/fapi/v1/ticker/price")
+            # Sembolsüz çağrı ağırlık 2'dir — sembol ZORUNLU.
+            assert fetcher._client.params[0] == {"symbol": "BTCUSDT"}
+            assert MarketDataGuard.snapshot(MAINNET)["window_weight"] == 1
+        finally:
+            await fetcher.close()
+
+    async def test_price_is_cached_per_symbol(self):
+        fetcher = _fetcher(MAINNET, [_price_response({"price": "100.5"})])
+        try:
+            assert await fetcher.get_price("BTCUSDT") == 100.5
+            assert await fetcher.get_price("BTCUSDT") == 100.5
+            assert len(fetcher._client.calls) == 1   # ikinci istek AĞA ÇIKMADI
+        finally:
+            await fetcher.close()
+
+    async def test_ban_blocks_the_price_call_without_network(self):
+        MarketDataGuard.trip("fapi.binance.com", "418", 60.0, hard=True)
+        fetcher = _fetcher(MAINNET, [])
+        try:
+            with pytest.raises(data_module.MarketDataUnavailable):
+                await fetcher.get_price("BTCUSDT")
+            assert fetcher._client.calls == []
+        finally:
+            await fetcher.close()
+
+    async def test_missing_price_field_is_an_error_not_zero(self):
+        """Sessiz 0 YOK: 0 bir baz referansı olarak felakettir."""
+        fetcher = _fetcher(MAINNET, [_price_response({"symbol": "BTCUSDT"})])
+        try:
+            with pytest.raises(data_module.MarketDataUnavailable):
+                await fetcher.get_price("BTCUSDT")
+        finally:
+            await fetcher.close()
+
+    async def test_price_is_not_retried(self):
+        """Kline yolundan farkı bilinçli: safety turunu 3 denemeyle bayatlatma."""
+        fetcher = _fetcher(MAINNET, [httpx.RequestError("ağ")])
+        try:
+            with pytest.raises(httpx.RequestError):
+                await fetcher.get_price("BTCUSDT")
+            assert len(fetcher._client.calls) == 1
+        finally:
+            await fetcher.close()
+
+    async def test_ticker_weight_is_one_in_the_budget_table(self):
+        assert data_module._TICKER_PRICE_WEIGHT == 1
+        # Önbellek ömrü safety turundan (2.0 sn) kısa OLMAMALI: sembol başına
+        # tur başına en fazla bir istek (ARCHITECTURE ağırlık hesabı).
+        from src.core.config import settings as live_settings
+
+        assert (
+            data_module.ticker_price_ttl_seconds()
+            >= live_settings.scalper_safety_interval_seconds
+        )
+        assert data_module.ticker_price_ttl_seconds() >= data_module._TICKER_PRICE_TTL_SECONDS
 
 
 class TestExitsMarketDataOutage:

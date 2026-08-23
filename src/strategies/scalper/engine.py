@@ -223,6 +223,10 @@ class ScalperEngine:
         self.exits = ExitManager(
             self.client, self.pm, self.tracker, self.cfg, self.fetcher.get_klines,
             loss_cooldown_cb=self.executor.start_loss_cooldown,
+            # D17-R3: borsa-arası baz LIKE-FOR-LIKE ölçülür — veri host'unun
+            # CANLI fiyatı da AYNI fetcher'dan (aynı host, aynı ağırlık
+            # bütçesi/kesici) gelir. Aynı host'ta hiç çağrılmaz.
+            data_price_fetch=self.fetcher.get_price,
         )
 
         # _task eski iç kullanımlar için scan task alias'ı olarak korunur.

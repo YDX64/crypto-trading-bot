@@ -37,13 +37,45 @@ Ağ erişimi yoksa/istenmiyorsa `--btc-klines-json <dosya>` ile Binance kline di
 söylenir — bkz. `docs/EXPERIMENTS.md` "rejim analizi" kalıbı (script bu kalıbı otomatikleştirir).
 
 ## Deploy ve geri alma
+
+**Üç halka vardır** ve her biri AYRI dizin/süreç/port/`.env` taşır. `--ring`
+verilmezse varsayılan `testnet`'tir (scalper halkası) — yani bir mainnet ya da
+takipçi deploy'u ASLA kazara olmaz:
+
+| Halka | `--ring` | Dizin | supervisord programı | Port | Durum |
+|---|---|---|---|---|---|
+| Scalper (TESTNET) | *(varsayılan)* `testnet` | `/opt/tradingbot-v2` | `tradingbot_v2` | 9091 | AKTİF |
+| Mainnet | `mainnet` | `/opt/tradingbot-main` | `tradingbot_main` | 9092 | pipeline hazır, dizin/program YOK |
+| AlgoPro takipçi (TESTNET) | `follower` | `/opt/tradingbot-ap` | `tradingbot_ap` | 9093 | AKTİF (D20) |
+
 ```bash
-scripts/deploy.sh awa                    # push edilmiş main → test → restart → sağlık → başarısızsa otomatik geri al
+scripts/deploy.sh awa                        # testnet halkası: push edilmiş main → test → restart → sağlık → başarısızsa otomatik geri al
 DEPLOY_NO_RESTART=1 scripts/deploy.sh awa    # dokümantasyon/harness değişikliği (süreç etkilenmez)
-scripts/deploy.sh awa <commit>           # elle geri alma; önceki commit backups/commit.prev-<tarih>
+scripts/deploy.sh awa <commit>               # elle geri alma; önceki commit backups/commit.prev-<tarih>
+scripts/deploy.sh awa --ring follower        # takipçi halkası (aynı repo, ayrı dizin/süreç)
+scripts/deploy.sh awa v1.2.0 --ring mainnet  # yalnız etiketli sürüm + elle 'MAINNET' onayı
 ```
 Deploy ön koşulları (script kendisi denetler): entry-halt dosyası yok, son 15 dk ban izi yok,
-temiz ağaç, yerel HEAD == origin/main. `.env` değişikliği deploy'dan AYRI bir adımdır:
+temiz ağaç, yerel HEAD == origin/main. Geri alma mantığı ÜÇ halkada da ORTAKtır
+(`scripts/server_deploy.sh`; `RING=` log etiketini, halka-özel entry-halt dosyasını
+— takipçide `state/follower_entry_halt.json` — ve mainnet ön kontrollerini seçer),
+yani her halka kendi `backups/commit.prev-<tarih>`ine döner.
+
+**Halkalar arası `.env` farkı** (salt okunur, secret DEĞERLERİ maskeli). Karşılaştırma
+İKİLİdir: `V2_ENV` ile `MAIN_ENV`. Takipçiyi görmek için `MAIN_ENV`'i takipçinin
+`.env`'ine çevir:
+```bash
+scripts/ring_env_diff.sh awa                                   # v2 ↔ mainnet
+MAIN_ENV=/opt/tradingbot-ap/.env scripts/ring_env_diff.sh awa  # v2 ↔ takipçi (D20)
+```
+Kapsam: `BINANCE_*`, `SCALPER_*`, `TV_*`, `RISK_*`, `FOLLOWER_*`, `BOT_MODE` ile
+başlayan TÜM anahtarlar (yani `SCALPER_TV_EVENTS_*`, `SCALPER_STRUCTURE_*`,
+`SCALPER_MARKET_DATA_BASE_URL`, `TV_EVENTS_STATE_PATH` de dahil). Adında
+`SECRET`/`KEY`/`TOKEN`/`PASS`/`BIND_IP` geçen anahtarların değeri **hiç yazdırılmaz**
+(`***`). ⚠️ Kapsam DIŞI kalanlar: `API_PORT`, `DATABASE_URL`, `TELEGRAM_*`,
+`APP_ENV`, `LOG_LEVEL` — halkaların ayrıştığını doğrularken bunlara ELLE bak.
+
+`.env` değişikliği deploy'dan AYRI bir adımdır:
 ```bash
 ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date +%Y%m%d)-<etiket> && sed -i "s/^ANAHTAR=.*/ANAHTAR=deger/" .env && ./.venv/bin/python -c "from src.core.config import settings as s; print(s.<alan>)" && supervisorctl restart tradingbot_v2'
 ```
@@ -72,15 +104,10 @@ Reddedilen durumlar: hedef `origin/main` veya `vX.Y.Z` biçiminde olmayan çıpl
 ya da etiket origin'e push edilmemişse — script deploy'u başlatmadan iptal eder.
 
 `scripts/server_deploy.sh` tarafında `RING=mainnet` iki şey yapar: log satırlarına `[ring=mainnet]`
-ekler (rollback mantığı iki halka için ORTAK, değişmez) ve ekstra bir ön kontrol çalıştırır — `.env`
+ekler (rollback mantığı ÜÇ halka için ORTAK, değişmez) ve ekstra bir ön kontrol çalıştırır — `.env`
 içinde `RISK_EVENT_SECRET` ve `TV_WEBHOOK_SECRET` dolu, `SCALPER_ENTRY_HALT_ENABLED=true` değilse
 deploy Türkçe bir hata mesajıyla reddedilir (bkz. `docs/MAINNET_PLAN.md` §3).
-
-İki halkanın `.env`'i arasındaki `SCALPER_*`/`TV_*`/`RISK_*` farkını (secret DEĞERLERİ maskelenerek)
-görmek için salt okunur yardımcı:
-```bash
-scripts/ring_env_diff.sh awa
-```
+Halkalar arası `.env` farkı için bölümün başındaki `scripts/ring_env_diff.sh` kutusuna bak.
 
 **Mainnet dizini/programı kurulduğunda** (insan tarafından, bkz. `docs/MAINNET_PLAN.md` §5 madde 4),
 supervisord'a eklenecek program tanımı (testnet'in `tradingbot_v2` programının eşleniği — port 9092,
@@ -502,9 +529,13 @@ ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date +%Y%m%d)-market
 ```
 Varsayılan zaten kapalı (satırı silmek de eşdeğerdir); kod geri alınmasına gerek yok.
 ## Kline kaynağını mainnet'e alma (`SCALPER_MARKET_DATA_BASE_URL`, D17)
-Ne yapar: YALNIZ public `/fapi/v1/klines` çekimi verilen host'tan yapılır. Emir, bakiye,
-pozisyon, evren taraması (`ticker/24hr`), `exchangeInfo` ve income `BINANCE_BASE_URL`'de
-KALIR — API anahtarı bu host'a asla gitmez. Amaç: testnet'te işlem yaparken RSI/Bollinger/
+Ne yapar: public `/fapi/v1/klines` çekimi ve (yalnız ayrı host'ta) chandelier bazının
+veri-tarafı referansı olan tek sembollük public `/fapi/v1/ticker/price` verilen host'tan
+yapılır. Emir, bakiye, pozisyon, `get_current_price`, evren taraması (`ticker/24hr`),
+`exchangeInfo` ve income `BINANCE_BASE_URL`'de KALIR — API anahtarı bu host'a asla gitmez.
+Ek yük: açık pozisyon başına ~30 istek/dk ≈ 30 ağırlık/dk (safety turu 2 sn, TTL = tur);
+`SCALPER_MAX_POSITIONS=3` ile en çok 90 ağırlık/dk — hesap `docs/ARCHITECTURE.md`
+§"Kline ağırlık bütçesi". Amaç: testnet'te işlem yaparken RSI/Bollinger/
 diverjans/rejim/ATR'yi GERÇEK piyasa mumlarından hesaplamak ve backtest harness'iyle (zaten
 mainnet) aynı veriye oturmak. Ayrıntı: `docs/DECISIONS.md` D17.
 
@@ -550,6 +581,7 @@ bir dize arıyordu; aşağıdakiler koddan doğrulanmıştır):
 | `grep -c "⏳ Piyasa verisi hız sınırı" logs/bot.log` | Tek başına 429 (soft throttle) — ban değil; tekrarlıyorsa bütçeyi/TOP_N'i düşür. |
 | `grep -c "⚖️ Piyasa verisi ağırlık bütçesi doldu" logs/bot.log` | Kendi 600/dk tavanımız bağladı — hesap (ARCHITECTURE §2) ile gerçek arasında sapma var. |
 | `grep -c "koruma tarafında değil" logs/bot.log` | Ötelenmiş trailing SL yanlış tarafa düştü, emir gönderilmedi. Sürekliyse iki defter arasındaki baz bozuk. |
+| `grep -c "canlı fiyatı okunamadı" logs/bot.log` | Veri host'unun `ticker/price` okuması başarısız — baz ölçülemedi, trailing turu atlandı (SL yerinde). Sürekliyse veri host'u/ağ arızalıdır. |
 
 Hepsi 0 olmalı. Çalışan süreçten aynı üç sayaç:
 ```bash
@@ -636,16 +668,25 @@ ssh awa 'grep -a "TV olayı\|TV yapı kapısı\|TV olay kanalı" /opt/tradingbot
 `allowlist_ok=false`, `gate_enabled=false`, `window_open=false` ya da
 `persist.ok=false` görürsen kanal SESSİZ demektir — adım 2/3'e dön.
 
-Elle sağlama **`?dry_run=1` ile** (secret'ı komut satırına YAZMA — `.env`'den oku).
-⚠️ `dry_run` olmadan bu komut CANLI DEFTERE gerçek bir olay yazar ve `active` modda
-açık pozisyonu etkileyebilir:
+Elle sağlama **DAİMA `?dry_run=1` ile** (secret'ı komut satırına YAZMA — `.env`'den
+oku). `dry_run` **her iki yolda da** yan etkisizdir: OLAY yolunda deftere yazmaz,
+GİRİŞ yolunda sağlamaya oy yazmaz, `external_signal`'ı ve takipçi köprüsünü
+ÇAĞIRMAZ. ⚠️ `dry_run` OLMADAN aynı komut canlı deftere gerçek bir olay yazar,
+`active` modda açık pozisyonu etkiler ve giriş yoluna düşerse **GERÇEK EMİR AÇAR**:
 ```bash
+# (a) OLAY yolu — yapı/çıkış alarmı şablonunu doğrula
 ssh awa 'cd /opt/tradingbot-v2 && S=$(grep ^TV_WEBHOOK_SECRET= .env | cut -d= -f2-) && curl -sS -X POST "http://127.0.0.1:9091/tv-signal?secret=$S&dry_run=1" -d "src=pac_choch kind=choch bearish BTCUSDT" | python3 -m json.tool'
+# (b) GİRİŞ yolu — mevcut 49 alarmdan birinin gövdesini doğrula
+ssh awa 'cd /opt/tradingbot-v2 && S=$(grep ^TV_WEBHOOK_SECRET= .env | cut -d= -f2-) && curl -sS -X POST "http://127.0.0.1:9091/tv-signal?secret=$S&src=luxso&dry_run=1" -d "LuxAlgo Bullish Confirmation BTCUSDT.P" | python3 -m json.tool'
 ```
-Beklenen: `"routed": "event"`, `"kind": "choch"`, `"direction": "SHORT"`,
-`"source": "pac_choch"`, `"dry_run": true`. **`"routed"` yoksa** (yanıtta `accepted`
-varsa) istek GİRİŞ yoluna düşmüştür → mesajda `kind=` belirteci mesajın BAŞINDA
-değildir (bkz. `docs/INTEGRATIONS.md` §7.1 "başlık koşusu").
+Beklenen (a): `"routed": "event"`, `"kind": "choch"`, `"direction": "SHORT"`,
+`"source": "pac_choch"`, `"dry_run": true`.
+Beklenen (b): `{"dry_run": true, "would": {"symbol": "BTCUSDT", "direction": "LONG",
+"source": "luxso"}}` — `routed`/`accepted` alanı YOKTUR.
+Teşhis: **(a) çağrısı `would` döndürüyorsa** istek GİRİŞ yoluna düşmüştür → `src=`/
+`kind=` belirteçleri mesajın BAŞINDA değildir (bkz. `docs/INTEGRATIONS.md` §7.1
+"başlık koşusu"). **422 + "yanlış şablon"** alıyorsan belirteçler ortadadır ve kanal
+seni bilerek durdurmuştur — mesajı düzelt, alarmı silme.
 
 **5) Olay defterini sıfırlama (yalnız gerektiğinde):** ⚠️ `state/tv_events.json`
 dosyasını SİLMEK çalışan süreci temizlemez — defter RAM'de otoritedir ve bir
@@ -661,11 +702,16 @@ yeni olay gelene kadar sessizleşmesidir (fail-open, `docs/INTEGRATIONS.md` §7.
 
 **Tuzaklar (D19a):**
 - Bir çıkış alarmının mesajından `kind=` düşerse **ya da belirteçler mesajın
-  BAŞINDA değilse** istek **422** alır (`olay kaynağı giriş oyu veremez`) — TV alarm
-  günlüğünde "webhook failed" görürsün. Bu BİLİNÇLİDİR: alternatifi, o alarmın
-  sessizce bir GİRİŞ OYUNA dönüşüp pozisyon açmasıydı. Çözüm: mesajı
-  `src=… kind=… {{ticker}}` sırasına getir (şablonlar: INTEGRATIONS §7.2);
-  alarmı SİLME.
+  BAŞINDA değilse** istek **422** alır — TV alarm günlüğünde "webhook failed"
+  görürsün. İki farklı mesaj çıkabilir: gövdede `src=<olay kaynağı>` varsa
+  `olay kaynağı giriş oyu veremez`, `src=` düşmüşse `olay alarmı yanlış şablon`.
+  Bu BİLİNÇLİDİR: alternatifi, o alarmın sessizce bir GİRİŞ OYUNA dönüşüp
+  pozisyon açmasıydı. Çözüm: mesajı `src=… kind=… {{ticker}}` sırasına getir
+  (şablonlar: INTEGRATIONS §7.2); alarmı SİLME.
+- **`src=`'i düşürme.** "Zaten `?src=` var" diye gövdeden çıkarırsan kaynak kimliği
+  kaybolur (kapı `GATE_SOURCES` ile eşleşmez) VE birinci kalkan devre dışı kalır.
+  İkinci kalkan (`kind=` taraması) yalnız gövde tanınan bir GİRİŞ biçimi değilse
+  korur (INTEGRATIONS §7.1/§7.2). Sayaç: `tv_events.counters.rejected_entry_kind_mention`.
 - `Kind: ...` / `Source: ...` gibi düz yazı başlangıçları GİRİŞ alarmlarını
   bozmaz — `:` ayracı yalnız TANINAN bir değer taşıyorsa belirteç sayılır.
 - `SCALPER_TV_EVENTS_MAX_AGE_MIN=0` ya da boş `SCALPER_TV_EVENTS_GATE_SOURCES`
@@ -684,8 +730,6 @@ yeni olay gelene kadar sessizleşmesidir (fail-open, `docs/INTEGRATIONS.md` §7.
   yapmaz** ve olayı tüketmez — `exits_failed` artar, olay en fazla 3 turda yeniden
   denenir. Bu, bayat fiyatla stop'u ters tarafa koyup acil kapanış tetiklememek
   içindir.
-Beklenen: `"routed": "event"`, `"kind": "choch"`, `"structure": "BEAR"` ve **hiçbir işlem
-açılmaması** (yanıtta `accepted` alanı YOKTUR — olay yolu sağlamaya hiç girmez).
 
 **Ne görürsün:**
 - Her olayda: `🧭 TV olayı: <SEMBOL> kind=… dir=… ← <src>`

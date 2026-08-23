@@ -76,13 +76,17 @@ boğayı yok ettiği için reddedildi, bkz. `docs/DECISIONS.md`).
 Mum verisi `KlineFetcher` (`src/strategies/scalper/data.py`) üzerinden public
 (imzasız) `/fapi/v1/klines`'tan gelir. Host seçimi:
 
-| Ayar | Kline host'u | Emir/bakiye/pozisyon/ticker host'u |
+| Ayar | Kline (+ baz referansı) host'u | Emir/bakiye/pozisyon/evren-ticker host'u |
 |---|---|---|
 | `SCALPER_MARKET_DATA_BASE_URL` boş (varsayılan) | `BINANCE_BASE_URL` | `BINANCE_BASE_URL` |
 | dolu (ör. `https://fapi.binance.com`) | o host | `BINANCE_BASE_URL` (DEĞİŞMEZ) |
 
-Yalnız kline çekimi ayrılır; `UniverseScanner` (24s ticker → evren) BİLİNÇLİ
-olarak işlem host'unda kalır — evren, işlem yapılamayan sembollerle dolmamalı.
+Ayrı host'a giden İKİ public çağrı vardır: kline çekimi ve (yalnız ayrı
+host'ta) chandelier bazının veri-tarafı referansı olan tek sembollük
+`/fapi/v1/ticker/price` (D17-R3, aşağıdaki 1. kalkan). `UniverseScanner`
+(24s ticker → evren) BİLİNÇLİ olarak işlem host'unda kalır — evren, işlem
+yapılamayan sembollerle dolmamalı; emir/bakiye/pozisyon ve `get_current_price`
+de İŞLEM host'undadır.
 `ExitManager` motorla AYNI fetcher örneğini kullanır (`engine.py`'de
 `self.fetcher.get_klines` callback'i), yani giriş ve trailing mumları hep aynı
 kaynaktan gelir. Mainnet'te işlem yapılırken market-data host'u testnet olamaz
@@ -100,19 +104,30 @@ Binance -2021 → `position_manager` pozisyonu ACİL KAPATIR).
 İki katmanlı kalkan (`exits._update_trailing`, yalnız ayrı host'ta; aynı host'ta
 ikisi de NO-OP → canlı davranış birebir korunur):
 
-1. **Dinamik baz çevirisi** (`_to_trading_price_space`). Her çıkış turunda
-   `baz = işlem_host_güncel_fiyat − veri_host_son_kapanış`; chandelier seviyesi
-   `+ baz` ile işlem uzayına taşınır, MESAFE (birim risk) korunur. İki referans
-   da AYNI turda okunur: `sp.position.current_price` `_step_one`'da işlem
-   host'undan tazelenir, `candles[-1].close` chandelier'ı besleyen serinin son
-   KAPANMIŞ mumudur. Baz ölçülemezse (işlem fiyatı bayat/eksik, |baz| > %2)
-   çeviri `None` döner ve **tur atlanır** — yabancı uzaydan emir gönderilmez.
+1. **Dinamik, LIKE-FOR-LIKE baz çevirisi** (`_to_trading_price_space`). Her
+   çıkış turunda `baz = işlem_host_CANLI_fiyat − veri_host_CANLI_fiyat`;
+   chandelier seviyesi `+ baz` ile işlem uzayına taşınır, MESAFE (birim risk)
+   korunur. İki referans da AYNI turda ve AYNI TÜRDEN okunur:
+   `sp.position.current_price` `_step_one`'da işlem host'unun ticker'ından
+   tazelenir, veri tarafı `exits._data_host_price` → `KlineFetcher.get_price`
+   (public `/fapi/v1/ticker/price`, ağırlık 1, `MarketDataGuard`'dan geçer,
+   sembol başına TTL = safety turu). Baz ölçülemezse (işlem fiyatı bayat/eksik,
+   veri host'u fiyatı okunamadı, |baz| > %2) çeviri `None` döner ve **tur
+   atlanır** — yabancı uzaydan emir gönderilmez.
    *Neden dinamik:* ilk sürüm bazı yalnız GİRİŞ anında ölçüyordu
    (`position.entry_price − signal.entry_price`) ve pozisyon ömrü boyunca sabit
    uyguluyordu; ayrıca `recover()` iki fiyatı da `trade.entry_price`'tan
    kurduğu için restart sonrası baz 0 çıkıp düzeltme sessizce no-op oluyordu
    (DB'de sinyal-anı fiyatı kolonu yok). Dinamik baz her turda yeniden
    ölçüldüğü için restart'ta ek alan/migrasyon gerektirmez.
+   *Neden like-for-like (D17-R3, bütünleşme incelemesi):* ikinci sürüm veri
+   tarafı için `candles[-1].close` (son KAPANMIŞ mum) kullanıyordu. Bu iki
+   büyüklük aynı türden DEĞİLDİR: fark, borsa-arası bazın ÜSTÜNE **mum-içi
+   sürüklenmeyi** de bindirir. Etki sistematiktir — fiyat pozisyonun lehine
+   gittikçe sürüklenme büyür, chandelier mandalı (`new_stop > current_sl`) her
+   turda biraz daha sıkışır ve stop fiilen CANLI FİYATI izler, chandelier
+   MESAFESİNİ değil (ters yönde ise koruma-tarafı kapısı turu boşa atlatır).
+   Mum kapanışı artık yalnız chandelier SEVİYESİNİ üretir, bazı değil.
 2. **Koruma-tarafı kapısı** (`_is_protective_side`). Çeviriden ve BE tabanından
    (`floor`, işlem uzayındadır) sonra: LONG stop güncel fiyatın `%0.05` altında,
    SHORT stop üstünde olmalıdır. Değilse emir **hiç gönderilmez** (eski SL
@@ -176,11 +191,25 @@ TAM BİR MUM bayat kalıyordu.
 | scan, bağlam TF | `5m` limit 100 | 20 sn (< 30 sn tur) | 2 × sembol | 4 × sembol |
 | scan, rejim TF | `15m` limit 250 | 60 sn | 1 × sembol | 2 × sembol |
 | exits trailing | `1m` limit 200 | 5 sn (safety 2 sn → TTL bağlar) | 10 × açık poz. | 20 × açık poz. |
+| exits baz referansı **(yalnız AYRI host)** | `ticker/price` (tek sembol) | 2 sn = safety turu | 30 × açık poz. | 30 × açık poz. |
 
 8 sembollük allowlist + 3 açık pozisyon → **40 + 30 = 70 istek/dk ≈ 140
 ağırlık/dk**; `SCALPER_TOP_N=12` ile 90 istek/dk ≈ **180 ağırlık/dk** (IP
 bütçesinin ~%7.5'i). Varsayılan (yavaş) profil 5m/15m/4h ise bunun yaklaşık
-yarısıdır. ⚠️ Bu bir HESAPTIR (TTL/tur aritmetiği), ölçüm değil:
+yarısıdır.
+
+**Ayrı market-data host'unda EK yük** (D17-R3 baz referansı; ayar boşken bu
+satır YOKTUR — aynı host'ta hiç istek atılmaz): safety turu 2 sn → 30 tur/dk,
+TTL = tur süresi → sembol başına **tur başına en fazla 1 istek**, ağırlığı 1.
+`SCALPER_MAX_POSITIONS=3` ile **90 istek/dk ≈ 90 ağırlık/dk**; toplam
+**160 istek/dk ≈ 230 ağırlık/dk** (IP bütçesinin ~%9.6'sı, kendi 600'lük
+bütçemizin ~%38'i). Kuramsal tavan — 8 sembolün HEPSİNDE açık pozisyon —
+8 × 30 = **240 istek/dk ≈ 240 ağırlık/dk**; buna trailing mumları da eklenirse
+40 + 80 + 240 = 360 istek/dk ≈ 80 + 160 + 240 = **480 ağırlık/dk**, yani
+600'lük bütçenin %80'i. Bu tavana `scalper_max_positions=3` yüzünden bugün
+ULAŞILAMAZ; tavanı yükseltmek isteyen önce bu satırı yeniden hesaplamalı.
+
+⚠️ Bu bir HESAPTIR (TTL/tur aritmetiği), ölçüm değil:
 `X-MBX-USED-WEIGHT-1M` telemetrisi D17'de eklendi, gerçek okuma canlıda henüz
 yapılmadı (D17 terfi adımı (c)). Harness AYRI bir profildir: `limit=1500`
 sayfaları ağırlık 10 eder (8 sembol × 21 gün ≈ 472, × 30 gün ≈ 656) — bu yüzden

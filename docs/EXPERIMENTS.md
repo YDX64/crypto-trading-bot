@@ -240,6 +240,12 @@ tabanla birebir aynı (AYI 1.04 / YATAY 1.29 / BOĞA 2.43), maxDD yarı (1841/16
 3683/3229/735) → negatif kontrol GEÇTİ (risk katmanı sinyali değiştirmez). E6c = E4f (TP1 %8)
 yarım ölçekte: PF 1.12/1.38/3.71, DD 1302/1077/257. E6a (`TF_REGIME=5m`) gerçek RED: AYI 1.01,
 YATAY 0.99, BOĞA +1944 (−%50). Karar/kapsam: `docs/superpowers/specs/2026-08-22-reversal-day-loss-design.md`.
+
+Aynı koşunun kalan varyantları (E6d/E6e) — yukarıdaki paragraf tabloyu böldüğü için
+başlık burada TEKRAR edilir (yalnız biçim; sayılar değişmedi):
+
+| Varyant | Pencere | Islem | WR% | PnL | PF | maxDD | Karar |
+|---|---|---|---|---|---|---|---|
 | E6d | AYI | 219 | 84.5 | +2664.58 | 1.20 | 2911.99 | - |
 | E6d | YATAY | 155 | 83.9 | +1574.64 | 1.17 | 2396.01 | - |
 | E6d | BOGA | 97 | 89.7 | +2764.36 | 1.67 | 683.56 | - |
