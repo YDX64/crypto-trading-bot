@@ -376,17 +376,25 @@ startup HATASI** (docs/MAINNET_PLAN.md §6).
 (scalper modunda `scalper_engine` — aynı yol), `/health` ve `/api/status`'a yalnız
 takipçi modunda çalışan erken dallar.
 
-**Kanıt:** `tests/test_follower_parser.py` (33 — TV'den alınan GERÇEK gövdeler),
-`test_follower_levels.py` (16), `test_follower_plan.py` (27 — kullanıcının üç örneği
-birebir), `test_follower_executor.py` (14 — korumalı açılış disiplini),
-`test_follower_engine.py` (35 — kapılar/flip/exit/HIT çapraz doğrulaması + gerçek
-`FollowerExitManager` ile TP1→BE), `test_follower_forwarder.py` (19),
-`test_follower_endpoint.py` (19 — 403/422/503 + köprü çağrı yeri),
-`test_follower_mode.py` (13 — BOT_MODE fail-fast, mainnet yasağı, scalper nötrlüğü),
-`tests/test_deploy_scripts.py` (+6 follower halkası). `python3 -m pytest tests -q`
-→ **862 passed, 1 skipped** (önceki: 676 passed, 1 skipped). Backtest harness'e
-DOKUNULMADI — takipçi yalnız canlı olay hattında çalışır ve strateji C'yi hiç
-kullanmaz (CLAUDE.md kural 2 kapsamı dışında).
+**Kanıt:** 183 yeni takipçi testi — `tests/test_follower_parser.py` (34, TV'den
+alınan GERÇEK gövdeler: SELL, SL HIT, TP1/TP2/TP3 HIT dizisi), `test_follower_levels.py`
+(16), `test_follower_plan.py` (27, kullanıcının üç örneği birebir),
+`test_follower_executor.py` (16, korumalı açılış disiplini + yeniden çapalama bütçesi),
+`test_follower_engine.py` (39, kapılar/flip/exit/HIT çapraz doğrulaması + gerçek
+`FollowerExitManager` ile uçtan uca giriş→TP1→BE→EXIT), `test_follower_forwarder.py` (19),
+`test_follower_endpoint.py` (19, 403/422/503 + köprü çağrı yeri),
+`test_follower_mode.py` (13, BOT_MODE fail-fast + mainnet yasağı + scalper nötrlüğü);
+ayrıca `test_deploy_scripts.py` (+6 halka) ve `test_ledger_report.py` (+4 `--strategy`).
+`python3 -m pytest tests -q` → **869 passed, 1 skipped** (önceki: 676 passed, 1 skipped).
+Backtest harness'e DOKUNULMADI — takipçi yalnız canlı olay hattında çalışır ve strateji
+C'yi hiç kullanmaz (CLAUDE.md kural 2 kapsamı dışında).
+
+**Kendi-incelemesi düzeltmeleri (commit'ten sonra, aynı dalda):** (1) `pm.place_stop_loss_or_close`
+yeniden çapalama bütçesi `FOLLOWER_MAX_SL_PCT` (%5) yerine
+`min(band, LIQ_GUARD/kaldıraç)` ile sınırlandı — 100x'te %5 mesafe likidasyonun
+ötesindeydi; (2) girişten hemen önce `get_position_risk(force_fresh=True)` ile
+"izlenmeyen ama borsada açık pozisyon" kapısı eklendi (fail-closed) — aksi halde
+`record_open` DB hatası sonrası ikinci bir giriş pozisyonu ikiye katlardı.
 
 **Beklenti:** YOK. Bu halka bir hipotez testidir: "AlgoPro'nun kendi seviyeleriyle,
 kendi giriş/çıkış komutlarıyla, 1m'de kâr edilebilir mi?" Kanıt canlı defterden
