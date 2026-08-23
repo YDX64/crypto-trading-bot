@@ -522,3 +522,131 @@ TEK eşikli, ön-kayıtlı (spec'ten veya mekanizmadan türeyen) kurallar denend
 4 ayrı kesitte (tümü / güvenilir / yarı-1 / yarı-2) + gün tipi kırılımında + bootstrap
 aralığıyla raporlandı. Yine de tek bir kuralın bile defter kanıtı **tek başına** terfi
 gerekçesi değildir (P2: 3 rejim penceresi + testnet soak).
+
+## 2026-08-23 — Piyasa yapısı (CHoCH/BOS) kapısı (E9)
+
+**Soru (kullanıcı):** "sistem dönüşleri tespit edemiyor" — rejim kapısı (D5, 15m
+EMA50/200) dönüş günlerinde saatler geç kalıyor; LuxAlgo Price Action Concepts'in
+CHoCH/BOS yapı sinyalleri bunu daha erken görüyor mu? Çözüm **sinyal** olmalı
+(boyut/TP/stop ayarı D16'da kullanıcı kararıyla reddedildi).
+
+**Ne kodlandı:** `src/strategies/scalper/structure.py` — saf (IO'suz, deterministik,
+look-ahead'siz) yapı durum makinesi: fraktal pivot → son onaylanmış swing seviyesi →
+kapanışla kırılım → BOS (devam) / CHoCH (karakter değişimi, yapı yönü döner). Motorda
+`_evaluate_symbol`'de rejim kapısının HEMEN ARDINDA tek giriş kapısı (C ve TV aynı
+yerden geçer), harness'ta `simulate_symbol` AYNI saf fonksiyon çiftini AYNI pencerelerle
+çağırır. Opsiyonel çıkış tetikleyicisi (`SCALPER_STRUCTURE_EXIT=be|close`) canlıda
+`engine._apply_structure_exits`, harness'ta `manage_position`. **Hepsi varsayılan KAPALI**
+(`tests/test_structure.py` 51 test + `tests/test_golden_backtest.py` DEĞİŞMEDEN geçer).
+
+**Komut kalıbı** (env tabanı `scripts/.scalper_env_snapshot.txt` = canlı 10/50/10/10,
+divergence=true; `--cache-dir data/klines_cache` → AĞSIZ; C-only, 8 majör):
+```bash
+env $(cat scripts/.scalper_env_snapshot.txt | xargs) SCALPER_STRUCTURE_GATE=true \
+  SCALPER_STRUCTURE_TF=context SCALPER_STRUCTURE_PIVOT=5 \
+  python3 -m src.strategies.scalper.backtest --strategies C \
+  --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,BNBUSDT,ADAUSDT,LTCUSDT \
+  --start 2026-01-23 --end 2026-02-13 --cache-dir data/klines_cache
+```
+Loglar: `logs/structure/<varyant>_<pencere>.log` (24 koşu; `logs/` gitignore'da).
+Varyantlar: **S0** kapalı (taban) · **S1** giriş kapısı 5m/pivot5 · **S2** giriş kapısı
+15m/pivot5 · **S3** = S1 + `EXIT=be` · **S4** = S1 + `EXIT=close` · **S1p3/S1p8/S2p8**
+pivot duyarlılığı.
+
+### E9.1 — Sonuç tablosu (işlem / WR% / PnL / PF / maxDD · kapı tetiği)
+| Varyant | AYI | YATAY | BOĞA | Yapı kapısı tetiği (A/Y/B) |
+|---|---|---|---|---|
+| **S0 taban** | 213 / 85.4 / **+584.4** / **1.04** / 3683 | 145 / 86.9 / **+2392.3** / 1.29 / 3229 | 90 / 93.3 / **+3901.7** / 2.43 / 735 | — |
+| S1 (5m, p5) | 84 / 83.3 / −1057.1 / 0.85 / 2140 | 71 / 81.7 / −356.4 / 0.93 / 2077 | 36 / 91.7 / +1289.4 / 1.84 / 1113 | 344 / 258 / 188 |
+| S2 (15m, p5) | 129 / 84.5 / −396.8 / 0.96 / 3314 | 104 / 80.8 / −1943.3 / 0.78 / 3260 | 59 / 89.8 / +1525.9 / 1.56 / 1295 | 239 / 149 / 103 |
+| S3 (S1+be) | 84 / 47.6 / −1589.3 / 0.70 / 2438 | 77 / 39.0 / −755.0 / 0.77 / 1566 | 40 / 52.5 / +1172.0 / 3.00 / 514 | 356 / 289 / 220 |
+| S4 (S1+close) | 89 / 33.7 / −2442.3 / 0.53 / 2821 | 81 / 33.3 / −898.9 / 0.69 / 1084 | 42 / 38.1 / +409.9 / 1.43 / 417 | 373 / 304 / 229 |
+| S1p3 (5m, p3) | 63 / 82.5 / −1240.9 / 0.78 / 2499 | 55 / 83.6 / +576.4 / 1.18 / 1282 | 26 / 96.2 / +1739.6 / 4.38 / 514 | 394 / 314 / 245 |
+| S1p8 (5m, p8) | 113 / 83.2 / −825.7 / 0.91 / 3311 | 84 / 83.3 / +227.6 / 1.04 / 2738 | 46 / 87.0 / +598.9 / 1.22 / 1423 | 252 / 208 / 165 |
+| S2p8 (15m, p8) | 137 / 83.9 / −11.3 / 1.00 / 2720 | 112 / 84.8 / +209.8 / 1.03 / 2352 | 66 / 89.4 / +1535.8 / 1.47 / 1454 | 215 / 118 / 89 |
+
+S0, E8.6/D12'nin tabanını **birebir** yeniden üretti (AYI 213 / +584.4 / PF 1.04 /
+DD 3682.60) → ölçüm hattı doğru.
+
+**P2 hükmü: 7 varyantın 7'si de REDDEDİLDİ.** Hiçbiri "AYI PF ≥ 1.1" ya da "AYI ve
+YATAY birlikte iyileşir" kolunu geçmiyor; BOĞA PnL kaybı her varyantta ≥ %55
+(kural: ≤ %20). En "iyi" varyant (S2p8) tabanı yalnızca **hiçbir şey yapmamaya
+yaklaşarak** yakalıyor: pivot büyüdükçe (yapı yavaşladıkça) tetik sayısı düşüyor ve
+sonuç tabana yakınsıyor — AYI PF 0.78 (p3) → 0.85 (p5) → 0.91 (p8) [5m] ve
+0.96 (p5) → 1.00 (p8) [15m]. **Monotonluk, bunun bir eşik/pivot ayarı sorunu
+OLMADIĞININ en güçlü kanıtıdır** (aynı desen E4a/E2ab'de de görülmüştü).
+
+### E9.2 — Kesilen kayıp mı, kesilen kâr mı? (çıkış nedeni kırılımı)
+| Pencere | Varyant | SL (n / PnL) | TRAIL (n / PnL) | Kesilen kayıp | Kesilen kâr | oran |
+|---|---|---|---|---|---|---|
+| AYI | S0 | 29 / −14907 | 182 / +15721 | — | — | — |
+| AYI | S1 | 14 / −7196 | 70 / +6139 | 7711 | 9582 | **0.80** |
+| AYI | S2 | 19 / −9766 | 109 / +9563 | 5141 | 6158 | **0.83** |
+| YATAY | S0 | 16 / −8224 | 125 / +10628 | — | — | — |
+| YATAY | S1 | 10 / −5140 | 57 / +4785 | 3084 | 5843 | **0.53** |
+| YATAY | S2 | 17 / −8738 | 83 / +6807 | **−514** | 3821 | **<0** |
+| BOĞA | S0 | 5 / −2570 | 84 / +6624 | — | — | — |
+| BOĞA | S1 | 3 / −1543 | 33 / +2832 | 1027 | 3792 | **0.27** |
+| BOĞA | S2 | 5 / −2571 | 53 / +4249 | −1 | 2375 | **0.00** |
+Yani kapı, her pencerede kestiği her 1 birim kayba karşılık **1.2–3.7 birim kâr**
+kesiyor; YATAY/BOĞA'da 15m kapısı **hiç kayıp kesmiyor**, yalnız kâr kesiyor.
+
+**Yön kırılımı — kullanıcının "düşen bıçak LONG" hipotezi doğrudan sınandı.** AYI
+penceresinde taban LONG bacağı 79 işlem / −956; 15m yapı kapısı 30 LONG'u engelledikten
+SONRA kalan LONG bacağı **49 işlem / −2050 (PF 0.84 → 0.60)** — yani kapı düşen-bıçak
+kayıplarını KESMEDİ, tersine **kârlı dip alımlarını** kesip başarısız sıçrama alımlarını
+bıraktı. (S1'de LONG −956 → −587 ama işlem 79 → 36; kayıp/işlem AYNI mertebede.)
+Mekanizma: C tanımı gereği ters-trend bir ortalamaya-dönüş stratejisidir (RSI ucu +
+BB taşması); "yapıya ters işlem açma" kuralı C'nin kâr kaynağını doğrudan yasaklar.
+Bu, E8.6'nın bağlam-TF kuralları için verdiği hükmün (defterde güçlü, harness'ta P2'yi
+geçmiyor) BAĞIMSIZ ikinci bir doğrulamasıdır.
+
+### E9.3 — Çıkış tetikleyicisi (S3/S4): en zararlı varyant
+| Pencere | Varyant | CHOCH/STRUCT_BE çıkışı (n / PnL) | TRAIL (n / PnL) | WR% |
+|---|---|---|---|---|
+| AYI | S3 (be) | STRUCT_BE 34 / −136 | 40 / +3687 | 47.6 |
+| AYI | S4 (close) | CHOCH 59 / −4682 | 29 / +2754 | 33.7 |
+| YATAY | S4 (close) | CHOCH 56 / −2835 | 23 / +1861 | 33.3 |
+| BOĞA | S4 (close) | CHOCH 27 / −939 | 15 / +1349 | 38.1 |
+S4, AYI'da SL sayısını 29'dan **1**'e düşürdü (kayıp −14907 → −514) — yani "dönüşte
+kes" mekanik olarak ÇALIŞIYOR — ama TRAIL kazananları 182'den **29**'a indirdi
+(+15721 → +2754). Kazanma oranı %85 → %34. S3 (BE'ye çek) daha yumuşak: 34 işlem
+başabaşa çekildi (−136 toplam) ama TRAIL 182 → 40. **Sonuç: açık bir C pozisyonuna
+ters CHoCH bir dönüş uyarısı değil, C'nin zaten fade ettiği gürültünün ta kendisidir.**
+Kullanıcının bilmesi gereken sayı: sistemin başabaş kazanma oranı ≈ %85 (SL ort −514,
+TRAIL ort +88); WR'yi %34'e düşüren her kural, kayıpları kesse bile matematiksel
+olarak kaybettirir.
+
+### E9.4 — Gecikme analizi (yapı vs rejim kapısı)
+Betik: scratchpad `structure_delay.py` (AĞSIZ, `data/klines_cache` üzerinde; 8 sembol ×
+3 pencere).
+- **Pivot onayı gecikmesi yapı SİNYALİNİ geciktirmez.** Bir pivot ancak sağındaki N mum
+  kapanınca onaylanır, ama o seviyeyi kıracak bir mum pivotu zaten geçersiz kılar
+  (`high[p] > high[j]` şartı) — yani kırılım olayı en erken `pivot+right+1`'de doğar ve
+  bu ASLA bir kaçırılmış kırılım demek değildir. Özellik testiyle sabitlendi
+  (`test_pivot_confirmation_delay_is_modelled`, `test_no_lookahead_prefix_stability`).
+- Kırılan seviyenin YAŞI (pivot → kırılım) medyan **11 mum** (pivot 5; p3'te 7, p8'te
+  17). Olay, kıran mumun KAPANIŞINDA doğar → 5m'de ≤5 dk, 15m'de ≤15 dk gecikme.
+- **CHoCH, EMA50/200 rejim dönüşünden çok daha erken:** 15m'de aynı yönlü son CHoCH,
+  rejim dönüşünden medyan **45 mum ≈ 11 saat** önce gerçekleşiyor (n=2128 dönüş;
+  pivot 3'te 28 mum, pivot 8'de 66 mum). **Ama bu "öngörü" değil FREKANStır:** aynı
+  veride 15m/pivot5 yapı, sembol-gün başına ≈2.4 CHoCH (5m'de ≈6.8) üretiyor — o kadar
+  sık dönen bir göstergenin her rejim dönüşünden önce "haber vermiş" olması kaçınılmaz.
+  Kapının 3 pencerede kaybettirmesinin nedeni de tam olarak budur: erken ama gürültülü.
+- Yapı olay sayıları (8 sembol × pencere, kapanış bazlı): 5m/p5 AYI 1111 BOS + 1138
+  CHoCH · YATAY 951/1044 · BOĞA 662/675; 15m/p5 AYI 402/410 · YATAY 363/404 ·
+  BOĞA 251/292.
+
+### E9.5 — Parite ve bilinen sapma
+- Motor ve harness **aynı saf fonksiyonları** çağırır (`structure_state_for` →
+  `structure_gate_blocks`; çıkışta `detect_structure` → `structure_exit_action`);
+  fonksiyon kimliği testle sabitlendi (`test_engine_and_harness_call_the_same_pure_function`).
+- **Bilinen 1 mumluk sapma (yeni değil, tüm göstergeler için geçerli):** canlı
+  `get_klines(limit=N)` oluşmakta olan mumu attığı için genelde N−1 KAPALI mum döndürür;
+  harness tam N mum diler. Yapı durum makinesi geçmişe bağımlı olduğundan bu ölçüldü
+  (scratchpad `structure_window_parity.py`, gerçek veri, 8 sembol × 3 pencere):
+  **5m/100 mum: yön farkı %0.06 (6520 örnekte 4), son-olay farkı %0.23; 15m/250 mum:
+  %0.00**. Yani sapma ölçüm sonuçlarını taşıyacak mertebede değil.
+- Kapı **motor-içi**dir (E8.6'nın post-hoc yönteminin aksine): engellenen sinyal
+  kapasite/sembol-içi tekilliği serbest bırakır, yerine başka sinyal geçebilir. Bu
+  yüzden E9 sayıları E8.6'nın "alt sınır" uyarısına tabi DEĞİLDİR.

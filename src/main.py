@@ -1043,6 +1043,7 @@ _EMPTY_SCALPER_STATUS = {
     "health": {"healthy": False, "running": False, "reason": "engine_not_created"},
     "universe": [],
     "regimes": {},
+    "structure": {},
     "daily_pnl": 0.0,
     "daily_pnl_source": "unavailable",
     "risk_ready": False,

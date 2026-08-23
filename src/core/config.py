@@ -333,6 +333,30 @@ class Settings(BaseSettings):
     # scalper_loss_cooldown_minutes'e (o da yoksa 60 dk) düşer — canlıda aynı
     # sembolün fiilen ne kadar süre meşgul sayılacağıyla aynı mertebede.
     scalper_shadow_dedup_minutes: float = 0.0
+    # --- Piyasa yapısı (BOS/CHoCH) kapısı — E9/D18 adayı, VARSAYILAN KAPALI ---
+    # Sorun (kullanıcı, 2026-08-23): rejim kapısı (D5) 15m EMA50/200 ile dönüşleri
+    # saatler geç görüyor; dönüş günlerinde düşen-bıçak LONG / rahatlama-rallisi
+    # SHORT kayıpları buradan geliyor. Yapı kapısı aynı soruyu ortalama yerine
+    # swing kırılımıyla sorar (src/strategies/scalper/structure.py).
+    # KAPALIYKEN hiçbir kod yolu davranış değiştirmez (byte-for-byte aynı
+    # backtest — tests/test_golden_backtest.py).
+    scalper_structure_gate: bool = False
+    # Hangi seri? Rol adı ("entry"/"context"/"regime") ya da doğrudan zaman
+    # dilimi ("5m") — canlı env'de context=5m, regime=15m. YENİ REST çağrısı
+    # yok: bu seriler her tarama turunda zaten çekiliyor.
+    scalper_structure_tf: str = "context"
+    # Fraktal pivot uzunluğu (her iki taraf). Büyük = daha az/daha güvenilir
+    # swing ama daha geç onay (pivot ancak sağındaki N mum kapanınca onaylanır).
+    scalper_structure_pivot: int = 5
+    # Kırılım kapanışla mı onaylansın (True, fitil-avı gürültüsünü eler) yoksa
+    # fitil yeter mi (False)?
+    scalper_structure_use_close: bool = True
+    # Kapı açıkken yapıya TERS girişleri engelle (BEAR yapıda LONG yok).
+    scalper_structure_block_counter: bool = True
+    # Açık pozisyonun TERSİNE CHoCH gelince ne yapılsın:
+    # "off" (varsayılan, hiçbir şey) | "be" (stopu break-even'a çek) |
+    # "close" (reduce-only MARKET ile kapat).
+    scalper_structure_exit: str = "off"
     scalper_c_allowed_regimes: str = "UP,DOWN,RANGE"  # deney: "RANGE" ile sınırla
     scalper_d_use_eqhl: bool = True              # D süpürmesi EQH/EQL kümelerine bağlı
     scalper_eqhl_tolerance_pct: float = 0.05     # pivot eşitlik eşiği (%)
@@ -374,6 +398,33 @@ class Settings(BaseSettings):
                     f"BINANCE_BIND_IP geçersiz IP adresi: {value!r}"
                 ) from e
         return value
+
+    @model_validator(mode="after")
+    def _validate_structure_gate(self) -> "Settings":
+        """Yapı kapısı/çıkışı AÇIKKEN ayarların anlamlı olduğunu startup'ta
+        doğrula. Kapalıyken (varsayılan) hiçbir kontrol yapılmaz — kapalı bir
+        özelliğin ayarı botu başlatmamazlık etmemeli.
+
+        Sessiz yanlış davranış riski: SCALPER_STRUCTURE_TF çözülemezse yapı
+        yanlış seriden okunur ya da hiç okunmaz; SCALPER_STRUCTURE_EXIT'te
+        yazım hatası çıkışı sessizce kapatır.
+        """
+        from src.strategies.scalper import structure as _structure  # döngüsel import yok (structure saf)
+
+        exit_raw = str(self.scalper_structure_exit or "off").strip().lower()
+        if exit_raw not in ("off", "be", "close"):
+            raise ValueError(
+                f"SCALPER_STRUCTURE_EXIT geçersiz: {self.scalper_structure_exit!r} "
+                f"(geçerli: off | be | close)"
+            )
+        if not (self.scalper_structure_gate or exit_raw != "off"):
+            return self
+        if int(self.scalper_structure_pivot or 0) < 1:
+            raise ValueError(
+                f"SCALPER_STRUCTURE_PIVOT >= 1 olmalı (verilen: {self.scalper_structure_pivot})"
+            )
+        _structure.resolve_structure_role(self)  # çözülemezse ValueError
+        return self
 
     @model_validator(mode="after")
     def _validate_fixed_roi_stop_consistency(self) -> "Settings":

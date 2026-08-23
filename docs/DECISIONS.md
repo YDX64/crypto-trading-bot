@@ -310,6 +310,57 @@ PF > 1.4 ama boğada toplam PnL tabanın ~%42'si (bilinçli tercih: "her rejimde
 "2026-08-23 02:57"`; değerlendirme ≥28 Ağu + ≥1 DOWN günü.
 **Geri alma:** `cp backups/env.bak-20260823-025623-riskpaketi .env && supervisorctl restart tradingbot_v2`.
 
+### D18 — Piyasa yapısı (CHoCH/BOS) kapısı · 2026-08-23 · **ADAY, UYGULANMADI (kanıt REDDETTİ)**
+**Ne:** `src/strategies/scalper/structure.py` — LuxAlgo Price Action Concepts'in yayınlanmış
+BOS/CHoCH tanımına yakın, saf ve deterministik bir piyasa-yapısı durum makinesi; üzerine iki
+entegrasyon: (a) giriş kapısı `SCALPER_STRUCTURE_GATE` (+`_TF`/`_PIVOT`/`_USE_CLOSE`/
+`_BLOCK_COUNTER`) — yapı BEAR iken LONG, BULL iken SHORT açılmaz; (b) çıkış tetikleyicisi
+`SCALPER_STRUCTURE_EXIT=off|be|close` — açık pozisyonun tersine CHoCH gelince stop BE'ye
+çekilir ya da reduce-only MARKET ile kapatılır. **Kod repoya girdi ama HER ŞEY VARSAYILAN
+KAPALI**: `.env`'de hiçbir `SCALPER_STRUCTURE_*` anahtarı yok, davranış bugünküyle birebir
+aynı (altın backtest `tests/test_golden_backtest.py` DEĞİŞMEDEN geçiyor).
+
+**Neden denendi:** kullanıcı kararı (2026-08-23) — "sistem dönüşleri tespit edemiyor";
+rejim kapısı (D5) 15m EMA50/200 ile dönüşleri saatler geç görüyor, dönüş günlerinde
+düşen-bıçak LONG / rahatlama-rallisi SHORT kayıpları oradan geliyor. Çözüm ayar değil
+SİNYAL olmalı (D16 geri alma gerekçesi).
+
+**Kanıt (E9, `docs/EXPERIMENTS.md`; loglar `logs/structure/*.log`, 24 koşu):**
+7 varyantın 7'si de P2'yi REDDETTİ. Taban (S0) E8.6/D12 ile birebir (AYI 213/+584.4/PF 1.04/
+DD 3683). En iyi varyant S2p8 (15m, pivot 8): AYI PF **1.00** (<1.1), YATAY +210 (taban
++2392, **−%91**), BOĞA +1536 (taban +3902, **−%61**). 5m/pivot5 (S1): AYI 0.85 / −1057.
+Çıkış tetikleyicisi daha da kötü: `close` modunda SL sayısı AYI'da 29→1 düştü (kayıp
+−14907 → −514) ama TRAIL kazananları 182→29 çöktü, WR %85 → **%34**.
+**Mekanizma:** C ters-trend bir ortalamaya-dönüş stratejisidir; "yapıya ters işlem açma"
+kuralı onun kâr kaynağını yasaklar. Kapı, kestiği her 1 birim kayba karşılık 1.2–3.7 birim
+kâr kesiyor (E9.2); AYI'da 30 LONG engelledikten sonra LONG bacağı −956 → **−2050**'ye
+KÖTÜLEŞTİ — yani düşen bıçağı değil, kârlı dip alımını kesiyor. Pivot 3/5/8 taraması
+monoton: yapı yavaşladıkça sonuç tabana yakınsıyor, yani kapının ulaşabildiği en iyi hâl
+"hiçbir şey yapmamak" (eşik uydurmasıyla kurtarılamaz).
+
+**Gecikme bulgusu (kullanıcının hipotezinin ölçülmüş hâli):** CHoCH gerçekten çok erken —
+15m'de rejim (EMA50/200) dönüşünden medyan **45 mum ≈ 11 saat** önce. Ama bu öngörü değil
+FREKANS: aynı veride 15m yapı sembol-gün başına ≈2.4 (5m'de ≈6.8) CHoCH üretiyor. "Erken"
+ile "doğru" aynı şey değil; kaybın kaynağı bu.
+
+**Ne kaldı (neden geri alınmadı):** modül saf, testli (51 test) ve KAPALI; iki şeye yarıyor:
+(1) `/scalper/status` → `structure` alanı canlı yapıyı sembol bazında yayınlıyor (kapı
+kapalıyken de) — operatör/soak gözlemi için ücretsiz telemetri, ek REST çağrısı yok;
+(2) gelecekteki bir sinyal kaynağı (ör. yapı + likidite süpürmesi birleşimi, ya da yalnız
+TV/haber sinyallerine uygulanan dar bir kapı) için hazır, parite-güvenli bir zemin.
+**Bu commit bir terfi ÖNERİSİ DEĞİLDİR** — kanıt kuralı P2'ye göre bu fikir REDDEDİLMİŞTİR.
+
+**Geri alma:** `.env`'de hiçbir şey yok, dolayısıyla "kapatma" gerekmez. Kodu tamamen
+geri almak gerekirse: `src/strategies/scalper/structure.py` (yeni dosya) +
+`src/core/config.py` (`scalper_structure_*` alanları + `_validate_structure_gate`) +
+`src/strategies/scalper/engine.py` (import, `_structure` sözlüğü, `_evaluate_symbol`
+yapı bloğu, `_apply_structure_exits`, `_close_position_market`'ın `forced_exit_reason`
+parametresi, snapshot `structure` alanı) + `src/strategies/scalper/exits.py`
+(`force_stop_to`) + `src/strategies/scalper/backtest.py` (import, `_StructureFeed`,
+`OpenPosition.signal_close_time`/`structure_be_applied`, `simulate_symbol` yapı kapısı,
+`manage_position` `structure_feed` parametresi, `_process_candle_exits` STRUCT_BE etiketi)
++ `src/main.py` (`_EMPTY_SCALPER_STATUS["structure"]`) + `tests/test_structure.py`.
+
 ## Reddedilen kararlar (kanıtla)
 
 | Fikir | Tarih | Sonuç | Neden reddedildi |
@@ -334,6 +385,9 @@ PF > 1.4 ama boğada toplam PnL tabanın ~%42'si (bilinçli tercih: "her rejimde
 | Lev tavanı 12 tek (E5c) | 08-21 | −347 | aynı |
 | TP1 8 + chandelier 3.0 (E5d) | 08-21 | +985 (< E4f tek +1058) | toplamsal değil; E4f tek başına tercih |
 | AlgoPro V1.6 + yüksek kaldıraç TP1 | 08-21 | TP1 kazanma ort %40.5 (başabaş %50) | repaint yok ama beklenti −0.19R |
+| Yapı (CHoCH/BOS) giriş kapısı — 5m pivot 5 (E9/S1) | 08-23 | AYI 0.85/−1057, YATAY 0.93/−356, BOĞA −%67 | C ters-trend; yapıya ters işlem yasağı kâr kaynağını yasaklıyor |
+| Yapı giriş kapısı — 15m pivot 5/8 (E9/S2, S2p8) | 08-23 | En iyi hâl AYI PF 1.00, YATAY −%91, BOĞA −%61 | pivot büyüdükçe tabana yakınsıyor = "en iyisi hiçbir şey yapmamak" |
+| Yapı CHoCH çıkışı — BE / market kapanış (E9/S3, S4) | 08-23 | WR %85 → %48 / %34; AYI −1589 / −2442 | SL 29→1 düşüyor ama TRAIL kazananları 182→29 çöküyor (ödeme asimetrisi) |
 
 ## Metodoloji kararları
 

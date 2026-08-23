@@ -64,6 +64,21 @@ from src.strategies.scalper.indicators import atr, chandelier_stop
 from src.strategies.scalper.regime import detect_regime
 from src.strategies.scalper.scanner import UniverseScanner
 from src.strategies.scalper.setups import apply_stop_policy, get_enabled
+from src.strategies.scalper.structure import (
+    EXIT_OFF,
+    StructureExitInput,
+    StructureState,
+    detect_structure,
+    resolve_structure_role,
+    structure_exit_action,
+    structure_exit_mode,
+    structure_gate_blocks,
+    structure_gate_enabled,
+    structure_pivot,
+    structure_state_for,
+    structure_use_close,
+    structure_window_bars,
+)
 from src.strategies.scalper.types import (
     Candle,
     Direction,
@@ -380,6 +395,15 @@ class OpenPosition:
     exit_reason: Optional[str] = None
     exit_price: Optional[float] = None
     exit_time: Optional[int] = None
+    # SİNYAL mumunun close_time'ı (dolum mumunun DEĞİL). Canlıda
+    # `ScalpPosition.entry_candle_time` ile birebir aynı anlam
+    # (executor.try_open: ctx.candles_5m[-1].close_time) — yapı çıkışının
+    # "olay girişten SONRA mı" tazelik şartı bunu kullanır (parite).
+    signal_close_time: int = 0
+    # Yapı çıkışı (SCALPER_STRUCTURE_EXIT=be) stopu BE'ye çekti mi? Yalnız
+    # RAPORLAMA için: TP1 öncesi bu stopa değen kapanış "SL" yerine
+    # "STRUCT_BE" etiketlenir ki kesilen kayıplar sayılabilsin.
+    structure_be_applied: bool = False
 
     def __post_init__(self) -> None:
         self.remaining_qty = self.qty_total
@@ -567,6 +591,7 @@ def open_position(
         regime=signal.regime.value if hasattr(signal.regime, "value") else str(signal.regime),
         entry_commission_rate=entry_commission_rate,
         exit_commission_rate=exit_commission_rate,
+        signal_close_time=candles_5m[signal_idx].close_time,
     )
 
 
@@ -619,7 +644,14 @@ def _process_candle_exits(pos: OpenPosition, c: Candle, direction: Direction) ->
         tp1_hit = _is_hit(c, pos.tp1_price, direction, is_stop=False)
 
         if sl_hit:
-            _close_remaining(pos, pos.current_stop, c.close_time, "SL")
+            # Etiket ayrımı (yalnız raporlama): yapı çıkışı (SCALPER_STRUCTURE_
+            # EXIT=be) stopu BE'ye çekmişse bu bir "SL kaybı" değil, kesilmiş
+            # bir kayıptır — E9 ölçümünde ayrı sayılabilsin. Bayrak varsayılan
+            # False olduğundan kapalı yapılandırmada davranış birebir aynıdır.
+            _close_remaining(
+                pos, pos.current_stop, c.close_time,
+                "STRUCT_BE" if pos.structure_be_applied else "SL",
+            )
             return True
         if tp1_hit:
             _fill_leg(pos, pos.tp1_qty, pos.tp1_price, "TP1")
@@ -728,9 +760,62 @@ def _finalize_trade(pos: OpenPosition, exit_idx: int, candles_5m: List[Candle]) 
     )
 
 
-def manage_position(pos: OpenPosition, candles_5m: List[Candle], cfg: Any) -> BacktestTrade:
+class _StructureFeed:
+    """`manage_position` için yapı serisi besleyicisi (yalnız harness).
+
+    Canlı karşılığı `engine._apply_structure_exits`: orada seri borsadan
+    (TTL önbellekli) çekilir, burada zaten elde olan seriden `_slice_upto`
+    ile aynı pencere kesilir. İKİ tarafta da AYNI saf fonksiyonlar
+    (`detect_structure` → `structure_exit_action`) AYNI pencere boyuyla
+    çağrılır — parite (DECISIONS P1).
+
+    Bellekleme (memoization) semantiği DEĞİŞTİRMEZ: yapı durumu yalnız yeni
+    bir yapı-TF mumu kapandığında değişir, bu yüzden sonuç (dilim son
+    close_time'ı, dilim uzunluğu) anahtarıyla önbelleklenir; önbellekli ve
+    önbelleksiz sonuçların aynılığı testle sabitlenmiştir.
+    """
+
+    __slots__ = ("series", "close_times", "window", "left", "right", "use_close", "_cache")
+
+    def __init__(self, series: List[Candle], window: int, cfg: Any) -> None:
+        self.series = series
+        self.close_times = [c.close_time for c in series]
+        self.window = window
+        self.left, self.right = structure_pivot(cfg)
+        self.use_close = structure_use_close(cfg)
+        self._cache: Dict[tuple, StructureState] = {}
+
+    def state_at(self, cutoff_ms: int) -> Optional[StructureState]:
+        window_slice = _slice_upto(self.series, self.close_times, cutoff_ms, self.window)
+        if not window_slice:
+            return None
+        key = (len(window_slice), window_slice[-1].close_time)
+        cached = self._cache.get(key)
+        if cached is None:
+            cached = detect_structure(
+                window_slice,
+                pivot_left=self.left,
+                pivot_right=self.right,
+                use_close=self.use_close,
+            )
+            self._cache[key] = cached
+        return cached
+
+
+def manage_position(
+    pos: OpenPosition,
+    candles_5m: List[Candle],
+    cfg: Any,
+    structure_feed: Optional["_StructureFeed"] = None,
+) -> BacktestTrade:
     """Pozisyonu entry_idx'ten itibaren, kapanana ya da veri bitene (EOD)
-    kadar mum mum yönetir."""
+    kadar mum mum yönetir.
+
+    `structure_feed` verilirse (yalnız `SCALPER_STRUCTURE_EXIT != off`) her
+    mum sonunda yapı-tabanlı çıkış kararı da uygulanır — canlı safety
+    turundaki sıra ile AYNI: önce SL/TP (intrabar), sonra trailing, en son
+    yapı. Verilmezse (varsayılan) kod yolu bugünküyle birebir aynıdır.
+    """
     n = len(candles_5m)
     exit_idx = n - 1
 
@@ -745,6 +830,26 @@ def manage_position(pos: OpenPosition, candles_5m: List[Candle], cfg: Any) -> Ba
 
         if pos.trailing_active:
             _update_trailing(pos, candles_5m, idx, cfg)
+
+        if structure_feed is not None:
+            action = structure_exit_action(
+                structure_feed.state_at(c.close_time),
+                StructureExitInput(
+                    direction=pos.direction,
+                    entry_close_time=pos.signal_close_time,
+                    current_price=c.close,
+                    current_stop=pos.current_stop,
+                    breakeven_price=pos.breakeven_price,
+                ),
+                cfg,
+            )
+            if action == "close":
+                _close_remaining(pos, c.close, c.close_time, "CHOCH")
+                exit_idx = idx
+                break
+            if action == "be":
+                pos.current_stop = pos.breakeven_price
+                pos.structure_be_applied = True
     else:
         exit_idx = n - 1
         last = candles_5m[-1]
@@ -792,6 +897,19 @@ def simulate_symbol(
         float(getattr(cfg, "scalper_loss_cooldown_minutes", 0) or 0) * 60_000
     )
     cooldown_until_ms = 0
+
+    # Yapı-tabanlı çıkış besleyicisi — yalnız SCALPER_STRUCTURE_EXIT != off
+    # iken kurulur; aksi halde manage_position bugünküyle birebir aynı yolu
+    # izler. Seri, rol adına göre ZATEN ELDE OLAN üç seriden seçilir (canlı
+    # motorda da yeni bir veri kaynağı yok).
+    structure_feed: Optional[_StructureFeed] = None
+    if structure_exit_mode(cfg) != EXIT_OFF:
+        _role_series = {
+            "entry": candles_5m, "context": candles_15m, "regime": candles_4h,
+        }[resolve_structure_role(cfg)]
+        structure_feed = _StructureFeed(
+            _role_series, structure_window_bars(cfg), cfg
+        )
     i = (
         bisect.bisect_left(close_times_5m, test_start_time_ms)
         if test_start_time_ms is not None
@@ -837,6 +955,24 @@ def simulate_symbol(
                 i += 1
                 continue
 
+        # Canlı parite: yapı kapısı (engine._evaluate_symbol'de rejim kapısının
+        # HEMEN ARDINDA, AYNI saf fonksiyonla — structure.structure_gate_blocks).
+        # Kapı kapalıyken (varsayılan) hiçbir şey hesaplanmaz.
+        if structure_gate_enabled(cfg):
+            # İstisna BİLİNÇLİ olarak yutulmaz: harness çevrimdışı bir ölçüm
+            # aracıdır; hatalı bir SCALPER_STRUCTURE_* ayarı sessizce "kapı
+            # kapalı" ölçümü üretmektense gürültüyle patlamalı. (Canlı motor
+            # tersine fail-open'dır — tarama döngüsü düşmemeli, bkz.
+            # engine._evaluate_symbol.)
+            state = structure_state_for(ctx, cfg)
+            if structure_gate_blocks(state, raw_signal.direction, cfg):
+                if missed_counter is not None:
+                    missed_counter["structure_gate"] = (
+                        missed_counter.get("structure_gate", 0) + 1
+                    )
+                i += 1
+                continue
+
         signal = apply_stop_policy(raw_signal, cfg)
 
         pos = open_position(signal, candles_5m, i, cfg, initial_balance, missed_counter=missed_counter)
@@ -844,7 +980,7 @@ def simulate_symbol(
             i += 1
             continue
 
-        trade = manage_position(pos, candles_5m, cfg)
+        trade = manage_position(pos, candles_5m, cfg, structure_feed=structure_feed)
         trades.append(trade)
         if loss_cooldown_ms > 0 and (trade.exit_reason == "SL" or trade.pnl < 0.0):
             cooldown_until_ms = trade.exit_time + loss_cooldown_ms

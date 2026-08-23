@@ -440,6 +440,29 @@ class ExitManager:
             return max(breakeven, runner_floor)
         return min(breakeven, runner_floor)
 
+    async def force_stop_to(
+        self, symbol: str, sp: ScalpPosition, new_stop: float, *, reason: str
+    ) -> bool:
+        """Stop'u verilen seviyeye taşı (boşluksuz `replace_stop_loss` yolu).
+
+        Yapı-tabanlı çıkış (`engine._apply_structure_exits`, D18 adayı) için
+        eklendi. KARAR burada verilmez — çağıran, saf `structure_exit_action`
+        fonksiyonundan aldığı kararı uygular; bu metot yalnız emir yolunu
+        paylaşır (yeni bir emir yolu yazılmadı, `_update_trailing` ile aynı
+        `pm.replace_stop_loss`). Seviye geçersizse (<=0) hiçbir şey yapmaz.
+        """
+        if not new_stop or new_stop <= 0:
+            return False
+        ok = await self.pm.replace_stop_loss(sp.position, new_stop)
+        if ok:
+            sp.position.current_stoploss = new_stop
+            self.logger.info(f"🛡️ {symbol}: SL {new_stop} seviyesine çekildi ({reason})")
+        else:
+            self.logger.warning(
+                f"⚠️ {symbol}: SL {new_stop} seviyesine çekilemedi ({reason}), eski SL korunuyor"
+            )
+        return ok
+
     async def _handle_closed(
         self,
         symbol: str,

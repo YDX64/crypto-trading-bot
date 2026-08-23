@@ -40,6 +40,19 @@ from src.strategies.scalper.indicators import atr as compute_atr
 from src.strategies.scalper.regime import detect_regime
 from src.strategies.scalper.scanner import UniverseScanner
 from src.strategies.scalper.setups import apply_stop_policy, get_enabled
+from src.strategies.scalper.structure import (
+    StructureExitInput,
+    detect_structure,
+    structure_exit_action,
+    structure_exit_mode,
+    structure_gate_blocks,
+    structure_pivot,
+    structure_snapshot,
+    structure_state_for,
+    structure_timeframe,
+    structure_use_close,
+    structure_window_bars,
+)
 from src.strategies.scalper.tracker import ScalpTracker
 from src.strategies.scalper.types import (
     Direction,
@@ -155,6 +168,10 @@ class ScalperEngine:
         # Anlık durum — snapshot() bunları okur.
         self._universe: List[str] = []
         self._regimes: Dict[str, str] = {}
+        # Sembol -> piyasa yapısı özeti (BOS/CHoCH). Kapı KAPALIYKEN de
+        # doldurulur: operatör kapıyı açmadan önce ne yapacağını
+        # /scalper/status'tan izleyebilsin (gözlem ucuz, karar değil).
+        self._structure: Dict[str, Dict[str, Any]] = {}
         self._regime_cache: Dict[str, Tuple[Regime, float]] = {}
         self._balance_cache: Tuple[Optional[float], float] = (None, 0.0)
         self._daily_pnl: float = 0.0
@@ -906,6 +923,7 @@ class ScalperEngine:
         # Artık tüm yeni dolumlar korumalı ve izleniyor: açık pozisyon çıkış
         # yönetimi ile gerçek günlük risk kapısı bundan sonra çalışabilir.
         await self.exits.step()
+        await self._apply_structure_exits()
         await self._reap_aged_positions()
         self._sync_scalper_reservations()
         was_blocked = self._kill_switch or self._entry_halted
@@ -921,6 +939,112 @@ class ScalperEngine:
                     self._track_opened_positions(
                         opened_during_cancel, source="risk kapısı iptal yarışı"
                     )
+
+    async def _apply_structure_exits(self) -> None:
+        """Açık pozisyonun TERSİNE CHoCH gelince stopu BE'ye çek ya da kapat.
+
+        `SCALPER_STRUCTURE_EXIT=off` (varsayılan) iken TEK BİR satır bile
+        çalışmaz — mum da çekilmez, davranış bugünküyle birebir aynıdır.
+
+        Karar saf fonksiyondan gelir (`structure.structure_exit_action`);
+        backtest harness'ı (`backtest.manage_position`) AYNI fonksiyonu AYNI
+        girdiyle çağırır — parite (DECISIONS P1).
+
+        Mum çekimi yeni bir REST maliyeti getirmez: (sembol, aralık, limit)
+        üçlüsü tarama döngüsünün istediğiyle BİREBİR aynıdır, yani
+        KlineFetcher'ın TTL önbelleğine düşer (bkz. data.KlineFetcher._cache).
+
+        Tur başına EN FAZLA BİR aksiyon: 2026-08-14'te 5 eşzamanlı kapanış
+        safety turunu şişirip watchdog restart'ı tetiklemişti (bkz.
+        `_reap_aged_positions`). Kalan pozisyonlar bir sonraki turda (≈8 sn)
+        değerlendirilir.
+        """
+        mode = structure_exit_mode(self.cfg)
+        if mode == "off":
+            return
+        try:
+            tf = structure_timeframe(self.cfg)
+            limit = structure_window_bars(self.cfg)
+            left, right = structure_pivot(self.cfg)
+            use_close = structure_use_close(self.cfg)
+        except Exception as e:
+            self.logger.warning(f"⚠️ Yapı çıkışı ayarı çözülemedi ({e}); tur atlandı")
+            return
+
+        for symbol in list(self.exits.tracked_symbols()):
+            sp = self.exits._positions.get(symbol)
+            if sp is None:
+                continue
+            try:
+                candles = await self.fetcher.get_klines(symbol, tf, limit)
+            except Exception as e:
+                self.logger.warning(
+                    f"⚠️ {symbol}: yapı çıkışı için mum alınamadı ({e}); tur atlandı"
+                )
+                continue
+            if not candles:
+                continue
+            try:
+                state = detect_structure(
+                    candles, pivot_left=left, pivot_right=right, use_close=use_close
+                )
+                plan = getattr(sp, "plan", None)
+                action = structure_exit_action(
+                    state,
+                    StructureExitInput(
+                        direction=sp.signal.direction,
+                        entry_close_time=int(getattr(sp, "entry_candle_time", 0) or 0),
+                        current_price=float(
+                            sp.position.current_price or sp.position.entry_price or 0.0
+                        ),
+                        current_stop=float(sp.position.current_stoploss or 0.0),
+                        breakeven_price=float(getattr(plan, "breakeven_price", 0.0) or 0.0),
+                    ),
+                    self.cfg,
+                )
+            except Exception as e:
+                self.logger.warning(f"⚠️ {symbol}: yapı çıkışı hesaplanamadı ({e})")
+                continue
+
+            if action == "none":
+                continue
+
+            yon = sp.signal.direction.value
+            if action == "be":
+                ok = await self.exits.force_stop_to(
+                    symbol, sp, float(getattr(plan, "breakeven_price", 0.0) or 0.0),
+                    reason="yapı CHoCH",
+                )
+                if ok:
+                    self.logger.info(
+                        f"🔄 {symbol}: {yon} pozisyonun TERSİNE CHoCH — stop BE'ye "
+                        f"çekildi (SCALPER_STRUCTURE_EXIT=be)",
+                        extra={"trade": True},
+                    )
+                return  # tur başına en fazla bir aksiyon
+
+            try:
+                closed = await self._close_position_market(
+                    symbol, sp, forced_exit_reason="STRUCT_CHOCH"
+                )
+            except Exception as e:
+                self.logger.warning(
+                    f"⚠️ {symbol}: yapı CHoCH kapanışı gönderilemedi ({e}); "
+                    f"sonraki turda denenecek"
+                )
+                return
+            if closed:
+                self.logger.info(
+                    f"🔄 {symbol}: {yon} pozisyonun TERSİNE CHoCH — reduce-only "
+                    f"MARKET ile kapatıldı (SCALPER_STRUCTURE_EXIT=close)",
+                    extra={"trade": True},
+                )
+            else:
+                self.logger.warning(
+                    f"⚠️ {symbol}: yapı CHoCH kapanışı borsada DOĞRULANAMADI — "
+                    f"pozisyon izlemede kalıyor (fail-closed)"
+                )
+            return  # tur başına en fazla bir aksiyon
 
     async def _reap_aged_positions(self) -> None:
         """Yaş limitini aşan KORUMASIZ pozisyonları kapat (ölü-sermaye reaper'ı).
@@ -996,7 +1120,9 @@ class ScalperEngine:
             signed=True,
         )
 
-    async def _close_position_market(self, symbol: str, sp: Any) -> bool:
+    async def _close_position_market(
+        self, symbol: str, sp: Any, forced_exit_reason: str = "RISK_EVENT"
+    ) -> bool:
         """Bir pozisyonu reduce-only MARKET ile kapat ve borsada DOĞRULA.
 
         Reaper'dan farkı: reaper "gönder ve bir sonraki safety turunda
@@ -1025,7 +1151,7 @@ class ScalperEngine:
         if amt == 0:
             # Zaten flat: emir gönderme, yalnız SL/TP temizliği + ledger.
             await self.exits._handle_closed(
-                symbol, sp, forced_exit_reason="RISK_EVENT"
+                symbol, sp, forced_exit_reason=forced_exit_reason
             )
             return True
         close_side = "SELL" if amt > 0 else "BUY"
@@ -1039,7 +1165,7 @@ class ScalperEngine:
             amt2 = abs(float(pos_info.get("positionAmt", 0))) if pos_info else 0.0
             if amt2 == 0:
                 await self.exits._handle_closed(
-                    symbol, sp, forced_exit_reason="RISK_EVENT"
+                    symbol, sp, forced_exit_reason=forced_exit_reason
                 )
                 return True
         return False
@@ -1191,6 +1317,30 @@ class ScalperEngine:
             leverage=self.cfg.scalper_leverage,
         )
 
+        # Piyasa yapısı (BOS/CHoCH) — ctx'te ZATEN çekilmiş serilerden türetilir,
+        # yeni REST çağrısı YOKTUR (bkz. structure.structure_series). Hesap saf ve
+        # ucuzdur (~100 mum); yine de bir hata tüm taramayı düşürmemeli.
+        structure_state = None
+        # getattr: object.__new__ ile kurulan test çiftleri bu alanı kurmayabilir
+        # (repo konvansiyonu — bkz. _scan_open_symbols).
+        structure_store = getattr(self, "_structure", None)
+        try:
+            structure_state = structure_state_for(ctx, self.cfg)
+            if structure_store is not None:
+                structure_store[symbol] = structure_snapshot(structure_state)
+        except Exception as e:
+            if structure_store is not None:
+                structure_store[symbol] = {"error": f"{type(e).__name__}: {e}"}
+            # Hata kalıcıdır (ör. SCALPER_STRUCTURE_TF çözülemiyor): her sembol
+            # × her tarama turu loglamak bot.log'u boğar. Bir kez yüksek sesle
+            # söyle, gerisi /scalper/status'taki "error" alanından okunur.
+            if not getattr(self, "_structure_error_logged", False):
+                self._structure_error_logged = True
+                self.logger.warning(
+                    f"⚠️ {symbol}: piyasa yapısı hesaplanamadı ({e}) — bu uyarı "
+                    f"bir kez loglanır, durum /scalper/status'ta"
+                )
+
         for strat in enabled_strategies:
             sig = strat.evaluate(ctx)
             if sig is None:
@@ -1217,6 +1367,22 @@ class ScalperEngine:
                         f"{kaynak} engellendi (SCALPER_REGIME_FILTER)"
                     )
                     continue
+            # 2026-08-23 yapı kapısı (E9/D18 adayı, varsayılan KAPALI): rejim
+            # kapısı 15m EMA50/200 ile dönüşleri saatler geç görüyor; yapı
+            # (son swing kırılımı) aynı soruyu daha erken yanıtlar. TEK kapı:
+            # C ve TV sinyalleri aynı yerden geçer (rejim kapısının yanı).
+            # Harness'ta simulate_symbol AYNI saf fonksiyonu AYNI girdiyle
+            # çağırır (DECISIONS P1).
+            if structure_gate_blocks(structure_state, sig.direction, self.cfg):
+                yon = getattr(sig.direction, "value", str(sig.direction))
+                kaynak = "TV sinyali" if is_external else "girişi"
+                self.logger.info(
+                    f"⛔ {symbol}: yapı kapısı — "
+                    f"{structure_state.direction.value} yapıda {yon} {kaynak} "
+                    f"engellendi (son olay {structure_state.last_event}, "
+                    f"{structure_state.age_bars} mum önce; SCALPER_STRUCTURE_GATE)"
+                )
+                continue
             # Ortak stop politikası: structural modda ATR tabanı, fixed_roi
             # modda marj-yüzdesi stopu. Backtest'te simulate_symbol aynı
             # dönüşümü uygular — canlı/backtest paritesi bozulmamalı.
@@ -1979,6 +2145,9 @@ class ScalperEngine:
             "health": self.health_snapshot(),
             "universe": list(self._universe),
             "regimes": dict(self._regimes),
+            "structure": {
+                k: dict(v) for k, v in (getattr(self, "_structure", None) or {}).items()
+            },
             "daily_pnl": self._daily_pnl,
             "daily_pnl_source": self._daily_pnl_source,
             "risk_ready": self._risk_ready,
