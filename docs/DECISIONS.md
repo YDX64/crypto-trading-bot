@@ -991,6 +991,7 @@ aynı hesapta başka bir bot çalışırsa her pozisyonu yetim sayar. (iv) Sunuc
 çalıştırılmadı: bu dalda deploy YAPILMADI (worktree; canlıya/`.env`'e dokunulmadı).
 
 ### D17 — Piyasa verisi ayrı host: `SCALPER_MARKET_DATA_BASE_URL` · 2026-08-23 · **ADAY, VARSAYILAN KAPALI** (canlıda uygulanmadı)
+**UYGULANDI (testnet, 2026-08-23 13:17 UTC, kullanıcı yetkisi):** deploy ce29e2f (1625 test) → `.env` `SCALPER_MARKET_DATA_BASE_URL=https://fapi.binance.com` (yedek `env.bak-20260823-131644-klinesrc`) → `scripts/restart_safe.sh testnet` (pid 3520054, sağlık 60 sn) → `/scalper/status`: `kline_source=separate`, guard `fapi.binance.com` ağırlık 15/dk, `scan_status=ok`, `trailing_skips=0`; lider kapısı `leader_source_host=fapi.binance.com`; log `📡 Kline kaynağı: fapi.binance.com (AYRI — emirler: testnet…)`. Geri alma: RUNBOOK "Kline kaynağını mainnet'e alma" kapatma komutu.
 **Ne:** Yeni ayar `SCALPER_MARKET_DATA_BASE_URL` (boş = bugünkü davranış, birebir).
 Doluyken YALNIZ public `/fapi/v1/klines` çekimi o host'tan yapılır; emir, bakiye, pozisyon,
 `ticker/24hr` (evren taraması), `exchangeInfo`, `income` ve tüm imzalı yollar
@@ -1245,6 +1246,7 @@ guard'ını geri almak (ayarı korumak) da mümkündür — `data.py`'deki `Mark
 `note_response`/`_raise_if_banned` çağrılarını `_fetch`'ten çıkarmak yeterlidir; üçü de
 bağımsızdır.
 ### D19 — TV olay kanalı: ÇIKIŞ + YAPI/DÖNÜŞ olayları (`kind=exit|choch|trend|tp1`) · 2026-08-23 · **GÖLGE (aktif DEĞİL)**
+**CANLI (gölge, 2026-08-23 13:17 UTC):** deploy ce29e2f ile kod canlıda; `SCALPER_TV_EVENTS_MODE` varsayılan `shadow`, `TV_SOURCE_ALLOWLIST` .env'de set değil → kod varsayılanı (olay kaynakları dahil), `allowlist_ok=true`. Alarm klonlama (5 sembol × 6 koşul, gövdede `src=… kind=…`) kullanıcıya bırakıldı (TV Desktop MCP'de Klonla menü aksiyonu programatik tetiklenemedi) — INTEGRATIONS §7.2 şablonları.
 > ⚠️ **Bu bölüm D19a ile GÜNCELLENDİ** (aynı gün, 14 düşmanca-inceleme düzeltmesi).
 > Aşağıdaki metin ilk tasarımı anlatır; **MIXED kuralı, `be`nin zararda
 > uygulanmaması, olay kaynaklarının giriş oyu verememesi ve tüketim
