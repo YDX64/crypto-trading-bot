@@ -578,3 +578,56 @@ def test_init_db_migration_adds_entry_order_id_column():
         assert "entry_order_id" in columns
         # İkinci çağrı idempotent olmalı, hata üretmemeli.
         _ensure_schema_migrations(conn)
+
+
+# --------------------------------------------------------------------------
+# Tek-finalizer kilidi: kapanış defteri saniyeler sürer (cancel_all +
+# userTrades + income merdiveni). O pencerede AYNI sembol için izlemeye
+# alınan YENİ bir pozisyon (AlgoPro takipçi halkasının flip yolu, D20)
+# koşulsuz `pop` ile silinirse borsada AÇIK ama motorun BİLMEDİĞİ bir
+# pozisyon kalır. Aşağıdaki iki test bu davranışı kilitler.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_handle_closed_pops_its_own_position():
+    client = SimpleNamespace(
+        cancel_all_open_orders=AsyncMock(),
+        get_current_price=AsyncMock(return_value=103.0),
+        get_order=AsyncMock(side_effect=RuntimeError("yok")),
+        get_income_history=AsyncMock(return_value=[]),
+    )
+    manager = _manager(client, tracker=SimpleNamespace(record_close=AsyncMock()))
+    sp = _scalp_position()
+    manager._positions["BTCUSDT"] = sp
+
+    await manager._handle_closed("BTCUSDT", sp)
+
+    assert "BTCUSDT" not in manager._positions
+
+
+@pytest.mark.asyncio
+async def test_handle_closed_keeps_a_position_tracked_by_another_path():
+    """Finalize sırasında izlemeye alınan YENİ pozisyon HAYATTA kalmalı."""
+    manager = _manager(
+        SimpleNamespace(), tracker=SimpleNamespace(record_close=AsyncMock())
+    )
+    old_sp = _scalp_position()
+    new_sp = _scalp_position(order_id="999")
+    manager._positions["BTCUSDT"] = old_sp
+
+    async def _cancel_all(symbol):
+        # Kapanış defteri sürerken başka bir yol (flip) yeni pozisyonu
+        # izlemeye alır — gerçek zamanlamanın birebir modeli.
+        manager._positions[symbol] = new_sp
+
+    manager.client = SimpleNamespace(
+        cancel_all_open_orders=AsyncMock(side_effect=_cancel_all),
+        get_current_price=AsyncMock(return_value=103.0),
+        get_order=AsyncMock(side_effect=RuntimeError("yok")),
+        get_income_history=AsyncMock(return_value=[]),
+    )
+
+    await manager._handle_closed("BTCUSDT", old_sp)
+
+    assert manager._positions.get("BTCUSDT") is new_sp

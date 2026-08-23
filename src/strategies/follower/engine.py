@@ -321,23 +321,38 @@ class FollowerEngine:
     async def _safety_loop(self) -> None:
         self.logger.info("🛡️ Takipçi safety döngüsü başladı")
         while self.running:
+            failure: Optional[str] = None
             try:
                 await self.exits.step()
-                await self._update_kill_switch()
             except asyncio.CancelledError:
                 raise
             except UnprotectedPositionError as exc:
                 self._latch_entry_halt(exc, source="safety")
-                self._safety_consecutive_errors += 1
-                self._safety_last_error = f"{type(exc).__name__}: {exc}"
+                failure = f"{type(exc).__name__}: {exc}"
             except Exception as exc:
-                self._safety_consecutive_errors += 1
-                self._safety_last_error = f"{type(exc).__name__}: {exc}"
+                failure = f"{type(exc).__name__}: {exc}"
                 self.logger.error(f"❌ Takipçi safety hatası: {exc}", exc_info=True)
-            else:
+
+            # Kill switch AYRI try'da: `exits.step()` patlarsa günlük zarar
+            # kapısı bayat `_risk_ready=True` ile açık kalırdı. Risk kapısı,
+            # çıkış turunun sağlığına BAĞLI OLMAMALIDIR.
+            try:
+                await self._update_kill_switch()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                failure = failure or f"{type(exc).__name__}: {exc}"
+                self.logger.error(
+                    f"❌ Takipçi kill switch güncellenemedi: {exc}", exc_info=True
+                )
+
+            if failure is None:
                 self._safety_last_success_monotonic = time.monotonic()
                 self._safety_consecutive_errors = 0
                 self._safety_last_error = None
+            else:
+                self._safety_consecutive_errors += 1
+                self._safety_last_error = failure
             await asyncio.sleep(self._safety_interval_seconds())
 
     def _safety_interval_seconds(self) -> float:
@@ -457,6 +472,24 @@ class FollowerEngine:
         raw = str(getattr(self.cfg, "follower_symbol_allowlist", "") or "")
         return {s.strip().upper() for s in raw.split(",") if s.strip()}
 
+    def _safety_stale_limit(self) -> float:
+        """Safety turunun bayat sayılacağı yaş (health_snapshot ile AYNI eşik)."""
+        return max(15.0, self._safety_interval_seconds() * 10.0)
+
+    def _safety_fresh(self) -> bool:
+        """Çıkış/BE/kapanış turu canlı mı? Bayatsa YENİ GİRİŞ YOK (fail-closed).
+
+        Takipçide safety turu TEK risk kapısıdır: TP1→BE, kapanış defteri ve
+        günlük zarar kesici hep oradan işler. Tur sürekli hata veriyorsa
+        `_risk_ready` bayat kalabilir; o hâlde giriş açmak, kapısı çalışmayan
+        bir sisteme pozisyon eklemektir.
+        """
+        if self._safety_last_success_monotonic is None:
+            return False
+        return (
+            time.monotonic() - self._safety_last_success_monotonic
+        ) <= self._safety_stale_limit()
+
     def _entries_ready(self) -> bool:
         exchange_age = (
             time.monotonic() - self._exchange_last_success_monotonic
@@ -468,6 +501,7 @@ class FollowerEngine:
             and exchange_age <= self._EXCHANGE_PROBE_INTERVAL * 3.0
             and self._recovery_ready
             and self._risk_ready
+            and self._safety_fresh()
             and not self._entry_halted
             and not self._kill_switch
             and not self.halt.active
@@ -485,6 +519,11 @@ class FollowerEngine:
             return "günlük risk kapısı doğrulanamadı"
         if not self._exchange_ready or not self._recovery_ready:
             return "borsa/kurtarma hazır değil"
+        if not self._safety_fresh():
+            return (
+                f"safety turu bayat (>{self._safety_stale_limit():.0f} sn): "
+                f"{self._safety_last_error or 'henüz başarılı tur yok'}"
+            )
         return None
 
     def _count_event(self, kind: str) -> None:
@@ -691,6 +730,23 @@ class FollowerEngine:
                 self._count_reject("equity")
                 return {"accepted": False, "reason": "hesap bakiyesi okunamadı"}
 
+            # SON kapı: aynı sembol için bir kapanış defteri HÂLÂ işleniyorsa
+            # yeni pozisyon AÇMA. `_finalize_close`'un ilk işi
+            # `cancel_all_open_orders(symbol)`'dır ve saniyeler sürebilir
+            # (userTrades + income merdiveni); bu pencerede açılan pozisyonun
+            # SL/TP emirleri o iptal turuna yakalanabilir → KORUMASIZ pozisyon.
+            # (Kapanış defterinin izleme listesinden düşürmesi artık kimlik
+            # kontrollüdür — bkz. scalper/exits.py `_handle_closed` — ama emir
+            # iptali yarışını yalnız bu kapı kapatır.)
+            if symbol in getattr(self.exits, "_closing", ()):
+                self._count_reject("close_in_flight")
+                return {
+                    "accepted": False,
+                    "reason": "aynı sembolde kapanış defteri işleniyor — "
+                    "yeni giriş yapılmadı",
+                    "flipped": flipped,
+                }
+
             try:
                 position = await self.executor.open_position(
                     event=event, levels=levels, equity_usdt=equity
@@ -875,8 +931,26 @@ class FollowerEngine:
             qty = await self.client.quantize_quantity(symbol, abs(amt))
             await self._submit_reduce_only_market_close(symbol, close_side, qty)
         except Exception as exc:
+            # Emir reddi "pozisyon hâlâ açık" DEMEK DEĞİLDİR: TP3/SL aynı anda
+            # dolduysa Binance reduce-only emri -2022 ile reddeder, oysa
+            # pozisyon KAPANMIŞTIR. Bir kez taze okuyup gerçeği sor; hâlâ
+            # açıksa fail-closed (False) — safety turu izlemeyi sürdürür.
             self.logger.error(f"❌ {symbol}: reduce-only kapanış gönderilemedi ({exc})")
-            return False
+            try:
+                after = await self.client.get_position_risk(symbol, force_fresh=True)
+                after_amt = (
+                    abs(float(after.get("positionAmt", 0) or 0)) if after else 0.0
+                )
+            except Exception:
+                return False
+            if after_amt != 0:
+                return False
+            self.logger.warning(
+                f"⚠️ {symbol}: kapanış emri reddedildi ama pozisyon zaten kapalı "
+                f"(eşzamanlı TP/SL dolumu) — defter işleniyor"
+            )
+            await self.exits._handle_closed(symbol, sp, forced_exit_reason=reason)
+            return True
 
         for delay in self._CLOSE_VERIFY_DELAYS:
             if delay:
@@ -928,28 +1002,40 @@ class FollowerEngine:
         flattened: List[str] = []
         errors: List[str] = []
         seen: Set[str] = set()
-        for _ in range(2):  # 2. tur: halt ile eşzamanlı dolan girişleri yakalar
-            remaining = sorted(self.exits.tracked_symbols() - seen)
-            if not remaining:
-                break
-            for symbol in remaining:
-                seen.add(symbol)
-                sp = self.exits._positions.get(symbol)
-                if sp is None:
-                    continue
-                try:
-                    closed = await self._close_tracked(
-                        symbol, sp, reason="RISK_EVENT"
-                    )
-                except Exception as exc:
-                    message = f"{symbol}: {type(exc).__name__}: {exc}"
-                    errors.append(message)
-                    self.logger.error(f"❌ takipçi flatten: {message}", exc_info=True)
-                    continue
-                if closed:
-                    flattened.append(symbol)
-                else:
-                    errors.append(f"{symbol}: kapanış borsa üzerinde doğrulanamadı")
+        # `_entry_lock` ZORUNLU: halt kurulduğu anda `_handle_entry` içinde
+        # UÇUŞTA olan bir giriş (MARKET + SL + 3×TP, saniyeler sürer) HENÜZ
+        # `tracked_symbols()`'a girmemiştir. Kilit alınmazsa flatten "hiç
+        # pozisyon yok" raporu döner ve saniyeler sonra AKTİF HALT ALTINDA
+        # açık bir pozisyon kalır (halt yalnız yeni girişi engeller, açığı
+        # kapatmaz). Kilit `_close_tracked` tarafından ALINMADIĞI için
+        # kilitlenme (deadlock) yoktur.
+        async with self._entry_lock:
+            for _ in range(2):  # 2. tur: savunma amaçlı (kilit altında boş kalır)
+                remaining = sorted(self.exits.tracked_symbols() - seen)
+                if not remaining:
+                    break
+                for symbol in remaining:
+                    seen.add(symbol)
+                    sp = self.exits._positions.get(symbol)
+                    if sp is None:
+                        continue
+                    try:
+                        closed = await self._close_tracked(
+                            symbol, sp, reason="RISK_EVENT"
+                        )
+                    except Exception as exc:
+                        message = f"{symbol}: {type(exc).__name__}: {exc}"
+                        errors.append(message)
+                        self.logger.error(
+                            f"❌ takipçi flatten: {message}", exc_info=True
+                        )
+                        continue
+                    if closed:
+                        flattened.append(symbol)
+                    else:
+                        errors.append(
+                            f"{symbol}: kapanış borsa üzerinde doğrulanamadı"
+                        )
         return {
             "flattened": flattened,
             "errors": errors,

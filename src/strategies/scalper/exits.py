@@ -477,7 +477,15 @@ class ExitManager:
             )
         finally:
             closing.discard(symbol)
-            self._positions.pop(symbol, None)
+            # KİMLİK kontrolü: `_finalize_close` saniyeler sürer (cancel_all +
+            # userTrades + income merdiveni). O sırada başka bir yol AYNI sembol
+            # için YENİ bir pozisyon izlemeye almış olabilir (takipçi halkasının
+            # flip yolu: AlgoPro ters sinyali eski pozisyonu kapatıp yenisini
+            # açar). Koşulsuz pop, yeni ve GERÇEK pozisyonu izleme listesinden
+            # düşürür → TP1→BE hiç taşınmaz, kapanış defteri hiç yazılmaz,
+            # kapasite sayacı boş slot gösterir. Yalnız KENDİ nesnesini düşür.
+            if self._positions.get(symbol) is sp:
+                self._positions.pop(symbol, None)
 
     async def _finalize_close(
         self,

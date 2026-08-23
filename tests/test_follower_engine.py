@@ -481,6 +481,105 @@ class TestExitAndHitEvents:
         assert result["accepted"] is False
 
 
+class TestConcurrencyGates:
+    """Eşzamanlılık kusurları (düşmanca inceleme, 2026-08-23) için regresyon."""
+
+    async def test_close_in_flight_blocks_new_entry(self, tmp_path):
+        """Kapanış defteri işlenirken açılan pozisyonun SL/TP'si iptal edilebilir.
+
+        `_finalize_close`'un İLK işi `cancel_all_open_orders(symbol)`'dır ve
+        saniyeler sürebilir; o pencerede açılan yeni pozisyon korumasız
+        kalabilirdi.
+        """
+        engine = _make_engine(tmp_path)
+        engine.exits._closing = {"BTCUSDT"}
+
+        result = await engine.handle_event(parse_follower_event(SELL_ENTRY))
+
+        assert result["accepted"] is False
+        assert "kapanış defteri işleniyor" in result["reason"]
+        engine.executor.open_position.assert_not_called()
+        assert engine._reject_counters.get("close_in_flight") == 1
+
+    async def test_stale_safety_loop_blocks_entries(self, tmp_path):
+        """Safety turu (TP1→BE, kapanış defteri, kill switch) bayatsa giriş YOK."""
+        engine = _make_engine(tmp_path)
+        engine._safety_last_success_monotonic = time.monotonic() - 600.0
+        engine._safety_last_error = "RuntimeError: boom"
+
+        result = await engine.handle_event(parse_follower_event(SELL_ENTRY))
+
+        assert result["accepted"] is False
+        assert "safety turu bayat" in result["reason"]
+        engine.executor.open_position.assert_not_called()
+
+    async def test_flatten_waits_for_an_in_flight_entry(self, tmp_path):
+        """`risk_event_flatten` `_entry_lock`'u ALIR.
+
+        Halt kurulduğu anda `_handle_entry` içinde uçuşta olan bir giriş
+        HENÜZ `tracked_symbols()`'a girmemiştir. Kilit alınmazsa flatten
+        "hiç pozisyon yok" der ve saniyeler sonra AKTİF HALT ALTINDA açık
+        bir pozisyon kalırdı.
+        """
+        engine = _make_engine(tmp_path)
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _slow_open(**_kwargs):
+            started.set()
+            await release.wait()
+            return _fake_position()
+
+        engine.executor.open_position = AsyncMock(side_effect=_slow_open)
+        entry_task = asyncio.create_task(
+            engine.handle_event(parse_follower_event(SELL_ENTRY))
+        )
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+
+        flatten_task = asyncio.create_task(
+            engine.risk_event_flatten(reason="haber", source="test", ttl_minutes=5)
+        )
+        await asyncio.sleep(0.02)
+        assert not flatten_task.done(), "flatten kilide takılmadı"
+
+        release.set()
+        assert (await asyncio.wait_for(entry_task, timeout=1.0))["accepted"] is True
+        result = await asyncio.wait_for(flatten_task, timeout=1.0)
+
+        assert result["flattened"] == ["BTCUSDT"]
+        assert result["errors"] == []
+
+    async def test_close_rejection_with_flat_position_counts_as_closed(self, tmp_path):
+        """-2022: TP3/SL aynı anda dolduysa emir reddi 'açık' demek DEĞİLDİR."""
+        engine = _make_engine(tmp_path, positions={"BTCUSDT": _fake_position()})
+        engine.client.get_position_risk = AsyncMock(
+            side_effect=[{"positionAmt": -0.12}, {"positionAmt": 0.0}]
+        )
+        engine.client._request_with_retry = AsyncMock(
+            side_effect=RuntimeError("-2022 ReduceOnly Order is rejected")
+        )
+
+        result = await engine.handle_event(parse_follower_event(EXIT_EVENT))
+
+        assert result["accepted"] is True
+        engine.exits._handle_closed.assert_awaited_once()
+
+    async def test_close_rejection_with_open_position_is_fail_closed(self, tmp_path):
+        engine = _make_engine(tmp_path, positions={"BTCUSDT": _fake_position()})
+        engine.client.get_position_risk = AsyncMock(
+            return_value={"positionAmt": -0.12}
+        )
+        engine.client._request_with_retry = AsyncMock(
+            side_effect=RuntimeError("-1111 precision")
+        )
+
+        result = await engine.handle_event(parse_follower_event(EXIT_EVENT))
+
+        assert result["accepted"] is False
+        engine.exits._handle_closed.assert_not_called()
+        assert "BTCUSDT" in engine.exits.tracked_symbols()
+
+
 class TestDuplicateDelivery:
     """İDEMPOTANS: aynı alarm iki kez iletilirse (TV retry / köprü tekrarı).
 
