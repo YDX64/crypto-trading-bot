@@ -743,3 +743,332 @@ Betik: scratchpad `structure_delay.py` (AĞSIZ, `data/klines_cache` üzerinde; 8
 - Kapı **motor-içi**dir (E8.6'nın post-hoc yönteminin aksine): engellenen sinyal
   kapasite/sembol-içi tekilliği serbest bırakır, yerine başka sinyal geçebilir. Bu
   yüzden E9 sayıları E8.6'nın "alt sınır" uyarısına tabi DEĞİLDİR.
+## 2026-08-23 — Lider piyasa kapısı (E7, spec §C / D15)
+
+Kod: `src/strategies/scalper/market_gate.py` (saf kural, motor + harness ORTAK), commit `ece8bd8`.
+Env tabanı: `scripts/.scalper_env_snapshot.txt` (sunucu env kopyası; TP1 10, fixed_roi 50,
+max_margin 10, TF 1m/5m/15m, entry maker, dyn lev 3-20, max_positions 5, divergence açık).
+⚠️ Atıf düzeltmesi (2026-08-23): bu paragraf önce "D16 paketi" diyordu — `docs/DECISIONS.md`'de
+**D16 diye bir karar YOKTUR** (aday paket geri alındı, numara hiç kullanılmadı), yani okuyucuyu
+var olmayan bir kayda yönlendiriyordu. Olgu şu: ölçümlerin ORTASINDA bir parametre paketi
+(chandelier/TP1 adayları, D11-D12 ailesi) uygulanıp GERİ ALINDI; tablodaki tüm koşular geri
+alınmış (orijinal) tabanla YENİDEN koşuldu — her log dosyasının başında o koşuda fiilen
+kullanılan tam env yazılıdır (`# taban env:` bloğu), gerçeğin kaynağı odur.
+Komut:
+```bash
+env $(cat scripts/.scalper_env_snapshot.txt | xargs) SCALPER_MARKET_GATE=true \
+  SCALPER_MARKET_GATE_DAY_PCT=<X> SCALPER_MARKET_GATE_RUN_PCT=<Y> SCALPER_MARKET_GATE_RUN_DAYS=3 \
+  python3 -m src.strategies.scalper.backtest --strategies C \
+  --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,BNBUSDT,ADAUSDT,LTCUSDT \
+  --start <YYYY-MM-DD> --end <YYYY-MM-DD> --cache-dir data/klines_cache
+```
+Loglar: `logs/market_gate/<varyant>_<pencere>.log` (24 dosya, sıralı koşuldu).
+
+### Varyantlar
+| Varyant | Ayar | Pencere | İşlem | WR% | PnL | PF | maxDD | ΔPnL | day tetik | run tetik |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **V0** | kapı KAPALI (taban) | AYI | 213 | 85.4 | +584 | 1.04 | 3683 | — | 0 | 0 |
+| V0 | | YATAY | 145 | 86.9 | +2392 | 1.29 | 3229 | — | 0 | 0 |
+| V0 | | BOĞA | 90 | 93.3 | +3902 | 2.43 | 735 | — | 0 | 0 |
+| **V1** | gün-içi %1.0 | AYI | 149 | 87.2 | **+2999** | **1.33** | 2956 | +2415 | 196 | 0 |
+| V1 | | YATAY | 135 | 87.4 | +2593 | 1.36 | 2882 | +201 | 62 | 0 |
+| V1 | | BOĞA | 88 | 93.2 | +3725 | 2.37 | 735 | −177 (−%4.5) | 15 | 0 |
+| **V1a** | gün-içi %0.7 | AYI | 138 | 88.4 | +3897 | 1.52 | 2442 | +3312 | 219 | 0 |
+| V1a | | YATAY | 124 | 85.5 | +873 | 1.11 | 3517 | **−1520 (−%63.5)** | 81 | 0 |
+| V1a | | BOĞA | 83 | 92.8 | +3384 | 2.24 | 813 | −518 (−%13.3) | 18 | 0 |
+| **V1b** | gün-içi %1.5 | AYI | 158 | 86.1 | +1832 | 1.17 | 3348 | +1247 | 162 | 0 |
+| V1b | | YATAY | 138 | 87.7 | +2962 | 1.41 | 2840 | +570 | 30 | 0 |
+| V1b | | BOĞA | 90 | 93.3 | +3902 | 2.43 | 735 | 0 (tetik yok) | 0 | 0 |
+| **V1c** | gün-içi %1.3 (E8 önerisi) | AYI | 158 | 88.0 | **+3812** | **1.43** | 2956 | **+3228** | 179 | 0 |
+| V1c | | YATAY | 137 | 87.6 | **+2791** | **1.38** | 2840 | **+399** | 32 | 0 |
+| V1c | | BOĞA | 89 | 93.3 | **+3798** | 2.39 | 735 | **−104 (−%2.7)** | 3 | 0 |
+| **V2** | uzama %15 / 3g | AYI | 196 | 87.2 | +2909 | 1.24 | 3083 | +2324 | 0 | 60 |
+| V2 | | YATAY | 145 | 86.9 | +2392 | 1.29 | 3229 | 0 (tetik yok) | 0 | 0 |
+| V2 | | BOĞA | 90 | 93.3 | +3902 | 2.43 | 735 | 0 (tetik yok) | 0 | 0 |
+| **V2a** | uzama %10 / 3g | AYI | 192 | 87.0 | +2563 | 1.21 | 3083 | +1979 | 0 | 70 |
+| V2a | | YATAY | 145 | 86.9 | +2392 | 1.29 | 3229 | 0 | 0 | 0 |
+| V2a | | BOĞA | 76 | 93.4 | +2941 | 2.14 | 735 | **−960 (−%24.6)** | 0 | 40 |
+| **V2b** | uzama %20 / 3g | AYI | 196 | 87.2 | +2909 | 1.24 | 3083 | +2324 | 0 | 60 |
+| V2b | | YATAY/BOĞA | = V0 | | | | | 0 | 0 | 0 |
+| **V3** | ikisi (%1.0 + %15/3g) | AYI/YATAY/BOĞA | **V1 ile BİREBİR AYNI** | | | | | | 196/62/15 | 0/0/0 |
+
+V0, `docs/DECISIONS.md`'deki mevcut tabanı **birebir** üretti (AYI 1.04/DD 3683 · YATAY 1.29/3229 ·
+BOĞA 2.43/735) → kapı kapalıyken harness çıktısı değişmemiştir (parite negatif kontrolü).
+**V3 ≡ V1:** uzama alt-kapısının engelleyeceği her sinyal gün-içi alt-kapısı tarafından zaten
+engelleniyor (V3'te `market_gate_run` sayacı üç pencerede de **0**) — iki alt-kapı toplamsal DEĞİL.
+
+### P2 hükmü (AYI PF ≥ 1.1 **veya** AYI+YATAY PnL birlikte ↑, **VE** BOĞA PnL kaybı ≤ %20)
+| Varyant | AYI PF | AYI+YATAY birlikte ↑ | BOĞA kaybı | Hüküm |
+|---|---|---|---|---|
+| V1 (gün-içi %1.0) | 1.33 ✓ | ✓ (+2415 / +201) | −%4.5 ✓ | **GEÇTİ** (her iki kol) |
+| V1a (%0.7) | 1.52 ✓ | ✗ (YATAY −%63.5) | −%13.3 ✓ | GEÇTİ ama YATAY'ı yıkıyor → red |
+| V1b (%1.5) | 1.17 ✓ | ✓ (+1247 / +570) | %0 ✓ | GEÇTİ (daha muhafazakâr) |
+| **V1c (%1.3)** | **1.43 ✓** | **✓ (+3228 / +399)** | **−%2.7 ✓** | **GEÇTİ — üç pencerede de V1'i domine ediyor** |
+| V2 (%15/3g) | 1.24 ✓ | ✗ (YATAY değişmedi) | %0 ✓ | GEÇTİ ama kanıt tek olaya dayanıyor |
+| V2a (%10/3g) | 1.21 ✓ | ✗ | **−%24.6 ✗** | **KALDI** |
+| V2b (%20/3g) | 1.24 ✓ | ✗ | %0 ✓ | V2 ile birebir aynı |
+| V3 (ikisi) | 1.33 ✓ | ✓ | −%4.5 ✓ | GEÇTİ (= V1) |
+
+### Hangi kaybı kesiyor? (yön/çıkış kırılımı — kapının asıl iddiası)
+**AYI penceresi, V0 → V1 (gün-içi %1.0)** — DEFTER farkları (engelleme + yeniden tahsis birlikte):
+- SL sayısı **29 → 17** (−%41), SL toplam zararı **−14907 → −8738** (+6169 kurtarıldı).
+- LONG: 79 işlem / **−956** → 61 işlem / **−121**.
+- SHORT: 134 / +1541 → 88 / **+3120**.
+- Rejim kırılımı: RANGE günleri **−1029 → +425** (asıl düzelme burada; DOWN 1758 → 2686).
+
+⚠️ **Bu satırlar ATIF DEĞİLDİR** (2026-08-23 inceleme düzeltmesi). Önceki sürüm LONG satırına
+"düşen-bıçak LONG'ları kesiliyor", SHORT satırına "kapı simetrik" yorumunu iliştiriyordu; bu iki
+cümle de defter farkını kapının ENGELLEMESİNE atfediyordu. Ayrıştırma (aşağıda) bunu çürüttü:
+LONG defter düzelmesinin çoğu, kapının boşalttığı slota giren YENİ işlemlerden geliyor.
+
+### Ayrıştırma — engelleme mi, yeniden tahsis mi? (2026-08-23)
+ΔPnL iki etkinin toplamıdır: **(a) engelleme** (vetolanan işlemlerin gerçekleşmemesi) ve
+**(b) yeniden tahsis** (boşalan slota giren YENİ işlemler). İki koşunun işlem listeleri
+`(symbol, entry_time, direction)` üçlüsüyle eşleştirilerek ayrıldı — **yeni backtest yok**.
+Betik: `scripts/decompose_gate_runs.py` (rapor yollarını `logs/market_gate/<varyant>_<pencere>.log`
+içinden türetir, elle yol girilmez). Ortak işlemlerin PnL'i iki koşuda **birebir aynı**
+(V1 ve V1c için ayrı ayrı **0 uyuşmazlık**) — yani atıf temiz.
+
+⚠️ **Sonuç EŞİĞE DUYARLIDIR ve benimsenen eşikte TERSİNE DÖNER.** İlk ayrıştırma yalnız V1
+(%1.0) üzerinde yapılmıştı; oysa varsayılan olarak benimsenen eşik **V1c (%1.3)**. Her ikisi de
+aşağıda.
+
+| Ölçü (V0 →) | **V1 (%1.0)** | **V1c (%1.3) — VARSAYILAN** |
+|---|---|---|
+| Toplam ΔPnL (3 pencere) | +2438.96 | +3522.89 |
+| **Yalnız-engelleme** bakiyesi | **+224.82** | **+2063.05** |
+| — AYI / YATAY / BOĞA | +1297.71 / **−831.56** / −241.34 | +2010.41 / **+156.69** / −104.05 |
+| Yeniden tahsis payı | **%90.8** | **%41.4** |
+| AYI yalnız-engelleme PF | 1.039 → **1.210** | 1.039 → **1.289** |
+| AYI maxDD (yalnız-engelleme) | 3682.60 → **2956.08** | 3682.60 → **2956.08** |
+| AYI LONG bacağı, engelleme | **−224.87** (n=27) | **+76.12** (n=24) |
+| AYI SHORT bacağı, engelleme | **+1522.59** (n=47) | **+1934.29** (n=42) |
+| AYI engellenen SL | 12 adet / −6169.50 | 12 adet / −6169.50 |
+| Küme boyu (engellenen / yeni) | AYI 74/10 · YATAY 21/11 · BOĞA 3/1 | AYI 66/11 · YATAY 11/3 · BOĞA 1/0 |
+
+**Okunuşu:**
+- **%1.0'da** kazancın **%91'i** kapasite yeniden tahsisinden gelir ve YATAY (−832) ile BOĞA
+  (−241) pencerelerinde engellemenin KENDİSİ net negatiftir.
+- **%1.3'te (benimsenen) tablo tersine döner:** kazancın **%59'u doğrudan engellemedendir** ve
+  YATAY'da bile engelleme net **pozitiftir** (+156.69). Yani "kapı ağırlıklı olarak bir slot
+  yeniden tahsis mekanizmasıdır" hükmü **yalnız %1.0 için** geçerlidir, varsayılan eşikte DEĞİL.
+  Daha sıkı eşik daha AZ ama daha İSABETLİ engelleme yapıyor (AYI 74 → 66 engelleme, bakiye
+  +1298 → +2010).
+- **İki eşikte de değişmeyen tek nitel bulgu:** LONG bacağının engellemesi ≈başabaş
+  (−225 / +76), koruma **SHORT bacağındadır** (+1523 / +1934).
+- **Bacak başına atıf (V1c, AYI penceresi) — iki bacak İKİ FARKLI mekanizmadır:**
+
+  | Bacak | Defter iyileşmesi | engelleme | ikinci-derece |
+  |---|---|---|---|
+  | SHORT | +2091.75 | **+1934.29 (%92)** | +157.46 (%8) |
+  | LONG | +1136.11 | +76.12 (%7) | **+1059.99 (%93)** |
+
+  Yani kapının GERÇEK koruması SHORT bacağında ve doğrudan engellemedendir (lider ralli
+  gününde short açmamak); LONG bacağının düzelmesinin **%93'ü kapının kendisi değil,
+  ikinci-derece terimdir**. Bu yüzden "düşen-bıçak LONG'ları kesiliyor" cümlesi yanlıştı.
+- **AYI maxDD iyileşmesinin tamamı engellemeden:** ölçüldü — yalnız-engelleme kümesinin maxDD'si
+  (2956.08) tam koşunun maxDD'si ile aynı, V0 ise 3682.60. Bu bir ÖLÇÜM sonucudur, teorem değil:
+  yeniden tahsis, drawdown penceresine kâr eklerse maxDD'yi pekâlâ düşürebilirdi. (Nitekim V1
+  YATAY'da yalnız-engelleme DD'si 3032.30'da kalıyor, tam koşu 2882.04'e iniyor — orada yeniden
+  tahsis DD'yi de düşürüyor.)
+- **Engellenen 12 AYI SL'i = −6169.50** rakamı, 20 satır yukarıdaki defter farkıyla (29→17 SL,
+  −14907→−8738) **tesadüfen** birebir aynıdır: kapının açtığı koşuda yeni giren hiçbir işlem SL
+  olmamıştır, bu yüzden iki büyüklük çakışır. Atıf hatası DEĞİLDİR.
+- **P2 KRİTERLERİ yalnız-engelleme kümesinde de sağlanıyor** — AYI PF 1.210 (V1) / 1.289 (V1c)
+  ≥ 1.1 ✓, BOĞA kaybı −%6.19 (V1) / −%2.67 (V1c) ≤ %20 ✓. Bu yeni bir P2 **hükmü değildir**
+  (P2 gerçek bir koşu üzerinde tanımlıdır; bu küme V0'dan işlem çıkarılarak kurulmuş sentetik bir
+  kümedir, kapasite kapısı yeniden koşulmamıştır) — bir **dayanıklılık kontrolüdür**.
+- **İkinci-derece terimin MEKANİZMASI ölçüldü — "slot boşaldı" DEĞİL.** Önceki sürüm bunu
+  küresel kapasiteye (`scalper_max_positions`) atfediyordu; ölçüm bunu ÇÜRÜTTÜ
+  (`scripts/decompose_gate_runs.py --mechanism`, her yeni işlem EN DAR açıklamaya atanır):
+
+  | Mekanizma | V1c AYI | V1c YATAY |
+  |---|---|---|
+  | sembol-içi **işgal penceresi** | **11 işlem / +1217.45 (%100)** | **3 / +242.39 (%100)** |
+  | kayıp-cooldown'u | 0 / 0.00 | 0 / 0.00 |
+  | kapasite / diğer | 0 / 0.00 | 0 / 0.00 |
+
+  Yani yeni işlemlerin TAMAMI, kapının engellediği işlemin AYNI SEMBOLDEKİ
+  `[giriş, çıkış]` penceresinin İÇİNDE açılıyor: `simulate_symbol` bir sembolde tek pozisyon
+  tutar (`i = trade.exit_idx + 1`), bu yüzden o işlemler taban koşuda kapasiteye HİÇ SIRA
+  GELMEDEN imkânsızdı. Kapasite fiilen bağlayıcı değil (V0 `capacity` sayacı 3, V1c 2 —
+  8 sembol × `max_positions` 5). Bu, E8.6'nın bağımsız ölçümüyle aynı sonuçtur
+  (işgal penceresi %100, kapasite 0, cooldown 0).
+- **Yine de bir ölçüm eseri DEĞİL:** sembol-içi işgal penceresi canlıda da gerçektir (motor da
+  bir sembolde tek pozisyon tutar), yani kazanca sayılır — yalnız ATFI doğru yapmak gerekir.
+  ⚠️ Ama tam da bu kanal harness'ın en zayıf modellediği yerdir: 8 saatlik reaper canlıda
+  pencereyi ERKEN kapatır, harness'ta kapatmaz (aşağıdaki reaper notu).
+- Not: **+225** (üç pencere yalnız-engelleme toplamı, +224.82) ile **−225** (AYI LONG bacağı,
+  −224.87) FARKLI büyüklüklerdir — yakınlıkları tesadüf.
+
+⚠️ **Reaper sapması — büyüklük DEĞİL, MARUZ KALAN KÜME ölçüldü.** Harness
+`SCALPER_MAX_HOLD_HOURS`'ü (D4, canlıda 8 sa) hiç uygulamaz; pozisyon SL/TP/trail'e kadar açık
+kalır. Reaper'ın gerçek popülasyonu (süre > 480 dk **ve** TP1 görmemiş — `_reap_aged_positions`
+şartı) AYI penceresinde: V0'da **13 işlem / −6681.25**, V1 ve V1c'de **9 işlem / −4624.75**.
+Kapının engellediği işlemlerin **4'ü** bu tanıma girer ve **−2056.50** taşır — yani V1 AYI
+Δ'sının (+2415) **%85'i**, V1c'nin (+3228) **%64'ü**, canlıda 8 saatte MARKET ile kapanacak
+pozisyonların harness'ta SL'ye kadar taşınmasına dayanıyor. Ayrıca sapmanın ikinci kolu (slotun
+canlıda erken boşalması) tam olarak **yeniden tahsis kanalını** vurur — yani yukarıdaki tablonun
+(b) sütunu harness'ın en zayıf modellediği mekanizmadır. **Net işaret ÖLÇÜLMEDİ ve tek bir
+yüzdeyle özetlenemez**; ama etkinin dokunduğu taban Δ'nın çoğunluğudur → **E7'nin AYI sayıları
+yukarı yanlı kabul edilmelidir.** Ölçmek için harness'a reaper eklenmesi gerekir (ayrı iş, kendi
+parite testiyle). Kod tarafındaki karşılığı: `backtest.py` `_apply_capacity_gate` "BİLİNEN
+SAPMALAR" madde 3. Betik: `scripts/decompose_gate_runs.py --reaper`.
+
+**Lider (BTCUSDT) tetik istatistiği** (pencere içi günler, `1d` serisinden türetildi):
+| Pencere | gün-içi %1 LONG-blok günü | gün-içi %1 SHORT-blok günü | uzama %15/3g LONG-blok | uzama %15/3g SHORT-blok |
+|---|---|---|---|---|
+| AYI | 11 | 5 | 0 | **1** (2026-02-06, koşu −%20.1) |
+| YATAY | 4 | 7 | 0 | 0 |
+| BOĞA | 1 | 3 | 0 | 0 |
+(Gün sayıları gün-SONU ölçümüdür; kapı dakika bazında değerlendirildiği için aynı gün içinde
+iki yön de tetiklenebilir — bu yüzden tetik sayısı gün sayısından çok daha büyüktür.)
+
+### Kanıtın gücü — dürüst değerlendirme
+(2026-08-23 incelemesinde GÜNCELLENDİ: mekanizma cümleleri ayrıştırmanın ölçtüğüyle
+değiştirildi, reaper sapması eklendi. Bölümün kendisi bir ara SİLİNMİŞTİ — geri kondu:
+ölçüm tablosunu kanıt-gücü değerlendirmesi olmadan bırakmak CLAUDE.md'nin "kenar incedir,
+rejime bölünmeden kabul edilmez" ilkesine aykırı.)
+- **Gün-içi alt-kapısı (V1/V1c): kanıt orta-güçlü.** Üç pencerede de tetikleniyor (196/62/15),
+  AYI'da 16 farklı güne yayılıyor. Mekanizma **ayrıştırmayla** doğrulandı: koruma SHORT
+  bacağında ve doğrudan engellemeden (V1c AYI: SHORT defter iyileşmesinin %92'si), LONG
+  bacağının düzelmesi ise %93 ikinci-derece. Kanıt yine de **tek lider** (BTCUSDT) ve **tek
+  21 günlük ayı penceresi** üzerinden; AYI'daki +2415/+3228'in büyük kısmı 02-05/02-06
+  çöküş-toparlanma çiftinden geliyor. ⚠️ Üstüne **reaper sapması** biniyor (yukarıda): AYI
+  Δ'sının çoğunluğuna dokunan bir küme, canlıda 8 saatte MARKET ile kapanacak pozisyonların
+  harness'ta SL'ye taşınmasına dayanıyor → **AYI sayıları yukarı yanlı**.
+- **Uzama alt-kapısı (V2): kanıt ZAYIF.** 60 tetiğin tamamı AYI penceresinde ve **TEK bir
+  lider olayından** (2026-02-06, 3 günlük −%20.1 koşu) geliyor; %15 ile %20 eşikleri
+  **birebir aynı** sonucu veriyor (arada hiç olay yok), YATAY ve BOĞA'da hiç tetiklenmiyor.
+  n=1 olay = istatistik değil, anekdot. Ayrıca %10'a gevşetmek BOĞA'yı −%24.6 ile P2'den
+  düşürüyor (08-20'de BTC'nin +%10.2'lik 3 günlük koşusu LONG'ları vetoluyor) — yani eşik
+  duyarlılığı yüksek ve yanlış tarafa ayarlanırsa doğrudan zarar veriyor.
+  **Ek (E8): harness'ın "üç pencerede inert" hükmü BUGÜNKÜ piyasaya taşınmıyor.** O pencerelerde
+  BTC 3 günde %15 koşmadığı için kapı hiç tetiklenmiyordu; botun ŞU AN soak ettiği dönemde
+  koşuyor — 7–22 Ağu canlı defterinde `RUN_PCT=15` **202 işlemin 35'inde tetikleniyor ve net
+  −152.7 ediyor** (12 DOWN-günü işlemini engelleyip +137.9 kurtarıyor, 23 UP-günü KAZANANINI
+  engelleyip −290.6 kaybettiriyor). "Harness'ta zararsız" ≠ "canlıda zararsız".
+  Bu iki bağımsız gerekçe yüzünden varsayılan **0'a çekildi** (D15 "Varsayılanlar").
+- **V3 ≡ V1** olduğu için uzama alt-kapısını gün-içi ile BİRLİKTE açmanın ölçülebilir hiçbir
+  faydası yok; tek başına açmanın da (V2) faydası tek olaya dayanıyor.
+- Simülatörün mutlak sayıları rejime duyarlıdır (P3); yukarıdaki hüküm **göreli** farklara
+  dayanır ve canlı defter nihai hakemdir.
+
+### Kapı sertleştirmesi sonrası regresyon — 2026-08-23
+Kapının GÖRÜNÜRLÜK/tazelik sertleştirmesi (lider doğrulaması, negatif önbellek, oran-sınırlı
+WARNING, tur başı tazeleme, UTC gün damgalı önbellek, `run_days+5`, rapor provenance'ı — D15)
+kapı KURALINI değiştirmez; bunu kanıtlamak için V1c AYI penceresi aynı env tabanı ve aynı kline
+önbelleğiyle YENİDEN koşuldu.
+
+| | E7 kaydı (V1c AYI) | Sertleştirme sonrası | |
+|---|---|---|---|
+| İşlem | 158 | **158** | ✓ |
+| Kazanma % | 88.0 | **88.0** | ✓ |
+| PnL | +3812 | **+3812.25** | ✓ |
+| PF | 1.43 | **1.43** | ✓ |
+| maxDD | 2956 | **2956.08** | ✓ |
+| `market_gate_day` tetiği | 179 | **179** | ✓ |
+| LONG / SHORT | 64 / 94 | **64 (+179.82) / 94 (+3632.43)** | ✓ |
+
+Log: `logs/market_gate/v1c_ayi_hardening.log`; inceleme düzeltmeleri TAMAMLANDIKTAN sonra bir
+kez daha koşuldu → `logs/market_gate/v1c_ayi_verify.log` (rapor
+`logs/backtest_20260823_105946.json`), **yedi satırın hepsi yine birebir aynı** ve
+`missed_signals` = `{'regime_gate': 558, 'market_gate_day': 179, 'maker_missed': 7,
+'capacity': 2}`. Komut E7'nin komutuyla aynı (env tabanı
+`scripts/.scalper_env_snapshot.txt`, `--cache-dir data/klines_cache`).
+`python3 -m pytest tests -q` → **825 passed, 1 skipped**; `tests/test_golden_backtest.py`
+değişmeden geçer.
+
+⚠️ **Bu koşuda bir HATA da yakalandı** (uçtan uca doğrulamanın değeri): `metadata["market_gate"]`
+üretiliyor ama JSON rapora HİÇ ulaşmıyordu. Kök neden `run_backtest`'te `run_metadata.update(
+metadata)`'nın SIĞ bir kopya olması — iç içe sözlüklere yapılan yerinde değişiklikler
+(`data_windows`) dışarı ulaşıyor, SONRADAN eklenen yeni anahtar kayboluyordu. Düzeltildi
+(`metadata` artık `run_metadata`'nın kendisi) + regresyon testi
+(`TestRunMetadataPropagation`). Yalnız birim testiyle bakılsaydı fark edilmezdi.
+
+### E8 (sinyal otopsisi) ile çapraz kontrol — 2026-08-23
+E8 ajanı kapıyı BAĞIMSIZ olarak, harness JSON'u üzerinde **post-hoc** ölçtü (her işlemi giriş
+zamanıyla zenginleştirip filtreleyerek). İki yöntem farklı şeyler ölçüyor ve bu fark önemli:
+
+| | E7 (bu bölüm) | E8 (post-hoc) |
+|---|---|---|
+| Kapı nerede | Motor-içi, gerçek `simulate_symbol` kapısı | İşlem listesi üzerinde filtre |
+| Kapasite | Engellenen sinyal slotu SERBEST bırakır (P1 kapasite paritesi) | Bırakmaz → **alt sınır** |
+| YATAY %1.0 sonucu | **+201** | **−487** |
+İşaret farkının kaynağı kapasite yeniden tahsisi: gerçek motorda engellenen bir sinyal slotu
+boşaltır ve sonraki (çoğu kez daha iyi) sinyal girebilir. E8 bunu kendisi de "gerçek motor-içi
+kapının ALT SINIRI" diye işaretledi — iki ölçüm çelişmiyor, E8 muhafazakâr taraftan bakıyor.
+
+**E8'in eşik önerisi (%1.3) motor-içi kapıyla DOĞRULANDI ve benimsendi:** V1c üç pencerede de
+V1'i (%1.0) domine ediyor — AYI +2999→**+3812** (PF 1.33→1.43), YATAY +2593→**+2791**
+(1.36→1.38), BOĞA kaybı −%4.5→**−%2.7**; maxDD hiçbir pencerede kötüleşmiyor.
+V1c AYI yön kırılımı: LONG 64/**+180** (PF 1.04), SHORT 94/**+3632** (1.84), SL 17 (V0: 29).
+**Bacak atfı — ilk yorumum YANLIŞTI, E8 haklıydı.** "E7'de LONG bacağı da iyileşiyor (79/−956 →
+64/+180), demek ki LONG kapısı da değerli" demiştim. E8 bunun kapasite etkisinden ayrılmadığını
+söyledi ve ayrıştırmayı önerdi; iki JSON raporunu (symbol, entry_time, direction) üzerinden
+eşleştirerek koştum (yeni backtest YOK):
+
+| AYI, V0 → V1c | Δ PnL | (i) engellenen | (ii) yeni giren | Atıf |
+|---|---|---|---|---|
+| **LONG** | +1136.1 | 24 işlem, PnL **−76.1** (≈başabaş) | 9 işlem, **+1060.0** | **~%7 kapı, ~%93 kapasite** |
+| **SHORT** | +2091.8 | 42 işlem, PnL **−1934.3** (gerçek kaybedenler) | 2 işlem, +157.5 | **~%92 kapı, ~%8 kapasite** |
+
+(Ortak 55 LONG / 92 SHORT işlemin PnL'i iki koşuda birebir aynı — atıf temiz.)
+Yani kapının KENDİSİ neredeyse tamamen SHORT bacağından kazandırıyor; LONG bacağının engellediği
+24 işlem toplamda −76.1, yani gürültü. LONG'daki +1136'nın %93'ü boşalan kapasiteye giren 9 YENİ
+işlemden geliyor — kapıya değil, kapasite yeniden tahsisine ait bir kazanç.
+**Bacak-ayrık eşik artık İKİ ölçümle de destekleniyor** ama yine de UYGULANMADI: ayrı bir tasarım
+kararıdır (kendi spec'i + kullanıcı onayı gerekir). Karşı argüman kayda geçsin: canlı defterin
+22 Ağu kaybı tam olarak LONG bacağından geldi (8 işlem, +102.1 kurtarırdı), yani harness'ta nötr
+görünen LONG bacağı canlıda hâlâ işe yarayabilir — bacakları ayrı kapatılabilir tutan bugünkü
+tasarım bu yüzden doğru.
+
+**Uzama alt-kapısı — ikinci bağımsız RED.** E8 canlı defterde net **negatif** ölçtü (−152.7;
+LONG eşiği %12'de −382.9, 50 kazanan engelleniyor) ve spec'in hipotezinin İŞARETİNİ ters buldu
+(kazananların `align_btc_run_3d` ort. 7.50 / kaybedenlerin 2.28; AUC 0.292, p<0.001 — yani koşuyla
+AYNI yönde açılan işlemler kazanıyor). E7'de zaten "n=1 olay, gün-içinin üstüne katkı yok"
+demiştik. İki bağımsız kanıt aynı yöne işaret ediyor → **`SCALPER_MARKET_GATE_RUN_PCT=0` kalmalı.**
+Varsayılan spec'te 15 onaylandığı için sessizce değiştirilmedi; bunun yerine motor açılışta
+uyarıyor (`ScalperEngine._maybe_log_market_gate_banner`).
+
+### "Gün açılışı" tanımı — ÇÖZÜLDÜ (E8'in 15m yolu), önceki sapma kapatıldı
+E8 ölçümünü gerçek `1d` mumu **open**'ı ile yaptı; bu uygulama son tamamlanmış günlük
+**close**'u vekil kullanıyor (gerekçe: `KlineFetcher._drop_unclosed` oluşmakta olan günlük mumu
+her zaman atar → canlıda "bugünün open'ı" ELDE EDİLEMEZ; bkz. D15). İki tanım arasındaki fark
+ÖLÇÜLDÜ (BTCUSDT, üç pencere, 70 gün, mainnet — harness'ın veri kaynağı):
+
+| Kaynak | Ortalama \|open−önceki close\| | Maksimum | Eşiğin (%1.0) kaçta kaçı |
+|---|---|---|---|
+| **Mainnet** (harness) | %0.000082 | %0.000597 | %0.06 |
+| **Testnet** (canlı motor) | %0.013 | %0.152 | **%15.2** |
+
+Mainnet'te iki tanım pratikte AYNI (fark eşiğin binde 6'sı); testnet'te fark ~200× büyüktü
+(en kötü günde eşiğin %15'i, dağılım kuyruklu: medyan %0.000167, p95 %0.106) ve bu bir süre
+"bilinen sapma" olarak kaydedildi.
+
+**E8 bu sapmayı kapatan yolu buldu ve uygulandı:** `1d` mumunun `open`'ı, o günün **00:00 UTC
+15m mumunun `open`'ına BİREBİR eşittir** (ikisi de aralığın ilk işlem fiyatıdır). Bağımsız
+doğruladım — BTCUSDT, mainnet (3 pencere önbelleği) + testnet, **76 gün sınırı, 0 uyuşmazlık,
+maks fark %0.00000000**. Böylece gerçek gün açılışı `_drop_unclosed`'a HİÇ dokunmadan (o 15m
+mumu çoktan kapanmıştır) okunabiliyor:
+- Motor: lider için `15m` limit 100 (= 25 saat, ağırlık 1). Kapı açıkken lider başına toplam
+  **3 istek / 60 sn** (`1d` + giriş TF + `15m`, üçü de ağırlık 1) — sembol başına DEĞİL.
+- Harness: `gather_leader_series` aynı 15m serisini `gather_symbol_data` ile AYNI önbellek
+  anahtarıyla çeker → lider evrende zaten varsa **ek ağ isteği YOK** (loglarda
+  `💾 BTCUSDT 15m: önbellekten yüklendi`).
+- Ortak kural `market_gate.resolve_day_open`; günün ilk 15 dakikasında (mum henüz kapanmamış,
+  look-ahead yasak) **iki taraf da** eski vekile düşer — `day_open_source` alanı hangisinin
+  kullanıldığını `/scalper/status`'te gösterir.
+- Neden liderin 15m'si AYRI çekiliyor (motorun zaten çektiği 15m serisi kullanılamaz mı?):
+  motorun `_evaluate_symbol` içinde çektiği seri DEĞERLENDİRİLEN SEMBOLE aittir, lidere değil;
+  ayrıca o serinin zaman dilimi `scalper_tf_regime`/`tf_context` ile konfigüre edilebilir
+  (sunucuda 15m ama garanti değil) ve kapı anlık görüntüsü lider başına önbelleklenir, hangi
+  sembolün tetiklediğinden bağımsızdır. Sembol==lider durumunda yeniden kullanmak yalnız 8
+  sembolün 1'inde işe yarar, konfigürasyona bağımlı ve kırılgan olurdu.
+
+**Regresyon kontrolü:** V1 ve V1c üç pencerede de yeniden koşuldu; sonuçlar önceki (vekil)
+koşularla **bit düzeyinde AYNI** (V1c AYI 158 işlem / WR 88.0 / +3812.25 / PF 1.43 / DD 2956.08,
+179 tetik · YATAY 137 / 87.6 / +2791.37 / 1.38 / 2840.06, 32 tetik · BOĞA 89 / 93.3 / +3797.60 /
+2.39 / 734.59, 3 tetik). Mainnet verisinde değişim inert — E7 tablosu her iki tanım altında da
+geçerli — ama testnet soak'undaki belirsizlik artık YOK.
+Eski (vekil) koşu logları `logs/market_gate_prevclose/` altında saklandı.

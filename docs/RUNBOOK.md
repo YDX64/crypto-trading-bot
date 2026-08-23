@@ -235,6 +235,111 @@ Mainnet'te (testnet DEĞİLKEN) gölge KAPALIYSA `RISK_EVENT_SECRET`, `TV_WEBHOO
 `SCALPER_SYMBOL_ALLOWLIST` boş (veya yalnız boşluk/virgül) OLAMAZ — `_validate_binance_environment`
 startup'ta reddeder (docs/MAINNET_PLAN.md §5.3); doldurmadan kapatamazsın.
 
+## Lider piyasa kapısı (`SCALPER_MARKET_GATE`, D15) — ADAY, HENÜZ ONAYLANMADI
+Liderin (varsayılan BTCUSDT) gün-içi sapmasına bakıp o yöne yeni giriş kapatan kapı
+(ayrıntı: `docs/ARCHITECTURE.md` §4.1, ölçüm: `docs/EXPERIMENTS.md` E7). **Varsayılan
+kapalı ve canlıya UYGULANMADI** — bu bölüm, kullanıcı onayı geldiğinde doğru değerlerle
+açılabilmesi içindir; onaysız açma.
+
+⚠️ **Yine de çıplak varsayılanlara GÜVENME.** `config.py` varsayılanları 2026-08-23'te
+ölçümün önerdiği çifte çekildi (`DAY_PCT=1.3`, `RUN_PCT=0` — bkz. D15 "Varsayılanlar"), yani
+`SCALPER_MARKET_GATE=true`'yu tek başına yazmak artık ÖNCEKİ kadar tehlikeli değil. Ama
+**varsayılan bir KONTROL değildir**: sunucudaki `.env` eski bir değer taşıyabilir (ör. daha önce
+elle yazılmış `SCALPER_MARKET_GATE_RUN_PCT=15`) ve o zaman varsayılan hiç devreye girmez.
+Aşağıdaki komut bu yüzden üç değişkeni de AÇIKÇA yazar ve restart'tan önce `assert` ile
+geri-okur — okuduğun değer `.env`'in gerçeği, varsayılanın değil.
+
+⚠️ **Uzama alt-kapısı (`RUN_PCT`) KAPALI kalmalı** — E7 (harness): yalnız ayı penceresinde
+ve tek lider olayında tetikleniyor, gün-içi kapısının üstüne katkısı YOK. E8 (canlı defter,
+7–22 Ağu): `RUN_PCT=15` 202 işlemin 35'inde tetikleniyor ve net **−152.7** ediyor (12 DOWN-günü
+işlemini engelleyip +137.9 kurtarıyor, 23 UP-günü KAZANANINI engelleyip −290.6 kaybettiriyor).
+Harness'ın "üç pencerede inert" hükmü BUGÜNKÜ piyasaya taşınmıyor: o pencerelerde BTC 3 günde
+%15 koşmuyordu, şimdi koşuyor. Motor açılışta ayrıca WARNING basar ama **log bir KONTROL
+değildir** (D14 review bulgusu #4 emsali) — değeri komutta açıkça `0` yaz.
+
+**Açmak (yalnız kullanıcı onayıyla):**
+```bash
+ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date +%Y%m%d)-marketgate && for kv in "SCALPER_MARKET_GATE=true" "SCALPER_MARKET_GATE_SYMBOL=BTCUSDT" "SCALPER_MARKET_GATE_DAY_PCT=1.3" "SCALPER_MARKET_GATE_RUN_PCT=0"; do k="${kv%%=*}"; { grep -q "^$k=" .env && sed -i "s|^$k=.*|$kv|" .env || echo "$kv" >> .env; }; done && ./.venv/bin/python -c "from src.core.config import settings as s; assert s.scalper_market_gate, \"KAPI AÇILMADI\"; assert s.scalper_market_gate_day_pct == 1.3, f\"DAY_PCT={s.scalper_market_gate_day_pct}\"; assert s.scalper_market_gate_run_pct == 0, f\"RUN_PCT={s.scalper_market_gate_run_pct} — uzama alt-kapısı KAPALI olmalı\"; print(\"gate=\", s.scalper_market_gate, \"day=\", s.scalper_market_gate_day_pct, \"run=\", s.scalper_market_gate_run_pct)" && supervisorctl restart tradingbot_v2'
+```
+`sed -i` eşleşme bulamazsa 0 ile çıkar — bu yüzden her anahtar `{ grep -q && sed || echo; }`
+grubuyla yazılır ve restart'tan ÖNCE `assert`'li config geri-okuması yapılır (D14 review
+bulgusu #4 ile aynı disiplin).
+
+**ZORUNLU doğrulama — soak bu ÜÇÜ geçmeden BAŞLAMIŞ SAYILMAZ:**
+1. Komutun kendi `assert`'leri restart'tan ÖNCE `gate= True day= 1.3 run= 0.0` basmalı
+   (basmazsa `AssertionError` ile durur ve restart hiç çalışmaz).
+   ⚠️ **Bu geri-okuma TEK BAŞINA yetmez.** `DAY_PCT`/`RUN_PCT` varsayılanları artık zaten
+   `1.3`/`0`; yani `sed` sessizce HİÇBİR ŞEY yazmasa bile geri-okuma aynı değerleri basar ve
+   YEŞİL görünür — D14 bulgusu #4'ün (sessizce başarısız olan `sed`) tam olarak bu biçimi.
+   Bu yüzden `.env` SATIRLARININ varlığı ayrıca `grep` ile doğrulanır (tam satır eşleşmesi,
+   dört anahtar):
+```bash
+ssh awa 'cd /opt/tradingbot-v2 && for kv in "SCALPER_MARKET_GATE=true" "SCALPER_MARKET_GATE_SYMBOL=BTCUSDT" "SCALPER_MARKET_GATE_DAY_PCT=1.3" "SCALPER_MARKET_GATE_RUN_PCT=0"; do grep -qxF "$kv" .env || { echo "EKSİK/YANLIŞ .env satırı: $kv"; exit 1; }; done && echo ".env 4/4 satır DOĞRU"'
+```
+2. Restart sonrası (~90 sn) — **`enabled` DEĞİL, `gate_effective` bak.** Kapı fail-open'dır:
+   lider verisi gelmiyorsa (yanlış sembol, ağ) `enabled: true` görünür ama HİÇBİR KORUMA YOKTUR.
+   `stale` da açıkça `false` olmalı: bayat bir görüntü kapının ÖLÜ olduğunu gizler.
+```bash
+ssh awa 'curl -sS http://127.0.0.1:9091/scalper/status' | python3 -c "
+import sys, json
+g = json.load(sys.stdin)['market_gate']
+assert g['gate_effective'] is True, f'KAPI ETKİSİZ: {g}'
+assert g['stale'] is False, f'LİDER GÖRÜNTÜSÜ BAYAT: {g}'
+assert g['leader_ok'] is True and g['leader'] == 'BTCUSDT', g
+assert g['thresholds'] == {'day_pct': 1.3, 'run_pct': 0.0, 'run_days': 3}, g
+print('gate_effective=', g['gate_effective'], 'stale=', g['stale'],
+      'age=', g['snapshot_age_sec'], 'leader=', g['leader'],
+      'host=', g['leader_source_host'], 'day_open_source=', g['day_open_source'])"
+```
+   (`stale` ve `leader_ok` mantıken `gate_effective`'in İÇİNDEDİR — ayrı yazılmalarının sebebi
+   arıza anında HANGİ şartın düştüğünü hata mesajından okuyabilmek. `thresholds` ise ayrı bir
+   kontrol: `gate_effective` yalnız "en az bir eşik > 0" ister, DOĞRU eşikler olduğunu değil.)
+3. Açılış logunda `🧭 Piyasa kapısı lideri doğrulandı: BTCUSDT` satırı olmalı; `⛔ PİYASA KAPISI
+   DOĞRULANAMADI (degraded)` satırı OLMAMALI:
+```bash
+ssh awa "grep -E 'PİYASA KAPISI|kapısı lideri' /opt/tradingbot-v2/logs/bot.log | tail -5"
+```
+
+**Ne görürsün:**
+- Restart loglarında `🧭 PİYASA KAPISI AÇIK — lider BTCUSDT, gün-içi %1.3, uzama %0.0/3g`.
+  `RUN_PCT>0` bırakıldıysa ayrıca sert bir WARNING — görürsen komutu yanlış çalıştırmışsın.
+- Engellenen her sinyalde `⛔ <SEMBOL>: piyasa kapısı — gün-içi sapma (BTCUSDT gün −1.42%,
+  koşu +2.10%) nedeniyle LONG girişi engellendi (SCALPER_MARKET_GATE)`.
+- `GET /scalper/status` → `market_gate`. Alanlar ve NE İŞE YARADIKLARI:
+
+| Alan | Anlamı / ne zaman bakılır |
+|---|---|
+| `enabled` | `.env`'de kapı açık mı. **Koruma garantisi DEĞİLDİR.** |
+| `gate_effective` | **Kapı GERÇEKTEN koruyor mu — tek bakılacak alan.** BEŞ şart birden: `enabled` + `leader_ok` + en az bir BAŞARILI görüntü (`last_ok_at`) + `stale: false` + en az bir eşik > 0. |
+| `leader` / `leader_ok` | Lider sembol ve son veri denemesinin sonucu (`null` = hiç denenmedi). |
+| `leader_source_host` | Lider mumlarının geldiği host. Testnet'te `testnet.binancefuture.com` — E7 mainnet'ten ölçtü, soak sayıları birebir kıyaslanamaz (D15 "Veri kaynağı paritesi"). |
+| `thresholds` | Yürürlükteki EŞİKLER (`day_pct`/`run_pct`/`run_days`). Log banner'ı bir KONTROL değildir; eşiklerin doğruluğu buradan doğrulanır. |
+| `stale` / `snapshot_age_sec` | Görüntü 2 × tarama aralığından eskiyse (ya da UTC günü döndüyse) `true` — o an kapı KÖRDÜR. Yaş saniye cinsindendir. |
+| `day_drift_pct` / `run_drift_pct` | Kapının ŞU AN ÖLÇTÜĞÜ iki büyüklük (`null` = hesaplanamadı ya da BAYAT — 0.0 ile karıştırma). Eşik değil: eşikler `thresholds` altındadır. |
+| `day_open_source` | `intraday_open` (gerçek 00:00 UTC açılışı) ya da günün ilk 15 dakikasında `prev_daily_close` — beklenen davranış, hata değil. Bayat görüntüde `null`. |
+| `last_ok_at` | Son BAŞARILI lider çekimi (UTC). Uzun süre eskiyorsa kapı sessizce ölmüş demektir. |
+| `last_error` / `last_failure_at` / `consecutive_failures` | Son hata metni, zamanı ve ÜST ÜSTE hata sayısı (0 = şu an sağlıklı). |
+| `failures_total` | Süreç ömrü boyunca TOPLAM hata — toparlanmada SIFIRLANMAZ. Dönüşümlü (flapping) arıza yalnız `consecutive_failures`'a bakınca tertemiz görünür; soak değerlendirmesi bu sayaç olmadan yapılamaz. |
+| `last_reason` / `last_block_at` | **SON ENGELLEME** — serbest geçişler bunu silmez. `null` ve `rejects` boşsa kapı hiç tetiklenmemiştir. |
+| `rejects` | Süreç ömrü boyunca `market_gate_day` / `market_gate_run` sayaçları — soak sonunda tetik sayısını buradan oku. |
+
+**Arıza: kapı açık ama `gate_effective: false`.** Kapı fail-open olduğu için girişler devam eder;
+KORUMA yoktur. Sırayla bak:
+1. `last_error` ne diyor? "bulunamadı" → `SCALPER_MARKET_GATE_SYMBOL` yanlış yazılmış
+   (`BTCUSD` vb.). Düzelt + restart.
+2. Ağ/418 hatası → `consecutive_failures` artıyor. Kapı `SCALPER_MARKET_GATE_RETRY_SEC`
+   (vars. 60 sn) boyunca yeniden DENEMEZ (bilerek: boşa REST isteği + paylaşılan kline kilidi).
+   Ban aktifken **restart YASAK** (CLAUDE.md yasak #3) — banın geçmesini bekle, kapı kendiliğinden
+   toparlar (`leader_ok` true'ya döner, `last_error` null olur).
+3. Log'da uyarılar tür başına dakikada en çok bir satırdır — az satır görmek "az hata" demek
+   DEĞİLDİR; sayı `consecutive_failures`'tadır.
+
+**Kapatmak:**
+```bash
+ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date +%Y%m%d)-marketgate-off && { grep -q "^SCALPER_MARKET_GATE=" .env && sed -i "s/^SCALPER_MARKET_GATE=.*/SCALPER_MARKET_GATE=false/" .env || echo "SCALPER_MARKET_GATE=false" >> .env; } && ./.venv/bin/python -c "from src.core.config import settings as s; assert not s.scalper_market_gate, \"KAPI HÂLÂ AÇIK\"; print(\"gate=\", s.scalper_market_gate)" && supervisorctl restart tradingbot_v2'
+```
+Varsayılan zaten kapalı (satırı silmek de eşdeğerdir); kod geri alınmasına gerek yok.
+
 ## Güvenlik borçları
 1. Webhook düz HTTP + IP, secret sorgu dizesinde. Erişim logu kısmı ÇÖZÜLDÜ (D9,
    2026-08-21): `uvicorn.access`/`uvicorn.error` logger'larına `secret=...`'ü `secret=***`

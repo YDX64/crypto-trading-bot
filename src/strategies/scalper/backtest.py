@@ -23,7 +23,8 @@ seviyesinde, tüm sembollerin aday işlemleri birleştirildikten SONRA,
 giriş zamanına göre kronolojik tek bir POST-HOC geçişle uygulanır (bkz.
 `_apply_capacity_gate`, 2026-08-21 "parite: kapasite kapısı"). Kapasite
 yüzünden reddedilen adaylar `missed_counter["capacity"]`'de sayılır ve
-işleme dahil edilmez. Bilinen sapmalar `_apply_capacity_gate` docstring'inde.
+işleme dahil edilmez. Bilinen sapmalar `_apply_capacity_gate` docstring'inde
+(3 madde; #3 = 8 saatlik reaper/`SCALPER_MAX_HOLD_HOURS` harness'ta YOK).
 
 CLI:
     python -m src.strategies.scalper.backtest --days 30 \\
@@ -54,13 +55,18 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 from src.core.config import settings
 from src.core.logger import app_logger
 from src.strategies.scalper import kline_cache
 from src.strategies.scalper.data import KlineFetcher
 from src.strategies.scalper.indicators import atr, chandelier_stop
+from src.strategies.scalper.market_gate import (
+    MARKET_GATE_INTRADAY_TF,
+    evaluate_market_gate,
+    resolve_day_open,
+)
 from src.strategies.scalper.regime import detect_regime
 from src.strategies.scalper.scanner import UniverseScanner
 from src.strategies.scalper.setups import apply_stop_policy, get_enabled
@@ -93,7 +99,18 @@ from src.strategies.scalper.types import (
 # Sabitler
 # --------------------------------------------------------------------------
 
-# Kline çekme: aralığa göre günlük mum sayısı ve sayfalama arası bekleme.
+# Kline çekme: STRATEJİ zaman dilimi → günlük mum sayısı.
+#
+# ⚠️ "1d" BİLEREK YOKTUR (2026-08-23 inceleme bulgusu). Kısa bir süre buraya
+# eklenmişti — sözde "lider piyasa kapısının (D15) günlük serisi için" — ama
+# o giriş HİÇBİR YERDEN OKUNMUYORDU: `gather_leader_series` günlük mum
+# sayısını `days + run_days + _LEADER_DAILY_EXTRA_DAYS` ile doğrudan
+# hesaplar, önbellek anahtarı da `kline_cache._INTERVAL_MS`'ten gelir.
+# Tek FİİLİ etkisi doğrulamayı GEVŞETMEKTİ: bu sözlük `gather_symbol_data`'nın
+# tek kapısıdır ve `SCALPER_TF_REGIME=1d` gibi bir ayarı gürültülü bir
+# `ValueError` yerine SESSİZCE kabul ettiriyordu (günde 1 mumla rejim ve
+# indikatör hesaplanırdı). Buraya yeni bir dilim eklemeden önce: gerçekten
+# bir STRATEJİ dilimi mi?
 _CANDLES_PER_DAY: Dict[str, int] = {
     "1m": 1440, "3m": 480, "5m": 288, "15m": 96, "30m": 48, "1h": 24, "4h": 6,
 }
@@ -261,35 +278,187 @@ async def gather_symbol_data(
                 f"Desteklenmeyen zaman dilimi: {interval!r} "
                 f"(bilinenler: {sorted(_CANDLES_PER_DAY)})"
             )
-        needed = days * per_day + warmup
-
-        candles: Optional[List[Candle]] = None
-        cache_start_ms: Optional[int] = None
-        if cache_dir is not None and end_time is not None:
-            cache_start_ms = kline_cache.window_start_ms(interval, needed, end_time)
-            if not refresh:
-                candles = kline_cache.load(cache_dir, symbol, interval, cache_start_ms, end_time)
-                if candles is not None and len(candles) != needed:
-                    # Boyut uyuşmazlığı: eski/kısmi bir önbellek (aynı anahtarla
-                    # ama farklı içerikle) — güvenilmez say, taze çek.
-                    app_logger.warning(
-                        f"⚠️ {symbol} {interval}: önbellek boyutu uyuşmuyor "
-                        f"({len(candles)} != {needed}) — yeniden çekiliyor"
-                    )
-                    candles = None
-                elif candles is not None:
-                    app_logger.info(
-                        f"💾 {symbol} {interval}: önbellekten yüklendi ({len(candles)} mum)"
-                    )
-
-        if candles is None:
-            app_logger.info(f"📥 {symbol} {interval}: Binance'ten çekiliyor...")
-            candles = await fetch_paginated(fetch, symbol, interval, needed, end_time=end_time)
-            if cache_dir is not None and end_time is not None:
-                kline_cache.save(cache_dir, symbol, interval, cache_start_ms, end_time, candles)
-
-        out[interval] = candles
+        out[interval] = await _fetch_series_cached(
+            fetch, symbol, interval, days * per_day + warmup,
+            end_time=end_time, cache_dir=cache_dir, refresh=refresh,
+        )
     return out
+
+
+async def _fetch_series_cached(
+    fetch: FetchFn, symbol: str, interval: str, needed: int,
+    end_time: Optional[int], cache_dir: Optional[Path], refresh: bool,
+) -> List[Candle]:
+    """Tek bir (sembol, aralık, `needed` mum) serisini önbellekli çeker.
+
+    `gather_symbol_data`'nın döngü gövdesinden ORTAK KULLANIM için ayrıldı
+    (D15): lider piyasa kapısının serilerinin de BİREBİR aynı önbellek
+    anahtarını üretmesi gerekiyordu — aksi hâlde evrende zaten bulunan bir
+    liderin (BTCUSDT) giriş TF serisi ikinci kez Binance'ten çekilirdi.
+    Davranış değişmedi (log metinleri dahil).
+    """
+    candles: Optional[List[Candle]] = None
+    cache_start_ms: Optional[int] = None
+    if cache_dir is not None and end_time is not None:
+        cache_start_ms = kline_cache.window_start_ms(interval, needed, end_time)
+        if not refresh:
+            candles = kline_cache.load(cache_dir, symbol, interval, cache_start_ms, end_time)
+            if candles is not None and len(candles) != needed:
+                # Boyut uyuşmazlığı: eski/kısmi bir önbellek (aynı anahtarla
+                # ama farklı içerikle) — güvenilmez say, taze çek.
+                app_logger.warning(
+                    f"⚠️ {symbol} {interval}: önbellek boyutu uyuşmuyor "
+                    f"({len(candles)} != {needed}) — yeniden çekiliyor"
+                )
+                candles = None
+            elif candles is not None:
+                app_logger.info(
+                    f"💾 {symbol} {interval}: önbellekten yüklendi ({len(candles)} mum)"
+                )
+
+    if candles is None:
+        app_logger.info(f"📥 {symbol} {interval}: Binance'ten çekiliyor...")
+        candles = await fetch_paginated(fetch, symbol, interval, needed, end_time=end_time)
+        if cache_dir is not None and end_time is not None:
+            kline_cache.save(cache_dir, symbol, interval, cache_start_ms, end_time, candles)
+
+    return candles
+
+
+# ==========================================================================
+# Lider piyasa kapısı (D15) — pencere başında BİR KEZ çekilen lider serisi
+# ==========================================================================
+
+# Lider günlük serisi için ek gün payı: N günlük koşu N+1 kapanış ister ve
+# pencerenin İLK gününde de uygulanabilmesi gerekir.
+_LEADER_DAILY_EXTRA_DAYS = 3
+
+
+@dataclass
+class LeaderSeries:
+    """Lider sembolün (varsayılan BTCUSDT) kapı girdilerini zaman-hizalı
+    veren salt-okunur seri. AĞ YOK — yalnız çekilmiş mumlar üzerinde çalışır.
+
+    Canlı motorla parite: `inputs_at(cutoff)` canlının o an gördüğü ÜÇ
+    büyüklüğü birebir üretir — (gün açılışı, giriş TF son kapanışı,
+    tamamlanmış günlük kapanışlar). Türetme kuralı iki tarafta da
+    `market_gate.resolve_day_open`'dur: önce GERÇEK açılış (bugünün 00:00
+    UTC 15m mumunun open'ı), o yoksa son tamamlanmış günlük kapanış vekili.
+    """
+
+    symbol: str
+    entry_close_times: List[int]
+    entry_closes: List[float]
+    daily_close_times: List[int]
+    daily_closes: List[float]
+    # Gün açılışı serisi (15m). Eski çağrıcılar/testler vermezse yedek
+    # (önceki günlük kapanış) yoluna düşülür — davranış geriye uyumlu.
+    intraday_open_times: List[int] = field(default_factory=list)
+    intraday_opens: List[float] = field(default_factory=list)
+    intraday_close_times: List[int] = field(default_factory=list)
+
+    def inputs_at(
+        self, cutoff_ms: int
+    ) -> Optional[Tuple[float, float, List[float]]]:
+        """(day_open, last_close, daily_closes) — `cutoff_ms` anında KAPANMIŞ
+        veriden; yetersizse None (kapı uygulanmaz, canlıdaki fail-open ile
+        aynı ilke).
+
+        Look-ahead YASAK: tüm seriler `close_time <= cutoff_ms` ile kesilir —
+        canlı motorun `KlineFetcher._drop_unclosed`'ı ile aynı anlam (yalnız
+        kapanmış mum görülür). Gün açılışı mumu da bu kurala tabidir: günün
+        ilk 15 dakikasında henüz kapanmadığı için vekile düşülür, canlıda
+        olduğu gibi.
+        """
+        j = bisect.bisect_right(self.entry_close_times, cutoff_ms) - 1
+        if j < 0:
+            return None
+        k = bisect.bisect_right(self.daily_close_times, cutoff_ms)
+        closes = self.daily_closes[:k]
+        day_open, _source = resolve_day_open(
+            self.intraday_open_times,
+            self.intraday_opens,
+            self.intraday_close_times,
+            closes,
+            cutoff_ms,
+        )
+        if day_open is None:
+            return None
+        return day_open, self.entry_closes[j], closes
+
+
+def _leader_window_snapshot(
+    close_times: Sequence[int], candles: int
+) -> Dict[str, Any]:
+    """Lider serisinin rapora yazılan kapsamı: mum sayısı + ilk/son kapanış.
+
+    `market_gate` metadata'sı için (2026-08-23 inceleme bulgusu): rapor
+    yalnız mum SAYISINI taşıyordu, o da serinin doğru PENCEREYİ kapsayıp
+    kapsamadığını göstermiyordu. Zaman damgaları hem epoch ms hem okunur
+    UTC olarak yazılır (log'a bakan insan için).
+    """
+    first = int(close_times[0]) if close_times else None
+    last = int(close_times[-1]) if close_times else None
+    return {
+        "candles": int(candles),
+        "first_close_ms": first,
+        "last_close_ms": last,
+        # `_ms_to_utc_iso` (aşağıda) None kabul etmez — boş seri de geçerli
+        # bir durumdur (kapı fail-open olur), bu yüzden burada korunur.
+        "first_close_utc": _ms_to_utc_iso(first) if first is not None else None,
+        "last_close_utc": _ms_to_utc_iso(last) if last is not None else None,
+    }
+
+
+async def gather_leader_series(
+    fetch: FetchFn, symbol: str, days: int, end_time: Optional[int],
+    tf_entry: str, run_days: int,
+    cache_dir: Optional[Path] = None, refresh: bool = False,
+) -> LeaderSeries:
+    """Lider sembolün giriş TF + günlük serilerini pencere başında BİR KEZ
+    toplar.
+
+    Giriş TF serisi `gather_symbol_data` ile AYNI `needed` formülünü
+    kullanır — lider evrende zaten varsa aynı önbellek dosyasına düşer,
+    ikinci bir Binance çekimi olmaz.
+    """
+    # tf_entry bir STRATEJİ dilimidir (lider dilimi değil) — aynı doğrulama.
+    per_day = _CANDLES_PER_DAY.get(tf_entry)
+    if per_day is None:
+        raise ValueError(
+            f"Desteklenmeyen zaman dilimi: {tf_entry!r} "
+            f"(bilinenler: {sorted(_CANDLES_PER_DAY)})"
+        )
+    entry_candles = await _fetch_series_cached(
+        fetch, symbol, tf_entry, days * per_day + _CTX_5M_WINDOW,
+        end_time=end_time, cache_dir=cache_dir, refresh=refresh,
+    )
+    daily_needed = days + max(1, run_days) + _LEADER_DAILY_EXTRA_DAYS
+    daily_candles = await _fetch_series_cached(
+        fetch, symbol, "1d", daily_needed,
+        end_time=end_time, cache_dir=cache_dir, refresh=refresh,
+    )
+    # Gün açılışı serisi: 00:00 UTC mumunun `open`'ı = `1d` mumunun `open`'ı
+    # (ölçüldü: 76 gün sınırı, 0 uyuşmazlık). `needed` formülü
+    # gather_symbol_data'nın 15m anahtarıyla aynı tutulur ki evrende zaten
+    # bulunan bir liderin 15m serisi ikinci kez çekilmesin.
+    intraday_needed = (
+        days * _CANDLES_PER_DAY[MARKET_GATE_INTRADAY_TF] + _CTX_15M_WINDOW
+    )
+    intraday_candles = await _fetch_series_cached(
+        fetch, symbol, MARKET_GATE_INTRADAY_TF, intraday_needed,
+        end_time=end_time, cache_dir=cache_dir, refresh=refresh,
+    )
+    return LeaderSeries(
+        symbol=symbol,
+        entry_close_times=[c.close_time for c in entry_candles],
+        entry_closes=[c.close for c in entry_candles],
+        daily_close_times=[c.close_time for c in daily_candles],
+        daily_closes=[c.close for c in daily_candles],
+        intraday_open_times=[c.open_time for c in intraday_candles],
+        intraday_opens=[c.open for c in intraday_candles],
+        intraday_close_times=[c.close_time for c in intraday_candles],
+    )
 
 
 # ==========================================================================
@@ -868,6 +1037,7 @@ def simulate_symbol(
     initial_balance: float = _DEFAULT_VIRTUAL_BALANCE,
     missed_counter: Optional[Dict[str, int]] = None,
     test_start_time_ms: Optional[int] = None,
+    leader: Optional[LeaderSeries] = None,
 ) -> List[BacktestTrade]:
     """Bir sembol için TEK eşzamanlı pozisyonla tam backtest simülasyonu.
     AĞ YOK — yalnız zaten çekilmiş mum listeleri üzerinde çalışır (saf,
@@ -880,6 +1050,13 @@ def simulate_symbol(
     cfg.scalper_regime_filter (varsayılan True) rejime ters sinyalleri
     engeller (DOWN'da LONG, UP'ta SHORT) — canlı motorla (engine.py) birebir
     parite. Engellenenler `missed_counter["regime_gate"]` altında sayılır.
+
+    `leader` verilir VE `cfg.scalper_market_gate` açıksa lider piyasa kapısı
+    (D15) da uygulanır — canlı motorla AYNI saf fonksiyonla
+    (`market_gate.evaluate_market_gate`). Engellenenler
+    `missed_counter["market_gate_day"/"market_gate_run"]` altında sayılır.
+    Kapı kapalıyken (varsayılan) bu blok HİÇ çalışmaz; çıktı bit düzeyinde
+    değişmez (bkz. tests/test_golden_backtest.py).
     """
     trades: List[BacktestTrade] = []
     n5 = len(candles_5m)
@@ -910,6 +1087,7 @@ def simulate_symbol(
         structure_feed = _StructureFeed(
             _role_series, structure_window_bars(cfg), cfg
         )
+    market_gate_on = bool(getattr(cfg, "scalper_market_gate", False))
     i = (
         bisect.bisect_left(close_times_5m, test_start_time_ms)
         if test_start_time_ms is not None
@@ -955,6 +1133,24 @@ def simulate_symbol(
                 i += 1
                 continue
 
+        # Canlı parite (D15): lider piyasa kapısı — rejim kapısının HEMEN
+        # ardında, canlı motordaki (engine._evaluate_symbol) sırayla birebir.
+        # Karar anı = bu 5m/1m mumun close_time'ı; lider serisi o âna kadar
+        # KAPANMIŞ veriyle kesilir (look-ahead yasak, LeaderSeries.inputs_at).
+        if market_gate_on and leader is not None:
+            leader_inputs = leader.inputs_at(close_times_5m[i])
+            if leader_inputs is not None:
+                gate_reason = evaluate_market_gate(
+                    raw_signal.direction,
+                    leader_inputs[0], leader_inputs[1], leader_inputs[2], cfg,
+                )
+                if gate_reason is not None:
+                    if missed_counter is not None:
+                        missed_counter[gate_reason] = (
+                            missed_counter.get(gate_reason, 0) + 1
+                        )
+                    i += 1
+                    continue
         # Canlı parite: yapı kapısı (engine._evaluate_symbol'de rejim kapısının
         # HEMEN ARDINDA, AYNI saf fonksiyonla — structure.structure_gate_blocks).
         # Kapı kapalıyken (varsayılan) hiçbir şey hesaplanmaz.
@@ -1328,6 +1524,9 @@ def write_json_report(
         ),
         "data_windows": metadata.get("data_windows", {}),
         "data_source_base_url": metadata.get("data_source_base_url"),
+        # Kapı açıkken lider serisinin kimliği/kapsamı; kapalıyken None
+        # (rapor ŞEKLİ sabit kalsın diye anahtar her zaman var).
+        "market_gate": metadata.get("market_gate"),
     }
 
     payload = {
@@ -1411,6 +1610,18 @@ def _apply_capacity_gate(
        GERÇEKLEŞMİŞ gibi hesaba katılmıştır — sembol simülasyonu
        kapasiteden habersiz, kendi başına tamamlanır. Tam parite; kapasiteyi
        BİLEN tek bir küresel event-driven simülasyona geçmeyi gerektirir.
+    3) **REAPER MODELLENMİYOR** (2026-08-23 inceleme bulgusu). Canlı motor
+       `SCALPER_MAX_HOLD_HOURS` (D4, sunucuda 8) dolan ve TP1 görmemiş
+       pozisyonu reduce-only MARKET ile KAPATIR
+       (`engine._reap_aged_positions`); harness'ta böyle bir çıkış YOKTUR —
+       pozisyon SL/TP/trail'e kadar açık kalır. İki yönlü etkisi var:
+       (a) uzun sürünen kaybedenler harness'ta tam SL'ye kadar taşınır,
+       (b) o pozisyon slotu canlıda 8 saatte boşalırken harness'ta daha uzun
+       dolu kalır ve `_apply_capacity_gate` sonraki adayları fazladan reddeder.
+       Bu ikisi ters yönlü olduğu için NET işaret ölçülmedi; kapı gibi
+       kaybedenleri kesen değişikliklerin AYI penceresindeki kazancı bu
+       yüzden yukarı yanlı olabilir. Harness'a reaper eklemek AYRI bir iş
+       (kendi parite testiyle) — bilerek kapsam dışında.
     """
     max_positions_raw = getattr(cfg, "scalper_max_positions", 3)
     max_positions = int(max_positions_raw) if max_positions_raw is not None else 3
@@ -1508,6 +1719,13 @@ async def run_backtest(
     if run_metadata is not None:
         run_metadata.clear()
         run_metadata.update(metadata)
+        # ⚠️ Buradan sonra `metadata` ve `run_metadata` AYNI NESNE olmalı.
+        # Aksi hâlde yalnız İÇ İÇE sözlüklere yapılan yerinde değişiklikler
+        # (ör. `metadata["data_windows"][symbol] = ...`) dışarı ulaşır; SONRADAN
+        # eklenen YENİ bir anahtar (ör. `metadata["market_gate"] = ...`) sessizce
+        # kaybolurdu. 2026-08-23'te tam olarak bu oldu: kapı metadata'sı
+        # üretiliyor ama JSON rapora HİÇ ulaşmıyordu (uçtan uca koşuda yakalandı).
+        metadata = run_metadata
 
     fetcher = KlineFetcher(base_url=base_url)
     throttled = _ThrottledFetch(fetcher.get_klines)
@@ -1517,6 +1735,62 @@ async def run_backtest(
     try:
         timeframes = resolve_timeframes(cfg)
         tf_entry, tf_context, tf_regime = timeframes
+
+        # D15 lider piyasa kapısı: lider serisi pencere başında BİR KEZ
+        # çekilir ve her sembolün simülasyonuna aynen verilir. Kapı kapalıysa
+        # (varsayılan) hiç çekilmez — mevcut koşuların istek sayısı ve çıktısı
+        # bit düzeyinde değişmez.
+        leader_series: Optional[LeaderSeries] = None
+        if bool(getattr(cfg, "scalper_market_gate", False)):
+            leader_symbol = str(
+                getattr(cfg, "scalper_market_gate_symbol", "") or "BTCUSDT"
+            ).strip().upper() or "BTCUSDT"
+            try:
+                leader_run_days = int(
+                    getattr(cfg, "scalper_market_gate_run_days", 3) or 3
+                )
+            except (TypeError, ValueError):
+                leader_run_days = 3
+            app_logger.info(
+                f"🧭 Lider piyasa kapısı AÇIK — {leader_symbol} serisi çekiliyor "
+                f"(gün-içi %{getattr(cfg, 'scalper_market_gate_day_pct', 0)}, "
+                f"uzama %{getattr(cfg, 'scalper_market_gate_run_pct', 0)}/"
+                f"{leader_run_days}g)"
+            )
+            leader_series = await gather_leader_series(
+                throttled, leader_symbol, days, test_end_time_ms, tf_entry,
+                leader_run_days, cache_dir=cache_dir_path, refresh=refresh,
+            )
+            # Yeniden üretilebilirlik: kapının HANGİ veriyle karar verdiği
+            # rapordan okunabilmeli — yalnız mum SAYISI değil, serilerin
+            # zaman KAPSAMI da (bir seri beklenenden kısa/kaydıksa kapı
+            # sessizce fail-open olur; sayı tek başına bunu göstermez).
+            metadata["market_gate"] = {
+                "leader": leader_symbol,
+                # `*_threshold`: `/scalper/status`'te `run_drift_pct` ÖLÇÜLEN
+                # koşudur; ikisine de `run_pct` demek, iki çıktıyı yan yana
+                # koyan operatörde yanlış-teşhis üretiyordu.
+                "day_pct_threshold": getattr(
+                    cfg, "scalper_market_gate_day_pct", None
+                ),
+                "run_pct_threshold": getattr(
+                    cfg, "scalper_market_gate_run_pct", None
+                ),
+                "run_days": leader_run_days,
+                "entry_tf": tf_entry,
+                "intraday_tf": MARKET_GATE_INTRADAY_TF,
+                "daily": _leader_window_snapshot(
+                    leader_series.daily_close_times, len(leader_series.daily_closes)
+                ),
+                "entry": _leader_window_snapshot(
+                    leader_series.entry_close_times, len(leader_series.entry_closes)
+                ),
+                "intraday": _leader_window_snapshot(
+                    leader_series.intraday_close_times,
+                    len(leader_series.intraday_opens),
+                ),
+            }
+
         for symbol in symbols:
             app_logger.info(f"📥 {symbol}: tarihsel veri çekiliyor ({days} gün)...")
             data = await gather_symbol_data(
@@ -1539,6 +1813,7 @@ async def run_backtest(
                 symbol, candles_5m, candles_15m, candles_4h, strategies, cfg,
                 missed_counter=missed_counter,
                 test_start_time_ms=test_start_time_ms,
+                leader=leader_series,
             )
             app_logger.info(f"✅ {symbol}: {len(trades)} işlem simüle edildi")
             all_trades.extend(trades)

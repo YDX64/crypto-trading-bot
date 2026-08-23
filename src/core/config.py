@@ -164,6 +164,32 @@ class Settings(BaseSettings):
     # negatif); en kötüsü rejime ters 8 saatlik SHORT (SOL #92, −30.65).
     # False = eski davranış (TV muaf).
     scalper_tv_regime_filter: bool = True
+    # --- Lider piyasa kapısı ("ters-gün kapısı", D15 / spec §C) -----------
+    # Rejim kapısından (yukarıdaki scalper_regime_filter) FARKLI: o, sembolün
+    # KENDİ EMA50/200 trendine bakar; bu kapı yalnız LİDER sembole bakar ve
+    # kararı tüm evrene uygular. Varsayılan KAPALI — açmadan önce 3 rejim
+    # penceresinde backtest şart (CLAUDE.md yasak #1).
+    scalper_market_gate: bool = False
+    scalper_market_gate_symbol: str = "BTCUSDT"
+    # Gün-içi alt-kapısı (%; 0 = kapalı): lider gün açılışının ≥ bu kadar
+    # ALTINDAYSA yeni LONG, ≥ bu kadar ÜSTÜNDEYSE yeni SHORT açılmaz.
+    # 1.3: İKİ BAĞIMSIZ ölçümün uyuştuğu eşik — E7 (motor-içi harness kapısı,
+    # 3 pencere) V1c'yi V1'e (%1.0) üstün buldu; E8 (canlı defter post-hoc)
+    # aynı eşiği bağımsız önerdi. Bkz. docs/DECISIONS.md D15 "Varsayılanlar".
+    scalper_market_gate_day_pct: float = 1.3
+    # Uzama alt-kapısı (%; 0 = kapalı) ve gün sayısı: lider son N tamamlanmış
+    # günde ≥ +%Y koştuysa LONG, ≤ −%Y düştüyse SHORT açılmaz.
+    # 0 (KAPALI): iki bağımsız ölçüm bu alt-kapıyı ÇÜRÜTTÜ — E7: yalnız ayı
+    # penceresinde, TEK lider olayında tetikleniyor, gün-içi kapısının üstüne
+    # katkısı yok (V3 ≡ V1); E8: canlı defterde net NEGATİF (−152.7) ve
+    # hipotezin İŞARETİ ters. Motor açılışta ayrıca uyarır (>0 bırakılırsa).
+    scalper_market_gate_run_pct: float = 0.0
+    scalper_market_gate_run_days: int = 3
+    # Lider verisi alınamazsa NEGATİF ÖNBELLEK süresi (sn): bu süre dolana
+    # kadar yeniden denenmez. Yanlış bir lider sembolü ya da ağ kesintisinde
+    # her sinyalin 3 seri × 3 deneme boşa REST isteği açmasını (ve KlineFetcher
+    # kilidini saniyelerce tutmasını) engeller. 0 = negatif önbellek kapalı.
+    scalper_market_gate_retry_sec: float = 60.0
     scalper_leverage: int = 20
     scalper_risk_percentage: float = 2.0       # işlem başına bakiye riski (C yarısını kullanır)
     scalper_max_positions: int = 3

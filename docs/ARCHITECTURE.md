@@ -109,6 +109,11 @@ satır 56-63). `?src=` yoksa kaynak, AlgoPro'nun varsayılan mesaj biçiminden
 | `scalper_tv_symbol_allowlist` | `""` | TV dış sinyaline sembol filtresi (OSC kanıtı olan sembollerle sınırlamak için) |
 | `scalper_regime_filter` | `True` | Rejim kapısını (§4) aç/kapat |
 | `scalper_tv_regime_filter` | `True` | Rejim kapısının TV sinyaline de uygulanıp uygulanmayacağı |
+| `scalper_market_gate` | `False` | Lider piyasa kapısı (§4.1) — ters-gün kapısı, varsayılan KAPALI |
+| `scalper_market_gate_symbol` | `BTCUSDT` | Kapının baktığı lider sembol |
+| `scalper_market_gate_day_pct` | `1.3` | Gün-içi alt-kapısı eşiği (%; 0 = kapalı) — E7+E8 ölçümü |
+| `scalper_market_gate_run_pct` / `_run_days` | `0.0` / `3` | Uzama alt-kapısı — **varsayılan KAPALI**, iki bağımsız ölçüm çürüttü (D15) |
+| `scalper_market_gate_retry_sec` | `60.0` | Lider verisi alınamazsa negatif önbellek (sn; 0 = kapalı) |
 | `scalper_tf_entry/context/regime` | `5m/15m/4h` | Giriş/bağlam/rejim zaman dilimleri |
 | `scalper_c_rsi_long_max/short_min` | `25.0/75.0` | C'nin RSI uç eşiği |
 | `scalper_c_require_divergence` | `True` | C'de RSI diverjans şartı |
@@ -190,6 +195,64 @@ BİR KEZ olay üretir; yeni pivot onaylanınca seviye güncellenir.
   `/scalper/status` → `structure` (sembol → `direction/last_event/age_bars`)
   alanında yayınlanır; hesap hatası taramayı DÜŞÜRMEZ (fail-open, tek sefer
   loglanır) — bir sinyal filtresi, güvenlik kilidi değildir.
+### 4.1 Lider piyasa kapısı ("ters-gün kapısı", D15 — varsayılan KAPALI)
+
+Rejim kapısının **hemen yanında**, aynı tek giriş noktasında
+(`engine._market_gate_reason`, `_evaluate_symbol` içinde — yani C taraması
+VE TV `external_signal` aynı anda). Rejim kapısından farkı: rejim kapısı
+sembolün **kendi** EMA50/200 trendine bakar; bu kapı yalnız **lider**
+sembole (`scalper_market_gate_symbol`, varsayılan BTCUSDT) bakar ve kararı
+tüm evrene uygular. Saf kural `src/strategies/scalper/market_gate.py`
+(`evaluate_market_gate`, IO yok) — canlı motor ve backtest harness'ı
+(`backtest.simulate_symbol` + `LeaderSeries`) **aynı fonksiyon nesnesini**
+çağırır (parite: `tests/test_market_gate.py::TestEngineHarnessParity`).
+
+İki bağımsız alt-kapı (her biri kendi yüzdesi `0` yapılarak kapatılır):
+
+- **gün-içi** (`scalper_market_gate_day_pct`): lider son kapanışı gün
+  açılışının ≥%X **altındaysa** yeni LONG, ≥%X **üstündeyse** yeni SHORT
+  açılmaz.
+- **uzama** (`scalper_market_gate_run_pct` / `_run_days`): lider son N
+  **tamamlanmış** günde ≥+%Y koştuysa LONG, ≤−%Y düştüyse SHORT açılmaz
+  (koşu = `kapanış[-1]/kapanış[-1-N] − 1`, yani N+1 kapanış gerekir).
+  **Kullanılmamalı:** iki bağımsız ölçüm (E7 harness + E8 canlı defter) bu alt-kapıyı
+  desteklemiyor; `RUN_PCT>0` ile açılırsa motor başlangıçta WARNING basar (D15).
+
+"Gün açılışı" iki tarafta da `market_gate.resolve_day_open` ile bulunur:
+önce **gerçek açılış** — o günün 00:00 UTC `15m` mumunun `open`'ı, ki `1d`
+mumunun `open`'ına birebir eşittir (ikisi de aralığın ilk işlem fiyatı;
+ölçüldü: BTCUSDT mainnet+testnet, 76 gün sınırı, 0 uyuşmazlık). Bu yol
+`_drop_unclosed`'a hiç dokunmaz (o 15m mumu çoktan kapanmıştır), yani
+oluşmakta olan GÜNLÜK mumu görmeye gerek kalmaz. Günün ilk 15 dakikasında
+(mum henüz kapanmamış — look-ahead yasak) **iki taraf da** son tamamlanmış
+günlük kapanış vekiline düşer; hangisinin kullanıldığı `/scalper/status`
+`market_gate.day_open_source` alanındadır.
+
+REST ağırlığı: lider **başına** ~60 sn TTL önbellek (`_MARKET_GATE_CACHE_TTL`),
+sembol başına değil — tarama turu başına en çok **3 istek**: `1d`
+(limit `RUN_DAYS+5`, tavan 100), giriş TF (limit 3) ve `15m` (limit 100);
+üçü de limit ≤ 100 olduğu için ağırlık 1. Kapı AÇIKKEN anlık görüntü her
+tarama turunun başında tazelendiği için maliyet **≈3 ağırlık/dakika**
+(bütçe 2400/dk); kapalıyken **tek istek bile gitmez** — yani alt sınır
+0'dan 3'e çıkar, "değişmez" değil.
+Lider verisi alınamazsa kapı **uygulanmaz** (fail-open) ve oran-sınırlı WARNING
+loglanır — lider verisinin gelmemesi bir risk olayı değildir. Fail-open GÖRÜNÜR:
+lider sembolü başlangıçta exchangeInfo'da doğrulanır (yoksa ERROR + "degraded"),
+başarısızlık `SCALPER_MARKET_GATE_RETRY_SEC` boyunca negatif önbelleğe alınır
+(boşa REST + paylaşılan kline kilidi), ve `/scalper/status` →
+`market_gate.gate_effective` kapının GERÇEKTEN koruyup korumadığını söyler —
+`enabled` bunu söylemez (D15). `gate_effective` BEŞ şartı birden ister:
+`enabled` + lider doğrulandı + en az bir BAŞARILI anlık görüntü + görüntü
+BAYAT değil (yaş ≤ 2 × tarama aralığı, UTC günü dönmemiş) + en az bir eşik > 0. Anlık görüntü
+tarama turu başında bir kez tazelenir (tur içi tüm semboller aynı görüntüyü
+kullanır) ve önbellek UTC gün damgasıyla anahtarlanır. `/scalper/status`
+`market_gate` alt-sözlüğü (enabled/gate_effective/leader/leader_ok/
+leader_source_host/thresholds/stale/snapshot_age_sec/day_drift_pct/
+run_drift_pct/day_open_source/last_ok_at/last_error/last_failure_at/
+consecutive_failures/failures_total/last_reason/last_block_at/rejects)
+teşhis için dışa verilir; harness'ta engellenen sinyaller
+`missed_counter["market_gate_day"/"market_gate_run"]` altında raporlanır.
+Ölçüm ve P2 hükmü: `docs/EXPERIMENTS.md` "2026-08-23 — Lider piyasa kapısı (E7)".
 
 ## 5. Çıkış mimarisi
 
@@ -387,6 +450,7 @@ pencere tarihleri ve karar kuralı `docs/DECISIONS.md` P2'de.
 |---|---|
 | **C** | Strateji varyantı "Saf Uç Avcısı": rejim filtresiz, RSI ucu + Bollinger taşması + diverjans → ters yönde giriş, `risk_multiplier=0.5` (`setups.py:431-565`) |
 | **Rejim kapısı** | `DOWN`'da LONG, `UP`'ta SHORT sinyalini engelleyen kural (`engine.py:815-834`) |
+| **Lider piyasa kapısı** | Liderin (BTCUSDT) gün-içi sapmasına ve çok-günlük koşusuna bakıp o yöne yeni giriş kapatan kural (§4.1, `market_gate.py`; varsayılan KAPALI) |
 | **Sağlama / confluence** | Birden çok farklı TV göstergesinin aynı yönde oy vermesi şartı (`tv_confluence.py`) |
 | **Reaper** | Yaş limitini aşan, BE korumasız pozisyonları reduce-only MARKET ile kapatan görev (`engine.py:602`) |
 | **Chandelier** | ATR tabanlı, yalnız lehte kayan trailing stop (`indicators.py:280`) |
