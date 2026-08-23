@@ -23,6 +23,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from src.strategies.follower.executor import FOLLOWER_STRATEGY, FollowerPosition
 from src.strategies.follower.plan import split_three_quantities
+from src.strategies.follower.types import parse_ledger_levels
 from src.strategies.scalper.exits import ExitManager
 from src.strategies.scalper.executor import ScalpPosition
 from src.strategies.scalper.tracker import ScalpTracker
@@ -130,7 +131,12 @@ class FollowerExitManager(ExitManager):
 
         if not sp.tp1_done:
             await self._check_tp1_breakeven(symbol, sp, amt)
-        if sp.tp1_done and not sp.tp2_done:
+        # MERDİVEN, BE'YE DEĞİL BORSA DOLUMUNA BAĞLIDIR (düşmanca inceleme
+        # bulgu 9): eskiden TP2 kontrolü `sp.tp1_done`un arkasındaydı, o da
+        # "stop break-even'e taşındı" demektir. Ücret-farkında BE takipçide
+        # çoğu zaman ULAŞILAMAZ (D20 "ücret eşiği") → `tp1_done` YAPISAL
+        # OLARAK hiç True olmaz → TP2/TP3 dolumu HİÇ doğrulanmazdı.
+        if getattr(sp, "tp1_filled", False) and not sp.tp2_done:
             await self._check_tp_telemetry(symbol, sp, amt, index=2)
         if sp.tp2_done and not getattr(sp, "tp3_done", False):
             await self._check_tp_telemetry(symbol, sp, amt, index=3)
@@ -147,6 +153,28 @@ class FollowerExitManager(ExitManager):
         # fill kanıtı _confirmed_algo_fill'dir (scalper ile aynı ilke).
         if live_qty > filled - expected * 0.9:
             return
+
+        # FILL KANITI ÖNCE, EYLEM SONRA (bulgu 9): dolumun doğrulanması bir
+        # OLGUDUR ve BE'nin konulabilirliğinden BAĞIMSIZDIR. Eskiden BE
+        # ulaşılamaz olduğunda buradan erken dönülüyordu ve `tp1_filled`
+        # hiç işaretlenmiyordu → merdivenin geri kalanı ölüydü.
+        if not getattr(sp, "tp1_filled", False):
+            if not await self._confirmed_algo_fill(
+                symbol=symbol,
+                algo_id=getattr(sp.plan, "tp1_algo_id", None),
+                expected_quantity=expected,
+                label="TP1",
+            ):
+                self.logger.warning(
+                    f"⚠️ {symbol}: miktar azaldı ancak TP1 algo fill'i doğrulanamadı; "
+                    f"salt miktar azalması break-even tetiklemeyecek"
+                )
+                return
+            setattr(sp, "tp1_filled", True)
+            self.logger.info(
+                f"🎯 {symbol}: TP1 gerçek fill ile doğrulandı (kalan={live_qty})",
+                extra={"trade": True},
+            )
 
         target = sp.plan.breakeven_price
         current_sl = sp.position.current_stoploss
@@ -165,17 +193,6 @@ class FollowerExitManager(ExitManager):
             sp.signal.direction, target, sp.position.current_price
         ):
             self._log_be_unreachable(symbol, sp, target)
-            return
-        if not await self._confirmed_algo_fill(
-            symbol=symbol,
-            algo_id=getattr(sp.plan, "tp1_algo_id", None),
-            expected_quantity=expected,
-            label="TP1",
-        ):
-            self.logger.warning(
-                f"⚠️ {symbol}: miktar azaldı ancak TP1 algo fill'i doğrulanamadı; "
-                f"salt miktar azalması break-even tetiklemeyecek"
-            )
             return
         ok = already_tighter or await self.pm.replace_stop_loss(sp.position, target)
         if not ok:
@@ -259,10 +276,167 @@ class FollowerExitManager(ExitManager):
             sp.tp2_done = True
         else:
             setattr(sp, "tp3_done", True)
+        setattr(sp, "tp1_filled", True)  # merdiven sırayla dolar
         self.logger.info(
             f"🎯 {symbol}: TP{index} gerçek fill ile doğrulandı (kalan={live_qty})",
             extra={"trade": True},
         )
+
+    # ------------------------------------------------------------------
+    # Eksik TP emirlerini yeniden koyma (düşmanca inceleme bulgu 7 ve 9)
+    # ------------------------------------------------------------------
+
+    def tp_repair_snapshot(self) -> Dict[str, int]:
+        return dict(getattr(self, "_tp_repair_counters", {}) or {})
+
+    def _count_tp_repair(self, name: str) -> None:
+        counters = getattr(self, "_tp_repair_counters", None)
+        if counters is None:
+            counters = {}
+            self._tp_repair_counters = counters
+        counters[name] = counters.get(name, 0) + 1
+
+    async def ensure_tp_orders(self, symbol: str, sp: ScalpPosition) -> int:
+        """Borsada EKSİK olan TP bacaklarını yeniden koy. Dönüş: konan sayısı.
+
+        NEDEN: TP emri konulamamış (`tp1_missing`), restart sırasında
+        kaybolmuş ya da `_finalize_close`'un `cancel_all_open_orders`
+        turuna yakalanmış olabilir. Takipçide TP'ler ÇIKIŞIN KENDİSİDİR
+        (trailing yok): eksik bir bacak, o dilimin AlgoPro'nun hedefinde
+        değil stopta kapanması demektir.
+
+        GÜVENLİK: yeniden koyma yalnız (a) bacak henüz dolmamışsa,
+        (b) borsada o algoId'ye ait CANLI emir yoksa, (c) tetik fiyatı
+        güncel fiyatın KÂR tarafındaysa (aksi halde anında tetiklenir),
+        (d) toplam TP miktarı canlı pozisyonu AŞMIYORSA yapılır.
+        """
+        direction = sp.signal.direction
+        close_side = "SELL" if direction == Direction.LONG else "BUY"
+        try:
+            algo_orders = await self.client.get_open_algo_orders(symbol)
+        except Exception as exc:
+            self._count_tp_repair("read_failed")
+            self.logger.warning(
+                f"⚠️ {symbol}: TP onarımı için koşullu emirler okunamadı ({exc})"
+            )
+            return 0
+        live_ids = {
+            str(order.get("algoId"))
+            for order in (algo_orders or [])
+            if isinstance(order, dict) and order.get("algoId") is not None
+        }
+
+        try:
+            pos_info = await self.client.get_position_risk(symbol, force_fresh=True)
+            remaining = (
+                abs(float(pos_info.get("positionAmt", 0) or 0)) if pos_info else 0.0
+            )
+        except Exception as exc:
+            self._count_tp_repair("read_failed")
+            self.logger.warning(
+                f"⚠️ {symbol}: TP onarımı için pozisyon okunamadı ({exc})"
+            )
+            return 0
+        if remaining <= 0:
+            return 0
+
+        try:
+            current_price = await self.client.get_current_price(symbol)
+        except Exception:
+            current_price = None
+        if not current_price or float(current_price) <= 0:
+            self._count_tp_repair("no_price")
+            self.logger.warning(
+                f"⚠️ {symbol}: TP onarımı için canlı fiyat yok — atlandı "
+                f"(anında tetiklenecek bir emir konulamaz)"
+            )
+            return 0
+
+        plan = sp.plan
+        legs = (
+            (
+                1,
+                float(getattr(plan, "tp1_price", 0.0) or 0.0),
+                float(getattr(plan, "tp1_quantity", 0.0) or 0.0),
+                getattr(plan, "tp1_algo_id", None),
+                bool(getattr(sp, "tp1_filled", False) or sp.tp1_done),
+            ),
+            (
+                2,
+                float(getattr(plan, "tp2_price", 0.0) or 0.0),
+                float(getattr(plan, "tp2_quantity", 0.0) or 0.0),
+                getattr(plan, "tp2_algo_id", None),
+                bool(sp.tp2_done),
+            ),
+            (
+                3,
+                float(getattr(plan, "tp3_price", 0.0) or 0.0),
+                float(getattr(plan, "tp3_quantity", 0.0) or 0.0),
+                getattr(plan, "tp3_algo_id", None),
+                bool(getattr(sp, "tp3_done", False)),
+            ),
+        )
+
+        # Canlı emirlerin tükettiği miktar düşülür; kalan bütçe kadar konur.
+        budget = remaining
+        for _index, _price, qty, algo_id, done in legs:
+            if not done and algo_id and str(algo_id) in live_ids:
+                budget -= qty
+
+        placed = 0
+        for index, price, qty, algo_id, done in legs:
+            if done or price <= 0 or qty <= 0:
+                continue
+            if algo_id and str(algo_id) in live_ids:
+                continue
+            self._count_tp_repair("missing")
+            if not self._tp_price_is_ahead(direction, float(current_price), price):
+                self._count_tp_repair("skipped_wrong_side")
+                self.logger.warning(
+                    f"⚠️ {symbol}: TP{index} emri EKSİK ama tetik fiyatı "
+                    f"({price}) güncel fiyatın ({current_price}) yanlış "
+                    f"tarafında — yeniden konulmadı (anında tetiklenirdi)",
+                    extra={"trade": True},
+                )
+                continue
+            size = min(qty, budget)
+            if size <= 0:
+                self._count_tp_repair("skipped_no_budget")
+                continue
+            try:
+                order = await self.client.place_take_profit(
+                    symbol=symbol, side=close_side, stop_price=price, quantity=size
+                )
+            except Exception as exc:
+                self._count_tp_repair("replace_failed")
+                self.logger.error(
+                    f"⚠️ {symbol}: TP{index} yeniden konulamadı ({exc}); "
+                    f"pozisyon SL ile korunuyor"
+                )
+                continue
+            new_id = order.get("algoId") or order.get("orderId") if isinstance(order, dict) else None
+            if new_id is not None:
+                setattr(plan, f"tp{index}_algo_id", str(new_id))
+            budget -= size
+            placed += 1
+            self._count_tp_repair("replaced")
+            self.logger.warning(
+                f"🔧 {symbol}: EKSİK TP{index} yeniden kondu "
+                f"({size} @ {price}, algoId={new_id})",
+                extra={"trade": True},
+            )
+        return placed
+
+    @staticmethod
+    def _tp_price_is_ahead(
+        direction: Direction, current_price: float, price: float
+    ) -> bool:
+        """TP tetik fiyatı güncel fiyatın KÂR tarafında mı? (LONG: üstünde)"""
+        if price <= 0 or current_price <= 0:
+            return False
+        if direction == Direction.LONG:
+            return price > current_price
+        return price < current_price
 
     # ------------------------------------------------------------------
     # Restart kurtarma
@@ -353,7 +527,16 @@ class FollowerExitManager(ExitManager):
                 f"TP parçaları 1/3 varsayımıyla kuruluyor"
             )
         part1, part2, part3 = split_three_quantities(quantity, step_size)
-        tp_prices = self._live_tp_prices(algo_orders, direction, trade.entry_price)
+        # TP FİYATLARI: canlı emirler BİRİNCİL kaynaktır (borsadaki gerçek),
+        # defter notundaki AlgoPro seviyeleri (`ap_tp1..3`) YEDEKTİR. Bir TP
+        # emri düşmüşse fiyatı yalnız notta vardır — yoksa eksik bacak
+        # yeniden KONULAMAZ (D20a bulgu 9).
+        live_tps = self._live_tp_prices(algo_orders, direction, trade.entry_price)
+        note_levels = parse_ledger_levels(getattr(trade, "signal_reason", ""))
+        tp_prices = tuple(
+            live if live and live > 0 else float(note_levels.get(key) or 0.0)
+            for live, key in zip(live_tps, ("tp1", "tp2", "tp3"))
+        )
 
         tp1_done = await self._confirmed_algo_fill(
             symbol=symbol,
@@ -391,6 +574,10 @@ class FollowerExitManager(ExitManager):
         # çağrılmaz (takipçide trailing yoktur, telafi eden ikinci yol yok) ve
         # pozisyonun 2/3'ü tam risk stopuyla taşınır. Bayrağı düşürerek BE'yi
         # yeniden denenebilir kıl — fill kanıtı zaten her turda aranıyor.
+        # DOLUM OLGUSU ile BE EYLEMİ ayrıdır: aşağıda `tp1_done` BE'yi
+        # yeniden denemek için düşürülebilir, ama TP1'in DOLDUĞU gerçeği
+        # merdiven aritmetiği için korunmalıdır (bulgu 9).
+        tp1_filled = bool(tp1_done)
         if tp1_done and not self._is_at_least_as_protective(
             direction, current_stop, breakeven_price
         ):
@@ -478,6 +665,7 @@ class FollowerExitManager(ExitManager):
             plan=plan,
             entry_candle_time=entry_candle_time,
             tp1_done=tp1_done,
+            tp1_filled=tp1_filled or tp2_done or tp3_done,
             tp2_done=tp2_done,
             tp3_done=tp3_done,
             meta={"recovered": True},
@@ -488,6 +676,17 @@ class FollowerExitManager(ExitManager):
             f"(canlı_miktar={amt}, tp1={tp1_done}, tp2={tp2_done}, tp3={tp3_done})",
             extra={"trade": True},
         )
+        # KAYIP TP EMİRLERİNİ YENİDEN KOY (bulgu 9): restart sırasında bir TP
+        # emri iptal edilmiş/konulamamış olabilir. Takipçide TP'ler ÇIKIŞIN
+        # KENDİSİDİR; eksik bacak o dilimin stopta kapanması demektir.
+        # Hata kurtarmayı DÜŞÜRMEZ (SL zaten doğrulandı).
+        try:
+            await self.ensure_tp_orders(symbol, sp)
+        except Exception as exc:
+            self.logger.error(
+                f"⚠️ recover(): {symbol} eksik TP onarımı başarısız ({exc}); "
+                f"pozisyon SL ile korunuyor"
+            )
         return True
 
     @staticmethod

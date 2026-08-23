@@ -159,16 +159,34 @@ class TestFollowerEventValidation:
 
 
 class TestFollowerStatus:
-    async def test_status_without_engine_is_empty(self, monkeypatch):
+    @pytest.fixture
+    def follower_mode(self, monkeypatch):
+        monkeypatch.setattr(main_module.settings, "bot_mode", "follower")
+        return True
+
+    async def test_status_without_engine_is_empty(self, monkeypatch, follower_mode):
         monkeypatch.setattr(main_module, "follower_engine", None)
         status = await main_module.follower_status()
         assert status["mode"] == "follower"
         assert status["running"] is False
         assert status["positions"] == []
 
-    async def test_status_with_engine(self, follower_ready):
+    async def test_status_with_engine(self, follower_ready, follower_mode):
         status = await main_module.follower_status()
         assert status == {"mode": "follower", "running": True}
+
+    async def test_status_is_404_in_scalper_mode(self, monkeypatch):
+        """MOD İZOLASYONU (ana oturum eki F): yanlış halkada 404.
+
+        Düzeltme olmadan KIRMIZI: scalper halkası boş bir "takipçi durumu"
+        döndürüyor ve operatöre "takipçi çalışmıyor / pozisyon yok" izlenimi
+        veriyordu — oysa takipçi AYRI bir süreçtedir (:9093).
+        """
+        monkeypatch.setattr(main_module.settings, "bot_mode", "scalper")
+        monkeypatch.setattr(main_module, "follower_engine", None)
+        with pytest.raises(HTTPException) as exc:
+            await main_module.follower_status()
+        assert exc.value.status_code == 404
 
 
 class TestTvSignalForwarding:
@@ -197,7 +215,7 @@ class TestTvSignalForwarding:
         body = f"{REAL_SELL} secret={TV_SECRET}"
         await main_module.tradingview_webhook(_FakeRequest(body.encode(), {}))
         assert len(forwarded) == 1
-        assert forwarded[0][1] == "algopro"
+        assert forwarded[0][0] == body
 
     async def test_exit_event_forwarded_before_422(self, tv_ready, forwarded):
         """EXIT/TP/SL HIT mesajları ana botta 422 alır ama İLETİLİR."""
@@ -206,7 +224,25 @@ class TestTvSignalForwarding:
             await main_module.tradingview_webhook(_FakeRequest(body.encode(), {}))
         assert exc.value.status_code == 422
         assert len(forwarded) == 1
-        assert forwarded[0][1] == "algopro"
+        assert forwarded[0][0] == body
+
+    async def test_bridge_does_not_depend_on_source_allowlist(
+        self, tv_ready, forwarded, monkeypatch
+    ):
+        """Bulgu 5: `?src=` ve TV_SOURCE_ALLOWLIST iletim kararına GİRMEZ.
+
+        Allowlist BOŞALTILSA ve `?src=` allowlist DIŞINDA olsa bile gerçek
+        AlgoPro gövdesi köprüye verilir; kararı köprü (gövde tanıyıcısı)
+        verir.
+        """
+        monkeypatch.setattr(main_module.settings, "tv_source_allowlist", "")
+        body = f"{REAL_SELL} secret={TV_SECRET}"
+        await main_module.tradingview_webhook(
+            _FakeRequest(body.encode(), {"src": "bilinmeyen"})
+        )
+        assert len(forwarded) == 1
+        assert forwarded[0][0] == body
+        assert forwarded[0][1] == "bilinmeyen"
 
     async def test_wrong_secret_403_is_never_forwarded(self, tv_ready, forwarded):
         body = f"{REAL_SL_HIT} secret=yanlis"
@@ -215,13 +251,13 @@ class TestTvSignalForwarding:
         assert exc.value.status_code == 403
         assert forwarded == []
 
-    async def test_non_algopro_source_forwarder_sees_it_but_skips(
+    async def test_non_algopro_body_forwarder_sees_it_but_skips(
         self, tv_ready, forwarded
     ):
-        """Köprü çağrılır ama kaynak 'algopro' değilse iletim YAPMAZ.
+        """Köprü çağrılır ama gövde AlgoPro biçiminde değilse iletmez.
 
         (Filtre `maybe_forward_algopro_event` içindedir — bkz.
-        tests/test_follower_forwarder.py::TestSourceFiltering.)
+        tests/test_follower_forwarder.py::TestBodyRecognizer.)
         """
         body = json.dumps({"secret": TV_SECRET, "symbol": "BTCUSDT", "side": "buy"})
         await main_module.tradingview_webhook(

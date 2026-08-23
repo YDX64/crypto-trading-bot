@@ -28,6 +28,8 @@ from src.strategies.follower.types import (
     FollowerRejected,
     LeverageBracket,
     MessageLevels,
+    format_price,
+    parse_ledger_levels,
 )
 from src.strategies.scalper.types import Direction
 
@@ -47,6 +49,9 @@ def _cfg(**overrides):
         follower_max_sl_pct=5.0,
         follower_sl_atr_mult=3.0,
         follower_atr_len=14,
+        # Boyutlama testleri SAF FORMÜLÜ ölçer; ücret eşiği kapısı (varsayılan
+        # 1.0 = AÇIK) ayrı bir sınıfta test edilir (TestFeeThreshold).
+        follower_min_tp1_fee_ratio=0.0,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -370,9 +375,44 @@ class TestParseBrackets:
     def test_non_list_payload(self):
         assert parse_brackets("boom") == []
 
+    def test_zero_maint_margin_ratio_is_invalid(self):
+        """Bulgu 9: mmr==0 bir dilim DEĞİL, bozuk bir satırdır.
+
+        Sıfır bakım marjı `_guards_ok`'un mmr kapısını dişsiz bırakır
+        (1/lev − 0 hep büyük çıkar) ve 100x'te likidasyon mesafesini
+        olduğundan uzak gösterirdi. Düzeltme olmadan bu test KIRMIZIDIR.
+        """
+        payload = [
+            {
+                "symbol": "BTCUSDT",
+                "brackets": [
+                    {
+                        "initialLeverage": 125,
+                        "notionalCap": 50000,
+                        "notionalFloor": 0,
+                        "maintMarginRatio": 0,
+                    }
+                ],
+            }
+        ]
+        assert parse_brackets(payload) == []
+
+    def test_all_zero_mmr_rows_leave_the_list_empty_and_entry_is_refused(self):
+        """Boş dilim listesi = fail-closed (giriş yok) — zincir korunur."""
+        with pytest.raises(FollowerRejected) as exc:
+            build_plan(
+                symbol="BTCUSDT",
+                direction=Direction.LONG,
+                levels=_levels(0.30),
+                equity_usdt=1000.0,
+                brackets=[],
+                cfg=_cfg(),
+            )
+        assert exc.value.code == "no_bracket"
+
 
 class TestFeeThreshold:
-    """ÜCRET EŞİĞİ — ölçüm (kapı varsayılan KAPALI, bkz. D20).
+    """ÜCRET EŞİĞİ — kapı VARSAYILAN AÇIK (ratio 1.0, bkz. D20/D20a).
 
     `sl_roi = lev × sl_pct`, `tp1_roi = RR1 × sl_roi`. Kaldıraç LEV_MAX'e
     KIRPILDIĞINDA `tp1_roi` gidiş-dönüş komisyonun altına düşer. Bu bir
@@ -414,16 +454,41 @@ class TestFeeThreshold:
         assert plan.roundtrip_fee_roi_pct == pytest.approx(fee_roi)
         assert plan.as_dict()["tp1_covers_fees"] is covers
 
-    def test_gate_is_disabled_by_default(self):
+    def test_gate_is_enabled_by_default(self):
+        """Bulgu 3: VARSAYILAN 1.0 — BTC örneği (sl %0.08) artık AÇILMAZ.
+
+        Düzeltme olmadan bu test KIRMIZIDIR (eski varsayılan 0.0 = kapalı,
+        plan sorunsuz kurulurdu).
+        """
+        cfg = SimpleNamespace(
+            **{
+                k: v
+                for k, v in vars(_cfg()).items()
+                if k != "follower_min_tp1_fee_ratio"
+            }
+        )
+        with pytest.raises(FollowerRejected) as exc:
+            build_plan(
+                symbol="BTCUSDT",
+                direction=Direction.LONG,
+                levels=_levels(0.08),
+                equity_usdt=1000.0,
+                brackets=FREE_BRACKET,
+                cfg=cfg,
+            )
+        assert exc.value.code == "fee_gate"
+
+    def test_gate_can_be_disabled_by_user_decision(self):
+        """`FOLLOWER_MIN_TP1_FEE_RATIO=0` kapıyı KAPATIR (kullanıcı kararı)."""
         plan = build_plan(
             symbol="BTCUSDT",
             direction=Direction.LONG,
             levels=_levels(0.08),
             equity_usdt=1000.0,
             brackets=FREE_BRACKET,
-            cfg=_cfg(),
+            cfg=_cfg(follower_min_tp1_fee_ratio=0.0),
         )
-        assert plan.tp_roi_pct[0] < plan.roundtrip_fee_roi_pct  # yine de açılır
+        assert plan.tp_roi_pct[0] < plan.roundtrip_fee_roi_pct
 
     def test_gate_rejects_when_enabled(self):
         with pytest.raises(FollowerRejected) as exc:
@@ -435,7 +500,57 @@ class TestFeeThreshold:
                 brackets=FREE_BRACKET,
                 cfg=_cfg(follower_min_tp1_fee_ratio=1.0),
             )
-        assert exc.value.code == "fee_threshold"
+        assert exc.value.code == "fee_gate"
+
+    @pytest.mark.parametrize("sl_pct,accepted", [(0.19, False), (0.21, True)])
+    def test_threshold_is_leverage_independent(self, sl_pct, accepted):
+        """Aritmetik: sl_pct ≥ ratio × 2 × oran × 100 / RR1 = %0.20.
+
+        Kaldıraç EŞİTLİĞİN İKİ TARAFINDA da çarpandır; eşik yalnız stop
+        mesafesine bağlıdır (D20 "ücret eşiği" notu).
+        """
+        cfg = _cfg(follower_min_tp1_fee_ratio=1.0)
+        if accepted:
+            plan = build_plan(
+                symbol="BTCUSDT",
+                direction=Direction.LONG,
+                levels=_levels(sl_pct),
+                equity_usdt=1000.0,
+                brackets=FREE_BRACKET,
+                cfg=cfg,
+            )
+            assert plan.tp_roi_pct[0] >= plan.roundtrip_fee_roi_pct
+        else:
+            with pytest.raises(FollowerRejected) as exc:
+                build_plan(
+                    symbol="BTCUSDT",
+                    direction=Direction.LONG,
+                    levels=_levels(sl_pct),
+                    equity_usdt=1000.0,
+                    brackets=FREE_BRACKET,
+                    cfg=cfg,
+                )
+            assert exc.value.code == "fee_gate"
+
+    def test_real_exchange_fee_rate_is_used_when_given(self):
+        """Bulgu 3: kapı GERÇEK taker oranıyla çalışır (VIP indirimi vb.).
+
+        Borsadan okunan oran %0.02 ise komisyon ROI'si %4'e düşer ve
+        BTC örneği (TP1 %4) eşiği ZAR ZOR geçer; config'in %0.05'iyle
+        reddedilirdi.
+        """
+        cfg = _cfg(follower_min_tp1_fee_ratio=1.0)
+        plan = build_plan(
+            symbol="BTCUSDT",
+            direction=Direction.LONG,
+            levels=_levels(0.08),
+            equity_usdt=1000.0,
+            brackets=FREE_BRACKET,
+            cfg=cfg,
+            fee_rate=0.0002,
+        )
+        assert plan.roundtrip_fee_roi_pct == pytest.approx(4.0)
+        assert roundtrip_fee_roi_pct(100, cfg, 0.0002) == pytest.approx(4.0)
 
     def test_gate_passes_when_tp1_covers_fees(self):
         plan = build_plan(
@@ -460,3 +575,56 @@ class TestFeeThreshold:
         note = plan.ledger_note()
         assert "tp1_roi=4.00" in note
         assert "fee_roi=10.00" in note
+
+
+class TestLedgerNoteCarriesAlgoProLevels:
+    """D20a bulgu 9: defter notu MUTLAK seviyeleri de taşır.
+
+    Restart kurtarması TP fiyatlarını canlı emirlerden okur; düşmüş bir
+    emrin fiyatı BAŞKA HİÇBİR YERDE yoktu → eksik bacak yeniden konulamıyordu.
+    """
+
+    def test_note_carries_absolute_levels(self):
+        plan = build_plan(
+            symbol="BTCUSDT",
+            direction=Direction.LONG,
+            levels=_levels(0.30),
+            equity_usdt=1000.0,
+            brackets=FREE_BRACKET,
+            cfg=_cfg(),
+        )
+        note = plan.ledger_note()
+        for key in ("ap_sl=", "ap_tp1=", "ap_tp2=", "ap_tp3="):
+            assert key in note
+        parsed = parse_ledger_levels(note)
+        assert parsed["sl"] == pytest.approx(plan.levels.stop)
+        assert parsed["tp1"] == pytest.approx(plan.levels.tp1)
+        assert parsed["tp3"] == pytest.approx(plan.levels.tp3)
+
+    def test_note_stays_within_the_ledger_field(self):
+        """`signal_reason` 480 karakterle kırpılır — not sığmalı."""
+        plan = build_plan(
+            symbol="BTCUSDT",
+            direction=Direction.LONG,
+            levels=_levels(0.30),
+            equity_usdt=1000.0,
+            brackets=FREE_BRACKET,
+            cfg=_cfg(),
+        )
+        assert len(plan.ledger_note()) < 300
+
+    @pytest.mark.parametrize(
+        "value", [77167.77, 0.00012345, 1.0, 123456.789012, 0.5]
+    )
+    def test_price_formatting_is_lossless(self, value):
+        """`:g` 6 anlamlı haneye kırpar — bir stop seviyesinde bu KAYIPTIR."""
+        assert float(format_price(value)) == pytest.approx(value, rel=1e-9)
+
+    def test_broken_note_yields_no_levels(self):
+        assert parse_ledger_levels("saçma;metin=1") == {
+            "sl": None,
+            "tp1": None,
+            "tp2": None,
+            "tp3": None,
+        }
+        assert parse_ledger_levels(None)["sl"] is None

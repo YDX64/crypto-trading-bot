@@ -57,7 +57,12 @@ def _trade(quantity: float, **overrides):
         tp2_algo_id="502",
         tp3_algo_id="503",
         entry_order_id="1",
-        signal_reason="algopro:entry",
+        # Defter notu AlgoPro seviyelerini taşır (D20a bulgu 9): düşen bir
+        # TP emrinin fiyatı yalnız burada bulunabilir.
+        signal_reason=(
+            "algopro:entry;tf=1;follower;lev=50;levels=message;"
+            "ap_sl=99;ap_tp1=100.5;ap_tp2=101;ap_tp3=101.5"
+        ),
         opened_at=datetime.now(timezone.utc),
     )
     base.update(overrides)
@@ -84,6 +89,9 @@ def _manager(*, live_amt: float, stop_price: float, step: float = STEP,
         get_position_risk=AsyncMock(return_value={"positionAmt": live_amt}),
         get_open_algo_orders=AsyncMock(return_value=_algo_orders(stop_price)),
         get_symbol_filters=AsyncMock(return_value={"stepSize": step}),
+        # Eksik TP onarımı (D20a bulgu 9) canlı fiyat + TP emri yolunu kullanır.
+        get_current_price=AsyncMock(return_value=ENTRY),
+        place_take_profit=AsyncMock(return_value={"algoId": 777}),
     )
     manager = FollowerExitManager(
         client,
@@ -192,3 +200,51 @@ class TestRecoveredBreakEvenReconciliation:
         assert sp.tp1_done is False
         assert sp.tp2_done is False
         assert sp.tp3_done is False
+
+
+class TestRecoveryRepairsMissingTpOrders:
+    """D20a bulgu 9: restart kurtarması KAYIP TP emirlerini yeniden koyar.
+
+    Takipçide TP'ler ÇIKIŞIN KENDİSİDİR (trailing yok). Restart sırasında
+    (ya da bir kapanış turunun `cancel_all_open_orders`'ında) düşen bir
+    bacak, o dilimin AlgoPro hedefinde değil STOPTA kapanması demektir.
+    Düzeltme olmadan bu testler KIRMIZIDIR (kurtarma eksik bacağı görmezdi).
+    """
+
+    async def test_missing_leg_is_replaced_after_restart(self):
+        quantity = 12 * STEP
+        manager = _manager(live_amt=quantity, stop_price=99.0)
+        # TP3 (algoId 503) borsada YOK.
+        manager.client.get_open_algo_orders = AsyncMock(
+            return_value=[
+                order
+                for order in _algo_orders(99.0)
+                if order["algoId"] != "503"
+            ]
+        )
+
+        assert await manager._recover_one(_trade(quantity)) is True
+
+        manager.client.place_take_profit.assert_awaited_once()
+        kwargs = manager.client.place_take_profit.await_args.kwargs
+        assert kwargs["stop_price"] == pytest.approx(101.5)
+        assert kwargs["side"] == "SELL"  # LONG pozisyonu kapatır
+        assert manager.tp_repair_snapshot()["replaced"] == 1
+
+    async def test_complete_ladder_is_left_alone(self):
+        quantity = 12 * STEP
+        manager = _manager(live_amt=quantity, stop_price=99.0)
+
+        assert await manager._recover_one(_trade(quantity)) is True
+
+        manager.client.place_take_profit.assert_not_called()
+
+    async def test_repair_failure_never_breaks_recovery(self):
+        quantity = 12 * STEP
+        manager = _manager(live_amt=quantity, stop_price=99.0)
+        manager.client.get_open_algo_orders = AsyncMock(
+            side_effect=[_algo_orders(99.0), RuntimeError("ağ")]
+        )
+
+        # Kurtarma BAŞARILI kalır: SL doğrulandı, TP onarımı yalnız bir ek.
+        assert await manager._recover_one(_trade(quantity)) is True

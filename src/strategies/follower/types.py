@@ -40,6 +40,52 @@ LEVEL_SOURCE_MIXED = "mixed"       # SL mesajdan, eksik TP'ler RR ile türetildi
 LEVEL_SOURCE_ATR = "atr"           # mesajda seviye yok → k×ATR kuralı
 
 
+def format_price(value: Optional[float]) -> str:
+    """Fiyatı defter notu için KAYIPSIZ biçimle (``:g`` 6 haneye kırpar!).
+
+    ``f"{77167.77:g}"`` → ``77167.8``: bir stop/TP seviyesinde 0.03 birimlik
+    bu kayıp, yeniden konan emri YANLIŞ fiyata koyardı.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "0"
+    if not (number == number) or number in (float("inf"), float("-inf")):
+        return "0"
+    text = f"{number:.10f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def parse_ledger_levels(note: Optional[str]) -> Dict[str, Optional[float]]:
+    """``ledger_note()`` metninden ``ap_sl``/``ap_tp1..3`` seviyelerini oku."""
+    out: Dict[str, Optional[float]] = {
+        "sl": None,
+        "tp1": None,
+        "tp2": None,
+        "tp3": None,
+    }
+    text = str(note or "")
+    if not text:
+        return out
+    for chunk in text.replace(",", ";").split(";"):
+        key, sep, raw = chunk.strip().partition("=")
+        if not sep:
+            continue
+        key = key.strip().lower()
+        if not key.startswith("ap_"):
+            continue
+        field = key[3:]
+        if field not in out:
+            continue
+        try:
+            value = float(raw.strip())
+        except (TypeError, ValueError):
+            continue
+        if value > 0 and value == value:
+            out[field] = value
+    return out
+
+
 class FollowerParseError(ValueError):
     """AlgoPro alarm gövdesi çözülemedi (HTTP 422 karşılığı)."""
 
@@ -220,6 +266,12 @@ class FollowerPlan:
         Kullanıcı kararı (2026-08-23): her işlem için lev, sl_pct, sl_roi ve
         margin deftere YAZILIR. Ayrı bir şema alanı açmadan tracker'ın mevcut
         ``k=v;k=v`` notes sözleşmesiyle uyumlu tutulur.
+
+        D20a (bulgu 9): AlgoPro'nun MUTLAK seviyeleri de yazılır
+        (``ap_sl``/``ap_tp1..3``). Restart kurtarması TP fiyatlarını CANLI
+        emirlerden okur; bir emir DÜŞMÜŞSE fiyatı hiçbir yerde yoktu ve
+        eksik bacak yeniden KONULAMIYORDU (o dilim AlgoPro hedefinde değil
+        stopta kapanırdı). Şema değişmeden, aynı `k=v;` sözleşmesiyle.
         """
         return (
             f"follower;lev={self.leverage};sl_pct={self.sl_pct:.4f};"
@@ -227,5 +279,9 @@ class FollowerPlan:
             f"fee_roi={self.roundtrip_fee_roi_pct:.2f};"
             f"margin={self.margin_usdt:.4f};"
             f"lev_target={self.leverage_target};lev_cap={self.leverage_cap_reason};"
-            f"levels={self.levels.source}"
+            f"levels={self.levels.source};"
+            f"ap_sl={format_price(self.levels.stop)};"
+            f"ap_tp1={format_price(self.levels.tp1)};"
+            f"ap_tp2={format_price(self.levels.tp2)};"
+            f"ap_tp3={format_price(self.levels.tp3)}"
         )

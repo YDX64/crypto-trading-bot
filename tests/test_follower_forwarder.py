@@ -62,46 +62,110 @@ def _reset(monkeypatch):
     _FakeClient.raise_exc = None
     _FakeClient.delay = 0.0
     monkeypatch.setattr(fwd.httpx, "AsyncClient", _FakeClient)
+    # Sayaçlar ve uyarı oran-sınırı MODÜL DÜZEYİNDEDİR; testler arasında
+    # sızmasın (aksi halde bir testin tükettiği uyarı kotası diğerini düşürür).
+    fwd.reset_forwarder_stats()
     yield
     _FakeClient.calls = []
+    fwd.reset_forwarder_stats()
 
 
 def _configure(monkeypatch, url="http://127.0.0.1:9093/follower/event", secret="s3cr3t"):
     monkeypatch.setattr(fwd.settings, "follower_forward_url", url, raising=False)
     monkeypatch.setattr(fwd.settings, "follower_forward_secret", secret, raising=False)
     monkeypatch.setattr(
-        fwd.settings, "follower_forward_timeout_seconds", 2.0, raising=False
+        fwd.settings, "follower_forward_timeout_seconds", 20.0, raising=False
     )
 
 
-BODY = "🔴 SELL | BINANCE:BTCUSDT | TF: 1 | Price: 77126.08 | SL: 77167.77"
+# GERÇEK AlgoPro V1.6 gövdesi (TV Desktop sondası, 2026-08-23).
+BODY = (
+    "🔴 SELL | BINANCE:BTCUSDT | TF: 1 | Price: 77126.08 | TQI: .45 | Score: 8 "
+    "| SL: 77167.77 | TP1: 77105.23 | TP2: 77084.39 | TP3: 77063.54"
+)
+SL_HIT_BODY = "🛑 SL HIT | BINANCE:BTCUSDT | TF: 1 | Price: 77167.77"
+
+# Köprünün İLETMEMESİ gereken gövdeler (düşmanca inceleme bulgu 5). Bunların
+# hepsi ESKİ parmak izinden ("| TF:" ya da "| Price:" geçiyor mu?) geçerdi.
+NOT_ALGOPRO_BODIES = [
+    "src=luxosc BTCUSDT long | TF: 1 | Price: 100",
+    "BotV3 sinyal | TF: 15 | Price: 100 | BTCUSDT bullish",
+    "🟢 BUY | BTCUSDT | TF: 1 | Price: 100 | SL: 99 | TP1: 101 | TP2: 102 | TP3: 103",
+    "Bullish reversal on BINANCE:BTCUSDT",
+    "🔴 SELL | BINANCE:BTCUSDT | TF: 1 | Price: 77126.08 | SL: 77167.77",
+]
 
 
-class TestSourceFiltering:
-    @pytest.mark.parametrize("source", ["luxosc", "luxso", "botv3", "tv", "", "news"])
-    async def test_non_algopro_sources_are_not_forwarded(self, monkeypatch, source):
+class TestBodyRecognizer:
+    """Bulgu 5: iletim kararı GÖVDEYE bakar, `?src=`e DEĞİL."""
+
+    @pytest.mark.parametrize("body", NOT_ALGOPRO_BODIES)
+    @pytest.mark.parametrize("source", ["algopro", "luxosc", ""])
+    async def test_non_algopro_bodies_are_never_forwarded(
+        self, monkeypatch, body, source
+    ):
         _configure(monkeypatch)
-        assert fwd.maybe_forward_algopro_event(BODY, source) is None
+        assert fwd.maybe_forward_algopro_event(body, source) is None
         assert _FakeClient.calls == []
 
-    async def test_algopro_is_forwarded(self, monkeypatch):
+    @pytest.mark.parametrize("source", ["algopro", "luxosc", "tv", "", "news"])
+    async def test_real_algopro_body_is_forwarded_regardless_of_src(
+        self, monkeypatch, source
+    ):
+        """`?src=` yanlış/eksik olsa bile GERÇEK AlgoPro alarmı iletilir."""
+        _configure(monkeypatch)
+        task = fwd.maybe_forward_algopro_event(BODY, source)
+        assert task is not None
+        await task
+        assert len(_FakeClient.calls) == 1
+
+    async def test_forward_call_shape(self, monkeypatch):
         _configure(monkeypatch)
         task = fwd.maybe_forward_algopro_event(BODY, "algopro")
         assert task is not None
         await task
-        assert len(_FakeClient.calls) == 1
         call = _FakeClient.calls[0]
         assert call["url"] == "http://127.0.0.1:9093/follower/event"
         assert call["body"] == BODY
         assert call["headers"][fwd.SECRET_HEADER] == "s3cr3t"
-        assert call["timeout"] == 2.0
+        # Bağlantı/yazma KISA, okuma UZUN (bkz. modül başlığı).
+        timeout = call["timeout"]
+        assert timeout.connect == pytest.approx(fwd.CONNECT_TIMEOUT_SECONDS)
+        assert timeout.read == pytest.approx(20.0)
 
-    async def test_case_insensitive_source(self, monkeypatch):
+    async def test_hit_events_are_forwarded(self, monkeypatch):
+        """SL/TP HIT gövdeleri takipçi için KRİTİKTİR — iletilmeli."""
         _configure(monkeypatch)
-        task = fwd.maybe_forward_algopro_event(BODY, "AlgoPro")
+        task = fwd.maybe_forward_algopro_event(SL_HIT_BODY, "")
         assert task is not None
         await task
         assert len(_FakeClient.calls) == 1
+
+    async def test_skipped_bodies_are_counted(self, monkeypatch):
+        _configure(monkeypatch)
+        fwd.reset_forwarder_stats()
+        fwd.maybe_forward_algopro_event(NOT_ALGOPRO_BODIES[0], "algopro")
+        stats = fwd.forwarder_stats()
+        assert stats["counters"]["skipped_not_algopro"] == 1
+        assert stats["last_skipped"]["reason"] == "not_algopro"
+
+    async def test_forwarded_bodies_are_counted(self, monkeypatch):
+        _configure(monkeypatch)
+        fwd.reset_forwarder_stats()
+        task = fwd.maybe_forward_algopro_event(BODY, "algopro")
+        await task
+        counters = fwd.forwarder_stats()["counters"]
+        assert counters["forwarded"] == 1
+        assert counters["forwarded_entry"] == 1
+        assert counters["delivered"] == 1
+
+    async def test_stats_never_contain_the_secret(self, monkeypatch):
+        _configure(monkeypatch, secret="TOP-SECRET-VALUE")
+        fwd.reset_forwarder_stats()
+        fwd.maybe_forward_algopro_event(
+            f"secret=TOP-SECRET-VALUE {NOT_ALGOPRO_BODIES[0]}", "algopro"
+        )
+        assert "TOP-SECRET-VALUE" not in str(fwd.forwarder_stats())
 
 
 class TestDisabledConfiguration:
@@ -185,3 +249,40 @@ class TestSecretIsNeverLogged:
         task = fwd.maybe_forward_algopro_event(BODY, "algopro")
         await task
         assert "secret" not in _FakeClient.calls[0]["url"].lower()
+
+
+class TestFailureWarningsAreRateLimited:
+    """Ana oturum eki: başarısız iletim = sayaç + dakikada 1 WARNING."""
+
+    async def test_repeated_failures_warn_once_per_minute(self, monkeypatch):
+        from src.core.logger import app_logger
+
+        _configure(monkeypatch)
+        fwd.reset_forwarder_stats()
+        _FakeClient.raise_exc = RuntimeError("bağlantı reddedildi")
+        records: list = []
+        sink_id = app_logger.add(lambda message: records.append(str(message)))
+        try:
+            for _ in range(5):
+                await fwd.maybe_forward_algopro_event(BODY, "algopro")
+        finally:
+            app_logger.remove(sink_id)
+
+        counters = fwd.forwarder_stats()["counters"]
+        assert counters["transport_error"] == 5  # hiçbiri kaybolmaz
+        assert counters["suppressed_warnings"] == 4
+        warnings = [r for r in records if "iletemedi" in r]
+        assert len(warnings) == 1
+
+    async def test_rate_limit_is_per_failure_kind(self, monkeypatch):
+        _configure(monkeypatch)
+        fwd.reset_forwarder_stats()
+        _FakeClient.response = _FakeResponse(status_code=503, text="kapalı")
+        await fwd.maybe_forward_algopro_event(BODY, "algopro")
+        _FakeClient.response = _FakeResponse()
+        _FakeClient.raise_exc = RuntimeError("kopuk")
+        await fwd.maybe_forward_algopro_event(BODY, "algopro")
+        counters = fwd.forwarder_stats()["counters"]
+        assert counters["http_error"] == 1
+        assert counters["transport_error"] == 1
+        assert "suppressed_warnings" not in counters

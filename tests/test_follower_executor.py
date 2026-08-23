@@ -52,6 +52,12 @@ def _cfg(**overrides):
         follower_min_sl_pct=0.02,
         follower_max_sl_pct=5.0,
         follower_cooldown_sec=60.0,
+        # Ücret eşiği kapısı VARSAYILAN AÇIKTIR (1.0) ve ölçülen BTC 1m
+        # seviyeleriyle HER girişi reddeder; mekanik testler kapıyı açıkça
+        # kapatır, kapının kendisi TestFeeGate'te test edilir.
+        follower_min_tp1_fee_ratio=0.0,
+        follower_max_signal_drift_pct=0.0,
+        follower_max_event_age_sec=20.0,
         scalper_breakeven_buffer_pct=0.05,
         scalper_taker_fee_pct=0.05,
         scalper_maker_fee_pct=0.02,
@@ -68,6 +74,12 @@ class _FakeClient:
         self.tp_error: Exception | None = None
         self.filled_qty = 0.129
         self.entry_price = 77126.08
+        # Emirden ÖNCEKİ canlı fiyat kapısı (bulgu 1) bunu okur.
+        self.live_price: float | None = 77126.08
+
+    async def get_current_price(self, symbol):
+        self.calls.append("get_current_price")
+        return self.live_price
 
     async def get_symbol_filters(self, symbol):
         return {"stepSize": self.step, "minQty": 0.001, "minNotional": 5}
@@ -105,6 +117,13 @@ class _FakePm:
         self.sl_ok = sl_ok
         self.calls: list = []
         self.sl_kwargs: dict = {}
+        self.emergency_closed: list = []
+        self.emergency_ok = True
+
+    async def emergency_close(self, symbol):
+        self.calls.append("emergency_close")
+        self.emergency_closed.append(symbol)
+        return self.emergency_ok
 
     async def resolve_fill(self, symbol, entry_order):
         self.calls.append("resolve_fill")
@@ -469,7 +488,7 @@ class TestSafetyBudgetAndFeeThreshold:
                 equity_usdt=1000.0,
             )
 
-        assert exc.value.code == "fee_threshold"
+        assert exc.value.code == "fee_gate"
         assert not any(c.startswith("open_market_order") for c in client.calls)
 
     async def test_fee_gate_is_disabled_by_default(self):
@@ -525,3 +544,211 @@ class TestCooldown:
         executor._cooldowns["BTCUSDT"] = far_future
         executor.start_cooldown("BTCUSDT")  # 60 sn — kısaltmamalı
         assert executor._cooldowns["BTCUSDT"] == far_future
+
+
+class TestSignalDriftAndStopSide:
+    """Düşmanca inceleme bulgu 1: taraf kontrolü + sapma kapısı.
+
+    Düzeltme olmadan bu testler KIRMIZIDIR: eski kod canlı fiyata HİÇ
+    bakmadan MARKET emri gönderiyor, dolum stopu geçmişse `abs()` yüzünden
+    bunu göremiyor ve stopu "bütçeye" sıkıştırarak (ya da -2021 sonrası
+    `_reanchor_stop_price` ile) AlgoPro'nun HİÇ SEÇMEDİĞİ bir stop uyduruyordu.
+    """
+
+    async def test_stop_already_passed_before_order_blocks_entry(self):
+        executor, client, pm, _ = _make_executor()
+        # SHORT: stop 77167.77 girişin ÜSTÜNDE. Canlı fiyat stopun da
+        # üstüne çıkmışsa AlgoPro tezi ölmüştür.
+        client.live_price = 77200.0
+        with pytest.raises(FollowerRejected) as exc:
+            await executor.open_position(
+                event=parse_follower_event(SELL_ENTRY),
+                levels=_levels(),
+                equity_usdt=1000.0,
+            )
+        assert exc.value.code == "stop_already_passed"
+        assert not any(c.startswith("open_market_order") for c in client.calls)
+
+    async def test_stale_signal_price_blocks_entry(self):
+        """Sapma > SL mesafesinin %50'si → giriş YOK (türetilmiş varsayılan)."""
+        executor, client, pm, _ = _make_executor()
+        # sl_pct ≈ %0.0541 → sınır ≈ %0.027 (≈ 20.8 birim). 25 birim aşar.
+        client.live_price = 77126.08 + 25.0
+        with pytest.raises(FollowerRejected) as exc:
+            await executor.open_position(
+                event=parse_follower_event(SELL_ENTRY),
+                levels=_levels(),
+                equity_usdt=1000.0,
+            )
+        assert exc.value.code == "signal_drift"
+        assert not any(c.startswith("open_market_order") for c in client.calls)
+
+    async def test_drift_within_limit_still_opens(self):
+        executor, client, pm, _ = _make_executor()
+        client.live_price = 77126.08 + 5.0  # %0.0065 < %0.027
+        position = await executor.open_position(
+            event=parse_follower_event(SELL_ENTRY),
+            levels=_levels(),
+            equity_usdt=1000.0,
+        )
+        assert position is not None
+
+    async def test_explicit_drift_limit_overrides_the_derived_default(self):
+        cfg = _cfg(follower_max_signal_drift_pct=0.001)
+        executor, client, pm, _ = _make_executor(cfg)
+        client.live_price = 77126.08 + 5.0
+        with pytest.raises(FollowerRejected) as exc:
+            await executor.open_position(
+                event=parse_follower_event(SELL_ENTRY),
+                levels=_levels(cfg),
+                equity_usdt=1000.0,
+            )
+        assert exc.value.code == "signal_drift"
+
+    async def test_unreadable_live_price_is_fail_closed(self):
+        executor, client, pm, _ = _make_executor()
+        client.live_price = None
+        with pytest.raises(FollowerRejected) as exc:
+            await executor.open_position(
+                event=parse_follower_event(SELL_ENTRY),
+                levels=_levels(),
+                equity_usdt=1000.0,
+            )
+        assert exc.value.code == "live_price"
+        assert not any(c.startswith("open_market_order") for c in client.calls)
+
+    async def test_fill_past_the_stop_closes_and_never_reanchors(self):
+        """Dolum stopu geçtiyse: reduce-only kapat, stop KOYMA/ÇAPALAMA."""
+        executor, client, pm, tracker = _make_executor()
+
+        async def _late_fill(symbol, entry_order):
+            pm.calls.append("resolve_fill")
+            return 77200.0, 0.129  # SHORT dolumu stopun (77167.77) ÜSTÜNDE
+
+        pm.resolve_fill = _late_fill
+        position = await executor.open_position(
+            event=parse_follower_event(SELL_ENTRY),
+            levels=_levels(),
+            equity_usdt=1000.0,
+        )
+        assert position is None
+        assert pm.emergency_closed == ["BTCUSDT"]
+        # Ne SL emri, ne TP emri: uydurulmuş stop YOK.
+        assert "place_stop_loss_or_close" not in pm.calls
+        assert client.tp_orders == []
+        assert executor.reject_snapshot()["stop_already_passed"] == 1
+        # Defter satırı yazıldı (sessiz kalma yok).
+        notes = tracker.record_failed_execution.await_args.kwargs["notes"]
+        assert "stop_already_passed" in notes
+
+    async def test_unclosable_position_after_late_fill_raises(self):
+        """Kapatılamıyorsa korumasız pozisyon latch'i (motor entry-halt kurar)."""
+        from src.trading.position_manager import UnprotectedPositionError
+
+        executor, client, pm, _ = _make_executor()
+        pm.emergency_ok = False
+
+        async def _late_fill(symbol, entry_order):
+            return 77200.0, 0.129
+
+        pm.resolve_fill = _late_fill
+        with pytest.raises(UnprotectedPositionError):
+            await executor.open_position(
+                event=parse_follower_event(SELL_ENTRY),
+                levels=_levels(),
+                equity_usdt=1000.0,
+            )
+
+    async def test_sl_pct_fill_is_measured_from_the_real_stop(self):
+        """Telemetri GERÇEKTEN KONAN stoptan yazılır (`effectiveStopPrice`)."""
+        executor, client, pm, _ = _make_executor()
+
+        async def _shifted_stop(**kwargs):
+            pm.calls.append("place_stop_loss_or_close")
+            pm.sl_kwargs = dict(kwargs)
+            return {"algoId": 500, "effectiveStopPrice": 77160.0}
+
+        pm.place_stop_loss_or_close = _shifted_stop
+        position = await executor.open_position(
+            event=parse_follower_event(SELL_ENTRY),
+            levels=_levels(),
+            equity_usdt=1000.0,
+        )
+        expected = abs(77126.08 - 77160.0) / 77126.08 * 100.0
+        assert position.meta["plan"]["sl_pct_fill"] == pytest.approx(expected)
+
+    async def test_tp_on_the_wrong_side_of_the_fill_is_not_placed(self):
+        """LONG'da TP dolumun ÜSTÜNDE olmalı; SHORT'ta altında (bulgu 9)."""
+        executor, client, pm, _ = _make_executor()
+
+        async def _slipped_fill(symbol, entry_order):
+            return 77100.0, 0.129  # TP1 (77105.23) artık dolumun ÜSTÜNDE
+
+        pm.resolve_fill = _slipped_fill
+        position = await executor.open_position(
+            event=parse_follower_event(SELL_ENTRY),
+            levels=_levels(),
+            equity_usdt=1000.0,
+        )
+        assert position is not None
+        prices = [order["price"] for order in client.tp_orders]
+        assert 77105.23 not in prices  # anında tetiklenip zararla kapatırdı
+        assert prices == pytest.approx([77084.39, 77063.54])
+        assert executor.reject_snapshot()["tp_wrong_side"] == 1
+
+
+class TestFeeGateDefault:
+    """Bulgu 3: ücret eşiği kapısı VARSAYILAN AÇIK (ratio 1.0)."""
+
+    def _cfg_without_ratio(self):
+        return SimpleNamespace(
+            **{
+                k: v
+                for k, v in vars(_cfg()).items()
+                if k != "follower_min_tp1_fee_ratio"
+            }
+        )
+
+    async def test_measured_btc_entry_is_refused_by_default(self):
+        cfg = self._cfg_without_ratio()
+        executor, client, pm, _ = _make_executor(cfg)
+        with pytest.raises(FollowerRejected) as exc:
+            await executor.open_position(
+                event=parse_follower_event(SELL_ENTRY),
+                levels=_levels(cfg),
+                equity_usdt=1000.0,
+            )
+        assert exc.value.code == "fee_gate"
+        # Kapı EMİRDEN ÖNCEDİR: hiçbir emir gönderilmedi.
+        assert not any(c.startswith("open_market_order") for c in client.calls)
+
+    async def test_gate_uses_the_real_exchange_commission_rate(self):
+        """Borsadan okunan taker oranı düşükse aynı giriş GEÇER.
+
+        Config oranı (%0.05) ile reddedilirdi — kapı gerçek oranla çalışmalı.
+        """
+        cfg = self._cfg_without_ratio()
+        executor, client, pm, _ = _make_executor(cfg)
+
+        async def _cheap(symbol):
+            return {"takerCommissionRate": "0.0001", "makerCommissionRate": "0.0001"}
+
+        client.get_user_commission_rate = _cheap
+        position = await executor.open_position(
+            event=parse_follower_event(SELL_ENTRY),
+            levels=_levels(cfg),
+            equity_usdt=1000.0,
+        )
+        assert position is not None
+        assert position.meta["plan"]["tp1_covers_fees_real"] is True
+
+    async def test_zero_ratio_disables_the_gate(self):
+        executor, client, pm, _ = _make_executor(
+            _cfg(follower_min_tp1_fee_ratio=0.0)
+        )
+        position = await executor.open_position(
+            event=parse_follower_event(SELL_ENTRY),
+            levels=_levels(),
+            equity_usdt=1000.0,
+        )
+        assert position is not None

@@ -7,36 +7,96 @@
 # Kullanım: scripts/server_deploy.sh [hedef-ref]   (varsayılan: origin/main)
 #   DEPLOY_SKIP_TESTS=1   testleri atla (acil geri alma için)
 #   DEPLOY_NO_RESTART=1   yalnız kodu güncelle, süreci yeniden başlatma
-#   REPO_DIR / PROGRAM / HEALTH_URL   halka için dizin/program/sağlık uç noktası (deploy.sh --ring mainnet ayarlar)
-#   RING=testnet|follower|mainnet   yalnız log satırları, halka-özel entry-halt dosyası ve
-#                                   mainnet'e özel .env ön kontrolü için (rollback mantığı ORTAK)
+#   RING=testnet|follower|mainnet   HALKA. REPO_DIR/PROGRAM/HEALTH_URL/HALT_FILE
+#                                   ve .env BOT_MODE beklentisi BUNDAN TÜRER.
+#   REPO_DIR / PROGRAM / HEALTH_URL   açık override — halka ile TUTARLI olmalı;
+#                                   PROGRAM/HEALTH_URL uyuşmazlığı = HATA,
+#                                   REPO_DIR uyuşmazlığı için DEPLOY_REPO_DIR_OVERRIDE=1
+#                                   (yalnız test koşumu / kurtarma)
 set -euo pipefail
 
-REPO_DIR="${REPO_DIR:-/opt/tradingbot-v2}"
-PROGRAM="${PROGRAM:-tradingbot_v2}"
-TARGET="${1:-origin/main}"
-PY="$REPO_DIR/.venv/bin/python"
-HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:9091/api/status}"
 RING="${RING:-testnet}"
-LOG="$REPO_DIR/logs/deploy.log"
+TARGET="${1:-origin/main}"
 STAMP="$(date -u +%Y%m%d-%H%M%S)"
+
+# ── Halka → dizin/program/sağlık uç noktası (TEK GERÇEK KAYNAK) ────────────
+# Düşmanca inceleme (2026-08-23): RING yalnız log satırlarını ve HALT_FILE
+# adını etkiliyordu; REPO_DIR/PROGRAM/HEALTH_URL bağımsız env'lerdi. Sonuç:
+# `RING=follower` ile scalper programı (`tradingbot_v2`) yeniden başlatılabilir
+# ve o halkanın entry-halt kilidi ATLANABİLİRDİ. Artık üçü de halkadan türer;
+# açık override yalnız halka ile TUTARLIYSA kabul edilir.
+case "$RING" in
+  testnet)
+    RING_REPO_DIR="/opt/tradingbot-v2";   RING_PROGRAM="tradingbot_v2"
+    RING_HEALTH_URL="http://127.0.0.1:9091/api/status"
+    RING_HALT_FILE="state/scalper_entry_halt.json" ;;
+  follower)
+    RING_REPO_DIR="/opt/tradingbot-ap";   RING_PROGRAM="tradingbot_ap"
+    RING_HEALTH_URL="http://127.0.0.1:9093/api/status"
+    RING_HALT_FILE="state/follower_entry_halt.json" ;;
+  mainnet)
+    RING_REPO_DIR="/opt/tradingbot-main"; RING_PROGRAM="tradingbot_main"
+    RING_HEALTH_URL="http://127.0.0.1:9092/api/status"
+    RING_HALT_FILE="state/scalper_entry_halt.json" ;;
+  *)
+    echo "HATA: geçersiz RING: '$RING' (testnet|follower|mainnet olmalı)" >&2
+    exit 1 ;;
+esac
+
+REPO_DIR="${REPO_DIR:-$RING_REPO_DIR}"
+PROGRAM="${PROGRAM:-$RING_PROGRAM}"
+HEALTH_URL="${HEALTH_URL:-$RING_HEALTH_URL}"
+PY="$REPO_DIR/.venv/bin/python"
+LOG="$REPO_DIR/logs/deploy.log"
 
 log() { echo "[$(date -u '+%F %T')] $*" | tee -a "$LOG"; }
 die() { log "HATA: $*"; exit 1; }
 
-case "$RING" in
-  testnet|follower|mainnet) ;;
-  *) die "geçersiz RING: '$RING' (testnet|follower|mainnet olmalı)" ;;
-esac
+# Yeniden başlatılacak PROGRAM ve yoklanacak SAĞLIK UCU halkaya kilitlidir:
+# yanlış program = yanlış motoru yeniden başlatmak.
+if [ "$PROGRAM" != "$RING_PROGRAM" ]; then
+  echo "HATA: RING=$RING ile PROGRAM='$PROGRAM' uyuşmuyor (beklenen '$RING_PROGRAM')" >&2
+  exit 1
+fi
+if [ "$HEALTH_URL" != "$RING_HEALTH_URL" ]; then
+  echo "HATA: RING=$RING ile HEALTH_URL='$HEALTH_URL' uyuşmuyor (beklenen '$RING_HEALTH_URL')" >&2
+  exit 1
+fi
+# REPO_DIR farklıysa BİLİNÇLİ onay şart (test koşumu / kurtarma).
+if [ "$REPO_DIR" != "$RING_REPO_DIR" ] && [ "${DEPLOY_REPO_DIR_OVERRIDE:-0}" != "1" ]; then
+  echo "HATA: RING=$RING ile REPO_DIR='$REPO_DIR' uyuşmuyor (beklenen '$RING_REPO_DIR'); bilinçliyse DEPLOY_REPO_DIR_OVERRIDE=1" >&2
+  exit 1
+fi
 
 cd "$REPO_DIR" || die "repo dizini yok: $REPO_DIR"
 mkdir -p backups logs
 
 # ── Ön kontroller ──────────────────────────────────────────────────────────
+# Halka ↔ BOT_MODE bağı (D20a bulgu 4): `.env` hangi motoru başlatacağını
+# söyler. `RING=testnet` ama `.env`'de `BOT_MODE=follower` ise deploy,
+# scalper halkası sanılan bir dizinde TAKİPÇİ motorunu yeniden başlatır
+# (ve tersi: takipçi halkasına scalper .env'i ile deploy, AlgoPro
+# olaylarını hiç işlemeyen bir süreç bırakır). Fail-closed: uyuşmazlıkta
+# deploy YAPILMAZ.
+ENV_BOT_MODE=""
+if [ -f .env ]; then
+  # `|| true` ZORUNLU: `set -o pipefail` altında eşleşmeyen `grep` (BOT_MODE
+  # satırı olmayan bugünkü scalper .env'i) tüm boru hattını başarısız yapar ve
+  # `set -e` script'i SESSİZCE düşürürdü.
+  ENV_BOT_MODE="$(grep -E '^[[:space:]]*BOT_MODE[[:space:]]*=' .env | tail -1 | cut -d= -f2- | tr -d '[:space:]"'"'"'' | tr 'A-Z' 'a-z' || true)"
+fi
+if [ "$RING" = "follower" ]; then
+  [ -f .env ] || die "RING=follower ama .env yok ($REPO_DIR) — BOT_MODE doğrulanamıyor"
+  [ "$ENV_BOT_MODE" = "follower" ] || die "RING=follower ama .env'de BOT_MODE=follower yok (bulunan: '${ENV_BOT_MODE:-yok}') — yanlış dizine deploy ediliyor olabilir"
+else
+  if [ "$ENV_BOT_MODE" = "follower" ]; then
+    die "RING=$RING ama .env BOT_MODE=follower diyor — takipçi halkasına 'RING=follower' ile deploy edilir (scripts/deploy.sh --ring follower)"
+  fi
+fi
+
 # Takipçi halkasının (D20) giriş kilidi AYRI dosyadadır; scalper/mainnet
 # halkalarında dosya adı ve davranış DEĞİŞMEDİ.
-HALT_FILE="state/scalper_entry_halt.json"
-[ "$RING" = "follower" ] && HALT_FILE="state/follower_entry_halt.json"
+HALT_FILE="$RING_HALT_FILE"
 [ -f "$HALT_FILE" ] && die "entry-halt aktif ($HALT_FILE) — önce nedenini çöz (deploy iptal)"
 # Ban kilidi: son 15 dk'da `HTTP 418` ya da `banned` izi varsa deploy/restart YASAK.
 # ⚠️ ZAMAN DİLİMİ (düşmanca inceleme bulgusu): `logs/bot.log` damgaları loguru'nun
@@ -93,7 +153,8 @@ rollback() {
   git checkout -q -B main "$PREV" || git checkout -q "$PREV"
   cp "backups/env.bak-$STAMP-deploy" .env
   supervisorctl restart "$PROGRAM" >/dev/null || true
-  sleep 20
+  # Süreç oturması için bekleme; testler bunu kısaltır (varsayılan DEĞİŞMEDİ).
+  sleep "${ROLLBACK_SETTLE_SECONDS:-20}"
   supervisorctl status "$PROGRAM" | tee -a "$LOG"
   die "deploy başarısız; önceki sürüme dönüldü"
 }
@@ -113,7 +174,13 @@ fi
 
 # ── Restart + sağlık ───────────────────────────────────────────────────────
 if [ "${DEPLOY_NO_RESTART:-0}" = "1" ]; then log "restart atlandı (DEPLOY_NO_RESTART=1)"; exit 0; fi
-supervisorctl restart "$PROGRAM" | tee -a "$LOG"
+# RESTART HATASI DA GERİ ALINIR (düşmanca inceleme): `set -e` + `pipefail`
+# altında çıplak `supervisorctl restart | tee` başarısız olursa script
+# rollback'i ÇAĞIRMADAN ölürdü — sunucuda YENİ kod, ÇALIŞMAYAN süreç kalırdı.
+if ! supervisorctl restart "$PROGRAM" 2>&1 | tee -a "$LOG"; then
+  log "supervisorctl restart BAŞARISIZ ($PROGRAM) — geri alınıyor"
+  rollback
+fi
 # Açılış (Binance init + pozisyon devralma) 1-3 dk sürebilir: süreç RUNNING kaldığı sürece
 # portu sabırla yokla; süreç düşerse ya da HEALTH_TIMEOUT dolarsa geri al.
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-240}"
@@ -124,7 +191,7 @@ while [ "$waited" -lt "$HEALTH_TIMEOUT" ]; do
   sleep 5; waited=$((waited+5))
 done
 if [ "$healthy" != "1" ]; then log "sağlık uç noktası ${HEALTH_TIMEOUT}s içinde cevap vermedi: $HEALTH_URL"; rollback; fi
-PID="$(supervisorctl pid "$PROGRAM")"
+PID="$(supervisorctl pid "$PROGRAM" || echo '?')"
 if [ "$RING" = "testnet" ]; then
   log "TAMAM: $PROGRAM RUNNING pid=$PID commit=$NEW (sağlık ${waited}s sonra)"
 else

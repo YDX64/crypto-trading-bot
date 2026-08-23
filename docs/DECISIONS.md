@@ -858,6 +858,138 @@ gerekirse: bu commit'teki `src/strategies/follower/*`, `src/services/follower_fo
 `FOLLOWER_*`), `src/models/scalp_trade.py` + `src/core/database.py` (`tp3_algo_id`),
 `src/strategies/scalper/{types,exits,tracker}.py` (nötr eklemeler),
 `scripts/{deploy.sh,server_deploy.sh,ledger_report.py}` değişikliklerini revert et.
+### D20a — Takipçi halkası düşmanca inceleme düzeltmeleri (19 ajan) · 2026-08-23 · AKTİF
+**Bağlayıcılık:** D20 ile çelişirse **D20a geçerlidir**. D20'nin mimarisi (ayrı süreç,
+ayrı hesap, AlgoPro'nun kendi seviyeleri, 3 parça çıkış) DEĞİŞMEDİ; değişenler aşağıdaki
+KAPILAR ve VARSAYILANLARDIR. `BOT_MODE=scalper` davranışı byte-for-byte korunmuştur
+(scalper motoru/kapıları/`.env` varsayılanları değişmedi; ana bottaki TEK dokunuş
+`/tv-signal`'ın köprü satırıdır — aşağıda 5).
+
+**1. [high] Dolum stopu ZATEN geçmişse stop UYDURULUYORDU.**
+`executor._finalize`, stop mesafesini `abs(entry − stop)` ile ölçüyordu. İşaretsiz bu
+ölçüm, stopun gerçek dolumun YANLIŞ tarafında kalmasını GİZLER: LONG'da dolum 100 iken
+AlgoPro stopu 101 ise mesafe "%1" görünür, bütçe kapısı onu %0.15'e "sıkıştırır" ve
+AlgoPro'nun HİÇ SEÇMEDİĞİ bir stop konur; sıkışmazsa SL emri `-2021` alır ve
+`pm._reanchor_stop_price` stopu canlı fiyatın buffer'ına (%0.15) çapalar — 100x'te marjın
+%15'i. İkisi de "AlgoPro'yu takip et" sözleşmesinin ihlalidir.
+*Düzeltme:* (a) MARKET emrinden ÖNCE canlı fiyatla **taraf kontrolü** (`stop_on_correct_side`)
++ **sapma kapısı** `FOLLOWER_MAX_SIGNAL_DRIFT_PCT` (vars. 0 = SL mesafesinin %50'si);
+(b) dolumdan SONRA **işaretli** taraf kontrolü — stop ters taraftaysa tez GEÇERSİZDİR:
+`pm.emergency_close` ile reduce-only MARKET kapanış, defter satırı
+(`follower_stop_already_passed`), cooldown, `stop_already_passed` sayacı; kapatılamazsa
+`UnprotectedPositionError` (motor entry-halt latch'ler). **Yeniden çapalama YOK.**
+(c) `sl_pct_fill` telemetrisi artık GERÇEKTEN KONAN stoptan (`effectiveStopPrice` sonrası)
+yazılır.
+
+**2. [high] Parser FAIL-OPEN'dı.** Tanınmayan bir gövdede yalnız bir yön kelimesi
+("bullish", "long") geçmesi `kind=entry` üretiyor ve POZİSYON açtırabiliyordu (gövde
+taraması son çare olarak duruyordu). *Düzeltme:* takipçi girişi YALNIZ tam AlgoPro V1.6
+alert() biçimini kabul eder: **başlıkta** olay anahtarı (`BUY`/`SELL`/`EXIT`/`TPn HIT`/
+`SL HIT`) + `| BINANCE:<SEMBOL>USDT |` + `| TF:` + `| Price:` + girişlerde DÖRT seviyenin
+hepsi (`SL/TP1/TP2/TP3`) + yön sıralaması. Eksik alan → 422 + WARNING. Gövde-ortası
+anahtar taraması KALDIRILDI. `kind=` şablonu (elle/curl) korunur ama girişte aynı alan
+şartına tabidir. **Sonuç:** `levels.py`'deki k×ATR yedek kuralı GİRİŞLER için artık
+ULAŞILAMAZ (mesajda SL olmayan giriş 422 alır); kural, mesaj seviyesi girişin yanlış
+tarafında kaldığında ikinci savunma katmanı olarak KORUNUR.
+
+**3. [high] Ücret eşiği kapısı VARSAYILAN AÇIK (`FOLLOWER_MIN_TP1_FEE_RATIO=1.0`).**
+Ölçülen AlgoPro seviyeleriyle (BTC 1m, SL ≈ %0.07, TP1 = 0.5×SL) her sonuç negatiftir:
+`tp1_roi = RR1 × lev × sl_pct`, komisyon ROI'si = `lev × 2 × oran × 100`. Kaldıraç
+eşitliğin İKİ TARAFINDA da çarpandır → eşik kaldıraçtan BAĞIMSIZDIR:
+`sl_pct ≥ ratio × 2 × oran × 100 / RR1` = **%0.20** (ratio 1.0, taker %0.05, RR1 0.5).
+Kapı boyut/TP1/stop DEĞİŞTİRMEZ (kullanıcının 2026-08-23 yasağı korunur) — yalnız
+komisyonu ödeyemeyeceği aritmetik olarak kanıtlı bir işleme HİÇ girmez.
+*Kullanıcı kararı:* `FOLLOWER_MIN_TP1_FEE_RATIO=0` ile KAPATILABİLİR (o hâlde her girişte
+WARNING loglanır). Taker oranı `/fapi/v1/commissionRate`'ten okunur (1 sa önbellek),
+okunamazsa muhafazakâr config oranı (`max(taker, maker)`, vars. %0.05). Kapı EMİRDEN
+ÖNCE çalışır; reddedilen giriş `reject_counters.fee_gate` sayacında ve kalibrasyon
+defterinde (`state/follower_levels.jsonl`, `rejected` alanı) görünür.
+
+**4. [high] Deploy halkası ↔ `BOT_MODE` bağı yoktu.** `RING` ile `.env` arasında hiçbir
+doğrulama yoktu: takipçi `.env`'i olan bir dizine `RING=testnet` ile deploy edilebiliyor
+(scalper sanılan halkada TAKİPÇİ motoru yeniden başlıyor) ve tersi mümkündü.
+*Düzeltme (`scripts/server_deploy.sh` + `scripts/restart_safe.sh`):* `RING=testnet|mainnet`
+iken `.env`'de `BOT_MODE=follower` varsa `die`; `RING=follower` iken `BOT_MODE=follower`
+yoksa `die`. Ayrıca **RING artık `REPO_DIR`/`PROGRAM`/`HEALTH_URL`/`HALT_FILE`in TEK
+GERÇEK KAYNAĞIDIR**: `PROGRAM`/`HEALTH_URL` override'ı halka ile uyuşmazsa `die`,
+`REPO_DIR` override'ı `DEPLOY_REPO_DIR_OVERRIDE=1` ister. `supervisorctl restart`
+BAŞARISIZ olursa artık GERİ ALINIR (eskiden `set -e` script'i rollback ÇAĞRILMADAN
+düşürüyordu: sunucuda yeni kod + çalışmayan süreç kalırdı).
+
+**5. [high] Köprü parmak izi yanlış pozitifi.** `resolve_tv_source`, `?src=` yoksa
+gövdede `"| TF:"` ya da `"| Price:"` görmesini "algopro" saymaya yetiyordu — elle yazılmış
+bir LuxAlgo/BotV3 şablonu bu damgayı taşıyabilir ve takipçide sonucu POZİSYON açmaktır.
+*Düzeltme:* iletim kararı GÖVDEYE bakan katı tanıyıcıya (`parser.algopro_alert_kind`,
+bulgu 2 ile AYNI kural) taşındı ve `TV_SOURCE_ALLOWLIST`'ten BAĞIMSIZ hâle geldi
+(`?src=` yalnız telemetri). LuxAlgo/BotV3/serbest metin ASLA iletilmez; gerçek bir AlgoPro
+gövdesi `?src=` yanlış olsa bile iletilir. İletilmeyen gövdeler sayaçlara işlenir
+(`GET /follower/forwarder`; `last_skipped.body_head` secret MASKELİDİR) ve başarısız
+iletim uyarıları **dakikada 1** ile oran-sınırlıdır (bastırılanlar `suppressed_warnings`).
+Timeout artık bölünmüştür: bağlantı/yazma 2 sn (erişilemeyen halka task biriktirmesin),
+okuma `FOLLOWER_FORWARD_TIMEOUT_SECONDS` (20 sn — yanıt olay işlendikten sonra döner).
+
+**6. [medium] Boyutlama/seviyeler bayat alarm fiyatından; giriş kilidi uzun bekletiyor.**
+`_handle_entry` `event.price` varsa canlı fiyatı HİÇ okumuyordu; `sl_pct` kaldıraç
+formülünün paydasıdır ve bayat fiyat kaldıracı yanlış ölçekler. *Düzeltme:* kilit
+alındıktan SONRA (a) **olay yaşı** kapısı `FOLLOWER_MAX_EVENT_AGE_SEC` (vars. 20 sn;
+yaş HTTP'de alım anından ölçülür), (b) DAİMA canlı fiyat, (c) sapma kapısı, (d) taraf
+kontrolü. Aynı kapılar `executor`da emirden hemen önce TEKRAR uygulanır.
+
+**7. [medium] Terminal HIT + borsada AÇIK pozisyon yalnız telemetriydi.** AlgoPro
+"SL HIT" derken pozisyon borsada duruyorsa stop dolmamış ya da hiç konulamamıştır —
+eski davranış WARNING'ti ve 100x'lik pozisyon korumasız taşınıyordu. *Düzeltme:* SL HIT →
+kalan miktar reduce-only MARKET (`exit_reason=ALGOPRO_SL`), TP3 HIT → `ALGOPRO_TP3`;
+kapanış borsadan DOĞRULANIR (doğrulanamazsa `accepted:false`, izleme sürer). Terminal
+olmayan HIT'lerde (TP1/TP2) merdiven emirleri kontrol edilir ve EKSİK TP bacakları
+yeniden konur (`exits.ensure_tp_orders`; `tp_repair` sayaçları `/follower/status`ta).
+
+**8. [medium] Yetim pozisyonlar görünmezdi.** `recover()` yalnız DB'deki OPEN satırlarına
+bakar; `record_open` DB hatası sonrası açık kalan bir pozisyon ne EXIT'e, ne flip'e, ne
+`flatten`a görünürdü. *Düzeltme:* başlangıçta ve HER safety turunda borsa `positionRisk`
+ile izlenenler karşılaştırılır (`get_all_positions`, 15 sn hesap önbelleği; şüphe TAZE
+okumayla doğrulanır). Yetim bulunursa **ENTRY-HALT + CRITICAL**; `/risk-event flatten`
+artık yetimleri de kapatır. Yanlış pozitif korumaları: `_entry_lock` tutuluyorsa (uçuşta
+giriş) tur atlanır, `_closing` sembolleri hariç tutulur, kurtarma tamamlanmadıysa denetim
+yapılmaz.
+
+**9. [kapak dışı, aynı dalda]**
+(a) TP2/TP3 doğrulaması `tp1_done`un ARKASINDAYDI; `tp1_done` "stop BE'ye taşındı"
+demektir ve ücret-farkında BE takipçide çoğu zaman ULAŞILAMAZ → merdivenin geri kalanı
+YAPISAL OLARAK ölüydü. Yeni `tp1_filled` bayrağı dolum OLGUSUNU taşır; fill kanıtı artık
+BE denemesinden ÖNCE alınır. (b) TP seviyeleri GERÇEK doluma göre doğrulanır (LONG: TP >
+dolum) — yanlış tarafta kalan bacak KONULMAZ (`tp_wrong_side`), anında tetiklenip zararla
+kapatırdı. (c) `min_score`/allowlist/TF kapıları artık YALNIZ girişte — çıkış/HIT
+olaylarını bloklamaz ("riskten çıkma" hiçbir kapıya takılmaz). (d) `_handle_hit` kimlik
+kontrolü: pozisyon nesnesi değiştiyse `accepted:false` (hiçbir şey yapılmadı).
+(e) Restart kurtarması kayıp TP emirlerini yeniden koyar; bunun için defter notu artık
+AlgoPro'nun MUTLAK seviyelerini taşır (`ap_sl`/`ap_tp1..3`, kayıpsız biçim — `:g` 6
+haneye kırpıyordu). (f) Boyutlama ve günlük risk kapısı AYNI bakiye tanımını kullanır
+(**availableBalance**; eskiden risk kapısı `totalWalletBalance` okuyordu). (g)
+`parse_brackets` `mmr == 0` satırını GEÇERSİZ sayar (sıfır bakım marjı mmr kapısını
+dişsiz bırakıyordu). (h) `/follower/event` `?secret=` kabul etmez — INTEGRATIONS'taki
+yanlış satır düzeltildi. (i) `/follower/status` scalper modunda **404** (mod izolasyonu;
+eskiden boş bir "takipçi durumu" dönüp operatörü yanıltıyordu). (j) `.env` reçeteleri
+için `scripts/restart_safe.sh <halka>`: ban penceresi + entry-halt + BOT_MODE ön
+kontrolleri, saniye damgalı `.env` yedeği, ayar doğrulaması, restart, sağlık yoklaması.
+
+**Kanıt:** `python3 -m pytest tests -q` → **1580 passed, 1 skipped** (önceki: 1457
+passed, 1 skipped; +123 test). Her bulgu için regresyon testi yazıldı ve **düzeltme
+olmadan KIRMIZI olduğu `git stash` ile doğrulandı** (parser/executor kümesi 32/35 kırmızı,
+motor/exits kümesi 30/34, deploy+köprü kümesi 8 kırmızı + 27 hata). Backtest harness'e
+DOKUNULMADI (takipçi strateji C'yi hiç kullanmaz).
+
+**Değişen varsayılanlar:** `FOLLOWER_MIN_TP1_FEE_RATIO` 0.0 → **1.0**; yeni
+`FOLLOWER_MAX_SIGNAL_DRIFT_PCT=0` (türetilmiş: SL mesafesinin %50'si) ve
+`FOLLOWER_MAX_EVENT_AGE_SEC=20`. Diğer tüm `FOLLOWER_*`/`SCALPER_*` varsayılanları AYNI.
+
+**Doğrulanamadı (dürüst kayıt):** (i) `⚪ EXIT` gövdesi TV'de HÂLÂ ÖLÇÜLMEDİ — katı
+tanıyıcı `EXIT` anahtar kelimesi + `| BINANCE: | TF: | Price:` bekler; AlgoPro farklı bir
+biçim üretirse olay 422 alır ve loglanır (sessiz kalmaz). (ii) Ücret eşiğinin canlı
+etkisi (kaç girişin reddedileceği) TESTNET DEFTERİYLE ölçülecek — aritmetik kesindir,
+"kaç işlem kalır" değildir. (iii) Yetim denetimi ayrı bir Binance hesabı varsayar (D20);
+aynı hesapta başka bir bot çalışırsa her pozisyonu yetim sayar. (iv) Sunucuda
+çalıştırılmadı: bu dalda deploy YAPILMADI (worktree; canlıya/`.env`'e dokunulmadı).
+
 ### D17 — Piyasa verisi ayrı host: `SCALPER_MARKET_DATA_BASE_URL` · 2026-08-23 · **ADAY, VARSAYILAN KAPALI** (canlıda uygulanmadı)
 **Ne:** Yeni ayar `SCALPER_MARKET_DATA_BASE_URL` (boş = bugünkü davranış, birebir).
 Doluyken YALNIZ public `/fapi/v1/klines` çekimi o host'tan yapılır; emir, bakiye, pozisyon,

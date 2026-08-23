@@ -114,19 +114,38 @@ Content-Type: text/plain; charset=utf-8
 
 🔴 SELL | BINANCE:BTCUSDT | TF: 1 | Price: 77126.08 | TQI: .45 | Score: 8 | SL: 77167.77 | TP1: 77105.23 | TP2: 77084.39 | TP3: 77063.54
 ```
-- Secret: `X-Follower-Secret` başlığı (tercih) · gövdede `secret=…` · `?secret=`.
-  `TV_WEBHOOK_SECRET`/`RISK_EVENT_SECRET`'tan AYRIDIR; boş = 503 (fail-closed).
+- Secret: `X-Follower-Secret` başlığı (tercih) · gövdede `secret=…`.
+  **`?secret=` KABUL EDİLMEZ (403)** — uvicorn erişim logu query string'i düz metin
+  yazar (CLAUDE.md kural 5). `TV_WEBHOOK_SECRET`/`RISK_EVENT_SECRET`'tan AYRIDIR;
+  boş = 503 (fail-closed).
 - Olay türü gövdeden çözülür: `BUY`/`SELL` → giriş, `EXIT` → çıkış,
-  `TP1|TP2|TP3 HIT`, `SL HIT` → telemetri + borsa çapraz doğrulaması.
-  Alternatif açık şablon: `src=algopro kind=entry buy BTCUSDT tf=1 px=… sl=… tp1=…`.
+  `TP1|TP2|TP3 HIT`, `SL HIT` → borsa çapraz doğrulaması (**terminal HIT'te pozisyon
+  hâlâ açıksa kalan miktar reduce-only MARKET ile KAPATILIR** — D20a bulgu 7).
+- **KATI BİÇİM (D20a bulgu 2).** Gövde ancak şunların HEPSİNİ taşıyorsa kabul edilir:
+  başlıkta olay anahtarı + `| BINANCE:<SEMBOL>USDT |` + `| TF:` + `| Price:`;
+  GİRİŞLERDE ayrıca `SL`, `TP1`, `TP2`, `TP3` seviyelerinin DÖRDÜ ve yön sıralaması.
+  Eksik alan → 422 + WARNING. "Tanınmayan gövde + yön kelimesi = giriş" davranışı
+  (fail-open) KALDIRILDI.
+  Alternatif açık şablon (yalnız ELLE test; köprü bunu İLETMEZ):
+  `src=algopro kind=entry buy BTCUSDT tf=1 px=… sl=… tp1=… tp2=… tp3=…` — girişte
+  `px`+`sl`+`tp1`+`tp2`+`tp3` ZORUNLUDUR.
 - Yanıt: `{ok, kind, symbol, direction, accepted, reason, ...}`. `accepted=false`
   bir HATA DEĞİLDİR (kapasite/cooldown/kapı reddi) — HTTP 200 döner.
 - 403 = secret yanlış · 422 = gövde çözülemedi/>4KB · 503 = kanal kapalı ya da motor
   hazır değil (`/risk-event` ile AYNI semantik).
 - **Kaynak:** olaylar ana bottan (`/tv-signal`) İLETİLİR; TV alarm URL'leri ve
-  secret'ları DEĞİŞMEZ. Köprü yalnız `resolve_tv_source` "algopro" derse çalışır,
-  fire-and-forget'tir (2 sn timeout) ve ana motoru ASLA etkilemez. Kimliği
-  doğrulanmamış gövde (403) İLETİLMEZ.
+  secret'ları DEĞİŞMEZ. Köprü kararını **GÖVDEYE** verir (yukarıdaki katı biçim;
+  `parser.algopro_alert_kind`) — `?src=` ve `TV_SOURCE_ALLOWLIST` iletim kararına
+  GİRMEZ (D20a bulgu 5). LuxAlgo/BotV3/serbest metin, `?src=algopro` yazsa bile
+  İLETİLMEZ; gerçek bir AlgoPro gövdesi `?src=` yanlış olsa da iletilir.
+  Fire-and-forget'tir (bağlantı 2 sn, okuma `FOLLOWER_FORWARD_TIMEOUT_SECONDS`=20 sn)
+  ve ana motoru ASLA etkilemez. Kimliği doğrulanmamış gövde (403) İLETİLMEZ.
+  Telemetri: `GET /follower/forwarder` (iletilen/atlanan sayaçları; secret İÇERMEZ).
+- **Ücret eşiği kapısı VARSAYILAN AÇIK** (`FOLLOWER_MIN_TP1_FEE_RATIO=1.0`, D20a
+  bulgu 3): TP1 ROI'si gidiş-dönüş komisyonun altındaysa giriş HİÇ açılmaz
+  (stop ≥ ~%0.20 gerekir). `accepted=false`, `reject_counters.fee_gate`.
+- **`GET /follower/status` yalnız takipçi halkasında** (`BOT_MODE=follower`);
+  scalper halkasında **404** döner (mod izolasyonu).
 - **Backtest paritesi:** takipçi harness'ta modellenmez (strateji C'yi hiç kullanmaz);
   `backtest.py`'ye DOKUNULMADI.
 

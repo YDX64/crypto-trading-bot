@@ -26,6 +26,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from src.core.logger import app_logger
 from src.models.position import PositionModel, PositionSide, PositionStatus
 from src.strategies.follower.brackets import LeverageBracketCache
+from src.strategies.follower.levels import (
+    signal_drift_limit_pct,
+    stop_on_correct_side,
+    tp_on_correct_side,
+)
 from src.strategies.follower.plan import (
     build_plan,
     split_three_quantities,
@@ -47,7 +52,7 @@ from src.strategies.scalper.types import (
     fee_aware_breakeven_price,
 )
 from src.trading.binance_client_improved import BinanceAPIError, ImprovedBinanceClient
-from src.trading.position_manager import PositionManager
+from src.trading.position_manager import PositionManager, UnprotectedPositionError
 
 # Deftere yazılan strateji etiketi — `ledger_report.py --strategy AP`.
 FOLLOWER_STRATEGY = "AP"
@@ -63,6 +68,11 @@ class FollowerPosition(ScalpPosition):
     """
 
     tp3_done: bool = False
+    # TP1'in GERÇEK dolumu kanıtlandı mı? ``tp1_done``dan AYRIDIR: o "stop
+    # break-even'e taşındı" demektir ve ücret-farkında BE ulaşılamıyorsa
+    # (D20 "ücret eşiği") HİÇ True olmaz. Merdiven aritmetiği (TP2/TP3
+    # kontrolü) bu bayrağa bağlanır — aksi halde TP2/TP3 hiç doğrulanmaz.
+    tp1_filled: bool = False
     meta: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -175,6 +185,14 @@ class FollowerExecutor:
                 f"Borsa filtreleri okunamadı ({exc})", code="filters"
             ) from exc
 
+        # Komisyon oranları EMİRDEN ÖNCE okunur: ücret eşiği kapısı (bulgu 3)
+        # GERÇEK taker oranıyla çalışmalı ve reddedecekse emir GÖNDERİLMEDEN
+        # reddetmeli. Oranlar 1 saat önbelleklidir (client), ikinci bir REST
+        # çağrısı doğurmaz.
+        entry_fee_rate, exit_fee_rate, fee_rate_source = await self._resolve_fee_rates(
+            symbol
+        )
+
         plan = build_plan(
             symbol=symbol,
             direction=direction,
@@ -183,6 +201,7 @@ class FollowerExecutor:
             brackets=brackets,
             cfg=self.cfg,
             step_size=step_size,
+            fee_rate=max(float(entry_fee_rate), float(exit_fee_rate)),
         )
 
         try:
@@ -204,6 +223,11 @@ class FollowerExecutor:
                 f"stepSize={step_size}) — giriş yapılmadı",
                 code="split",
             )
+
+        # --- CANLI FİYAT KAPISI (emirden ÖNCE — düşmanca inceleme bulgu 1) ---
+        await self._preflight_price_gate(
+            symbol=symbol, direction=direction, levels=levels, event=event
+        )
 
         # --- Margin type + leverage (emirden ÖNCE — hata zararsız) ---
         try:
@@ -268,7 +292,72 @@ class FollowerExecutor:
             filled_qty=float(filled_qty),
             entry_order_id=str(entry_order.get("orderId") or ""),
             step_size=step_size,
+            entry_fee_rate=entry_fee_rate,
+            exit_fee_rate=exit_fee_rate,
+            fee_rate_source=fee_rate_source,
         )
+
+    async def _preflight_price_gate(
+        self,
+        *,
+        symbol: str,
+        direction: Direction,
+        levels: FollowerLevels,
+        event: FollowerEvent,
+    ) -> float:
+        """MARKET emrinden ÖNCE canlı fiyatla taraf + sapma kapısı.
+
+        NEDEN (düşmanca inceleme bulgu 1): sinyal ile emir arasında saniyeler
+        geçer. Fiyat AlgoPro'nun stopunu ZATEN geçmişse:
+          * ``_finalize``'daki ``abs()`` bunu göremez ve stopu "bütçeye"
+            sıkıştırır — AlgoPro'nun HİÇ seçmediği bir stop uydurulur;
+          * ya da SL emri ``-2021`` alır ve ``pm._reanchor_stop_price`` stopu
+            canlı fiyatın buffer'ına (%0.15) çapalar — 100x'te marjın %15'i.
+        İkisi de "AlgoPro'yu takip et" sözleşmesinin İHLALİDİR. Doğru
+        davranış: pozisyonu HİÇ AÇMAMAK.
+
+        Ayrıca sapma kapısı: alarm fiyatı ile canlı fiyat farkı
+        ``FOLLOWER_MAX_SIGNAL_DRIFT_PCT``i (vars. SL mesafesinin %50'si)
+        aşıyorsa RR merdiveni artık mesajdaki merdiven değildir → giriş yok.
+
+        Dönüş: canlı fiyat (telemetri için). Kapı reddederse
+        ``FollowerRejected`` yükseltilir — emir GÖNDERİLMEZ.
+        """
+        try:
+            live_price = await self.client.get_current_price(symbol)
+        except Exception as exc:
+            raise FollowerRejected(
+                f"Canlı fiyat okunamadı ({exc}) — giriş yapılmadı",
+                code="live_price",
+            ) from exc
+        if not live_price or float(live_price) <= 0:
+            raise FollowerRejected(
+                "Canlı fiyat çözülemedi — giriş yapılmadı", code="live_price"
+            )
+        live_price = float(live_price)
+
+        if not stop_on_correct_side(direction, live_price, levels.stop):
+            raise FollowerRejected(
+                f"AlgoPro stopu ({levels.stop:g}) canlı fiyatın "
+                f"({live_price:g}) yanlış tarafında — sinyal fiyatı "
+                f"{levels.entry:g} iken stop ZATEN geçilmiş; giriş yapılmadı "
+                f"(yeniden çapalama YASAK: AlgoPro'nun seçmediği bir stop "
+                f"uydurulamaz)",
+                code="stop_already_passed",
+            )
+
+        reference = float(event.price or levels.entry)
+        if reference > 0:
+            drift_pct = abs(live_price - reference) / reference * 100.0
+            limit_pct = signal_drift_limit_pct(levels.sl_pct, self.cfg)
+            if limit_pct > 0 and drift_pct > limit_pct:
+                raise FollowerRejected(
+                    f"Sinyal fiyatı bayat: alarm {reference:g} vs canlı "
+                    f"{live_price:g} (sapma %{drift_pct:.4f} > "
+                    f"%{limit_pct:.4f}) — giriş yapılmadı",
+                    code="signal_drift",
+                )
+        return live_price
 
     async def _finalize(
         self,
@@ -281,6 +370,9 @@ class FollowerExecutor:
         filled_qty: float,
         entry_order_id: str,
         step_size: float,
+        entry_fee_rate: float,
+        exit_fee_rate: float,
+        fee_rate_source: str,
     ) -> Optional[FollowerPosition]:
         symbol = plan.symbol
         levels = plan.levels
@@ -319,12 +411,48 @@ class FollowerExecutor:
         ]
         stop_budget_pct = min(budget_candidates) if budget_candidates else None
 
+        stop_target = float(levels.stop)
+
+        # --- İŞARETLİ TARAF KONTROLÜ (düşmanca inceleme bulgu 1) ---
+        # `abs()` ile ölçülen mesafe, stopun GERÇEK DOLUMUN yanlış tarafında
+        # kalmasını GİZLER: LONG'da dolum 100 iken stop 101 ise mesafe %1
+        # görünür ve bütçe kapısı onu "sıkıştırarak" AlgoPro'nun hiç seçmediği
+        # bir stop (ör. %0.15) uydurur; sıkıştırılmasa SL emri -2021 alır ve
+        # `pm._reanchor_stop_price` stopu canlı fiyatın buffer'ına çapalar.
+        # İkisi de tezi bozar. Doğru davranış: AlgoPro tezi GEÇERSİZ →
+        # pozisyonu reduce-only MARKET ile KAPAT, asla yeniden çapalama.
+        if not stop_on_correct_side(direction, entry_price, stop_target):
+            self.logger.critical(
+                f"🚨 {symbol}: dolum ({entry_price}) AlgoPro stopunu "
+                f"({stop_target}) ZATEN GEÇMİŞ ({direction.value}) — tez "
+                f"geçersiz, pozisyon reduce-only MARKET ile kapatılıyor "
+                f"(stop yeniden ÇAPALANMAZ)",
+                extra={"trade": True},
+            )
+            self.count_reject("stop_already_passed")
+            closed = await self.pm.emergency_close(symbol)
+            if not closed:
+                raise UnprotectedPositionError(
+                    f"{symbol}: dolum stopu geçmişti ve pozisyon kapatılamadı "
+                    f"(dolum={entry_price}, stop={stop_target}) — DERHAL ELLE "
+                    f"MÜDAHALE EDİN"
+                )
+            self.start_cooldown(symbol)
+            await self._record_protection_failure(
+                event=event,
+                plan=plan,
+                entry_price=entry_price,
+                filled_qty=filled_qty,
+                entry_order_id=entry_order_id,
+                notes="follower_stop_already_passed;exit_fill=unverified",
+            )
+            return None
+
         # GERÇEK dolum fiyatına göre stop mesafesini yeniden ölç. `sl_pct`
         # SİNYAL fiyatından hesaplanmıştı; MARKET girişte kayma bu oranı
         # büyütebilir ve planlanan risk (marjın %8'i) sessizce likidasyon
         # bölgesine kayabilir. Kapı yalnız SIKILAŞTIRIR — AlgoPro'nun stopu
         # asla GENİŞLETİLMEZ.
-        stop_target = float(levels.stop)
         fill_sl_pct = abs(entry_price - stop_target) / entry_price * 100.0
         if stop_budget_pct is not None and fill_sl_pct > stop_budget_pct:
             clamped = (
@@ -372,11 +500,31 @@ class FollowerExecutor:
             )
             stop_price = effective_stop
 
+        # TELEMETRİ, GERÇEKTEN KONAN STOPTAN (düşmanca inceleme bulgu 1):
+        # `sl_pct_fill` daha önce "konmasını istediğimiz" stoptan yazılıyordu;
+        # borsa tetik fiyatını yuvarladıysa (`effectiveStopPrice`) ya da
+        # `pm` gecikme telafisiyle kaydırdıysa defter GERÇEK riski göstermezdi.
+        fill_sl_pct = abs(entry_price - stop_price) / entry_price * 100.0
+
         # --- 3 parça TP (reduce-only) — GERÇEK dolum miktarından bölünür ---
         parts = split_three_quantities(filled_qty, step_size)
         tp_prices = (levels.tp1, levels.tp2, levels.tp3)
         algo_ids: List[Optional[str]] = []
         for index, (price, qty) in enumerate(zip(tp_prices, parts), start=1):
+            # TP SEVİYESİ GERÇEK DOLUMA GÖRE DOĞRULANIR (bulgu 9): LONG'da
+            # TP dolumun ÜSTÜNDE olmalı. Kayma TP1'i dolumun arkasında
+            # bırakmışsa TAKE_PROFIT_MARKET tetiklendiği anda 1/3 pozisyonu
+            # ZARARLA kapatır (ya da -2021 alır). Böyle bir bacak KONULMAZ.
+            if price > 0 and not tp_on_correct_side(direction, entry_price, price):
+                self.count_reject("tp_wrong_side")
+                self.logger.warning(
+                    f"⚠️ {symbol}: TP{index} ({price}) gerçek dolumun "
+                    f"({entry_price}) yanlış tarafında — emir KONULMADI "
+                    f"(anında tetiklenip zararla kapatırdı)",
+                    extra={"trade": True},
+                )
+                algo_ids.append(None)
+                continue
             algo_ids.append(
                 await self._place_tp_safely(symbol, sl_side, price, qty, f"TP{index}")
             )
@@ -385,7 +533,12 @@ class FollowerExecutor:
         # (`exits._check_tp1_breakeven` → `_confirmed_algo_fill`). TP1 emri
         # yoksa BE hiç kurulamaz ve pozisyon tam risk stopuna kadar taşınır.
         # Bir kez yeniden dene; olmazsa SESSİZ KALMA: sayaç + CRITICAL.
-        if algo_ids[0] is None and parts[0] > 0 and tp_prices[0] > 0:
+        if (
+            algo_ids[0] is None
+            and parts[0] > 0
+            and tp_prices[0] > 0
+            and tp_on_correct_side(direction, entry_price, tp_prices[0])
+        ):
             algo_ids[0] = await self._place_tp_safely(
                 symbol, sl_side, tp_prices[0], parts[0], "TP1 (2. deneme)"
             )
@@ -407,11 +560,7 @@ class FollowerExecutor:
             )
             self.count_reject("partial_fill_split")
 
-        entry_fee_rate, exit_fee_rate, fee_rate_source = await self._resolve_fee_rates(
-            symbol
-        )
-
-        # ÜCRET EŞİĞİ (ölçüm, kapı DEĞİL — bkz. docs/DECISIONS.md D20).
+        # ÜCRET EŞİĞİ (kapı `build_plan`'da, EMİRDEN ÖNCE — D20a bulgu 3).
         # `sl_roi = lev × sl_pct` tavana kırpıldığında (sl_pct < ~%0.30 → lev
         # 100) TP1 ROI gidiş-dönüş komisyonun ALTINA düşer: BTC örneğinde
         # TP1 = marjın %4'ü, komisyon %10'u → üç TP de dolsa NET NEGATİF.
@@ -426,7 +575,9 @@ class FollowerExecutor:
                 f"gidiş-dönüş komisyonun (%{real_fee_roi:.2f}) ALTINDA — "
                 f"lev={plan.leverage}x, sl_pct=%{plan.sl_pct:.4f}. Üç TP de "
                 f"dolsa işlem net negatif olabilir ve break-even kurulamaz. "
-                f"(Kapı varsayılan KAPALI: FOLLOWER_MIN_TP1_FEE_RATIO)",
+                f"(Bu satırı görüyorsan FOLLOWER_MIN_TP1_FEE_RATIO ELLE 0'a "
+                f"çekilmiş demektir — varsayılan 1.0 böyle bir girişi HİÇ "
+                f"açmaz.)",
                 extra={"trade": True},
             )
 
@@ -556,6 +707,7 @@ class FollowerExecutor:
         entry_price: float,
         filled_qty: float,
         entry_order_id: str,
+        notes: str = "follower_initial_sl_failed;exit_fill=unverified",
     ) -> None:
         """İlk SL kurulamayıp acil kapatılan dolumu deftere DÜŞÜR.
 
@@ -584,7 +736,7 @@ class FollowerExecutor:
                 realized_pnl=0.0,
                 pnl_source="estimated_gross",
                 entry_order_id=entry_order_id,
-                notes="follower_initial_sl_failed;exit_fill=unverified",
+                notes=notes,
             )
         except Exception as exc:
             self.logger.error(

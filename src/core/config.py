@@ -548,13 +548,15 @@ class Settings(BaseSettings):
     follower_mmr_safety_mult: float = 2.0
     # Borsa kaldıraç dilimi (/fapi/v1/leverageBracket) önbellek ömrü.
     follower_bracket_cache_ttl_seconds: float = 21600.0
-    # ÜCRET EŞİĞİ KAPISI — varsayılan 0.0 = KAPALI (kullanıcı kararı
-    # 2026-08-23: "boyut/TP1/stop ile kayıp küçültme YASAK"). Açılırsa TP1
-    # ROI'si gidiş-dönüş komisyonun bu KATININ altında kalan işleme HİÇ
-    # girilmez (boyut değişmez, işlem hiç açılmaz). Aritmetik: kaldıraç
-    # LEV_MAX'e kırpıldığında (sl_pct < ~%0.30) TP1 ROI komisyonun altına
-    # düşer — bkz. docs/DECISIONS.md D20 "ücret eşiği".
-    follower_min_tp1_fee_ratio: float = 0.0
+    # ÜCRET EŞİĞİ KAPISI — varsayılan **1.0 = AÇIK** (düşmanca inceleme
+    # 2026-08-23: ölçülen AlgoPro seviyeleriyle BTC 1m'de her sonuç negatifti).
+    # TP1 ROI'si gidiş-dönüş komisyonun bu KATININ altında kalan işleme HİÇ
+    # girilmez (boyut/TP1/stop DEĞİŞMEZ — işlem yalnız hiç açılmaz, kullanıcının
+    # "boyutla oynama" yasağıyla uyumlu). Aritmetik kaldıraçtan BAĞIMSIZDIR:
+    #   tp1_roi = RR1 × lev × sl_pct ≥ ratio × (lev × 2 × oran × 100)
+    #   → sl_pct ≥ ratio × 2 × oran × 100 / RR1  (RR1=0.5, taker %0.05 → %0.20)
+    # 0.0 yazarak KAPATILABİLİR (kullanıcı kararı) — bkz. docs/DECISIONS.md D20.
+    follower_min_tp1_fee_ratio: float = 1.0
 
     # --- Seviye motoru ---
     # Öncelik: (a) AlgoPro mesajındaki sl/tp1/tp2/tp3, (b) hesaplanan kural.
@@ -567,6 +569,16 @@ class Settings(BaseSettings):
     # sl_pct kaldıraç formülünün paydasıdır, sıfıra yaklaşması yasak.
     follower_min_sl_pct: float = 0.02
     follower_max_sl_pct: float = 5.0
+    # SİNYAL SAPMA KAPISI: alarm mesajındaki `Price` ile emir anındaki CANLI
+    # fiyat arasındaki fark bu yüzdeyi aşarsa GİRİŞ YOK. 0.0 = türetilmiş
+    # varsayılan: SL mesafesinin %50'si (`sl_pct × 0.5`). AlgoPro'nun
+    # seviyeleri alarm fiyatına göre çizilir; fiyat o mesafenin yarısını
+    # geçtiyse tez artık geçerli değildir ve stop "zaten geçilmiş" olabilir.
+    follower_max_signal_drift_pct: float = 0.0
+    # Olay YAŞI: HTTP'de alındığı andan giriş emrine kadar geçen süre bunu
+    # aşarsa giriş YAPILMAZ (global `_entry_lock` kuyruğunda bekleyen bayat
+    # sinyal 1 dakikalık grafikte artık bir sinyal değildir).
+    follower_max_event_age_sec: float = 20.0
     # Kalibrasyon kancası: her girişte hesaplanan + (varsa) mesaj seviyeleri.
     follower_levels_log_path: str = "state/follower_levels.jsonl"
 
