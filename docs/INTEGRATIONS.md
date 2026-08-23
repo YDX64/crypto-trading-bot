@@ -102,10 +102,23 @@ kanalın kapsamı dışındadır (bkz. D10, `docs/DECISIONS.md`).
 4. Mainnet: yalnız etiketli sürümle (bkz. CLAUDE.md terfi kuralı).
 
 ## 4b. AlgoPro takipçi kanalı (`POST /follower/event`) — D20, 2026-08-23'ten beri AKTİF
-Yukarıdaki sözleşme "motor tektir" der; takipçi halkası bunun İSTİSNASI DEĞİL,
-**ikinci bir motorun ayrı bir süreçte** çalıştırılmasıdır (`BOT_MODE=follower`,
-`/opt/tradingbot-ap`, port 9093, AYRI Binance testnet hesabı). Scalper halkasının
-motoru, kapıları ve `.env`'i DEĞİŞMEZ.
+Yukarıdaki sözleşme "motor tektir" der; takipçi bunun İSTİSNASI DEĞİL,
+**ikinci bir motorun** çalıştırılmasıdır. İki kurulum vardır:
+
+* **Gömülü (D20b, TERCİH EDİLEN):** `FOLLOWER_EMBEDDED=true` — AYNI süreç
+  (`tradingbot_v2`, :9091), AYNI Binance testnet hesabı, AYNI pano; boyutlama
+  **SANAL deftere** dayanır. Bu modda AlgoPro gövdesi `/tv-signal`'dan **süreç içi**
+  takipçiye teslim edilir (HTTP köprüsü kullanılmaz) ve yanıt
+  `200 {"routed":"follower", …}` olur; gövde ana botun sağlamasına **OY VERMEZ**.
+  Aşağıdaki `/follower/event` sözleşmesi bu modda da geçerlidir ama YALNIZ
+  `FOLLOWER_FORWARD_SECRET` doldurulmuşsa (boşsa uç 503 döner — gömülü modda
+  köprüye gerek olmadığı için normalde boştur; elle test isteniyorsa doldurulur).
+* **Ayrı halka (D20):** `BOT_MODE=follower`, `/opt/tradingbot-ap`, port 9093, AYRI
+  Binance testnet hesabı; olaylar HTTP köprüsüyle iletilir.
+
+Her iki kurulumda da scalper'ın motoru, kapıları ve `.env` varsayılanları DEĞİŞMEZ.
+İkisi AYNI ANDA kullanılamaz (`BOT_MODE=follower` + `FOLLOWER_EMBEDDED=true` =
+startup HATASI).
 
 ```
 POST http://127.0.0.1:9093/follower/event
@@ -144,8 +157,9 @@ Content-Type: text/plain; charset=utf-8
 - **Ücret eşiği kapısı VARSAYILAN AÇIK** (`FOLLOWER_MIN_TP1_FEE_RATIO=1.0`, D20a
   bulgu 3): TP1 ROI'si gidiş-dönüş komisyonun altındaysa giriş HİÇ açılmaz
   (stop ≥ ~%0.20 gerekir). `accepted=false`, `reject_counters.fee_gate`.
-- **`GET /follower/status` yalnız takipçi halkasında** (`BOT_MODE=follower`);
-  scalper halkasında **404** döner (mod izolasyonu).
+- **`GET /follower/status`** takipçi AKTİF olan süreçte çalışır: ayrı halka
+  (`BOT_MODE=follower`) ya da **gömülü mod** (`FOLLOWER_EMBEDDED=true`, D20b).
+  Takipçisi olmayan bir süreçte **404** döner (mod izolasyonu).
 - **Backtest paritesi:** takipçi harness'ta modellenmez (strateji C'yi hiç kullanmaz);
   `backtest.py`'ye DOKUNULMADI.
 

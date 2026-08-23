@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from sqlalchemy import func, select
 
@@ -347,21 +347,44 @@ class ScalpTracker:
             )
             return float(result.scalar() or 0.0)
 
-    async def compounding_snapshot(self, start_trade_id: int = 0) -> Dict[str, Any]:
+    async def compounding_snapshot(
+        self,
+        start_trade_id: int = 0,
+        *,
+        strategies: Optional[Sequence[str]] = None,
+        exclude_strategies: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
         """Sanal sermayeye eklenebilecek muhafazakâr gerçekleşmiş PnL özeti.
 
         - Binance tarafından doğrulanmış net PnL: pozitif/negatif dahil.
         - ``estimated_gross``: yalnız negatifse dahil (kayıp saklanmaz).
         - Pozitif fallback ve tüm legacy satırlar: sermayeyi şişiremez.
+
+        ``strategies`` / ``exclude_strategies`` (D20b): gömülü takipçi
+        (``strategy="AP"``) scalper ile AYNI DB'yi paylaşır. İki defter
+        birbirinin sanal sermayesini KİRLETMEMELİDİR: scalper AP'yi dışlar,
+        takipçi YALNIZ AP'yi sayar. İkisi de None (varsayılan) = eski
+        davranış birebir.
         """
         start_id = max(0, int(start_trade_id or 0))
+        wanted = {str(s).strip().upper() for s in (strategies or ()) if str(s).strip()}
+        unwanted = {
+            str(s).strip().upper()
+            for s in (exclude_strategies or ())
+            if str(s).strip()
+        }
         async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(ScalpTradeModel).where(
-                    ScalpTradeModel.status == "CLOSED",
-                    ScalpTradeModel.id >= start_id,
-                )
+            stmt = select(ScalpTradeModel).where(
+                ScalpTradeModel.status == "CLOSED",
+                ScalpTradeModel.id >= start_id,
             )
+            if wanted:
+                stmt = stmt.where(ScalpTradeModel.strategy.in_(sorted(wanted)))
+            if unwanted:
+                stmt = stmt.where(
+                    ScalpTradeModel.strategy.notin_(sorted(unwanted))
+                )
+            result = await session.execute(stmt)
             rows = list(result.scalars().all())
 
         eligible_pnl = 0.0
@@ -392,10 +415,45 @@ class ScalpTracker:
             "excluded_legacy": excluded_legacy,
         }
 
-    async def eligible_compounding_pnl(self, start_trade_id: int = 0) -> float:
+    async def eligible_compounding_pnl(
+        self,
+        start_trade_id: int = 0,
+        *,
+        strategies: Optional[Sequence[str]] = None,
+        exclude_strategies: Optional[Sequence[str]] = None,
+    ) -> float:
         """``compounding_snapshot`` için geriye uyumlu sayısal sarmalayıcı."""
-        snapshot = await self.compounding_snapshot(start_trade_id)
+        snapshot = await self.compounding_snapshot(
+            start_trade_id,
+            strategies=strategies,
+            exclude_strategies=exclude_strategies,
+        )
         return float(snapshot["eligible_realized_pnl"])
+
+    async def strategy_realized_pnl_since(
+        self, strategy: str, since: datetime
+    ) -> float:
+        """``since``den (naive UTC) sonra KAPANAN tek strateji PnL toplamı.
+
+        D20b: gömülü modda Binance income'ı iki motorun işlemlerini birlikte
+        raporlar. Takipçinin günlük kesicisi ve scalper'ın AP düzeltmesi bu
+        DEFTER toplamını kullanır — ``realized_pnl`` komisyon DÜŞÜLMÜŞ nettir
+        (bkz. ``_CloseLedger.net_pnl_estimate``).
+        """
+        wanted = str(strategy or "").strip().upper()
+        if not wanted:
+            return 0.0
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(
+                    func.coalesce(func.sum(ScalpTradeModel.realized_pnl), 0.0)
+                ).where(
+                    ScalpTradeModel.status == "CLOSED",
+                    ScalpTradeModel.strategy == wanted,
+                    ScalpTradeModel.closed_at >= since,
+                )
+            )
+            return float(result.scalar() or 0.0)
 
     async def stats(self) -> Dict[str, Dict[str, Any]]:
         """Strateji bazında kapanmış işlem istatistikleri.

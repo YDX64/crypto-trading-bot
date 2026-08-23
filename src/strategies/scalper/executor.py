@@ -54,6 +54,7 @@ from src.core.logger import app_logger
 from src.models.position import PositionModel, PositionStatus, PositionSide
 from src.strategies.scalper.tracker import ScalpTracker
 from src.strategies.scalper.types import (
+    FOLLOWER_LEDGER_STRATEGY,
     Direction,
     ExitPlan,
     Regime,
@@ -753,13 +754,31 @@ class ScalpExecutor:
             int(getattr(self.cfg, "scalper_virtual_capital_start_trade_id", 0) or 0),
         )
         try:
+            # D20b: gömülü takipçi (strategy="AP") AYNI DB'ye yazar. AP
+            # işlemleri scalper'ın sanal kasasını NE BÜYÜTÜR NE KÜÇÜLTÜR —
+            # iki defter ayrıdır. Ayrı halkada (bugünkü kurulum) DB'de hiç AP
+            # satırı yoktur, bu yüzden dışlama davranışı DEĞİŞTİRMEZ.
+            # `exclude_strategies` desteklemeyen eski test çiftleri için
+            # TypeError'da argümansız çağrıya düşülür.
             snapshot_method = getattr(self.tracker, "compounding_snapshot", None)
             if snapshot_method is not None:
-                tracker_snapshot = await snapshot_method(start_id)
+                try:
+                    tracker_snapshot = await snapshot_method(
+                        start_id, exclude_strategies=(FOLLOWER_LEDGER_STRATEGY,)
+                    )
+                except TypeError:
+                    tracker_snapshot = await snapshot_method(start_id)
                 eligible_pnl = float(tracker_snapshot["eligible_realized_pnl"])
             else:
                 eligible_method = getattr(self.tracker, "eligible_compounding_pnl")
-                eligible_pnl = float(await eligible_method(start_id))
+                try:
+                    eligible_pnl = float(
+                        await eligible_method(
+                            start_id, exclude_strategies=(FOLLOWER_LEDGER_STRATEGY,)
+                        )
+                    )
+                except TypeError:
+                    eligible_pnl = float(await eligible_method(start_id))
         except Exception as exc:
             # Sanal kasa doğrulanamıyorsa tam borsa bakiyesine sessizce dönmek,
             # kullanıcının 1000-USDT risk sınırını aşar. Giriş fail-closed.

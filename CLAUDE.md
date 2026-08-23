@@ -35,6 +35,18 @@ Yeni sinyal kaynağı (haber botu vb.) eklemek: `docs/INTEGRATIONS.md`. Otomatik
   `FOLLOWER_MIN_TP1_FEE_RATIO=1.0` VARSAYILAN AÇIKTIR (stop ≥ ~%0.20), dolum stopu
   geçtiyse pozisyon kapatılır (yeniden çapalama YOK), yetim pozisyon = entry-halt.
   Ayrıntı: `docs/RUNBOOK.md` "AlgoPro takipçi halkası", D20/D20a.
+- **GÖMÜLÜ takipçi (D20b, TERCİH EDİLEN — kullanıcı kararı "yeni hesap yok, yeni panel
+  yok"):** `FOLLOWER_EMBEDDED=true` (varsayılan false) ile takipçi scalper ile AYNI
+  süreçte/hesapta/panoda çalışır; boyutlaması **1000 USD'lik SANAL deftere** dayanır
+  (`FOLLOWER_VIRTUAL_CAPITAL_USDT`, equity = taban + AP net PnL, DB'den). AlgoPro
+  alert() gövdesi `/tv-signal`'dan **süreç içi** takipçiye gider ve ana botun
+  sağlamasına OY VERMEZ (eski özel mesaj biçimi eskisi gibi oy verir).
+  `FOLLOWER_SYMBOLS` doluysa o sembol(ler) scalper'ın tarama evreninden ve TV giriş
+  oylamasından OTOMATİK çıkarılır; sembol KODDA SABİT DEĞİLDİR (yalnız `.env`).
+  Çakışma koruması: süreç-içi `symbol_reservations` (sembol başına TEK motor).
+  `/risk-event` gömülü modda İKİ motoru da kapsar. Açma reçetesi:
+  `docs/RUNBOOK.md` "Gömülü takipçiyi açma"; karar+kanıt: D20b.
+  **D20/D20a ile mimari çelişkide D20b bağlayıcıdır; D20a'nın KAPILARI aynen geçerlidir.**
 - **Ayarlar:** `/opt/tradingbot-v2/.env` (commit'lenmez; her değişiklikte
   `backups/env.bak-<tarih>-<etiket>` yedeği). Varsayılanlar `src/core/config.py`.
   Kapalı duran kanallar: `RISK_EVENT_SECRET` (boş = /risk-event 503), `SCALPER_SHADOW_MODE=false`,
@@ -51,7 +63,7 @@ Yeni sinyal kaynağı (haber botu vb.) eklemek: `docs/INTEGRATIONS.md`. Otomatik
 
 ## Nasıl çalıştırılır / test edilir / deploy edilir
 ```bash
-python3 -m pytest tests -q                      # 1844 test, ~43 sn — her değişiklikten önce
+python3 -m pytest tests -q                      # 1899 test, ~45 sn — her değişiklikten önce
 scripts/deploy.sh awa                           # push edilmiş main'i sunucuya uygula (test + restart + sağlık + otomatik geri alma)
 DEPLOY_NO_RESTART=1 scripts/deploy.sh awa       # yalnız kod/test; süreci yeniden başlatma
 scripts/deploy.sh awa <önceki-commit>           # geri alma (backups/commit.prev-*)

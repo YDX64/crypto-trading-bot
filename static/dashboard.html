@@ -408,6 +408,30 @@
   .badge-strat-b{color:var(--purple); background:var(--purple-bg); border-color:rgba(163,133,218,0.35);}
   .badge-strat-c{color:var(--orange); background:var(--orange-bg); border-color:rgba(224,149,78,0.35);}
   .badge-strat-none{color:var(--text-faint); background:rgba(255,255,255,0.04); border-color:var(--border);}
+  /* D20b: gömülü AlgoPro takipçisinin defter etiketi (strategy="AP").
+     Scalper satırlarından AYIRT EDİLEBİLİR olmalı — iki defter aynı
+     tabloda görünür ve karıştırılırsa PF/PnL yanlış okunur. */
+  .badge-strat-ap{color:var(--gold); background:var(--gold-bg); border-color:var(--gold-border);}
+  tr.trade-ap > td{background:rgba(212,169,78,0.05);}
+  tr.trade-ap > td:first-child{box-shadow:inset 2px 0 0 var(--gold);}
+
+  /* --- AlgoPro takipçi kartı (D20b) --- */
+  .ap-grid{
+    display:grid;
+    grid-template-columns:repeat(auto-fit, minmax(150px, 1fr));
+    gap:10px;
+    margin-bottom:12px;
+  }
+  .ap-kv{
+    background:var(--panel-2);
+    border:1px solid var(--border);
+    border-radius:var(--radius);
+    padding:9px 11px;
+  }
+  .ap-kv .k{display:block; font-size:10px; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-faint);}
+  .ap-kv .v{display:block; font-family:var(--mono); font-size:15px; font-weight:700; margin-top:3px;}
+  .ap-note{font-size:11px; color:var(--text-dim); margin-top:8px;}
+  .ap-warn{color:var(--loss); font-weight:700;}
 
   .badge-status{color:var(--text-dim); background:rgba(255,255,255,0.05); border-color:var(--border);}
   .badge-tp1{color:var(--profit); background:var(--profit-bg); border-color:var(--profit-border);}
@@ -741,6 +765,19 @@
     <div class="pnl-quality" id="pnl-quality"></div>
     <div class="cards-grid" id="strategy-cards">
       <!-- doldurulacak -->
+    </div>
+  </div>
+
+  <!-- 2b. ALGOPRO TAKİPÇİ (D20b) — yalnız FOLLOWER_EMBEDDED=true iken görünür -->
+  <div class="section" id="ap-section" style="display:none;">
+    <div class="section-head">
+      <div class="section-title">AlgoPro Takipçi <span class="num" id="ap-state"></span></div>
+      <div class="section-sub" id="ap-sub"></div>
+    </div>
+    <div class="panel">
+      <div class="ap-grid" id="ap-grid"></div>
+      <div class="table-wrap" id="ap-positions-wrap"></div>
+      <div class="ap-note" id="ap-note"></div>
     </div>
   </div>
 
@@ -1292,6 +1329,127 @@
     return '<span class="badge badge-status">' + escapeHtml(dir || "?") + '</span>';
   }
 
+  // ---------------------------------------------------------------
+  // AlgoPro takipçi kartı (D20b)
+  // ---------------------------------------------------------------
+  // Verisi /api/status gövdesindeki `follower` bloğundan gelir — pano AYRI
+  // bir yoklama AÇMAZ (2026-08-18 pano-açlığı dersi). Blok yoksa
+  // (FOLLOWER_EMBEDDED=false) bölüm gizli kalır ve pano bugünküyle aynıdır.
+  function apKv(key, value, cls){
+    return '<div class="ap-kv"><span class="k">' + escapeHtml(key) + '</span>' +
+      '<span class="v ' + (cls || "") + '">' + value + '</span></div>';
+  }
+
+  function renderFollower(statusRes){
+    var section = qs("ap-section");
+    if (!section) return;
+    var f = (statusRes && statusRes.ok && statusRes.data) ? statusRes.data.follower : null;
+    if (!f){
+      section.style.display = "none";
+      return;
+    }
+    section.style.display = "";
+
+    if (f.error){
+      qs("ap-state").textContent = "";
+      qs("ap-sub").textContent = "";
+      qs("ap-grid").innerHTML = "";
+      qs("ap-positions-wrap").innerHTML =
+        '<div class="placeholder">durum okunamadı: ' + escapeHtml(String(f.error)) + '</div>';
+      qs("ap-note").innerHTML = "";
+      return;
+    }
+
+    var ledger = f.virtual_ledger || {};
+    var coins = (f.universe || []).join(", ") || "—";
+    var reserved = (f.reserved_symbols || []).join(", ");
+    var positions = f.positions || [];
+
+    var stateTxt = f.running ? (f.entries_ready ? "aktif" : "giriş kapalı") : "durdu";
+    qs("ap-state").textContent = stateTxt;
+    qs("ap-sub").textContent =
+      "sanal defter · aynı hesap · " + escapeHtml(coins) +
+      " · " + escapeHtml(String(f.timeframe || "?")) + "m";
+
+    var equity = isNum(ledger.equity_usdt) ? ledger.equity_usdt : null;
+    var pnl = isNum(ledger.realized_pnl_usdt) ? ledger.realized_pnl_usdt : null;
+    var daily = isNum(f.daily_pnl) ? f.daily_pnl : null;
+
+    // SEVİYE değerleri (sermaye/equity/marj) işaretsiz yazılır; yalnız
+    // DEĞİŞİMLER (K/Z) `fmtUsdt` ile işaretlidir — "+1.000 USDT sermaye"
+    // bir kazanç gibi okunurdu.
+    var grid = "";
+    grid += apKv("Coin", '<span style="font-size:13px;">' + escapeHtml(coins) + '</span>');
+    grid += apKv("Sanal sermaye", fmtNum(ledger.base_usdt, 0) + " USDT");
+    grid += apKv("Güncel equity",
+      equity === null ? "—" : fmtNum(equity, 2) + " USDT",
+      pnl === null ? "" : pnlClass(pnl));
+    grid += apKv("Toplam K/Z", pnl === null ? "—" : fmtUsdt(pnl), pnlClass(pnl));
+    grid += apKv("Günlük K/Z", daily === null ? "—" : fmtUsdt(daily), pnlClass(daily));
+    grid += apKv("İşlem başı marj",
+      isNum(ledger.margin_per_trade_usdt)
+        ? fmtNum(ledger.margin_per_trade_usdt, 2) + " USDT" : "—");
+    grid += apKv("Açık pozisyon", positions.length + " / " + (f.max_positions || "?"));
+    grid += apKv("Komisyon kapısı reddi", String(f.fee_gate_rejects || 0),
+      (f.fee_gate_rejects || 0) > 0 ? "ap-warn" : "");
+    grid += apKv("Alarm olayı", String(f.events_total || 0));
+    grid += apKv("Son olay", f.last_event_at ? fmtClock(f.last_event_at) : "—");
+    qs("ap-grid").innerHTML = grid;
+
+    var wrap = qs("ap-positions-wrap");
+    if (!positions.length){
+      wrap.innerHTML = '<div class="placeholder">açık AlgoPro pozisyonu yok</div>';
+    } else {
+      var html = '<table><thead><tr>' +
+        '<th>Sembol</th><th>Yön</th><th class="num">Giriş</th><th class="num">SL</th>' +
+        '<th class="num">TP1 / TP2 / TP3</th><th class="num">Kald.</th>' +
+        '<th class="num">Marj</th><th class="num">ROI</th><th>Durum</th>' +
+        '</tr></thead><tbody>';
+      positions.forEach(function(p){
+        var steps = [];
+        if (p.tp1_filled || p.tp1_done) steps.push("TP1");
+        if (p.tp2_done) steps.push("TP2");
+        if (p.tp3_done) steps.push("TP3");
+        if (p.tp1_done) steps.push("BE");
+        html += '<tr>' +
+          '<td class="cell-symbol">' + escapeHtml(p.symbol) + '</td>' +
+          '<td>' + directionBadge(p.direction) + '</td>' +
+          '<td class="num">' + fmtPrice(p.entry_price) + '</td>' +
+          '<td class="num cell-dim">' + fmtPrice(p.stop_loss) + '</td>' +
+          '<td class="num cell-dim">' + fmtPrice(p.tp1) + ' / ' + fmtPrice(p.tp2) +
+            ' / ' + fmtPrice(p.tp3) + '</td>' +
+          '<td class="num">' + escapeHtml(String(p.leverage || "?")) + 'x</td>' +
+          '<td class="num cell-dim">' + (isNum(p.margin_usdt) ? fmtNum(p.margin_usdt, 2) : "—") + '</td>' +
+          '<td class="num ' + pnlClass(p.roi_pct) + '">' + fmtPct(p.roi_pct, 2) + '</td>' +
+          '<td class="cell-dim">' + (steps.length ? escapeHtml(steps.join(" → ")) : "—") + '</td>' +
+          '</tr>';
+      });
+      wrap.innerHTML = html + '</tbody></table>';
+    }
+
+    var notes = [];
+    if (reserved) notes.push("takipçiye ayrılmış (scalper görmez): " + escapeHtml(reserved));
+    if (f.daily_pnl_source === "ap_ledger") notes.push("günlük K/Z kaynağı: AP defteri");
+    if (isNum(f.daily_loss_threshold_usdt)){
+      notes.push("günlük kesici eşiği " + fmtUsdt(f.daily_loss_threshold_usdt) +
+        " (%" + escapeHtml(String(f.daily_loss_limit_pct)) + ")");
+    }
+    var warn = "";
+    if (f.entry_halted){
+      warn = '<span class="ap-warn">GİRİŞ KİLİDİ: ' +
+        escapeHtml(String(f.entry_halt_reason || "bilinmiyor")) + '</span>';
+    } else if (f.kill_switch_active){
+      warn = '<span class="ap-warn">KILL SWITCH (günlük zarar limiti)</span>';
+    } else if ((f.orphan_positions || []).length){
+      warn = '<span class="ap-warn">YETİM POZİSYON: ' +
+        escapeHtml((f.orphan_positions || []).join(", ")) + '</span>';
+    } else if (!f.entries_ready && f.entry_block_reason){
+      warn = '<span class="ap-warn">giriş kapalı: ' +
+        escapeHtml(String(f.entry_block_reason)) + '</span>';
+    }
+    qs("ap-note").innerHTML = (warn ? warn + (notes.length ? " · " : "") : "") + notes.join(" · ");
+  }
+
   function renderPositions(positionsRes, scalperRes){
     var wrap = qs("positions-wrap");
     var countEl = qs("positions-count");
@@ -1702,6 +1860,19 @@
     if (e.tv && e.tv.sources){
       html += fxKv("TV kaynakları", escapeHtml(e.tv.sources.join(", ")));
     }
+    // D20b: AlgoPro takipçisinin girişinde strateji göstergesi YOKTUR;
+    // "neden girildi" sorusunun yanıtı alarmın kendi telemetrisidir.
+    if (e.algopro){
+      var ap = e.algopro;
+      html += fxKv("AlgoPro TQI / Score",
+        fxNum(ap.tqi, 2) + " / " + fxNum(ap.score, 0));
+      html += fxKv("AlgoPro seviyeleri",
+        "SL " + fmtPrice(ap.sl) + " · TP " + fmtPrice(ap.tp1) + " / " +
+        fmtPrice(ap.tp2) + " / " + fmtPrice(ap.tp3));
+      html += fxKv("Seviye kaynağı", escapeHtml(String(ap.levels_source || "—")));
+      html += fxKv("Alarm fiyatı → dolum",
+        fmtPrice(ap.alarm_price) + " → " + fmtPrice(e.fill_price));
+    }
     html += '<div class="fx-kv" style="margin-top:8px;"><span class="k">Kapılar</span>' +
       '<span class="v">' +
       "rejim " + fxGateChip(gates.regime) + " · lider " + fxGateChip(gates.leader) +
@@ -1842,8 +2013,12 @@
         ? '<span class="fx-tag" style="padding:2px 7px;">' + escapeHtml(tags[0]) +
           (tags.length > 1 ? " +" + (tags.length - 1) : "") + '</span>'
         : '<span class="cell-dim">—</span>';
-      html += '<tr' + (clickable ? ' class="fx-clickable' + (open ? ' fx-open' : '') +
-          '" data-fx-id="' + t.id + '"' : '') + '>' +
+      // D20b: AlgoPro takipçisinin satırları (strategy="AP") AYRI renkle
+      // işaretlenir — iki defter aynı tabloda görünür ve karıştırılmamalı.
+      var apRow = String(t.strategy || "").toUpperCase() === "AP" ? " trade-ap" : "";
+      var rowCls = (clickable ? "fx-clickable" + (open ? " fx-open" : "") : "") + apRow;
+      html += '<tr' + (rowCls.trim() ? ' class="' + rowCls.trim() + '"' : '') +
+          (clickable ? ' data-fx-id="' + t.id + '"' : '') + '>' +
         '<td class="fx-caret">' + (clickable ? (open ? "▾" : "▸") : "") + '</td>' +
         '<td class="cell-dim">' + fmtDateTime(t.closed_at) + '</td>' +
         '<td>' + strategyBadge(t.strategy) + '</td>' +
@@ -2048,6 +2223,7 @@
 
       renderTopbar(health, status, positions, scalperStatus);
       renderSysbar(scalperStatus);
+      renderFollower(status);
       renderStrategyCards(scalperStats);
       renderPositions(positions, scalperStatus);
       renderRegimeMap(scalperStatus);

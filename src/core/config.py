@@ -6,8 +6,8 @@ Tüm environment variables ve uygulama ayarları burada yönetilir.
 import ipaddress
 import sys
 import warnings
-from typing import Optional
-from pydantic import Field, field_validator, model_validator
+from typing import ClassVar, List, Optional
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -551,6 +551,26 @@ class Settings(BaseSettings):
     follower_symbol_allowlist: str = (
         "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,BNBUSDT,ADAUSDT,LTCUSDT"
     )
+    # --- D20b: GÖMÜLÜ TAKİPÇİ (kullanıcı kararı 2026-08-23) ---------------
+    # true = takipçi motoru scalper ile AYNI süreçte, AYNI Binance hesabında
+    # ve AYNI panoda çalışır (ayrı hesap/panel YOK). false (varsayılan) =
+    # BUGÜNKÜ davranış: takipçi yalnız `BOT_MODE=follower` ayrı halkasında
+    # çalışır ve scalper halkası ona HTTP köprüsüyle bağlanır.
+    follower_embedded: bool = False
+    # Gömülü takipçinin SANAL defteri (USDT). Hesap paylaşıldığı için
+    # takipçinin boyutlaması gerçek bakiyeye DEĞİL bu sanal sermayeye
+    # dayanır: equity = taban + AP işlemlerinin gerçekleşmiş net PnL'i.
+    # YALNIZ `FOLLOWER_EMBEDDED=true` iken uygulanır — ayrı halkada hesap
+    # zaten takipçinindir ve sanal defter davranışı DEĞİŞTİRMEZ.
+    follower_virtual_capital_usdt: float = 1000.0
+    # Takipçiye AYRILMIŞ semboller (virgüllü). Boş = takipçi evreni
+    # `FOLLOWER_SYMBOL_ALLOWLIST`tir (8 majör) ve hiçbir sembol scalper'dan
+    # çıkarılmaz. Dolu VE `FOLLOWER_EMBEDDED=true` ise: (a) takipçi evreni
+    # BU listedir, (b) bu semboller scalper'ın tarama evreninden ve TV giriş
+    # oylamasından OTOMATİK dışlanır (kullanıcı kararı 2026-08-23: "ana
+    # sistem o coini GÖRMEZ"). Rezervasyon kilidi ikinci savunma olarak
+    # KALIR.
+    follower_symbols: str = ""
     # TradingView {{interval}} 1 dakikalık grafikte "1" döner; "1m" de kabul.
     follower_timeframe: str = "1"
     follower_max_positions: int = 4
@@ -561,16 +581,32 @@ class Settings(BaseSettings):
     follower_min_score: float = 0.0
     # Ters AlgoPro sinyalinde mevcut pozisyonu kapatıp yeni yöne gir.
     follower_flip: bool = True
-    follower_daily_loss_limit_pct: float = 15.0  # SCALPER_DAILY_LOSS_LIMIT_PCT mantığı
+    # D20b: varsayılan 15 → 10 (kullanıcı kararı). Gömülü modda eşik SANAL
+    # sermayeye (bkz. follower_virtual_capital_usdt) göre ölçülür; ayrı
+    # halkada hesap bakiyesine göre (bugünkü mantık, yalnız eşik daralttı).
+    follower_daily_loss_limit_pct: float = 10.0  # SCALPER_DAILY_LOSS_LIMIT_PCT mantığı
 
     # --- Boyutlama (KULLANICI KARARI 2026-08-23) ---
     # Marj = bakiyenin %'si; kaldıraç VOLATİLİTEYE göre dinamik:
     #   lev = clamp(round(SL_ROI_TARGET / sl_pct), LEV_MIN, LEV_MAX)
     # yani stop, marjın ~%SL_ROI_TARGET'i olacak şekilde seçilir.
     follower_margin_pct: float = 10.0
+    # KALDIRAÇ FORMÜLÜNÜN SABİTİ — "stop, marjın yüzde kaçı olsun?"
+    #   lev = clamp(round(FOLLOWER_SL_MARGIN_PCT / sl_pct),
+    #               FOLLOWER_LEV_MIN, FOLLOWER_MAX_LEVERAGE)
+    # `FOLLOWER_SL_ROI_TARGET` ESKİ adıdır ve çalışmaya devam eder; ikisi
+    # AYNI büyüklüktür ve `_reconcile_follower_sl_margin` ile eşitlenir
+    # (ikisi birden ve FARKLI verilirse startup HATASI — sessiz galip yok).
+    # Geçerli aralık 10–50 (kullanıcı kararı 2026-08-23): 10'un altı stopu
+    # gürültüye, 50'nin üstü marjı likidasyona yaklaştırır.
+    follower_sl_margin_pct: float = 30.0
     follower_sl_roi_target: float = 30.0
     follower_lev_min: int = 3
-    follower_lev_max: int = 100
+    # `FOLLOWER_MAX_LEVERAGE` ve `FOLLOWER_LEV_MAX` AYNI ayardır.
+    follower_lev_max: int = Field(
+        default=100,
+        validation_alias=AliasChoices("FOLLOWER_LEV_MAX", "FOLLOWER_MAX_LEVERAGE"),
+    )
     # Likidasyon koruması: lev × sl_pct bu değeri aşamaz (stop marjın %'si).
     follower_lev_liq_guard_pct: float = 50.0
     # mmr payı: (1/lev − mmr) > mult × sl_pct/100 değilse kaldıraç düşürülür.
@@ -735,10 +771,95 @@ class Settings(BaseSettings):
             )
         return normalized
 
+    #: Kaldıraç formülü sabitinin (SL başına marj %) geçerli aralığı.
+    FOLLOWER_SL_MARGIN_PCT_MIN: ClassVar[float] = 10.0
+    FOLLOWER_SL_MARGIN_PCT_MAX: ClassVar[float] = 50.0
+
+    @model_validator(mode="after")
+    def _reconcile_follower_sl_margin(self) -> "Settings":
+        """`FOLLOWER_SL_MARGIN_PCT` ↔ `FOLLOWER_SL_ROI_TARGET` eşitle + sınırla.
+
+        İkisi AYNI büyüklüktür (yeni ad + eski ad). Kural:
+          * yalnız biri verilmişse diğeri ONA eşitlenir (geri uyum),
+          * ikisi de verilmiş ve FARKLIysa startup HATASI (sessiz galip yok),
+          * sonuç 10–50 aralığında değilse startup HATASI — bu sabit
+            kaldıracın PAYIDIR, bant dışı bir değer her işlemin riskini
+            sessizce ölçekler.
+        """
+        provided = self.model_fields_set
+        new_given = "follower_sl_margin_pct" in provided
+        old_given = "follower_sl_roi_target" in provided
+        if new_given and old_given and abs(
+            float(self.follower_sl_margin_pct) - float(self.follower_sl_roi_target)
+        ) > 1e-9:
+            raise ValueError(
+                "AYAR ÇELİŞKİSİ: FOLLOWER_SL_MARGIN_PCT="
+                f"{self.follower_sl_margin_pct} ile FOLLOWER_SL_ROI_TARGET="
+                f"{self.follower_sl_roi_target} AYNI büyüklüktür ama farklı "
+                "verildi. Yalnız birini yazın (yeni ad: FOLLOWER_SL_MARGIN_PCT)."
+            )
+        if old_given and not new_given:
+            self.follower_sl_margin_pct = float(self.follower_sl_roi_target)
+        else:
+            self.follower_sl_roi_target = float(self.follower_sl_margin_pct)
+
+        value = float(self.follower_sl_margin_pct)
+        if not (
+            self.FOLLOWER_SL_MARGIN_PCT_MIN <= value <= self.FOLLOWER_SL_MARGIN_PCT_MAX
+        ):
+            raise ValueError(
+                f"FOLLOWER_SL_MARGIN_PCT geçersiz: {value} — "
+                f"{self.FOLLOWER_SL_MARGIN_PCT_MIN:g}–"
+                f"{self.FOLLOWER_SL_MARGIN_PCT_MAX:g} aralığında olmalı "
+                "(stop, marjın yüzde kaçı olsun?)."
+            )
+        return self
+
     @property
     def is_follower_mode(self) -> bool:
         """AlgoPro takipçi halkası mı? (BOT_MODE=follower)"""
         return str(self.bot_mode or "").strip().lower() == "follower"
+
+    @property
+    def follower_active(self) -> bool:
+        """Bu süreçte bir takipçi motoru koşacak mı?
+
+        İki yol: ayrı halka (`BOT_MODE=follower`) ya da gömülü mod
+        (`FOLLOWER_EMBEDDED=true`, scalper'ın YANINDA — D20b).
+        """
+        return bool(self.is_follower_mode or self.follower_embedded)
+
+    @staticmethod
+    def _csv_symbols(value) -> List[str]:
+        """`A,B , c` → `["A", "B", "C"]` (boş öğeler atılır, sıra korunur)."""
+        seen: List[str] = []
+        for item in str(value or "").split(","):
+            symbol = item.strip().upper()
+            if symbol and symbol not in seen:
+                seen.append(symbol)
+        return seen
+
+    @property
+    def follower_universe(self) -> List[str]:
+        """Takipçinin GİRİŞ evreni: `FOLLOWER_SYMBOLS` doluysa o, yoksa
+        `FOLLOWER_SYMBOL_ALLOWLIST` (8 majör — bugünkü davranış)."""
+        return (
+            self._csv_symbols(self.follower_symbols)
+            or self._csv_symbols(self.follower_symbol_allowlist)
+        )
+
+    @property
+    def follower_reserved_symbols(self) -> List[str]:
+        """Scalper'ın GÖRMEYECEĞİ semboller (kullanıcı kararı 2026-08-23).
+
+        YALNIZ gömülü modda ve YALNIZ `FOLLOWER_SYMBOLS` açıkça
+        doldurulduğunda doludur. Boş liste = bugünkü davranış birebir
+        (hiçbir sembol dışlanmaz); `FOLLOWER_EMBEDDED=false` iken de
+        DAİMA boştur.
+        """
+        if not self.follower_embedded:
+            return []
+        return self._csv_symbols(self.follower_symbols)
 
     @model_validator(mode="after")
     def _validate_structure_gate(self) -> "Settings":
@@ -905,6 +1026,17 @@ class Settings(BaseSettings):
            TESTNET host'unu gösteremez -> ValueError. Gerçek para sahte
            mumlarla yönetilemez.
         """
+        if self.is_follower_mode and self.follower_embedded:
+            # Ayrı halka ZATEN takipçidir; gömülü bayrak orada anlamsızdır ve
+            # "iki takipçi mi koşuyor?" sorusunu doğurur. Sessiz yok saymak
+            # yerine fail-fast: operatör hangi mimaride olduğunu bilmeli.
+            raise ValueError(
+                "GÜVENLİK HATASI: BOT_MODE=follower ile FOLLOWER_EMBEDDED=true "
+                "birlikte kullanılamaz. Ayrı halka (BOT_MODE=follower) zaten "
+                "yalnız takipçiyi çalıştırır; gömülü mod (D20b) scalper "
+                "halkasında BOT_MODE=scalper ile açılır."
+            )
+
         if self.is_follower_mode and not (self.risk_event_secret or "").strip():
             # TESTNET DAHİL zorunludur: takipçi halkasının TEK uzaktan durdurma
             # yolu /risk-event'tir. Telegram YOKTUR, scanner YOKTUR ve köprüyü
@@ -933,7 +1065,7 @@ class Settings(BaseSettings):
                     "https://testnet.binancefuture.com olarak ayarlayın."
                 )
 
-            if self.is_follower_mode:
+            if self.follower_active:
                 # docs/MAINNET_PLAN.md §6: takipçi halkası (D20) mainnet'e
                 # KENDİ BAŞINA terfi ETMEZ. Ölçülmüş bir kenarı yoktur (kanıt:
                 # yok — testnet ölçümü kanıt olacak) ve boyutlaması scalper'ın
@@ -941,10 +1073,11 @@ class Settings(BaseSettings):
                 # kaldıraç ≤100x). Testnet .env'i mainnet'e kopyalanınca bu
                 # sessizce gerçek parayla çalışamaz.
                 raise ValueError(
-                    "GÜVENLİK HATASI: BOT_MODE=follower yalnız TESTNET'te "
-                    "çalıştırılabilir. AlgoPro takipçi halkası mainnet'e kendi "
-                    "başına terfi etmez (docs/MAINNET_PLAN.md §6, D20) — "
-                    "BINANCE_BASE_URL'i testnet'e çevirin."
+                    "GÜVENLİK HATASI: AlgoPro takipçisi (BOT_MODE=follower ya da "
+                    "FOLLOWER_EMBEDDED=true) yalnız TESTNET'te çalıştırılabilir. "
+                    "Takipçi mainnet'e kendi başına terfi etmez "
+                    "(docs/MAINNET_PLAN.md §6, D20/D20b) — BINANCE_BASE_URL'i "
+                    "testnet'e çevirin ya da FOLLOWER_EMBEDDED=false yapın."
                 )
 
             if not self.scalper_entry_halt_enabled:

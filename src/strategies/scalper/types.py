@@ -234,3 +234,9 @@ def fee_aware_breakeven_price(
         raise ValueError(f"Geçersiz yön: {direction}")
 
     return float(result)
+
+
+#: Gömülü AlgoPro takipçisinin defter etiketi (`scalp_trades.strategy`, D20b).
+#: Scalper ve takipçi AYNI tabloyu paylaşır; bu sabit iki defteri ayırmanın
+#: TEK gerçek kaynağıdır (`follower/executor.FOLLOWER_STRATEGY` buna eşittir).
+FOLLOWER_LEDGER_STRATEGY = "AP"

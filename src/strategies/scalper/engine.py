@@ -72,6 +72,7 @@ from src.strategies.scalper.structure import (
 )
 from src.strategies.scalper.tracker import ScalpTracker
 from src.strategies.scalper.types import (
+    FOLLOWER_LEDGER_STRATEGY,
     Direction,
     Regime,
     ScalpSignal,
@@ -1037,6 +1038,36 @@ class ScalperEngine:
         except Exception:  # pragma: no cover - teşhis alanı asla patlamamalı
             return None
 
+    def _follower_reserved_symbols(self) -> Set[str]:
+        """Gömülü takipçiye AYRILMIŞ semboller (D20b, kullanıcı kararı).
+
+        Boş küme = bugünkü davranış birebir. Dolu olması için İKİSİ de şart:
+        `FOLLOWER_EMBEDDED=true` **ve** `FOLLOWER_SYMBOLS` dolu.
+        """
+        try:
+            return {
+                str(s).strip().upper()
+                for s in (getattr(self.cfg, "follower_reserved_symbols", []) or [])
+                if str(s).strip()
+            }
+        except Exception:  # savunmacı: teşhis alanı taramayı düşürmemeli
+            return set()
+
+    def _exclude_follower_symbols(self, universe: List[str]) -> List[str]:
+        """Tarama evreninden takipçi sembollerini çıkar (bir kez loglar)."""
+        reserved = self._follower_reserved_symbols()
+        if not reserved:
+            return list(universe)
+        kept = [s for s in universe if str(s).upper() not in reserved]
+        dropped = sorted({str(s).upper() for s in universe} & reserved)
+        if dropped and dropped != getattr(self, "_follower_excluded_logged", None):
+            self._follower_excluded_logged = dropped
+            self.logger.info(
+                f"🤖 Tarama evreninden çıkarıldı — AlgoPro takipçisine ayrılmış: "
+                f"{', '.join(dropped)}"
+            )
+        return kept
+
     def _sync_scalper_reservations(self) -> None:
         """Release normal closed/cancelled symbols, never an active safety hold."""
 
@@ -1484,11 +1515,12 @@ class ScalperEngine:
         if allowlist_csv:
             # Kanıt disiplini: canlı evren, backtest'in kapsadığı sembollere
             # sabitlenebilir — scanner'ın top_n listesi hiç sorgulanmaz.
-            self._universe = [
+            universe = [
                 s.strip().upper() for s in allowlist_csv.split(",") if s.strip()
             ]
         else:
-            self._universe = await self.scanner.get_universe()
+            universe = await self.scanner.get_universe()
+        self._universe = self._exclude_follower_symbols(universe)
 
         if not self._entries_ready():
             return
@@ -3175,6 +3207,15 @@ class ScalperEngine:
         symbol = str(symbol).upper()
         if not self.running:
             return {"accepted": False, "reason": "scalper çalışmıyor"}
+        # D20b: takipçiye AYRILMIŞ sembol TV oyu da ALAMAZ. `.env`'deki
+        # `SCALPER_TV_SYMBOL_ALLOWLIST` unutulsa bile ana sistem o coini
+        # GÖRMEZ (kullanıcı kararı 2026-08-23); allowlist'ten BAĞIMSIZ kapı.
+        if symbol in self._follower_reserved_symbols():
+            self.logger.info(
+                f"🚫 TV sinyali reddedildi: {symbol} — AlgoPro takipçisine "
+                f"ayrılmış sembol (FOLLOWER_SYMBOLS)"
+            )
+            return {"accepted": False, "reason": "takipçiye ayrılmış sembol"}
         tv_allow = str(
             getattr(self.cfg, "scalper_tv_symbol_allowlist", "") or ""
         ).strip()
@@ -4246,7 +4287,45 @@ class ScalperEngine:
 
         self._daily_income_cache = (net, now_monotonic, today)
         self._income_cache_close_seq = getattr(self.tracker, "close_seq", 0)
-        return net
+        return net - await self._follower_daily_pnl_offset(today)
+
+    async def _follower_daily_pnl_offset(self, today: str) -> float:
+        """Gömülü takipçinin (strategy="AP") BUGÜNKÜ defter PnL'i (D20b).
+
+        NEDEN: gömülü modda iki motor AYNI Binance hesabındadır ve
+        `/fapi/v1/income` iki defteri BİRLİKTE raporlar. Scalper'ın günlük
+        kesicisi başkasının işlemleriyle tetiklenemez (ve tersi de olamaz),
+        bu yüzden AP satırlarının net PnL'i income'dan DÜŞÜLÜR.
+
+        Kapsam ve DÜRÜST sınırı: `realized_pnl` komisyon düşülmüş nettir
+        (`_CloseLedger.net_pnl_estimate`), fakat AÇIK bir AP pozisyonunun
+        FUNDING_FEE satırı ve HENÜZ kapanmamış işlemin komisyonu bu
+        düzeltmeye girmez — o kalıntı scalper'ın eşiğinde kalır (fail-closed
+        yön: eşiği daraltır, gevşetmez).
+
+        Önbellek DIŞINDA hesaplanır: scalper'ın `close_seq` sayacı KENDİ
+        tracker örneğinindir ve AP kapanışlarında artmaz; düzeltmeyi
+        önbelleğe almak 120 sn boyunca bayat bir eşik üretirdi.
+
+        `FOLLOWER_EMBEDDED=false` (varsayılan) → DAİMA 0.0, davranış birebir.
+        """
+        if not bool(getattr(self.cfg, "follower_embedded", False)):
+            return 0.0
+        getter = getattr(self.tracker, "strategy_realized_pnl_since", None)
+        if getter is None:
+            return 0.0
+        try:
+            day_start = datetime.strptime(today, "%Y-%m-%d")
+            return float(await getter(FOLLOWER_LEDGER_STRATEGY, day_start))
+        except Exception as exc:
+            # Fail-closed DEĞİL: düzeltme okunamazsa ham income kullanılır
+            # (eşik yalnız AP kârı kadar GEVŞER değil, AP zararı kadar
+            # DARALIR) — ama sessiz kalınmaz.
+            self.logger.warning(
+                f"⚠️ Takipçi (AP) günlük PnL düzeltmesi okunamadı ({exc}); "
+                f"scalper günlük eşiği ham hesap income'ıyla ölçülüyor"
+            )
+            return 0.0
 
     async def _get_cached_balance(self) -> Optional[float]:
         balance, cached_at = self._balance_cache

@@ -338,7 +338,11 @@ async def test_virtual_capital_compounds_only_tracker_eligible_pnl_and_caps_exch
     assert await executor.get_sizing_equity() == pytest.approx(1_075.0)
     assert executor.last_sizing_equity == pytest.approx(1_075.0)
     assert executor.sizing_snapshot()["start_trade_id"] == 8
-    tracker.compounding_snapshot.assert_awaited_once_with(8)
+    # D20b: scalper'ın sanal kasası gömülü takipçinin (strategy="AP")
+    # satırlarını DIŞLAR — iki defter birbirini kirletmez.
+    tracker.compounding_snapshot.assert_awaited_once_with(
+        8, exclude_strategies=("AP",)
+    )
 
 
 @pytest.mark.asyncio

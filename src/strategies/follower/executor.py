@@ -45,6 +45,7 @@ from src.strategies.follower.types import (
 from src.strategies.scalper.executor import ScalpPosition
 from src.strategies.scalper.tracker import ScalpTracker
 from src.strategies.scalper.types import (
+    FOLLOWER_LEDGER_STRATEGY,
     Direction,
     ExitPlan,
     Regime,
@@ -55,7 +56,9 @@ from src.trading.binance_client_improved import BinanceAPIError, ImprovedBinance
 from src.trading.position_manager import PositionManager, UnprotectedPositionError
 
 # Deftere yazılan strateji etiketi — `ledger_report.py --strategy AP`.
-FOLLOWER_STRATEGY = "AP"
+#: `scalp_trades.strategy` etiketi — tek gerçek kaynak scalper/types.py'dedir
+#: (gömülü modda scalper defteri AP satırlarını AYNI sabitle dışlar, D20b).
+FOLLOWER_STRATEGY = FOLLOWER_LEDGER_STRATEGY
 
 
 @dataclass
@@ -650,6 +653,21 @@ class FollowerExecutor:
         )
 
         margin_usdt = (filled_qty * entry_price) / plan.leverage
+        forensics_document = self._build_entry_forensics(
+            signal=signal,
+            event=event,
+            plan=plan,
+            levels=levels,
+            direction=direction,
+            entry_price=entry_price,
+            filled_qty=filled_qty,
+            margin_usdt=margin_usdt,
+            stop_price=stop_price,
+            breakeven_price=breakeven_price,
+            fill_sl_pct=fill_sl_pct,
+            real_fee_roi=real_fee_roi,
+            fee_rate_source=fee_rate_source,
+        )
         try:
             trade_id = await self.tracker.record_open(
                 signal=signal,
@@ -662,6 +680,7 @@ class FollowerExecutor:
                 tp2_algo_id=algo_ids[1],
                 tp3_algo_id=algo_ids[2],
                 entry_order_id=entry_order_id,
+                forensics=forensics_document,
             )
         except Exception as exc:
             self.logger.critical(
@@ -698,6 +717,111 @@ class FollowerExecutor:
                 "opened_at": datetime.now(timezone.utc).isoformat(),
             },
         )
+
+    def _build_entry_forensics(
+        self,
+        *,
+        signal: ScalpSignal,
+        event: FollowerEvent,
+        plan: Any,
+        levels: FollowerLevels,
+        direction: Direction,
+        entry_price: float,
+        filled_qty: float,
+        margin_usdt: float,
+        stop_price: float,
+        breakeven_price: float,
+        fill_sl_pct: float,
+        real_fee_roi: float,
+        fee_rate_source: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Takipçi girişinin adli kaydı (D21 belgesi, D20b'de takipçiye açıldı).
+
+        SALT GÖZLEM: hiçbir kapıya girmez, hata hâlinde None döner ve giriş
+        normal biçimde sürer. Scalper'ın belgesiyle AYNI şemadır — pano ve
+        `ledger_report.py` iki defteri tek kartla okuyabilsin diye:
+        `source="AlgoPro"`, göstergeler yerine AlgoPro telemetrisi
+        (`TQI`/`Score`) ve MESAJDAN gelen seviyeler yazılır. Takipçide
+        strateji göstergesi, rejim ve lider kapısı YOKTUR; o alanlar
+        uydurulmaz, `off` olarak işaretlenir.
+        """
+        if not bool(getattr(self.cfg, "scalper_forensics_enabled", True)):
+            return None
+        try:
+            from src.strategies.scalper import forensics as fx
+
+            now = datetime.now(timezone.utc)
+            entry = fx.build_entry(
+                at=now.isoformat(timespec="seconds"),
+                signal=signal,
+                ctx=None,
+                cfg=self.cfg,
+                fill_price=entry_price,
+                quantity=filled_qty,
+                leverage=plan.leverage,
+                margin_usdt=margin_usdt,
+                stop_price=stop_price,
+                tp1_price=levels.tp1,
+                tp2_price=levels.tp2,
+                breakeven_price=breakeven_price,
+                signal_at=event.ts or None,
+                entry_mode="taker",
+                indicators={},
+                regime_info={},
+                leader_gate={},
+                gates={
+                    # Takipçide strateji kapıları YOKTUR — "passed" yazmak
+                    # olmayan bir kapıyı geçmiş göstermek olurdu.
+                    "regime": "off",
+                    "leader": "off",
+                    "structure": "off",
+                    "tv_structure": "off",
+                    "capacity": "passed",
+                    "cooldown": "passed",
+                    "fee_gate": "passed",
+                },
+                tv={
+                    "source": "algopro",
+                    "sources": ["algopro"],
+                    "kind": event.kind,
+                    "timeframe": event.timeframe,
+                    "alarm_price": event.price,
+                    "tqi": event.tqi,
+                    "score": event.score,
+                },
+                source="AlgoPro",
+                open_positions=None,
+                daily_pnl=None,
+            )
+            # Takipçiye ÖZGÜ alanlar (build_entry'nin şemasında yoktur).
+            entry["algopro"] = {
+                "tqi": event.tqi,
+                "score": event.score,
+                "alarm_price": event.price,
+                "levels_source": getattr(levels, "source", None),
+                "sl": levels.stop,
+                "tp1": levels.tp1,
+                "tp2": levels.tp2,
+                "tp3": levels.tp3,
+            }
+            entry["tp3_price"] = levels.tp3
+            entry["sl_pct_plan"] = plan.sl_pct
+            entry["sl_pct_fill"] = fill_sl_pct
+            entry["tp_roi_pct"] = list(plan.tp_roi_pct)
+            entry["fee_roi_real_pct"] = real_fee_roi
+            entry["fee_rate_source"] = fee_rate_source
+            thresholds = fx.thresholds_from_cfg(self.cfg)
+            return {
+                "v": fx.FORENSICS_VERSION,
+                "entry": entry,
+                "verdict": fx.classify_entry(entry, thresholds),
+            }
+        except Exception as exc:
+            self.logger.warning(
+                f"⚠️ {signal.symbol}: takipçi adli kaydı kurulamadı ({exc}) — "
+                f"giriş ETKİLENMEDİ"
+            )
+            return None
 
     async def _record_protection_failure(
         self,
