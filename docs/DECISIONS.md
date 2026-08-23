@@ -1510,6 +1510,7 @@ canlı testnet davranışı HER İKİ durumda da aynıdır). Bulgu 3 → giriş 
 
 
 ### D21 — İşlem adli kaydı (trade forensics) · 2026-08-23 · **AKTİF (yalnız gözlemlenebilirlik — DAVRANIŞ DEĞİŞİKLİĞİ YOK)**
+**CANLI (testnet, 2026-08-23 13:34 UTC):** merge 17d2eee (1751 test) → `scripts/deploy.sh awa` (pid 490631, sağlık 45 sn). `/scalper/forensics/summary` ve `/recent` yanıt veriyor, `scalp_trades.forensics` kolonu var; kayıt bir sonraki açılan işlemle başlar (23 Ağu günlük kesici aktif → ilk kayıtlar 24 Ağu 00:00 UTC sonrası).
 
 **Ne:** her scalp işlemi için giriş ve çıkış ANINDA bilinen bağlamın tamamı tek
 bir JSON belgesine yazılır (`scalp_trades.forensics` + append-only
