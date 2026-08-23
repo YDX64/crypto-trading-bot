@@ -354,11 +354,28 @@ doğrulanmamış gövde takipçiye enjekte edilemez).
 function call" modunda mesajı script üretir ve seviyeleri İÇERİR:
 `🔴 SELL | BINANCE:BTCUSDT | TF: 1 | Price: 77126.08 | TQI: .45 | Score: 8 | SL: 77167.77
 | TP1: 77105.23 | TP2: 77084.39 | TP3: 77063.54 | TP: fixed ×1.00`; `🎯 TP1 HIT | … | Price: …`;
-`🛑 SL HIT | … | Price: …`. TP'ler SL mesafesinin 0.5/1.0/1.5 katıdır (fiyat
-hassasiyetine yuvarlanmış, ölçülen fark ≤ yarım tick). Bu yüzden sembol başına TEK
-alarm yeter (mesaj şablonu yazılmaz) ve ayrıştırma emoji'ye DEĞİL anahtar kelimelere
-(`BUY/SELL/EXIT/TPn HIT/SL HIT`) ve `Anahtar: değer` çiftlerine dayanır. `TQI`/`Score`
-telemetriye yazılır; opsiyonel `FOLLOWER_MIN_SCORE` (vars. 0 = kapalı).
+`🛑 SL HIT | … | Price: …`. LONG bacağı da AYNI kalıptadır (ölçüldü):
+`🟢 BUY | BINANCE:BTCUSDT | TF: 1 | Price: 76556.52 | TQI: .54 | Score: 17 | SL: 76501.73
+| TP1: 76583.92 | TP2: 76611.32 | TP3: 76638.72 | TP: fixed ×1.00` → `🎯 TP1 HIT` →
+`🎯 TP2 HIT` → `🏆 TP3 HIT`; başka bir BUY `🛑 SL HIT | … | Price: 76497.98` ile bitti.
+TP'ler SL mesafesinin 0.5/1.0/1.5 katıdır (her seviye AYRI yuvarlandığı için ölçülen
+sapma ≤ 2 tick). Bu yüzden sembol başına TEK alarm yeter (mesaj şablonu yazılmaz) ve
+ayrıştırma emoji'ye DEĞİL anahtar kelimelere (`BUY/SELL/EXIT/TPn HIT/SL HIT`) ve
+`Anahtar: değer` çiftlerine dayanır. `TQI`/`Score` telemetriye yazılır; opsiyonel
+`FOLLOWER_MIN_SCORE` (vars. 0 = kapalı). **EXIT gövdesi henüz ÖLÇÜLMEDİ** — `⚪ EXIT`
+anahtar kelimesi varsayımdır (kod anahtar kelimeye dayandığı için biçim küçük
+farklarla gelse de çalışır; gelmezse olay 422 alır ve loglanır, sessiz kalmaz).
+
+**Seviye SIRASI kapısı (parser, 2026-08-23 kullanıcı kararı):** ölçülen gerçek
+gövdelerde sıra DAİMA `LONG: SL < Price < TP1 < TP2 < TP3` (SHORT tersi). Giriş
+olaylarında bu sıra bozuksa (ya da iki seviye EŞİTSE) gövde AlgoPro V1.6 girişi
+DEĞİLDİR ve `FollowerParseError` → **HTTP 422** ile REDDEDİLİR: bir "SL"yi TP sanıp
+ters tarafa emir koymaktansa işlemi kaçırmak doğrudur. Doğrulama yalnız mesajda VAR
+OLAN alanlar üzerinde yapılır (eksik alan zinciri kırmaz) ve yalnız `entry`
+olaylarında çalışır (HIT/EXIT mesajları yön taşımaz). `levels.resolve_levels`'deki
+"yanlış taraf → hesaplanana düş" kuralı KALDIRILMADI: giriş fiyatı mesajdakinden
+farklı olabilir (mesajda `Price` yoksa canlı fiyat kullanılır), o yüzden ikinci bir
+savunma katmanı olarak durur.
 
 **Neden AYRI halka:** takipçinin ölçülmüş bir kenarı YOKTUR ve boyutlaması scalper'ın
 risk-tabanlı boyutlamasından tamamen farklıdır (marj %10 + ≤100x). Aynı süreçte
@@ -376,16 +393,19 @@ startup HATASI** (docs/MAINNET_PLAN.md §6).
 (scalper modunda `scalper_engine` — aynı yol), `/health` ve `/api/status`'a yalnız
 takipçi modunda çalışan erken dallar.
 
-**Kanıt:** 183 yeni takipçi testi — `tests/test_follower_parser.py` (34, TV'den
-alınan GERÇEK gövdeler: SELL, SL HIT, TP1/TP2/TP3 HIT dizisi), `test_follower_levels.py`
-(16), `test_follower_plan.py` (27, kullanıcının üç örneği birebir),
-`test_follower_executor.py` (16, korumalı açılış disiplini + yeniden çapalama bütçesi),
-`test_follower_engine.py` (39, kapılar/flip/exit/HIT çapraz doğrulaması + gerçek
-`FollowerExitManager` ile uçtan uca giriş→TP1→BE→EXIT), `test_follower_forwarder.py` (19),
-`test_follower_endpoint.py` (19, 403/422/503 + köprü çağrı yeri),
-`test_follower_mode.py` (13, BOT_MODE fail-fast + mainnet yasağı + scalper nötrlüğü);
-ayrıca `test_deploy_scripts.py` (+6 halka) ve `test_ledger_report.py` (+4 `--strategy`).
-`python3 -m pytest tests -q` → **869 passed, 1 skipped** (önceki: 676 passed, 1 skipped).
+**Kanıt:** 223 yeni takipçi testi — `tests/test_follower_parser.py` (52, TV'den
+alınan GERÇEK gövdeler: SELL dizisi, BUY→TP1→TP2→TP3 dizisi, SL HIT + seviye sırası
+kapısı), `test_follower_levels.py` (16), `test_follower_plan.py` (27, kullanıcının üç
+örneği birebir), `test_follower_brackets.py` (16, kaldıraç dilimi önbelleği:
+fail-closed / bayat kayıt / tek uçuş), `test_follower_executor.py` (16, korumalı
+açılış disiplini + yeniden çapalama bütçesi), `test_follower_engine.py` (45,
+kapılar/flip/exit/HIT çapraz doğrulaması + İDEMPOTANS (aynı alarmın ikinci teslimi) +
+gerçek `FollowerExitManager` ile uçtan uca giriş→TP1→BE→EXIT),
+`test_follower_forwarder.py` (19), `test_follower_endpoint.py` (19, 403/422/503 +
+köprü çağrı yeri), `test_follower_mode.py` (13, BOT_MODE fail-fast + mainnet yasağı +
+scalper nötrlüğü); ayrıca `test_deploy_scripts.py` (+6 halka) ve
+`test_ledger_report.py` (+4 `--strategy`).
+`python3 -m pytest tests -q` → **909 passed, 1 skipped** (önceki: 676 passed, 1 skipped).
 Backtest harness'e DOKUNULMADI — takipçi yalnız canlı olay hattında çalışır ve strateji
 C'yi hiç kullanmaz (CLAUDE.md kural 2 kapsamı dışında).
 

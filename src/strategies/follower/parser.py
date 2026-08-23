@@ -33,6 +33,20 @@ diyorsa" (bkz. ``levels.resolve_levels``). ``TQI`` ve ``Score`` telemetri/defter
 için taşınır; ``Score`` opsiyonel ``FOLLOWER_MIN_SCORE`` filtresinde kullanılır.
 ``TP: fixed ×1.00`` gibi alanlar seviye DEĞİLDİR (yalnız ``tp1/tp2/tp3``).
 
+## Seviye SIRASI doğrulaması (giriş olayları)
+
+2026-08-23'te TV'de yakalanan gerçek gövdelerde sıra DAİMA şudur::
+
+    LONG  (🟢 BUY):  SL < Price < TP1 < TP2 < TP3
+    SHORT (🔴 SELL): SL > Price > TP1 > TP2 > TP3
+
+Bu sıra bozuksa mesaj AlgoPro V1.6'nın ürettiği bir giriş DEĞİLDİR (alert
+biçimi değişmiş, alanlar yer değiştirmiş ya da gövde başka bir kaynaktan
+gelmiştir). Bir "SL"yi TP sanıp ters tarafa emir koymaktansa REDDETMEK
+doğrudur → ``FollowerParseError`` (HTTP 422). Doğrulama yalnız ``entry``
+olaylarında ve yalnız mesajda VAR OLAN alanlar üzerinde yapılır; eşitlik de
+tutarsızlıktır (sıfır mesafeli stop/TP emir olarak konulamaz).
+
 ## İkincil biçim — açık ``key=value`` şablonu
 
 Elle kurulan alarmlar, curl testleri ve ileride başka bir kaynak için::
@@ -169,6 +183,50 @@ def _resolve_symbol(candidates: List[str], text: str) -> str:
     )
 
 
+def _validate_entry_level_order(
+    direction: Optional[Direction],
+    price: Optional[float],
+    levels: MessageLevels,
+) -> None:
+    """Giriş mesajındaki seviyelerin YÖNE göre sırasını doğrula (fail-closed).
+
+    LONG: ``SL < Price < TP1 < TP2 < TP3`` — SHORT tersi. Yalnız mesajda VAR
+    OLAN alanlar zincire girer; eksik alan doğrulamayı atlatmaz, sadece o
+    halkayı düşürür. Tutarsızlık ``FollowerParseError`` (HTTP 422) demektir:
+    seviyeleri yanlış yorumlamak ters tarafa emir koymak olurdu.
+    """
+    if direction is None:
+        return
+
+    # Zincir: artan (LONG) ya da azalan (SHORT) olması beklenen etiketli
+    # değerler. ``None`` olanlar çıkarılır.
+    chain: List[Tuple[str, float]] = []
+    for label, value in (
+        ("SL", levels.sl),
+        ("Price", price),
+        ("TP1", levels.tp1),
+        ("TP2", levels.tp2),
+        ("TP3", levels.tp3),
+    ):
+        if value is not None and math.isfinite(value) and value > 0:
+            chain.append((label, float(value)))
+    if len(chain) < 2:
+        return
+
+    ascending = direction == Direction.LONG
+    expected = "SL < Price < TP1 < TP2 < TP3" if ascending else (
+        "SL > Price > TP1 > TP2 > TP3"
+    )
+    for (prev_label, prev_value), (label, value) in zip(chain, chain[1:]):
+        ordered = value > prev_value if ascending else value < prev_value
+        if not ordered:
+            raise FollowerParseError(
+                f"Seviye sırası {direction.value} yönüyle tutarsız: "
+                f"{prev_label}={prev_value:g}, {label}={value:g} "
+                f"(beklenen {expected}) — giriş reddedildi"
+            )
+
+
 def _parse_key_value_template(text: str) -> Optional[FollowerEvent]:
     """İkincil biçim: ``kind=… src=… px=…``. ``kind=`` yoksa None döner."""
     tokens = text.split()
@@ -202,19 +260,24 @@ def _parse_key_value_template(text: str) -> Optional[FollowerEvent]:
             "Giriş olayında yön çözülemedi — 'buy'/'sell' (long/short) gerekli"
         )
 
+    price = _parse_positive_float(fields.get("px"))
+    levels = MessageLevels(
+        sl=_parse_positive_float(fields.get("sl")),
+        tp1=_parse_positive_float(fields.get("tp1")),
+        tp2=_parse_positive_float(fields.get("tp2")),
+        tp3=_parse_positive_float(fields.get("tp3")),
+    )
+    if kind == KIND_ENTRY:
+        _validate_entry_level_order(direction, price, levels)
+
     return FollowerEvent(
         kind=kind,
         symbol=symbol,
         direction=direction,
         timeframe=str(fields.get("tf", "")).strip(),
-        price=_parse_positive_float(fields.get("px")),
+        price=price,
         ts=str(fields.get("t", "")).strip()[:64],
-        levels=MessageLevels(
-            sl=_parse_positive_float(fields.get("sl")),
-            tp1=_parse_positive_float(fields.get("tp1")),
-            tp2=_parse_positive_float(fields.get("tp2")),
-            tp3=_parse_positive_float(fields.get("tp3")),
-        ),
+        levels=levels,
         score=_parse_finite_float(fields.get("score")),
         tqi=_parse_finite_float(fields.get("tqi")),
         source=str(fields.get("src", "algopro")).strip().lower()[:32] or "algopro",
@@ -286,19 +349,24 @@ def _parse_algopro_message(text: str) -> FollowerEvent:
 
     symbol = _resolve_symbol(symbol_candidates, text)
 
+    price = _parse_positive_float(fields.get("price"))
+    levels = MessageLevels(
+        sl=_parse_positive_float(fields.get("sl")),
+        tp1=_parse_positive_float(fields.get("tp1")),
+        tp2=_parse_positive_float(fields.get("tp2")),
+        tp3=_parse_positive_float(fields.get("tp3")),
+    )
+    if kind == KIND_ENTRY:
+        _validate_entry_level_order(direction, price, levels)
+
     return FollowerEvent(
         kind=kind,
         symbol=symbol,
         direction=direction,
         timeframe=str(fields.get("tf", "")).strip(),
-        price=_parse_positive_float(fields.get("price")),
+        price=price,
         ts=str(fields.get("time", "") or fields.get("t", "")).strip()[:64],
-        levels=MessageLevels(
-            sl=_parse_positive_float(fields.get("sl")),
-            tp1=_parse_positive_float(fields.get("tp1")),
-            tp2=_parse_positive_float(fields.get("tp2")),
-            tp3=_parse_positive_float(fields.get("tp3")),
-        ),
+        levels=levels,
         score=_parse_finite_float(fields.get("score")),
         tqi=_parse_finite_float(fields.get("tqi")),
         source="algopro",

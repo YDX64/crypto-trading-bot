@@ -481,6 +481,116 @@ class TestExitAndHitEvents:
         assert result["accepted"] is False
 
 
+class TestDuplicateDelivery:
+    """İDEMPOTANS: aynı alarm iki kez iletilirse (TV retry / köprü tekrarı).
+
+    Köprü fire-and-forget'tir ve TradingView bir alarmı yeniden gönderebilir;
+    hiçbir olay türü ikinci gelişinde İKİNCİ bir pozisyon/işlem üretmemelidir.
+    """
+
+    def _finalizing_engine(self, tmp_path, **kwargs):
+        """`_handle_closed`'ı GERÇEKÇİ yap: izleme listesinden düşür."""
+        engine = _make_engine(tmp_path, **kwargs)
+        tracked = engine.exits._positions
+
+        async def _closed(symbol, sp, *, forced_exit_reason=None):
+            tracked.pop(symbol, None)
+
+        engine.exits._handle_closed = AsyncMock(side_effect=_closed)
+        return engine
+
+    async def test_duplicate_entry_opens_only_one_position(self, tmp_path):
+        engine = _make_engine(tmp_path)
+        event = parse_follower_event(SELL_ENTRY)
+
+        first = await engine.handle_event(event)
+        second = await engine.handle_event(event)
+
+        assert first["accepted"] is True
+        assert second["accepted"] is False
+        assert "aynı yönde açık pozisyon" in second["reason"]
+        assert engine.executor.open_position.await_count == 1
+        assert engine._reject_counters.get("already_open") == 1
+
+    async def test_concurrent_duplicate_entries_are_serialized(self, tmp_path):
+        """Aynı anda gelen iki kopya: `_entry_lock` ikinciyi kapıya çarpar."""
+        engine = _make_engine(tmp_path)
+        event = parse_follower_event(SELL_ENTRY)
+
+        results = await asyncio.gather(
+            engine.handle_event(event), engine.handle_event(event)
+        )
+
+        assert sorted(bool(r["accepted"]) for r in results) == [False, True]
+        assert engine.executor.open_position.await_count == 1
+
+    async def test_duplicate_reverse_signal_flips_only_once(self, tmp_path):
+        """Ters sinyal iki kez gelirse ikinci artık AYNI yöndedir → ret."""
+        existing = _fake_position(direction=Direction.SHORT)
+        engine = self._finalizing_engine(tmp_path, positions={"BTCUSDT": existing})
+        engine.client.get_position_risk = AsyncMock(
+            side_effect=[
+                {"positionAmt": -0.12},  # flip kapanışı için canlı miktar
+                {"positionAmt": 0.0},    # kapanış doğrulaması
+                {"positionAmt": 0.0},    # yeni girişten önceki borsa kapısı
+            ]
+        )
+        engine.executor.open_position = AsyncMock(
+            return_value=_fake_position(direction=Direction.LONG)
+        )
+        event = parse_follower_event(BUY_ENTRY)
+
+        first = await engine.handle_event(event)
+        second = await engine.handle_event(event)
+
+        assert first["accepted"] is True and first["flipped"] is True
+        assert second["accepted"] is False
+        assert "aynı yönde açık pozisyon" in second["reason"]
+        assert engine.exits._handle_closed.await_count == 1
+        assert engine.executor.open_position.await_count == 1
+
+    async def test_duplicate_exit_closes_only_once(self, tmp_path):
+        engine = self._finalizing_engine(
+            tmp_path, positions={"BTCUSDT": _fake_position()}
+        )
+        engine.client.get_position_risk = AsyncMock(
+            side_effect=[{"positionAmt": -0.12}, {"positionAmt": 0.0}]
+        )
+        event = parse_follower_event(EXIT_EVENT)
+
+        first = await engine.handle_event(event)
+        second = await engine.handle_event(event)
+
+        assert first["accepted"] is True
+        assert second["accepted"] is False
+        assert "izlenen pozisyon yok" in second["reason"]
+        assert engine.exits._handle_closed.await_count == 1
+
+    async def test_duplicate_terminal_hit_finalizes_only_once(self, tmp_path):
+        engine = self._finalizing_engine(
+            tmp_path, positions={"BTCUSDT": _fake_position()}, position_amt=0.0
+        )
+        event = parse_follower_event(SL_HIT)
+
+        first = await engine.handle_event(event)
+        second = await engine.handle_event(event)
+
+        assert first["accepted"] is True
+        assert second["accepted"] is False
+        assert engine.exits._handle_closed.await_count == 1
+
+    async def test_duplicate_tp_hit_is_telemetry_only(self, tmp_path):
+        engine = self._finalizing_engine(
+            tmp_path, positions={"BTCUSDT": _fake_position()}, position_amt=-0.08
+        )
+        event = parse_follower_event(TP1_HIT)
+
+        assert (await engine.handle_event(event))["accepted"] is True
+        assert (await engine.handle_event(event))["accepted"] is True
+        engine.exits._handle_closed.assert_not_called()
+        assert engine._event_counters["tp1"] == 2
+
+
 class TestTelemetry:
     async def test_events_and_counters_recorded(self, tmp_path):
         engine = _make_engine(tmp_path)

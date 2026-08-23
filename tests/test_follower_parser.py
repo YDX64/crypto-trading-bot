@@ -31,11 +31,24 @@ REAL_TP1_HIT_2 = "🎯 TP1 HIT | BINANCE:BTCUSDT | TF: 1 | Price: 77037.49"
 REAL_TP2_HIT_2 = "🎯 TP2 HIT | BINANCE:BTCUSDT | TF: 1 | Price: 77012.87"
 REAL_TP3_HIT_2 = "🏆 TP3 HIT | BINANCE:BTCUSDT | TF: 1 | Price: 76988.26"
 
-# BUY ve EXIT gövdeleri TV'de HENÜZ GÖRÜLMEDİ (2026-08-23). Aşağıdakiler aynı
-# kalıptan VARSAYIMDIR; ayrıştırma emoji'ye değil anahtar kelimeye (BUY/EXIT)
-# dayandığı için biçim küçük farklarla gelse de çalışır.
+# --- GERÇEK LONG dizisi (TV Desktop sonda alarmı, 2026-08-23) --------------
+# Kullanıcı doğrulaması: BUY girişi → TP1 → TP2 → TP3 HIT; ayrı bir BUY ise
+# SL HIT ile bitti. Seviye sırası LONG'da SL < Price < TP1 < TP2 < TP3.
+REAL_BUY = (
+    "🟢 BUY | BINANCE:BTCUSDT | TF: 1 | Price: 76556.52 | TQI: .54 | Score: 17 "
+    "| SL: 76501.73 | TP1: 76583.92 | TP2: 76611.32 | TP3: 76638.72 | TP: fixed ×1.00"
+)
+REAL_BUY_TP1_HIT = "🎯 TP1 HIT | BINANCE:BTCUSDT | TF: 1 | Price: 76583.92"
+REAL_BUY_TP2_HIT = "🎯 TP2 HIT | BINANCE:BTCUSDT | TF: 1 | Price: 76611.32"
+REAL_BUY_TP3_HIT = "🏆 TP3 HIT | BINANCE:BTCUSDT | TF: 1 | Price: 76638.72"
+# Başka bir BUY'ın sonu (aynı sonda, farklı işlem).
+REAL_BUY_SL_HIT = "🛑 SL HIT | BINANCE:BTCUSDT | TF: 1 | Price: 76497.98"
 
-# --- Aynı kalıptan beklenen diğer olaylar (BUY/EXIT henüz ölçülmedi) -------
+# EXIT gövdesi TV'de HENÜZ GÖRÜLMEDİ (2026-08-23). Aşağıdaki aynı kalıptan
+# VARSAYIMDIR; ayrıştırma emoji'ye değil anahtar kelimeye (EXIT) dayandığı
+# için biçim küçük farklarla gelse de çalışır.
+
+# --- Türetilmiş örnekler (aynı kalıp, başka sembol) ------------------------
 BUY = (
     "🟢 BUY | BINANCE:ETHUSDT | TF: 1 | Price: 3000.5 | TQI: .61 | Score: 7 "
     "| SL: 2985.5 | TP1: 3008.0 | TP2: 3015.5 | TP3: 3023.0 | TP: fixed ×1.00"
@@ -248,3 +261,146 @@ class TestBrokenBodies:
     def test_junk_body(self):
         with pytest.raises(FollowerParseError):
             parse_follower_event("lorem ipsum dolor sit amet")
+
+
+class TestRealLongSequence:
+    """GERÇEK LONG dizisi: BUY → TP1 → TP2 → TP3 HIT; ayrı bir BUY → SL HIT."""
+
+    def test_real_buy_entry_full_levels(self):
+        event = parse_follower_event(REAL_BUY)
+        assert event.kind == "entry"
+        assert event.direction == Direction.LONG
+        assert event.symbol == "BTCUSDT"
+        assert event.timeframe == "1"
+        assert event.price == pytest.approx(76556.52)
+        assert event.levels.sl == pytest.approx(76501.73)
+        assert event.levels.tp1 == pytest.approx(76583.92)
+        assert event.levels.tp2 == pytest.approx(76611.32)
+        assert event.levels.tp3 == pytest.approx(76638.72)
+        assert event.tqi == pytest.approx(0.54)
+        assert event.score == pytest.approx(17.0)
+
+    def test_real_buy_levels_ascend_for_long(self):
+        """LONG'da ölçülen sıra: SL < Price < TP1 < TP2 < TP3."""
+        e = parse_follower_event(REAL_BUY)
+        assert (
+            e.levels.sl < e.price < e.levels.tp1 < e.levels.tp2 < e.levels.tp3
+        )
+
+    def test_real_buy_rr_is_half_one_onehalf(self):
+        """LONG bacağında da RR 0.5/1.0/1.5.
+
+        Tolerans 2 tick (0.02): AlgoPro her seviyeyi AYRI AYRI tick'e
+        yuvarlıyor, bu yüzden TP3 sapması tek tick'i aşabiliyor
+        (ölçülen: 82.20 vs 1.5 × 54.79 = 82.185).
+        """
+        e = parse_follower_event(REAL_BUY)
+        distance = e.price - e.levels.sl
+        assert e.levels.tp1 - e.price == pytest.approx(0.5 * distance, abs=0.02)
+        assert e.levels.tp2 - e.price == pytest.approx(1.0 * distance, abs=0.02)
+        assert e.levels.tp3 - e.price == pytest.approx(1.5 * distance, abs=0.02)
+
+    @pytest.mark.parametrize(
+        "body,kind",
+        [
+            (REAL_BUY_TP1_HIT, "tp1"),
+            (REAL_BUY_TP2_HIT, "tp2"),
+            (REAL_BUY_TP3_HIT, "tp3"),
+            (REAL_BUY_SL_HIT, "sl"),
+        ],
+    )
+    def test_long_sequence_hit_kinds(self, body, kind):
+        event = parse_follower_event(body)
+        assert event.kind == kind
+        assert event.symbol == "BTCUSDT"
+        assert event.direction is None
+        assert event.levels.has_any is False
+
+    def test_hit_prices_match_entry_levels(self):
+        entry = parse_follower_event(REAL_BUY)
+        assert parse_follower_event(REAL_BUY_TP1_HIT).price == pytest.approx(
+            entry.levels.tp1
+        )
+        assert parse_follower_event(REAL_BUY_TP2_HIT).price == pytest.approx(
+            entry.levels.tp2
+        )
+        assert parse_follower_event(REAL_BUY_TP3_HIT).price == pytest.approx(
+            entry.levels.tp3
+        )
+
+
+class TestEntryLevelOrdering:
+    """Giriş seviyelerinin yöne göre sırası bozuksa gövde REDDEDİLİR (422).
+
+    Gerekçe: sıra bozuksa mesaj AlgoPro V1.6 girişi değildir (biçim değişmiş
+    ya da alanlar yer değiştirmiştir); "SL"yi TP sanıp ters tarafa emir
+    koymaktansa reddetmek doğrudur.
+    """
+
+    def test_long_with_stop_above_price_rejected(self):
+        with pytest.raises(FollowerParseError, match="Seviye sırası"):
+            parse_follower_event(
+                "🟢 BUY | BINANCE:BTCUSDT | TF: 1 | Price: 100 | SL: 101 "
+                "| TP1: 105 | TP2: 110 | TP3: 115"
+            )
+
+    def test_short_with_stop_below_price_rejected(self):
+        with pytest.raises(FollowerParseError, match="Seviye sırası"):
+            parse_follower_event(
+                "🔴 SELL | BINANCE:BTCUSDT | TF: 1 | Price: 100 | SL: 99 "
+                "| TP1: 95 | TP2: 90 | TP3: 85"
+            )
+
+    def test_long_with_tp_below_price_rejected(self):
+        with pytest.raises(FollowerParseError, match="Seviye sırası"):
+            parse_follower_event(
+                "🟢 BUY | BINANCE:BTCUSDT | TF: 1 | Price: 100 | SL: 99 | TP1: 98"
+            )
+
+    def test_swapped_tp2_tp3_rejected(self):
+        """TP2/TP3 yer değiştirmişse 3 parça çıkışın anlamı bozulur."""
+        with pytest.raises(FollowerParseError, match="Seviye sırası"):
+            parse_follower_event(
+                "🟢 BUY | BINANCE:BTCUSDT | TF: 1 | Price: 100 | SL: 99 "
+                "| TP1: 101 | TP2: 103 | TP3: 102"
+            )
+
+    def test_short_swapped_tp1_tp2_rejected(self):
+        with pytest.raises(FollowerParseError, match="Seviye sırası"):
+            parse_follower_event(
+                "🔴 SELL | BINANCE:BTCUSDT | TF: 1 | Price: 100 | SL: 101 "
+                "| TP1: 97 | TP2: 99 | TP3: 95"
+            )
+
+    def test_equal_levels_rejected(self):
+        """Sıfır mesafeli seviye emir olarak konulamaz — eşitlik tutarsızlıktır."""
+        with pytest.raises(FollowerParseError, match="Seviye sırası"):
+            parse_follower_event(
+                "🟢 BUY | BINANCE:BTCUSDT | TF: 1 | Price: 100 | SL: 100 | TP1: 101"
+            )
+
+    def test_missing_levels_do_not_break_the_chain(self):
+        """TP2 yoksa zincir TP1→TP3 olarak kurulur ve geçerli kalır."""
+        event = parse_follower_event(
+            "🟢 BUY | BINANCE:BTCUSDT | TF: 1 | Price: 100 | SL: 99 "
+            "| TP1: 101 | TP3: 103"
+        )
+        assert event.kind == "entry"
+        assert event.levels.tp2 is None
+
+    def test_price_only_entry_is_accepted(self):
+        """Seviyesiz giriş (ATR yedek yoluna düşer) doğrulamaya takılmaz."""
+        event = parse_follower_event("🟢 BUY | BINANCE:BTCUSDT | TF: 1 | Price: 100")
+        assert event.kind == "entry"
+        assert event.levels.has_any is False
+
+    def test_ordering_applies_to_key_value_template_too(self):
+        with pytest.raises(FollowerParseError, match="Seviye sırası"):
+            parse_follower_event(
+                "kind=entry buy BTCUSDT tf=1 px=100 sl=101 tp1=105"
+            )
+
+    def test_hit_events_are_not_order_checked(self):
+        """HIT/EXIT olaylarında yön yoktur; sıra doğrulaması UYGULANMAZ."""
+        assert parse_follower_event(REAL_BUY_SL_HIT).kind == "sl"
+        assert parse_follower_event(EXIT).kind == "exit"

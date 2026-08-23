@@ -172,14 +172,25 @@ kanaldan gelir. 8 sembol (BTC, ETH, SOL, XRP, DOGE, BNB, ADA, LTC) × **1 dakika
 | Webhook URL | `http://<sunucu>:9091/tv-signal?secret=<TV_WEBHOOK_SECRET>&src=algopro` (BUGÜNKÜ URL — DEĞİŞMEZ) |
 | Mesaj | boş bırak (script üretir) |
 
-2026-08-23'te TV Desktop sondasıyla doğrulanan gerçek gövdeler:
+2026-08-23'te TV Desktop sondasıyla doğrulanan gerçek gövdeler (iki yön de):
 ```
 🔴 SELL | BINANCE:BTCUSDT | TF: 1 | Price: 77126.08 | TQI: .45 | Score: 8 | SL: 77167.77 | TP1: 77105.23 | TP2: 77084.39 | TP3: 77063.54 | TP: fixed ×1.00
-🎯 TP1 HIT | BINANCE:BTCUSDT | TF: 1 | Price: 77037.49
-🛑 SL HIT | BINANCE:BTCUSDT | TF: 1 | Price: 77167.77
+🟢 BUY  | BINANCE:BTCUSDT | TF: 1 | Price: 76556.52 | TQI: .54 | Score: 17 | SL: 76501.73 | TP1: 76583.92 | TP2: 76611.32 | TP3: 76638.72 | TP: fixed ×1.00
+🎯 TP1 HIT | BINANCE:BTCUSDT | TF: 1 | Price: 76583.92
+🎯 TP2 HIT | BINANCE:BTCUSDT | TF: 1 | Price: 76611.32
+🏆 TP3 HIT | BINANCE:BTCUSDT | TF: 1 | Price: 76638.72
+🛑 SL HIT | BINANCE:BTCUSDT | TF: 1 | Price: 76497.98
 ```
 Ayrıştırma emoji'ye DEĞİL anahtar kelimeye dayanır: `BUY`/`SELL` → giriş,
 `EXIT` → çıkış, `TP1|TP2|TP3 HIT` ve `SL HIT` → telemetri/çapraz doğrulama.
+`⚪ EXIT` gövdesi TV'de HENÜZ görülmedi (varsayım); gelirse ayrıştırılır, biçim
+beklenmedikse 422 + WARNING (sessiz kalmaz).
+
+⚠️ **Seviye sırası kapısı:** giriş mesajında sıra `LONG: SL < Price < TP1 < TP2 < TP3`
+(SHORT tersi) DEĞİLSE olay **422** ile reddedilir ve `logs/bot.log`'a
+`Takipçi olayı ayrıştırılamadı: Seviye sırası …` yazılır. Bunu görürsen AlgoPro'nun
+alert biçimi değişmiş demektir — alarmları çoğaltma, önce gövdeyi TV'den yeniden
+ölç (bkz. D20).
 
 ⚠️ **Sıralama uyarısı:** bu alarmlar ana bota da düşer. `BUY`/`SELL` mesajları
 BUGÜNKÜ gibi TV sağlamasına oy verir (davranış değişmedi); `EXIT`/`TP HIT`/`SL HIT`
