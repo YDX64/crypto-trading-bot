@@ -66,7 +66,12 @@ def raw_target_leverage(sl_pct: float, cfg: Any) -> int:
             f"Geçersiz stop yüzdesi ({sl_pct}) — kaldıraç çözülemez",
             code="invalid_sl_pct",
         )
-    return int(round(_cfg_float(cfg, "follower_sl_roi_target", 30.0) / sl_pct))
+    # "Stop, marjın yüzde kaçı olsun?" — YENİ ad `FOLLOWER_SL_MARGIN_PCT`,
+    # eski ad `FOLLOWER_SL_ROI_TARGET`. Settings ikisini startup'ta EŞİTLER;
+    # burada yeni ad öncelikli okunur ki yalnız yeni adı taşıyan bir cfg
+    # nesnesi (test çifti / SimpleNamespace) de doğru payı kullansın.
+    fallback = _cfg_float(cfg, "follower_sl_roi_target", 30.0)
+    return int(round(_cfg_float(cfg, "follower_sl_margin_pct", fallback) / sl_pct))
 
 
 def target_leverage(sl_pct: float, cfg: Any) -> int:

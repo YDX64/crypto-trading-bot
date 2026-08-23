@@ -502,6 +502,25 @@ def build_symbol_table(trades: List[ClosedTrade]) -> List[Dict[str, Any]]:
     return rows
 
 
+def build_strategy_table(trades: List[ClosedTrade]) -> List[Dict[str, Any]]:
+    """Tablo 3b: STRATEJİ bazında (D20b).
+
+    Gömülü takipçi (`strategy="AP"`) scalper ile AYNI `scalp_trades`
+    tablosuna yazar. İki defteri tek bir toplamda okumak, birinin kenarını
+    diğerininkiyle gizler — bu tablo ayrımı raporun kendisinde yapar.
+    `--strategy` ile filtrelenmiş bir raporda tek satır kalır (ve o zaten
+    notlarda yazılıdır).
+    """
+    grouped: Dict[str, List[ClosedTrade]] = {}
+    for t in trades:
+        grouped.setdefault(str(t.strategy or "?").upper(), []).append(t)
+    rows: List[Dict[str, Any]] = []
+    for strategy in sorted(grouped.keys()):
+        stats = _group_stats(grouped[strategy])
+        rows.append({"strategy": strategy, **stats})
+    return rows
+
+
 def build_daily_table(
     trades: List[ClosedTrade], daily_changes: Dict[str, float], days: List[str],
 ) -> List[Dict[str, Any]]:
@@ -647,6 +666,7 @@ def build_report(
         "regime_direction": build_regime_direction_table(trades, daily_changes, days),
         "exit_reason_direction": build_exit_reason_direction_table(trades),
         "symbol": build_symbol_table(trades),
+        "strategy": build_strategy_table(trades),
         "daily": build_daily_table(trades, daily_changes, days),
         "headline": headline,
         "checklist": build_checklist(headline, since, until),
@@ -722,6 +742,14 @@ def _symbol_rows(report: Dict[str, Any]) -> List[List[str]]:
     ]
 
 
+def _strategy_rows(report: Dict[str, Any]) -> List[List[str]]:
+    return [
+        [r["strategy"], str(r["trades"]), f"{r['winrate']:.1f}",
+         f"{r['pnl']:.2f}", _fmt_pf(r["profit_factor"]), f"{r['avg_win']:.2f}", f"{r['avg_loss']:.2f}"]
+        for r in report.get("strategy") or []
+    ]
+
+
 def _daily_rows(report: Dict[str, Any]) -> List[List[str]]:
     return [
         [r["day"], r["regime"], _fmt_pct_or_q(r["btc_pct"]), str(r["trades"]),
@@ -733,6 +761,7 @@ def _daily_rows(report: Dict[str, Any]) -> List[List[str]]:
 _TABLE1_HEADERS = ["Rejim", "Yön", "İşlem", "WR%", "PnL", "PF", "Ort.Kazanç", "Ort.Kayıp"]
 _TABLE2_HEADERS = ["ÇıkışNedeni", "Yön", "İşlem", "WR%", "PnL", "PF", "Ort.Kazanç", "Ort.Kayıp"]
 _TABLE3_HEADERS = ["Sembol", "İşlem", "WR%", "PnL", "PF", "Ort.Kazanç", "Ort.Kayıp"]
+_TABLE3B_HEADERS = ["Strateji", "İşlem", "WR%", "PnL", "PF", "Ort.Kazanç", "Ort.Kayıp"]
 _TABLE4_HEADERS = ["Gün", "Rejim", "BTC%", "İşlem", "GünPnL", "KümülatifPnL"]
 _TABLE5_HEADERS = ["Etiket", "İşlem", "WR%", "PnL", "Ort.PnL", "PF", "Anlamı"]
 
@@ -778,6 +807,10 @@ def render_text(report: Dict[str, Any]) -> str:
     lines.append("")
     lines.append("3) SEMBOL BAZINDA")
     lines.append(_render_table(_TABLE3_HEADERS, _symbol_rows(report)))
+
+    lines.append("")
+    lines.append("3b) STRATEJİ BAZINDA (C = scalper, AP = AlgoPro takipçisi)")
+    lines.append(_render_table(_TABLE3B_HEADERS, _strategy_rows(report)))
 
     lines.append("")
     lines.append("4) GÜNLÜK (BTC % ve kümülatif PnL)")
@@ -843,6 +876,10 @@ def render_md(report: Dict[str, Any]) -> str:
     lines.append("")
     lines.append("## 3) Sembol bazında")
     lines.append(_render_md_table(_TABLE3_HEADERS, _symbol_rows(report)))
+
+    lines.append("")
+    lines.append("## 3b) Strateji bazında (C = scalper, AP = AlgoPro takipçisi)")
+    lines.append(_render_md_table(_TABLE3B_HEADERS, _strategy_rows(report)))
 
     lines.append("")
     lines.append("## 4) Günlük (BTC % ve kümülatif PnL)")

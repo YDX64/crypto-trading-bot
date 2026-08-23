@@ -1402,7 +1402,7 @@ class TestForensicsEndpoints:
 
         seen = {}
 
-        async def _summary(since=None, until=None):
+        async def _summary(since=None, until=None, **kwargs):
             seen["since"] = since
             seen["until"] = until
             return {"tags": []}
@@ -2053,7 +2053,7 @@ class TestForensicsHardening:
 
         seen = {}
 
-        async def _summary(since=None, until=None):
+        async def _summary(since=None, until=None, **kwargs):
             seen["since"] = since
             return {"tags": []}
 

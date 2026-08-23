@@ -695,7 +695,9 @@ class _FakeTracker:
         self.calls.append("record_open")
         return 1
 
-    async def open_trades(self):
+    async def open_trades(self, *, strategies=None, exclude_strategies=None):
+        # D20b: gerçek tracker strateji filtresi alır (gömülü modda AP
+        # satırları ayrılır); çift de aynı imzayı taşımalı.
         self.calls.append("open_trades")
         return list(self.open_rows)
 

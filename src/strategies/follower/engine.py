@@ -40,6 +40,7 @@ from src.strategies.follower.levels import (
 from src.strategies.follower.risk_halt import RiskEventHaltStore
 from src.strategies.follower.types import (
     KIND_ENTRY,
+    ROUTE_REJECT_OUTSIDE_UNIVERSE,
     KIND_EXIT,
     KIND_SL,
     KIND_TP3,
@@ -52,6 +53,10 @@ from src.strategies.scalper.tracker import ScalpTracker
 from src.strategies.scalper.types import Direction
 from src.trading.binance_client_improved import ImprovedBinanceClient
 from src.trading.position_manager import PositionManager, UnprotectedPositionError
+from src.trading.symbol_reservations import (
+    FOLLOWER_RESERVATION_OWNER,
+    symbol_reservations,
+)
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -80,8 +85,32 @@ class FollowerEngine:
     # uyku olmadan çalışır — scalper'ın INCOME_RETRY_DELAYS deseniyle aynı.
     _CLOSE_VERIFY_DELAYS = (0.0, 0.3, 0.6, 1.0, 2.0)
     _INCOME_CACHE_TTL = 120.0
+    #: Sanal defter toplamının önbellek ömrü (scalper'ın DB toplamalarıyla
+    #: aynı mertebe). `tracker.close_seq` değişince ANINDA geçersizleşir.
+    _VIRTUAL_EQUITY_CACHE_TTL = 30.0
     _BALANCE_CACHE_TTL = 300.0
     _EVENT_HISTORY = 50
+    #: `symbol_reservations` sahiplik etiketi (scalper'ınki "scalper").
+    #: Gömülü modda (D20b) iki motor AYNI süreçte olduğu için sembol
+    #: sahipliği tek bir süreç-içi kayıttan yürür.
+    _RESERVATION_OWNER = FOLLOWER_RESERVATION_OWNER
+    # Sanal defter telemetrisi SINIF düzeyinde varsayılanlıdır: motoru
+    # `__init__` çalıştırmadan kuran test çiftleri de `snapshot()` alabilsin.
+    _virtual_equity_usdt: Optional[float] = None
+    _virtual_realized_pnl: float = 0.0
+    _exchange_available_usdt: Optional[float] = None
+    _virtual_equity_cache_seq: int = -1
+    _virtual_equity_cached_at: float = 0.0
+    #: Gömülü modda: hiçbir motorun izlemediği/rezerve etmediği CANLI
+    #: pozisyonlar. Bunlar YETİM DEĞİLDİR (elle/Telegram açılmış olabilir) —
+    #: yalnız görünürlük; entry-halt ya da flatten TETİKLEMEZ.
+    _unknown_positions: List[str] = []
+    #: Yetim denetimi bu turda GERÇEKTEN çalıştı mı? (borsa okuması patlarsa
+    #: False kalır ve rezervasyon senkronu sahipliği bırakmaz.)
+    _orphans_check_ok: bool = False
+    #: Diğer motorların izlediği sembolleri veren callback (main.py enjekte
+    #: eder; ayrı halkada None → D20a davranışı birebir).
+    foreign_tracked_cb = None
 
     def __init__(self) -> None:
         self.cfg = settings
@@ -146,10 +175,19 @@ class FollowerEngine:
         )
         self._income_cache_close_seq = -1
         self._balance_cache: Tuple[Optional[float], float] = (None, 0.0)
+        # D20b sanal defter: son hesaplanan sanal sermaye ve AP net PnL'i
+        # (telemetri; kaynak DAİMA DB'dir, bu alanlar yalnız gösterim için).
+        self._virtual_equity_usdt: Optional[float] = None
+        self._virtual_realized_pnl: float = 0.0
+        self._exchange_available_usdt: Optional[float] = None
+        self._virtual_equity_cache_seq = -1
+        self._virtual_equity_cached_at = 0.0
 
         # Borsada AÇIK ama motorun İZLEMEDİĞİ pozisyonlar (bulgu 8).
         self._orphans: List[str] = []
         self._orphans_checked_at: Optional[str] = None
+        self._unknown_positions: List[str] = []
+        self._orphans_check_ok = False
 
         self._events: Deque[Dict[str, Any]] = deque(maxlen=self._EVENT_HISTORY)
         self._event_counters: Dict[str, int] = {}
@@ -169,10 +207,23 @@ class FollowerEngine:
             f"🎯 Evren={sorted(self.symbol_allowlist())} tf={self.cfg.follower_timeframe} "
             f"marj=%{self.cfg.follower_margin_pct} kaldıraç="
             f"[{self.cfg.follower_lev_min}-{self.cfg.follower_lev_max}]x "
-            f"hedef SL ROI=%{self.cfg.follower_sl_roi_target} "
+            f"SL başına marj=%{getattr(self.cfg, 'follower_sl_margin_pct', self.cfg.follower_sl_roi_target)} "
             f"azami pozisyon={self.cfg.follower_max_positions}"
         )
+        if bool(getattr(self.cfg, "follower_embedded", False)):
+            reserved = sorted(
+                getattr(self.cfg, "follower_reserved_symbols", []) or []
+            )
+            self.logger.info(
+                f"🧩 GÖMÜLÜ mod (D20b): scalper ile aynı süreç/hesap. "
+                f"Sanal defter tabanı={self._virtual_capital_base():.2f} USDT, "
+                f"günlük kesici=%{getattr(self.cfg, 'follower_daily_loss_limit_pct', 0)}, "
+                f"takipçiye ayrılmış semboller="
+                f"{', '.join(reserved) if reserved else '(yok — evren paylaşılıyor)'}"
+            )
         if await self._probe_exchange():
+            # Sembol sahipliği artık `_attempt_recovery` İÇİNDE alınır (hem
+            # buradaki hem `_exchange_loop`'taki ertelenmiş yol kapsanır).
             await self._attempt_recovery()
             # Kurtarmadan HEMEN SONRA: DB'de satırı olmayan (ör. record_open
             # hatası) açık pozisyonlar ancak burada görünür (bulgu 8).
@@ -199,6 +250,10 @@ class FollowerEngine:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        # Süreç kapanırken sembol sahipliği bırakılır (kayıt süreç-içidir;
+        # kalıcı bir şey sızdırmaz ama test/reload izolasyonunu korur).
+        for symbol in list(self.exits.tracked_symbols()):
+            self._release_symbol(symbol)
         for closer in (self.fetcher.close, self.client.close):
             try:
                 await closer()
@@ -296,19 +351,36 @@ class FollowerEngine:
         return True
 
     async def _attempt_recovery(self) -> bool:
+        """Restart kurtarması + kurtarılan sembollerin SAHİPLENİLMESİ.
+
+        SAHİPLİK DÖNGÜSÜ İSTİSNA YOLLARINDA DA KOŞAR (doğrulayıcı bulgusu,
+        YÜKSEK regresyon): `exits.recover()` bir satırı izlemeye ALIP sonraki
+        satırda `UnprotectedPositionError` yükseltebilir. Erken `return`
+        edilirse o sembol "izleniyor ama rezerve DEĞİL" kalır ve scalper aynı
+        net pozisyona girebilir — yeniden deneme 30 sn'de bir, kalıcı hatada
+        pencere SÜRESİZ açık. Scalper aynı işi TÜM yollarda yapar
+        (`scalper/engine.py`: "Başarısız/yarım recovery'de de …"); iki motor
+        ancak böyle simetriktir.
+
+        Sahiplik BURADA alınır, `start()`'ta değil: ilk borsa probu başarısız
+        olursa kurtarma `_exchange_loop`'ta GEÇ çalışır ve `start()`'taki bir
+        döngü o yolu hiç görmezdi.
+        """
         try:
             recovered = await self.exits.recover()
         except UnprotectedPositionError as exc:
             self._recovery_ready = False
             self._latch_entry_halt(exc, source="restart recovery")
-            return False
         except Exception as exc:
             self._recovery_ready = False
             self.logger.error(
                 f"❌ Takipçi restart kurtarması başarısız: {exc}", exc_info=True
             )
-            return False
-        self._recovery_ready = bool(recovered)
+        else:
+            self._recovery_ready = bool(recovered)
+        # KOŞULSUZ: yarım kalmış kurtarmada izlemeye ALINMIŞ semboller de
+        # sahiplenilir (fail-closed yön — sahipsiz izlenen sembol bırakmaz).
+        self._reserve_recovered_symbols()
         if not self._recovery_ready:
             self.logger.error(
                 "⛔ Takipçi kurtarma güvenliği kanıtlanamadı; izleme sürüyor, "
@@ -316,9 +388,149 @@ class FollowerEngine:
             )
         return self._recovery_ready
 
+    def _reserve_recovered_symbols(self) -> None:
+        """Kurtarılan AP pozisyonlarını takipçi adına sahiplen.
+
+        Çakışmada `break` DEĞİL `continue`: bir sembol başka motordaysa geri
+        kalan pozisyonlar yine de sahiplenilmelidir (aksi halde tek çakışma
+        tüm listeyi sahipsiz bırakırdı). Çakışma artık KALICI disk halt'ı
+        yazmaz — defter filtresi (aynı düzeltme paketinde) iki motorun aynı
+        satırı kurtarmasını zaten imkânsız kıldığı için buraya düşmek bir
+        VERİ TUTARSIZLIĞI işaretidir: RAM'de girişleri kapat + CRITICAL logla,
+        ama operatörün her deploy'da dosya silmesini gerektirme.
+        """
+        conflicts = []
+        for symbol in sorted(self.exits.tracked_symbols()):
+            if not self._reserve_symbol(symbol):
+                conflicts.append(symbol)
+        if not conflicts:
+            return
+        self._recovery_ready = False
+        self.logger.critical(
+            f"🚨 Takipçi kurtarmasında sembol sahipliği çakıştı: {conflicts} "
+            f"(sahipler={ {s: symbol_reservations.owner(s) for s in conflicts} }). "
+            f"Yeni girişler kapatıldı; açık pozisyonların çıkış takibi sürüyor. "
+            f"KALICI kilit YAZILMADI — süreci yeniden başlatmak yeterlidir, ama "
+            f"önce iki defterin (scalp_trades.strategy) tutarlılığını inceleyin.",
+            extra={"trade": True},
+        )
+
     # ------------------------------------------------------------------
     # Yetim pozisyon denetimi (düşmanca inceleme bulgu 8)
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Sembol sahipliği (D20b — scalper ile AYNI süreçte)
+    # ------------------------------------------------------------------
+
+    def _embedded(self) -> bool:
+        return bool(getattr(self.cfg, "follower_embedded", False))
+
+    def _foreign_tracked_symbols(self) -> Set[str]:
+        """Diğer motorların GERÇEKTEN izlediği semboller (gömülü mod).
+
+        Rezervasyon bir NİYET işaretidir, "o motor bu pozisyonu yönetiyor"
+        KANITI değildir: scalper entry-halt'a düştüğünde `_sync_scalper_
+        reservations` ilk satırda döner ve rezervasyonlar DONAR. Donmuş bir
+        rezervasyon, o sembolde açılan GERÇEK bir yetimi görünmez yapardı.
+        Bu yüzden yetim denetimi asıl kaynağı buradan alır; kayıt yalnız
+        ikinci katmandır. Callback yoksa (ayrı halka) boş küme döner ve
+        davranış D20a ile birebir aynıdır.
+        """
+        callback = getattr(self, "foreign_tracked_cb", None)
+        if callback is None:
+            return set()
+        try:
+            return {str(s).strip().upper() for s in (callback() or ()) if str(s).strip()}
+        except Exception as exc:  # pragma: no cover - teşhis motoru düşürmez
+            self.logger.warning(
+                f"⚠️ Diğer motorun izleme listesi okunamadı ({exc}); yetim "
+                f"denetimi yalnız rezervasyon kaydına dayanıyor"
+            )
+            return set()
+
+    def _foreign_symbols(self) -> Set[str]:
+        """BAŞKA bir motorun (scalper/orchestrator) sahiplendiği semboller."""
+        try:
+            return {
+                symbol
+                for symbol, owner in symbol_reservations.snapshot().items()
+                if owner != self._RESERVATION_OWNER
+            }
+        except Exception:  # pragma: no cover - kayıt asla motoru düşürmemeli
+            return set()
+
+    def _reserve_symbol(self, symbol: str, *, enforce_capacity: bool = False) -> bool:
+        """Sembolü takipçi adına sahiplen (aynı sahip için idempotent).
+
+        ``enforce_capacity`` (D20b düşmanca inceleme): GİRİŞ yolunda takipçi
+        de KENDİ tavanına (`FOLLOWER_MAX_POSITIONS`) atomik olarak takılır.
+        Sayım YALNIZ takipçinin kendi rezervasyonlarını kapsar — scalper'ın
+        ve Telegram'ın slotları tüketilmez, tersi de olmaz. Kurtarma yolunda
+        tavan UYGULANMAZ: borsada zaten AÇIK olan bir pozisyonun sahipliğini
+        reddetmek onu sahipsiz bırakırdı.
+        """
+        try:
+            kwargs = {}
+            if enforce_capacity:
+                kwargs = {
+                    "capacity": int(
+                        getattr(self.cfg, "follower_max_positions", 4) or 4
+                    ),
+                    "capacity_owners": (self._RESERVATION_OWNER,),
+                    "exchange_symbols": set(self.exits.tracked_symbols()),
+                }
+            return bool(
+                symbol_reservations.reserve(
+                    symbol, self._RESERVATION_OWNER, **kwargs
+                )
+            )
+        except Exception as exc:  # pragma: no cover
+            self.logger.warning(f"⚠️ {symbol}: sembol rezervasyonu yapılamadı ({exc})")
+            return False
+
+    def _release_symbol(self, symbol: str) -> None:
+        try:
+            symbol_reservations.release(symbol, self._RESERVATION_OWNER)
+        except Exception as exc:  # pragma: no cover
+            self.logger.warning(f"⚠️ {symbol}: sembol rezervasyonu bırakılamadı ({exc})")
+
+    def _sync_follower_reservations(self) -> None:
+        """İzlenmeyen sembollerin sahipliğini bırak (scalper'ın eşleniği).
+
+        İKİ fail-closed koşulda hiçbir sahiplik bırakılmaz:
+          * `_entry_halted`: korumasız/yetim bir pozisyon varken sembolü
+            serbest bırakmak diğer motorun aynı net pozisyona ikinci bir
+            yönetici olmasına yol açardı;
+          * `_entry_lock` tutuluyor: UÇUŞTA bir giriş vardır, sahiplik
+            emirden ÖNCE alınır ama sembol `track()` edilene kadar
+            `tracked_symbols()`ta GÖRÜNMEZ — bu pencerede bırakmak
+            scalper'ı aynı sembole davet ederdi;
+          * yetim denetimi BU TURDA çalışamadı (`_orphans_check_ok=False`):
+            borsa okuması patladığında (418/ağ) halt latch'lenmez; sahipliği
+            yine de bırakmak, defter satırı yazılamamış açık bir pozisyonu
+            hem defterden hem kayıttan düşürürdü (düşmanca inceleme).
+        """
+        if (
+            self._entry_halted
+            or self._entry_lock.locked()
+            or not self._orphans_check_ok
+        ):
+            return
+        active = set(self.exits.tracked_symbols()) | set(
+            getattr(self.exits, "_closing", ()) or ()
+        )
+        try:
+            owned = [
+                symbol
+                for symbol, owner in symbol_reservations.snapshot().items()
+                if owner == self._RESERVATION_OWNER
+            ]
+        except Exception:  # pragma: no cover
+            return
+        for symbol in owned:
+            if symbol not in active:
+                self._release_symbol(symbol)
 
     @staticmethod
     def _open_symbols(rows: Any) -> Set[str]:
@@ -336,24 +548,41 @@ class FollowerEngine:
         return found
 
     async def _check_orphans(self) -> List[str]:
-        """Borsada AÇIK ama motorun İZLEMEDİĞİ pozisyonları bul.
+        """Borsada AÇIK ama HİÇBİR motorun izlemediği pozisyonları bul.
 
-        NEDEN (bulgu 8): izlenmeyen bir pozisyon ne EXIT'e, ne flip'e, ne
+        NEDEN (D20a bulgu 8): izlenmeyen bir pozisyon ne EXIT'e, ne flip'e, ne
         risk-olayı ``flatten``ına görünür; ``recover()`` yalnız DB'deki OPEN
         satırlarına bakar, bu yüzden defter satırı hiç yazılamamış bir dolum
-        (ör. `record_open` DB hatası) SONSUZA KADAR görünmez kalır — 100x'lik
-        korumasız bir pozisyon sessizce likidasyona gider.
+        (ör. `record_open` DB hatası) SONSUZA KADAR görünmez kalır.
 
-        Bulunursa: ENTRY-HALT (kalıcı, fail-closed) + CRITICAL. Kapatma
-        OTOMATİK YAPILMAZ (yetimin kaynağı bilinmiyor); ``/risk-event``
-        ``flatten`` artık yetimleri de kapatır.
+        **D20b: VARSAYIM DEĞİŞTİ.** Ayrı halkada hesap YALNIZ takipçinindi, bu
+        yüzden izlenmeyen her pozisyon takipçinin kayıp pozisyonuydu ve kalıcı
+        entry-halt doğru cevaptı. Gömülü modda hesap PAYLAŞILIR: Telegram
+        orchestrator'ı, elle açılmış bir pozisyon ya da scalper'ın uçuştaki
+        girişi MEŞRU biçimde "takipçinin izlemediği" pozisyonlardır. Bu yüzden:
+
+        * **ayrı halka** (`BOT_MODE=follower`): D20a davranışı AYNEN —
+          ENTRY-HALT (kalıcı) + CRITICAL;
+        * **gömülü mod**: entry-halt YOK, flatten YOK — WARNING + sayaç +
+          panoda uyarı satırı. Yabancı pozisyona dokunmak, operatörün
+          "takipçiyi düzleştir" komutunu Telegram defterini kapatmaya
+          çevirirdi.
+
+        "Yabancı" kümesi İKİ kaynaktan gelir (düşmanca inceleme): (a) diğer
+        motorların GERÇEKTEN izlediği semboller (`foreign_tracked_cb` — gömülü
+        modda main.py enjekte eder), (b) `symbol_reservations` kaydı. (b) tek
+        başına yeterli DEĞİLDİR: scalper entry-halt'a düştüğünde rezervasyonları
+        DONAR ve o pozisyon kapansa bile kayıtta kalır — gerçek bir yetim o
+        sembolde görünmez olurdu.
 
         Yanlış pozitif korumaları: (a) `_entry_lock` tutuluyorsa uçuşta bir
         giriş vardır ve henüz `track` edilmemiştir → tur atlanır;
         (b) kapanış defteri işlenen semboller (`_closing`) hariç tutulur;
-        (c) kurtarma tamamlanmadıysa (DB satırları henüz izlemeye alınmadı)
-        denetim yapılmaz; (d) şüphe TAZE bir okumayla doğrulanır.
+        (c) kurtarma tamamlanmadıysa denetim yapılmaz; (d) şüphe TAZE bir
+        okumayla doğrulanır; (e) gömülü modda kalıcı bir karar verilmediği
+        için tek turluk yarışlar zararsızdır.
         """
+        self._orphans_check_ok = False
         if self._entry_lock.locked() or not self._recovery_ready:
             return []
         try:
@@ -365,12 +594,15 @@ class FollowerEngine:
         def _suspects(source: Any) -> Set[str]:
             tracked = set(self.exits.tracked_symbols())
             closing = set(getattr(self.exits, "_closing", ()) or ())
-            return self._open_symbols(source) - tracked - closing
+            foreign = self._foreign_symbols() | self._foreign_tracked_symbols()
+            return self._open_symbols(source) - tracked - closing - foreign
 
         suspects = _suspects(rows)
         self._orphans_checked_at = _utcnow_iso()
         if not suspects:
             self._orphans = []
+            self._unknown_positions = []
+            self._orphans_check_ok = True
             return []
 
         # Önbellek 15 sn'liktir: geri alınamaz bir karar (entry-halt) taze
@@ -383,16 +615,56 @@ class FollowerEngine:
             )
             return []
         confirmed = _suspects(fresh_rows)
+        self._orphans_check_ok = True
         if not confirmed:
             self._orphans = []
+            self._unknown_positions = []
             return []
 
-        self._orphans = sorted(confirmed)
+        # AYRIM (kullanıcı kararı): takipçinin KENDİ rezerve ettiği ama
+        # izlemediği pozisyon onun YETİMİDİR (ör. `record_open` DB hatası) →
+        # gömülü modda bile D20a davranışı geçerlidir. Hiç kimsenin rezerve
+        # ETMEDİĞİ pozisyon ise "sahipsiz"dir (elle/Telegram) ve dokunulmaz.
+        mine = {
+            symbol
+            for symbol in confirmed
+            if symbol_reservations.owner(symbol) == self._RESERVATION_OWNER
+        }
+        found = sorted(confirmed)
+        if self._embedded() and not mine:
+            # Gömülü mod: SAHİPSİZ ama MEŞRU olabilir → yalnız GÖRÜNÜRLÜK.
+            self._orphans = []
+            # Sayaç TUR başına değil OLAY başına artar (doğrulayıcı bulgusu):
+            # safety turu 2 sn'de bir koştuğu için eski hâli "kaç tur geçti"yi
+            # ölçüyordu ve diğer `reject_counters` anahtarlarıyla anlamı
+            # uyuşmuyordu. Sembol kümesi DEĞİŞTİĞİNDE bir kez artar.
+            first_time = found != self._unknown_positions
+            self._unknown_positions = found
+            if first_time:
+                self._count_reject("unknown_position")
+            if first_time:
+                self.logger.warning(
+                    f"⚠️ Hesapta SAHİPSİZ açık pozisyon(lar): {found} — hiçbir "
+                    f"motor izlemiyor ve rezerve etmemiş (elle ya da Telegram "
+                    f"botuyla açılmış olabilir). Takipçi bunlara DOKUNMAZ ve "
+                    f"girişleri DURDURMAZ (D20b); /risk-event flatten de "
+                    f"kapatmaz. İzlenen(takipçi)="
+                    f"{sorted(self.exits.tracked_symbols())}",
+                    extra={"trade": True},
+                )
+            return []
+
+        # Gömülü modda YALNIZ takipçinin kendi yetimi halt üretir; sahipsiz
+        # olanlar görünürlük listesinde kalır.
+        self._orphans = sorted(mine) if self._embedded() else found
+        self._unknown_positions = (
+            sorted(confirmed - mine) if self._embedded() else []
+        )
         self.logger.critical(
             f"🚨 TAKİPÇİ YETİM POZİSYON(LAR): {self._orphans} borsada AÇIK ama "
             f"motor İZLEMİYOR (izlenen={sorted(self.exits.tracked_symbols())}). "
             f"Yeni girişler durduruldu. Kapatmak için: "
-            f"POST /risk-event {{\"action\":\"flatten\"}}",
+            f"POST /risk-event " + '{"action":"flatten"}',
             extra={"trade": True},
         )
         self._latch_entry_halt(
@@ -433,7 +705,13 @@ class FollowerEngine:
             # Yetim denetimi AYRI try'da (bulgu 8): `exits.step()` patlasa
             # bile borsa gerçeği ile izleme listesi karşılaştırılmalıdır.
             try:
+                # SIRA ÖNEMLİ: önce yetim denetimi. Defter satırı yazılamamış
+                # (ama borsada AÇIK) bir pozisyon önce entry-halt latch'ler;
+                # sonra çalışan sahiplik senkronu o hâlde hiçbir sembolü
+                # bırakmaz. Ters sırada, halt latch'lenmeden önceki pencerede
+                # sembol serbest kalır ve scalper aynı net pozisyona girerdi.
                 await self._check_orphans()
+                self._sync_follower_reservations()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -504,7 +782,7 @@ class FollowerEngine:
         if self._kill_switch:
             return
 
-        balance = await self._cached_balance()
+        balance = await self._risk_equity()
         if balance is None or balance <= 0:
             self._risk_ready = False
             self._risk_equity_usdt = None
@@ -525,6 +803,31 @@ class FollowerEngine:
             )
 
     async def _daily_net_income(self, today: str) -> float:
+        """Takipçinin BUGÜNKÜ net PnL'i.
+
+        Gömülü modda (D20b) hesap scalper ile PAYLAŞILDIĞI için
+        `/fapi/v1/income` iki defteri birlikte raporlar ve takipçinin
+        kesicisini scalper'ın işlemleri tetikleyebilirdi. O yüzden gömülü
+        modda kaynak DEFTERDİR (`scalp_trades`, `strategy='AP'`,
+        `realized_pnl` = komisyon düşülmüş net). Ayrı halkada hesap zaten
+        takipçinindir → Binance income'ı (bugünkü davranış) kullanılır.
+        """
+        if bool(getattr(self.cfg, "follower_embedded", False)):
+            return await self._ledger_daily_pnl(today)
+        return await self._account_daily_net_income(today)
+
+    async def _ledger_daily_pnl(self, today: str) -> float:
+        """AP defterinin bugünkü (UTC) toplam net PnL'i."""
+        getter = getattr(self.tracker, "strategy_realized_pnl_since", None)
+        if getter is None:  # pragma: no cover - eski tracker çifti
+            raise RuntimeError(
+                "tracker.strategy_realized_pnl_since yok — takipçi günlük "
+                "PnL'i defterden okunamıyor"
+            )
+        day_start = datetime.strptime(today, "%Y-%m-%d")
+        return float(await getter(FOLLOWER_STRATEGY, day_start))
+
+    async def _account_daily_net_income(self, today: str) -> float:
         cached_value, cached_at, cached_day = self._income_cache
         now_monotonic = time.monotonic()
         if (
@@ -560,8 +863,30 @@ class FollowerEngine:
         self._income_cache_close_seq = getattr(self.tracker, "close_seq", 0)
         return net
 
+    async def _risk_equity(self) -> Optional[float]:
+        """Günlük kesicinin sermaye tabanı.
+
+        D20b: gömülü modda SANAL sermaye (taban + AP net PnL) — hesap
+        bakiyesi scalper'ın marjıyla birlikte dalgalanır ve takipçinin
+        günlük eşiğini onun pozisyonları belirleyemez. Sanal defter kapalıysa
+        (ayrı halka) bugünkü tanım: hesabın `availableBalance`'ı.
+        """
+        if self._virtual_capital_base() > 0:
+            # Telemetri: `virtual_ledger.exchange_available_usdt` İLK GİRİŞE
+            # kadar null kalıyordu; 5 dk önbellekli bu okuma ihmal edilebilir
+            # bir yük getirir ve pano kartı süreç başlar başlamaz dolu olur.
+            await self._cached_balance()
+            try:
+                equity = await self._virtual_equity()
+            except FollowerRejected as exc:
+                # Fail-closed: defter okunamıyorsa günlük kapı doğrulanamaz.
+                self.logger.error(f"❌ Takipçi sanal sermayesi okunamadı: {exc.reason}")
+                return None
+            return equity if equity > 0 else None
+        return await self._cached_balance()
+
     async def _cached_balance(self) -> Optional[float]:
-        """Günlük risk kapısının sermaye tanımı.
+        """Hesabın kullanılabilir bakiyesi (kısa önbellekli).
 
         BOYUTLAMA İLE AYNI TANIM (bulgu 9): `_entry_equity` →
         ``get_account_balance()`` = **availableBalance**. Eskiden burada
@@ -574,6 +899,7 @@ class FollowerEngine:
         balance, cached_at = self._balance_cache
         now = time.monotonic()
         if balance is not None and (now - cached_at) < self._BALANCE_CACHE_TTL:
+            self._exchange_available_usdt = balance
             return balance
         try:
             fresh = await self.client.get_account_balance()
@@ -581,6 +907,7 @@ class FollowerEngine:
             self.logger.error(f"❌ Takipçi bakiye sorgusu hatası: {exc}")
             return balance
         self._balance_cache = (fresh, now)
+        self._exchange_available_usdt = fresh
         return fresh
 
     # ------------------------------------------------------------------
@@ -588,7 +915,22 @@ class FollowerEngine:
     # ------------------------------------------------------------------
 
     def symbol_allowlist(self) -> Set[str]:
-        raw = str(getattr(self.cfg, "follower_symbol_allowlist", "") or "")
+        """Takipçinin GİRİŞ evreni.
+
+        D20b: `FOLLOWER_SYMBOLS` doluysa evren ODUR (ve aynı semboller
+        scalper'ın tarama evreninden + TV giriş oylamasından OTOMATİK
+        dışlanır — bkz. `config.follower_reserved_symbols`). Boşsa bugünkü
+        davranış korunur: `FOLLOWER_SYMBOL_ALLOWLIST` (8 majör).
+
+        Sembol listesi KODDA SABİT DEĞİLDİR; tamamı `.env`'den gelir ve
+        her okumada güncel değeri yansıtır.
+        """
+        universe = getattr(self.cfg, "follower_universe", None)
+        if universe:
+            return {str(s).strip().upper() for s in universe if str(s).strip()}
+        raw = str(getattr(self.cfg, "follower_symbols", "") or "") or str(
+            getattr(self.cfg, "follower_symbol_allowlist", "") or ""
+        )
         return {s.strip().upper() for s in raw.split(",") if s.strip()}
 
     def _safety_stale_limit(self) -> float:
@@ -650,6 +992,30 @@ class FollowerEngine:
 
     def _count_reject(self, reason: str) -> None:
         self._reject_counters[reason] = self._reject_counters.get(reason, 0) + 1
+
+    def note_route_reject(self, reason: str, *, kind: str = KIND_ENTRY) -> None:
+        """Köprü katmanında (motora HİÇ ulaşmadan) reddedilen olayı say.
+
+        D20b: takipçi evreni dışındaki AlgoPro girişleri motora verilmez ama
+        SESSİZ de kalmaz. Doğrulayıcı bulgusu: yalnız `reject_counters`
+        artırmak YETMİYORDU — panonun "Alarm olayı"/"Son olay" satırları
+        `event_counters`/`last_event_at`ten beslendiği için o alarmlar panoda
+        HİÇ görünmüyordu. Artık olay sayacı da artar ve olay geçmişine
+        (`events`) bir satır düşer.
+        """
+        self._count_reject(reason)
+        self._count_event(kind)
+        self._last_event_at = _utcnow_iso()
+        self._events.append(
+            {
+                "at": self._last_event_at,
+                "kind": kind,
+                "symbol": None,
+                "accepted": False,
+                "reason": reason,
+                "routed": "bridge",
+            }
+        )
 
     def _record_event(self, event: FollowerEvent, result: Dict[str, Any]) -> None:
         self._last_event_at = _utcnow_iso()
@@ -714,8 +1080,16 @@ class FollowerEngine:
         if event.kind == KIND_ENTRY:
             allowlist = self.symbol_allowlist()
             if allowlist and symbol not in allowlist:
-                self._count_reject("symbol_allowlist")
-                return {"accepted": False, "reason": "sembol takipçi evreninde değil"}
+                # TEK AD (doğrulayıcı bulgusu): gömülü köprü ile ayrı halkanın
+                # `/follower/event` yolu AYNI reddi AYNI adla raporlar; aksi
+                # halde "kaç alarm evren dışında kaldı?" sorusu iki farklı
+                # sayaçtan toplanmak zorunda kalırdı.
+                self._count_reject(ROUTE_REJECT_OUTSIDE_UNIVERSE)
+                return {
+                    "accepted": False,
+                    "reason": ROUTE_REJECT_OUTSIDE_UNIVERSE,
+                    "detail": "sembol takipçi evreninde değil",
+                }
 
             configured_tf = str(getattr(self.cfg, "follower_timeframe", "1") or "1")
             tf = str(event.timeframe or "")
@@ -798,6 +1172,19 @@ class FollowerEngine:
                 self._count_reject("cooldown")
                 return {"accepted": False, "reason": "sembol cooldown'da"}
 
+            # D20b: sembol BAŞKA bir motorun (scalper) yönetimindeyse giriş
+            # YOK. Binance one-way modda sembol başına TEK net pozisyon
+            # vardır; iki yönetici aynı pozisyona `closePosition` stop
+            # koyarsa biri diğerinin miktarını kapatır.
+            if symbol in self._foreign_symbols():
+                self._count_reject("reserved_by_other")
+                return {
+                    "accepted": False,
+                    "reason": "sembol başka bir motorun yönetiminde "
+                    "(scalper) — giriş yapılmadı",
+                }
+
+            # Kapasite takipçinin KENDİ tavanıdır (scalper'ınki değişmez).
             tracked = self.exits.tracked_symbols()
             max_positions = int(getattr(self.cfg, "follower_max_positions", 4) or 4)
             if symbol not in tracked and len(tracked) >= max_positions:
@@ -940,13 +1327,30 @@ class FollowerEngine:
                     "flipped": flipped,
                 }
 
+            # SEMBOL SAHİPLİĞİ emirden HEMEN ÖNCE alınır: `_entry_lock`
+            # yalnız takipçinin kendi girişlerini sıraya sokar, scalper'ın
+            # tarama turunu DEĞİL. Rezervasyon atomiktir (RLock) ve
+            # scalper `_evaluate_symbol`'da aynı kayda bakar.
+            if not self._reserve_symbol(symbol, enforce_capacity=True):
+                self._count_reject("reserved_by_other")
+                return {
+                    "accepted": False,
+                    "reason": "sembol sahipliği alınamadı (başka motor ya da "
+                    "takipçi kapasitesi dolu) — giriş yapılmadı",
+                    "flipped": flipped,
+                }
+
             try:
                 position = await self.executor.open_position(
                     event=event, levels=levels, equity_usdt=equity
                 )
             except UnprotectedPositionError:
+                # Sahiplik BIRAKILMAZ: korumasız pozisyon şüphesi varken
+                # sembolü serbest bırakmak ikinci bir yöneticiyi davet eder
+                # (motor zaten entry-halt latch'ler).
                 raise
             except FollowerRejected as exc:
+                self._release_symbol(symbol)
                 # Kapıda reddedilen giriş DEFTERE yazılır (D20a bulgu 3):
                 # "kaç işlem ücret eşiğine takıldı" sorusu ancak ölçülebilir
                 # bir kayıtla yanıtlanır; sayaç süreç ömrüyle sınırlıdır.
@@ -990,7 +1394,82 @@ class FollowerEngine:
         value = compute_atr(candles, period)
         return value if value > 0 else None
 
+    # -- sanal defter (D20b) -------------------------------------------
+
+    def _virtual_capital_base(self) -> float:
+        """Sanal defterin TABANI (USDT) — 0 = sanal defter KAPALI.
+
+        YALNIZ gömülü modda (`FOLLOWER_EMBEDDED=true`) uygulanır: orada hesap
+        scalper ile PAYLAŞILIR ve gerçek bakiye takipçinin kenarını ölçmez.
+        Ayrı halkada (`BOT_MODE=follower`) hesap zaten takipçinindir →
+        bugünkü davranış birebir korunur (gerçek bakiye).
+        """
+        if not bool(getattr(self.cfg, "follower_embedded", False)):
+            return 0.0
+        try:
+            return max(
+                0.0, float(getattr(self.cfg, "follower_virtual_capital_usdt", 0.0) or 0.0)
+            )
+        except (TypeError, ValueError):
+            return 0.0
+
+    async def _virtual_equity(self) -> float:
+        """Sanal sermaye = taban + AP işlemlerinin gerçekleşmiş net PnL'i.
+
+        Restart'a dayanıklıdır: toplam RAM'de değil `scalp_trades`
+        (`strategy='AP'`) satırlarından hesaplanır. Muhafazakâr kural
+        scalper'ın sanal kasasıyla AYNIdır (`compounding_snapshot`):
+        Binance'ın doğruladığı net PnL her iki işaretiyle sayılır, tahmini
+        (fallback) satır YALNIZ negatifse sayılır, legacy satır hiç sayılmaz —
+        yani sermaye doğrulanmamış kârla ŞİŞMEZ.
+
+        Okunamazsa `FollowerRejected` (fail-closed): defteri doğrulayamadan
+        1000 USDT'lik varsayımla pozisyon açmak sessiz bir risk artışıdır.
+        """
+        base = self._virtual_capital_base()
+        # 30 sn ÖNBELLEK (düşmanca inceleme): safety turu 2 sn'de bir çalışır
+        # ve her turda iki DB toplaması yapmak gereksiz iştir (scalper'ın
+        # eşdeğer yolu da önbelleklidir). Kapanış olduğunda (`close_seq`
+        # artışı) önbellek ANINDA düşer — sanal sermaye bir işlem geriden
+        # gelmez.
+        close_seq = int(getattr(self.tracker, "close_seq", 0) or 0)
+        cached_at = self._virtual_equity_cached_at
+        if (
+            self._virtual_equity_usdt is not None
+            and self._virtual_equity_cache_seq == close_seq
+            and (time.monotonic() - cached_at) < self._VIRTUAL_EQUITY_CACHE_TTL
+        ):
+            return self._virtual_equity_usdt
+        try:
+            snapshot_method = getattr(self.tracker, "compounding_snapshot", None)
+            if snapshot_method is not None:
+                snapshot = await snapshot_method(
+                    0, strategies=(FOLLOWER_STRATEGY,)
+                )
+                eligible = float(snapshot["eligible_realized_pnl"])
+            else:
+                eligible = float(
+                    await self.tracker.eligible_compounding_pnl(
+                        0, strategies=(FOLLOWER_STRATEGY,)
+                    )
+                )
+        except Exception as exc:
+            raise FollowerRejected(
+                f"Takipçi sanal sermayesi doğrulanamadı ({exc}) — giriş yapılmadı",
+                code="virtual_equity",
+            ) from exc
+        self._virtual_equity_usdt = max(0.0, base + eligible)
+        self._virtual_realized_pnl = eligible
+        self._virtual_equity_cache_seq = close_seq
+        self._virtual_equity_cached_at = time.monotonic()
+        return self._virtual_equity_usdt
+
     async def _entry_equity(self) -> Optional[float]:
+        """Boyutlamanın sermaye tabanı (marj = equity × FOLLOWER_MARGIN_PCT).
+
+        Gömülü modda SANAL sermaye döner; gerçek hesap bakiyesi yalnız
+        "marjı ödeyebiliyor muyum?" kapısıdır (yetmezse giriş YOK + log).
+        """
         try:
             balance = await self.client.get_account_balance()
         except Exception as exc:
@@ -998,7 +1477,38 @@ class FollowerEngine:
             return None
         if balance is None or float(balance) <= 0:
             return None
-        return float(balance)
+        available = float(balance)
+        self._exchange_available_usdt = available
+
+        if self._virtual_capital_base() <= 0:
+            self._virtual_equity_usdt = None
+            return available
+
+        equity = await self._virtual_equity()
+        if equity <= 0:
+            self._count_reject("virtual_equity_zero")
+            self.logger.error(
+                f"⛔ Takipçi sanal sermayesi tükendi (taban="
+                f"{self._virtual_capital_base():.2f} + AP net PnL="
+                f"{self._virtual_realized_pnl:.2f} ≤ 0) — yeni giriş yok"
+            )
+            return None
+
+        margin_pct = float(getattr(self.cfg, "follower_margin_pct", 10.0) or 0.0)
+        margin_needed = equity * margin_pct / 100.0
+        if available < margin_needed:
+            self.logger.error(
+                f"⛔ Takipçi girişi atlandı: hesabın kullanılabilir bakiyesi "
+                f"({available:.2f} USDT) gereken marjı ({margin_needed:.2f} USDT "
+                f"= sanal sermaye {equity:.2f} × %{margin_pct:g}) KARŞILAMIYOR. "
+                f"Scalper'ın açık marjı hesabı doldurmuş olabilir.",
+                extra={"trade": True},
+            )
+            raise FollowerRejected(
+                f"gerçek bakiye yetersiz ({available:.2f} < {margin_needed:.2f} USDT)",
+                code="insufficient_balance",
+            )
+        return equity
 
     def _log_calibration(
         self,
@@ -1319,6 +1829,13 @@ class FollowerEngine:
         `_close_tracked` kullanılamaz (izlenen bir `sp` nesnesi yoktur ve
         kapanış defteri yazılamaz); kapanış borsadan DOĞRULANIR ve doğrulama
         başarısızsa hata olarak raporlanır (fail-closed).
+
+        **D20b (düşmanca inceleme):** gömülü modda hesap PAYLAŞILIR.
+        `flatten` YALNIZ takipçinin kendi pozisyonlarını ve gerçekten YETİM
+        saydıklarını kapatır; başka bir motorun (scalper / Telegram
+        orchestrator) yönettiği ya da hiç kimseye ait olmayan (elle açılmış)
+        pozisyonlara DOKUNMAZ — aksi halde operatörün "takipçiyi düzleştir"
+        komutu sessizce Telegram defterini kapatırdı. Atlananlar loglanır.
         """
         flattened: List[str] = []
         errors: List[str] = []
@@ -1329,6 +1846,12 @@ class FollowerEngine:
             return flattened, errors
 
         tracked = set(self.exits.tracked_symbols())
+        # Gömülü modda: yabancı sahipli + sahipsiz semboller KORUNUR.
+        # Ayrı halkada bu kümeler boştur → D20a davranışı birebir.
+        protected: Set[str] = set()
+        if self._embedded():
+            protected = self._foreign_symbols() | self._foreign_tracked_symbols()
+        skipped: List[str] = []
         for row in rows or []:
             if not isinstance(row, dict):
                 continue
@@ -1338,6 +1861,20 @@ class FollowerEngine:
             except (TypeError, ValueError):
                 continue
             if not symbol or amount == 0 or symbol in tracked or symbol in seen:
+                continue
+            if self._embedded():
+                # Gömülü modda YALNIZ takipçinin KENDİ pozisyonları kapatılır:
+                # izlenenler (yukarıda `_close_tracked` ile) ve kendi
+                # rezervasyonunu taşıyan yetimler. Yabancı ya da sahipsiz
+                # (elle/Telegram) her pozisyona DOKUNULMAZ.
+                is_mine = (
+                    symbol_reservations.owner(symbol) == self._RESERVATION_OWNER
+                )
+                if not is_mine or symbol in protected:
+                    skipped.append(symbol)
+                    continue
+            elif symbol in protected:
+                skipped.append(symbol)
                 continue
             seen.add(symbol)
             close_side = "SELL" if amount > 0 else "BUY"
@@ -1378,6 +1915,15 @@ class FollowerEngine:
                 errors.append(
                     f"{symbol} (yetim): kapanış borsa üzerinde doğrulanamadı"
                 )
+        if skipped:
+            self.logger.critical(
+                f"🛑 takipçi flatten: {sorted(set(skipped))} DOKUNULMADI — bu "
+                f"pozisyonlar takipçinin DEĞİL (başka motorun ya da elle "
+                f"açılmış). Hesap TAMAMEN düz DEĞİLDİR; onları kapatmak için "
+                f"ilgili motorun kendi flatten'ını çalıştırın ya da elle "
+                f"kapatın (D20b).",
+                extra={"trade": True},
+            )
         return flattened, errors
 
     # ------------------------------------------------------------------
@@ -1412,6 +1958,69 @@ class FollowerEngine:
             "exchange_last_error": self._exchange_last_error,
         }
 
+    def dashboard_snapshot(self) -> Dict[str, Any]:
+        """Panonun "AlgoPro Takipçi" kartı için KÜÇÜK özet (D20b).
+
+        `/api/status` gövdesine gömülür — pano AYRI bir yoklama yapmaz ve bu
+        yol HİÇ REST çağrısı üretmez (2026-08-18 pano-açlığı dersi: panonun
+        her tikte taze borsa okuması istemesi rate-limiter'ı doyurup tarama
+        döngüsünü aç bırakmıştı).
+        """
+        full = self.snapshot()
+        rejects = full.get("reject_counters") or {}
+        events = full.get("event_counters") or {}
+        return {
+            "running": full.get("running"),
+            "embedded": full.get("embedded"),
+            "forward_bridge_conflict": full.get("forward_bridge_conflict"),
+            "universe": full.get("universe"),
+            "reserved_symbols": full.get("reserved_symbols"),
+            "timeframe": full.get("timeframe"),
+            "max_positions": full.get("max_positions"),
+            "entries_ready": full.get("entries_ready"),
+            "entry_block_reason": full.get("entry_block_reason"),
+            "kill_switch_active": full.get("kill_switch_active"),
+            "entry_halted": full.get("entry_halted"),
+            "entry_halt_reason": full.get("entry_halt_reason"),
+            "orphan_positions": full.get("orphan_positions"),
+            "unknown_positions": full.get("unknown_positions"),
+            "virtual_ledger": full.get("virtual_ledger"),
+            "daily_pnl": full.get("daily_pnl"),
+            "daily_pnl_source": full.get("daily_pnl_source"),
+            "daily_loss_threshold_usdt": full.get("daily_loss_threshold_usdt"),
+            "daily_loss_limit_pct": full.get("daily_loss_limit_pct"),
+            "positions": full.get("positions"),
+            "sizing": full.get("sizing"),
+            # "durum": kaç alarm olayı geldi, en sonuncusu ne zaman.
+            "events_total": sum(int(v or 0) for v in events.values()),
+            "event_counters": dict(events),
+            "last_event_at": full.get("last_event_at"),
+            # Komisyon kapısı ret sayacı (D20a bulgu 3) panoda görünür.
+            "fee_gate_rejects": int(rejects.get("fee_gate", 0) or 0),
+            "reject_counters": dict(rejects),
+        }
+
+    @staticmethod
+    def _position_roi_pct(sp: Any) -> Optional[float]:
+        """Açık pozisyonun MARJ ROI'si (%) — YENİ REST ÇAĞRISI YOK.
+
+        `current_price` safety turunda zaten tazelenir (`exits.step`); pano
+        bu bellek değerini okur, kendi başına fiyat sormaz (2026-08-18
+        pano-açlığı dersi).
+        """
+        try:
+            entry = float(sp.position.entry_price or 0.0)
+            last = float(sp.position.current_price or 0.0)
+            lev = int(sp.position.leverage or 1) or 1
+            if entry <= 0 or last <= 0:
+                return None
+            move = (last - entry) / entry * 100.0
+            if sp.signal.direction != Direction.LONG:
+                move = -move
+            return round(move * lev, 2)
+        except Exception:
+            return None
+
     def snapshot(self) -> Dict[str, Any]:
         positions: List[Dict[str, Any]] = []
         for symbol, sp in self.exits._positions.items():
@@ -1421,6 +2030,8 @@ class FollowerEngine:
                     "symbol": symbol,
                     "direction": sp.signal.direction.value,
                     "entry_price": sp.position.entry_price,
+                    "current_price": sp.position.current_price,
+                    "roi_pct": self._position_roi_pct(sp),
                     "quantity": sp.position.quantity,
                     "leverage": sp.position.leverage,
                     "stop_loss": sp.position.current_stoploss,
@@ -1466,8 +2077,44 @@ class FollowerEngine:
             "cooldowns": self.executor.cooldown_snapshot(),
             "kill_switch_active": self._kill_switch,
             "daily_pnl": self._daily_pnl,
+            "daily_pnl_source": (
+                "ap_ledger"
+                if bool(getattr(self.cfg, "follower_embedded", False))
+                else "binance_account_income"
+            ),
             "daily_loss_threshold_usdt": self._daily_loss_threshold_usdt,
+            "daily_loss_limit_pct": float(
+                getattr(self.cfg, "follower_daily_loss_limit_pct", 0.0) or 0.0
+            ),
             "risk_equity_usdt": self._risk_equity_usdt,
+            # D20b sanal defter (gömülü mod). `enabled=False` → bugünkü
+            # davranış: boyutlama ve günlük kesici gerçek bakiyeye bakar.
+            "virtual_ledger": {
+                "enabled": self._virtual_capital_base() > 0,
+                "base_usdt": self._virtual_capital_base(),
+                "equity_usdt": self._virtual_equity_usdt,
+                "realized_pnl_usdt": self._virtual_realized_pnl,
+                "exchange_available_usdt": self._exchange_available_usdt,
+                "margin_per_trade_usdt": (
+                    None
+                    if self._virtual_equity_usdt is None
+                    else self._virtual_equity_usdt
+                    * float(getattr(self.cfg, "follower_margin_pct", 10.0) or 0.0)
+                    / 100.0
+                ),
+            },
+            "embedded": bool(getattr(self.cfg, "follower_embedded", False)),
+            # Gömülü modda HTTP köprüsü HİÇ çağrılmaz. Bu bayrak doluysa ayrı
+            # halka (tradingbot_ap) alarmsız kalmış demektir — startup CRITICAL
+            # loglar, operatör burada da görür (düşmanca inceleme).
+            "forward_bridge_conflict": bool(
+                getattr(self.cfg, "follower_embedded", False)
+                and str(getattr(self.cfg, "follower_forward_url", "") or "").strip()
+            ),
+            "reserved_symbols": sorted(
+                getattr(self.cfg, "follower_reserved_symbols", []) or []
+            ),
+            "symbol_reservations": symbol_reservations.snapshot(),
             "risk_event_halt": {
                 "active": halt_snapshot.get("active"),
                 "reason": halt_snapshot.get("reason"),
@@ -1477,6 +2124,15 @@ class FollowerEngine:
             "entry_halt_reason": self._entry_halt_reason,
             "sizing": {
                 "margin_pct": float(getattr(self.cfg, "follower_margin_pct", 10.0)),
+                # `sl_margin_pct` (yeni ad) ve `sl_roi_target` (eski ad) AYNI
+                # büyüklüktür; config startup'ta eşitler (bkz. D20b).
+                "sl_margin_pct": float(
+                    getattr(
+                        self.cfg,
+                        "follower_sl_margin_pct",
+                        getattr(self.cfg, "follower_sl_roi_target", 30.0),
+                    )
+                ),
                 "sl_roi_target": float(
                     getattr(self.cfg, "follower_sl_roi_target", 30.0)
                 ),
@@ -1505,7 +2161,12 @@ class FollowerEngine:
             # Borsada açık ama izlenmeyen pozisyonlar (bulgu 8). Boş liste =
             # borsa gerçeği ile izleme listesi UYUŞUYOR.
             "orphan_positions": list(self._orphans),
+            # D20b: hiçbir motorun izlemediği/rezerve etmediği CANLI
+            # pozisyonlar. YETİM DEĞİLDİR (elle/Telegram açılmış olabilir):
+            # entry-halt kurmaz, flatten kapsamına GİRMEZ — yalnız görünürlük.
+            "unknown_positions": list(self._unknown_positions),
             "orphans_checked_at": self._orphans_checked_at,
+            "orphans_check_ok": bool(self._orphans_check_ok),
             "tp_repair": (
                 self.exits.tp_repair_snapshot()
                 if hasattr(self.exits, "tp_repair_snapshot")

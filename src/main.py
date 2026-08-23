@@ -44,6 +44,7 @@ from src.services.tv_events import (
 from src.strategies.scalper.data import MarketDataGuard
 from src.strategies.scalper.engine import ScalperEngine
 from src.strategies.scalper.tracker import ScalpTracker
+from src.strategies.scalper.types import FOLLOWER_LEDGER_STRATEGY
 from src.trading.symbol_reservations import symbol_reservations
 
 
@@ -118,6 +119,97 @@ def _risk_engine():
     `FollowerEngine` döner — D10 semantiği iki halkada da aynıdır.
     """
     return scalper_engine or follower_engine
+
+
+#: Gömülü takipçi KAPALIYKEN defterde açık kalmış AP satırları (D20b).
+#: `/health` bunu ayrı bir alan olarak raporlar; hard fail YOKTUR (418/ban
+#: kuralı: teşhis bir restart döngüsü doğurmamalı).
+_orphaned_follower_trades: list = []
+
+
+async def _check_disabled_follower_open_trades() -> list:
+    """`FOLLOWER_EMBEDDED=false` iken DB'de OPEN AP satırı var mı? (D20b)
+
+    NEDEN (doğrulayıcı bulgusu Y10): gömülü mod açıkken pozisyon açıp bayrağı
+    kapatmak, o pozisyonu HİÇBİR motorun yönetmediği bir hâle sokar — takipçi
+    hiç başlamaz, scalper da defter filtresi yüzünden AP satırını almaz.
+    Borsada SL/TP emirleri durur ama TP1→BE, EXIT/flip ve kapanış defteri
+    çalışmaz.
+
+    KASTEN hard fail DEĞİL: startup'ı düşürmek ban/deploy döngüsü doğurur ve
+    pozisyonu KAPATMAZ. CRITICAL log + `/health` alanı + RUNBOOK reçetesi.
+    """
+    global _orphaned_follower_trades
+    _orphaned_follower_trades = []
+    if settings.follower_active:
+        return []
+    try:
+        rows = await ScalpTracker().open_trades(
+            strategies=(FOLLOWER_LEDGER_STRATEGY,)
+        )
+    except Exception as exc:  # pragma: no cover - teşhis startup'ı düşürmez
+        app_logger.warning(
+            f"⚠️ Açık AP işlemleri kontrol edilemedi ({exc}); "
+            f"gömülü takipçi kapalıyken yönetimsiz pozisyon olabilir"
+        )
+        return []
+    if not rows:
+        return []
+    _orphaned_follower_trades = [
+        {"id": r.id, "symbol": r.symbol, "direction": r.direction} for r in rows
+    ]
+    symbols = sorted({str(r.symbol) for r in rows})
+    app_logger.bind(trade=True).critical(
+        f"🚨 FOLLOWER_EMBEDDED KAPALI ama defterde AÇIK AlgoPro işlemi var: "
+        f"{symbols}. Bu pozisyonları HİÇBİR motor yönetmiyor (TP1→BE, EXIT ve "
+        f"kapanış defteri ÇALIŞMAZ; borsadaki SL/TP emirleri durur). Çözüm: "
+        f"FOLLOWER_EMBEDDED=true ile yeniden başlatıp /risk-event flatten ile "
+        f"kapatın, ya da pozisyonları elle kapatıp scalp_trades satırlarını "
+        f"kapanmış olarak işaretleyin (docs/RUNBOOK.md 'Gömülü takipçiyi "
+        f"kapatma')."
+    )
+    return _orphaned_follower_trades
+
+
+def _foreign_tracked_symbols() -> set:
+    """Takipçi DIŞINDAKİ motorların GERÇEKTEN yönettiği semboller (D20b).
+
+    Gömülü takipçinin yetim denetimi bunu BİRİNCİ kaynak olarak kullanır:
+    `symbol_reservations` bir NİYET kaydıdır ve scalper entry-halt'a
+    düştüğünde DONAR (`_sync_scalper_reservations` ilk satırda döner), o
+    yüzden tek başına ne yanlış-pozitifi ne yanlış-negatifi engeller.
+
+    Hata hâlinde istisna YUTULMAZ: çağıran (`FollowerEngine._foreign_tracked_
+    symbols`) onu yakalar, WARNING loglar ve o tur için boş küme kullanır —
+    yani denetim rezervasyon kaydına düşer, SESSİZ kalmaz. Burada yakalamamak
+    bilinçlidir: hatanın kaynağı çağıranın log satırında görünmelidir.
+    """
+    symbols: set = set()
+    if scalper_engine is not None:
+        symbols |= {str(s).upper() for s in scalper_engine.exits.tracked_symbols()}
+        symbols |= {str(s).upper() for s in scalper_engine.executor.pending_symbols()}
+        symbols |= {
+            str(s).upper() for s in getattr(scalper_engine, "_opening_symbols", ())
+        }
+    if orchestrator is not None:
+        symbols |= {
+            str(s).upper() for s in getattr(orchestrator, "active_positions", {})
+        }
+    return symbols
+
+
+def _risk_engines() -> list:
+    """`/risk-event`'in uygulanacağı TÜM motorlar (D20b).
+
+    Gömülü modda scalper ve takipçi AYNI süreçte ve AYNI Binance hesabında
+    çalışır: `halt` yalnız birine uygulanırsa diğeri yeni pozisyon açmayı
+    sürdürür, `flatten` yalnız birine uygulanırsa hesap FLAT DEĞİLDİR —
+    ikisi de operatörün "durdur" komutunu YANLIŞ okutur. Sıra scalper
+    önce (bugünkü yanıt alanları onun sonucundan türer), takipçi sonra.
+
+    Gömülü mod kapalıyken liste tek elemanlıdır → davranış birebir aynı.
+    """
+    return [engine for engine in (scalper_engine, follower_engine) if engine]
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +347,7 @@ async def lifespan(app: FastAPI):
             scalper_engine = ScalperEngine()
             await scalper_engine.start()
             app_logger.info("✅ Scalper motoru görevleri başlatıldı")
+
             # TV olay kanalı yapılandırma sağlığı (D19a bulgu E): sunucu
             # `.env`'i TV_SOURCE_ALLOWLIST'i açıkça set etmişse ya da
             # pencere/kapı kaynakları boşsa kanal "kurulu görünüp ölü"
@@ -266,6 +359,58 @@ async def lifespan(app: FastAPI):
         # orchestrator kurtarır ve izlemeye alır.
         await orchestrator.start()
         app_logger.info("✅ Trading Orchestrator başlatıldı")
+
+        # --- GÖMÜLÜ TAKİPÇİ (D20b, kullanıcı kararı 2026-08-23) -----------
+        # Scalper'ın YANINDA, AYNI süreçte/hesapta/panoda; boyutlaması SANAL
+        # defterle (FOLLOWER_VIRTUAL_CAPITAL_USDT) yapılır.
+        # `FOLLOWER_EMBEDDED=false` (varsayılan) → bu blok hiç çalışmaz ve
+        # bugünkü davranış birebir korunur.
+        #
+        # SIRA ÖNEMLİ (düşmanca inceleme): takipçi EN SONDA başlar. `start()`
+        # senkron bir yetim denetimi çalıştırır; orchestrator kendi açık
+        # pozisyonlarını `start()` İÇİNDE rezerve ettiği için ondan ÖNCE
+        # başlatmak Telegram'ın her pozisyonunu "sahipsiz" gösterirdi.
+        if settings.scalper_enabled and settings.follower_embedded:
+            from src.strategies.follower.engine import FollowerEngine
+
+            follower_engine = FollowerEngine()
+            # Yetim denetiminin BİRİNCİ kaynağı: diğer motorların GERÇEK
+            # izleme listeleri (rezervasyon kaydı yalnız ikinci katmandır —
+            # scalper entry-halt'ta rezervasyonlarını DONDURUR).
+            follower_engine.foreign_tracked_cb = _foreign_tracked_symbols
+            await follower_engine.start()
+            app_logger.info(
+                "✅ AlgoPro takipçisi GÖMÜLÜ modda başlatıldı "
+                f"(sanal sermaye={settings.follower_virtual_capital_usdt:g} USDT, "
+                f"evren={sorted(follower_engine.symbol_allowlist())})"
+            )
+            if not (settings.risk_event_secret or "").strip():
+                # Ayrı halkada bu ZORUNLUDUR (Telegram yok). Gömülü modda
+                # scalper'ın Telegram/supervisor yolları da vardır, o yüzden
+                # fail-fast değil — ama sessiz de kalınmaz.
+                app_logger.warning(
+                    "⚠️ RISK_EVENT_SECRET boş: /risk-event 503 döner. "
+                    "Gömülü takipçiyi uzaktan flatten etmenin tek yolu "
+                    "odur (bkz. docs/RUNBOOK.md 'Gömülü takipçiyi açma')."
+                )
+            if str(getattr(settings, "follower_forward_url", "") or "").strip():
+                # İki kurulum aynı anda ANLAMLI DEĞİLDİR: gömülü modda AlgoPro
+                # gövdesi süreç içinde tüketilir ve HTTP köprüsü HİÇ çağrılmaz
+                # — ayrı halka (tradingbot_ap) sessizce alarmsız kalır ve açık
+                # pozisyonlarına EXIT/flip komutu ULAŞMAZ.
+                app_logger.critical(
+                    "🚨 FOLLOWER_EMBEDDED=true iken FOLLOWER_FORWARD_URL DOLU: "
+                    "ayrı halka (tradingbot_ap) artık HİÇBİR AlgoPro olayı "
+                    "ALMAZ. Önce ayrı halkayı düzleştirip durdurun, sonra "
+                    "FOLLOWER_FORWARD_URL'i boşaltın "
+                    "(docs/RUNBOOK.md 'Gömülü takipçiyi açma' adım 0).",
+                    extra={"trade": True},
+                )
+
+        # Bayrak kapalıyken defterde açık AP satırı kaldıysa SESSİZ kalma.
+        # Telegram supervisor'ından ÖNCE: `await`, supervisor task'ına sıra
+        # verirdi ve lifespan başlatma sırası testleri kırılırdı.
+        await _check_disabled_follower_open_trades()
 
         # Telegram ağ/409 hatası scalper safety döngülerini öldürmemeli.
         # Supervisor tam yaşam döngüsünü await eder ve bounded backoff ile
@@ -459,6 +604,31 @@ async def health_check():
         "scalper": scalper_state,
         "scalper_details": scalper_health,
     }
+    # D20b: gömülü takipçi AYRI bir bileşen olarak raporlanır. `core_healthy`
+    # KASTEN etkilenmez: takipçinin safety turu bayatlarsa çözüm süreci
+    # yeniden başlatmak DEĞİL, takipçinin kendi fail-closed kilididir
+    # (entry-halt) — scalper'ın soak'unu bir teşhis restart'ıyla kesmek
+    # 2026-08-14 dersine aykırıdır. Durum panoda ve /follower/status'ta.
+    if settings.follower_embedded:
+        follower_health = (
+            follower_engine.health_snapshot()
+            if follower_engine
+            else {"healthy": False, "running": False, "reason": "engine_not_created"}
+        )
+        body["follower"] = (
+            "running" if follower_health.get("healthy") else "degraded"
+        )
+        body["follower_details"] = follower_health
+    elif _orphaned_follower_trades:
+        # D20b: bayrak KAPALI ama defterde açık AP satırı var → o pozisyonlar
+        # YÖNETİMSİZ. `core_healthy` KASTEN etkilenmez (hard fail bir restart
+        # döngüsü doğurur ve pozisyonu kapatmaz); operatör burada görür.
+        body["follower"] = "disabled_with_open_trades"
+        body["follower_details"] = {
+            "healthy": False,
+            "reason": "follower_disabled_but_open_ap_trades",
+            "open_trades": list(_orphaned_follower_trades),
+        }
     # Telegram has its own retry supervisor.  Its outage is reported as
     # degraded but does not provoke a process restart while the trading core
     # and protection loops remain healthy.
@@ -638,6 +808,21 @@ async def api_status(request: Request = None):
         # D22: gövdenin kurulduğu an (önbellekten servis edilse de sabit).
         "as_of": _utcnow_iso(),
     }
+
+    # D20b: pano "AlgoPro Takipçi" kartını BU gövdeden okur — ayrı bir
+    # yoklama açmaz. `dashboard_snapshot()` yalnız BELLEK okur (REST YOK),
+    # bu yüzden 2026-08-18 pano-açlığı riski doğurmaz. Gömülü mod kapalıyken
+    # anahtar hiç EKLENMEZ → yanıt bugünküyle birebir aynıdır.
+    if settings.follower_embedded:
+        try:
+            payload["follower"] = (
+                follower_engine.dashboard_snapshot()
+                if follower_engine
+                else {"running": False, "embedded": True, "positions": []}
+            )
+        except Exception as e:  # teşhis alanı asla status'u düşürmemeli
+            payload["follower"] = {"error": f"{type(e).__name__}: {e}"}
+
     return _store_status(_api_status_cache, cache_key, payload)
 
 
@@ -1055,6 +1240,131 @@ def _maybe_forward_to_follower(request: Request, raw: str) -> None:
         )
     except Exception as exc:  # savunmacı: köprü ana akışı ASLA düşürmez
         app_logger.warning(f"⚠️ Takipçi köprüsü çağrılamadı ({exc})")
+
+
+async def _maybe_route_embedded_follower(raw: str, *, dry_run: bool):
+    """GERÇEK AlgoPro alert() gövdesini SÜREÇ İÇİ takipçiye teslim et (D20b).
+
+    Yalnız `FOLLOWER_EMBEDDED=true` iken devreye girer. Karar gövdenin
+    KENDİSİNE bakan katı tanıyıcıdadır (`parser.algopro_alert_kind`, D20a
+    bulgu 5 ile AYNI kural) ve `TV_SOURCE_ALLOWLIST`/`?src=`ten BAĞIMSIZDIR.
+
+    Bu gövde ana botun SAĞLAMASINA OY VERMEZ: AlgoPro alert() biçimi
+    takipçinin giriş/çıkış komut hattıdır, scalper'ın dış sinyal oyu değil.
+    Ana botun bugünkü TV davranışı DEĞİŞMEZ — eski özel mesaj biçimi
+    ("BUY on {{ticker}} | TF: 5 | Price: …") katı tanıyıcıdan GEÇMEZ ve
+    eskisi gibi oy vermeye devam eder.
+
+    **TEK AYRIŞTIRICI (düşmanca inceleme):** yönlendirme kararı, dry-run
+    raporu ve gerçek yürütme AYNI `parse_follower_event()` sonucundan üretilir.
+    Eskiden karar `algopro_alert_kind` (yalnız AlgoPro kalıbı), yürütme ise
+    `parse_follower_event` (önce `kind=` şablonu) ile veriliyordu; gövdede bir
+    `kind=exit` belirteci varsa `?dry_run=1` "entry" raporlarken gerçek istek
+    pozisyonu KAPATIYORDU.
+
+    **EVREN KAPISI (düşmanca inceleme):** takipçi evreni dışındaki bir GİRİŞ
+    sessizce yutulmaz — 200 + `accepted:false` +
+    `reason:"symbol_not_in_follower_universe"` + WARNING + sayaç ile raporlanır.
+    Giriş/oy yoluna DÜŞMEZ: ana botun davranışı bu dalda da değişmez.
+    ÇIKIŞ/HIT olayları koşulsuz iletilir (evren daralsa bile açık pozisyonun
+    çıkışı düşmemeli — D20a bulgu 9 ilkesi).
+
+    Dönüş: yanıt sözlüğü (yönlendirme yapıldı) ya da None (bu gövde takipçinin
+    değil → çağıran bugünkü yola devam eder).
+    """
+    if not settings.follower_embedded:
+        return None
+    try:
+        from src.strategies.follower.parser import (
+            algopro_alert_kind,
+            parse_follower_event,
+        )
+        from src.strategies.follower.types import (
+            KIND_ENTRY,
+            ROUTE_REJECT_OUTSIDE_UNIVERSE,
+            FollowerParseError,
+        )
+    except Exception as exc:  # pragma: no cover - savunmacı
+        app_logger.warning(f"⚠️ Gömülü takipçi tanıyıcısı yüklenemedi ({exc})")
+        return None
+
+    try:
+        if algopro_alert_kind(raw) is None:
+            return None
+    except Exception as exc:  # pragma: no cover - savunmacı
+        app_logger.warning(f"⚠️ Gömülü takipçi ön kapısı çalışmadı ({exc})")
+        return None
+
+    received_monotonic = time.monotonic()
+    try:
+        event = parse_follower_event(raw)
+    except FollowerParseError as exc:
+        app_logger.warning(f"⚠️ Gömülü takipçi: AlgoPro gövdesi çözülemedi ({exc})")
+        raise HTTPException(status_code=422, detail=f"AlgoPro gövdesi: {exc}")
+
+    universe = {
+        str(sym).strip().upper()
+        for sym in (getattr(settings, "follower_universe", []) or [])
+        if str(sym).strip()
+    }
+    outside = bool(
+        event.kind == KIND_ENTRY and universe and event.symbol not in universe
+    )
+
+    if dry_run:
+        # `?dry_run=1` HİÇBİR yan etki üretmez (pozisyon açmak bir yan
+        # etkidir) — yalnız yapılacak işi RAPORLAR. Rapor, gerçek yolun
+        # kullandığı AYNI ayrıştırmadan gelir.
+        return {
+            "dry_run": True,
+            "would": {
+                "routed": "follower",
+                "kind": event.kind,
+                "symbol": event.symbol,
+                "direction": (
+                    event.direction.value if event.direction is not None else None
+                ),
+                "accepted": not outside,
+                "reason": ROUTE_REJECT_OUTSIDE_UNIVERSE if outside else None,
+            },
+        }
+
+    if outside:
+        if follower_engine is not None:
+            follower_engine.note_route_reject(
+                ROUTE_REJECT_OUTSIDE_UNIVERSE, kind=event.kind
+            )
+        app_logger.warning(
+            f"⚠️ AlgoPro girişi işlenmedi: {event.symbol} takipçi evreninde "
+            f"({sorted(universe)}) DEĞİL. Gömülü modda AlgoPro alert() gövdeleri "
+            f"YALNIZ takipçiye aittir; ana botun sağlamasına oy YAZILMAZ "
+            f"(D20b). Bu sembolü takipçiye vermek için FOLLOWER_SYMBOLS'a "
+            f"ekleyin ya da alarmını kapatın."
+        )
+        return {
+            "routed": "follower",
+            "embedded": True,
+            "kind": event.kind,
+            "symbol": event.symbol,
+            "accepted": False,
+            "reason": ROUTE_REJECT_OUTSIDE_UNIVERSE,
+        }
+
+    if not follower_engine:
+        raise HTTPException(
+            status_code=503, detail="Gömülü AlgoPro takipçisi hazır değil"
+        )
+    result = await follower_engine.handle_event(
+        event, received_monotonic=received_monotonic
+    )
+    return {
+        "routed": "follower",
+        "embedded": True,
+        "kind": event.kind,
+        "symbol": event.symbol,
+        **result,
+    }
+
 
 def _tv_truthy(value) -> bool:
     """`?dry_run=1|true|yes` gibi sorgu bayraklarını çöz."""
@@ -1526,6 +1836,16 @@ async def tradingview_webhook(request: Request):
             dry_run=dry_run,
         )
 
+    # GÖMÜLÜ TAKİPÇİ (D20b): gövde GERÇEK bir AlgoPro alert() mesajıysa
+    # (BUY/SELL/EXIT/TPn HIT/SL HIT + `| BINANCE: | TF: | Price:` + girişte
+    # dört seviye) istek SÜREÇ İÇİ takipçiye teslim edilir ve BURADA biter:
+    # ana botun sağlamasına oy YAZILMAZ, `external_signal` ÇAĞRILMAZ.
+    # `FOLLOWER_EMBEDDED=false` (varsayılan) → None döner, aşağıdaki yol
+    # bugünküyle birebir aynıdır.
+    routed = await _maybe_route_embedded_follower(raw, dry_run=dry_run)
+    if routed is not None:
+        return routed
+
     # Kaynak etiketi: GÖVDEDEKİ `src` (allowlist'teyse) `?src=`'i geçersiz
     # kılar (klon senaryosu, D19); yoksa alarm URL'sindeki ?src=... geçerli;
     # o da yoksa AlgoPro'nun varsayılan mesaj biçimi ("BUY on X | TF: 1 |
@@ -1896,6 +2216,8 @@ async def risk_event(request: Request):
     engine = _risk_engine()
     if not engine:
         raise HTTPException(status_code=503, detail="Scalper hazır değil")
+    # D20b: gömülü modda komut İKİ motora da uygulanır (aynı hesap).
+    engines = _risk_engines()
 
     if action in ("halt", "flatten") and not reason:
         raise HTTPException(
@@ -1918,7 +2240,8 @@ async def risk_event(request: Request):
         _reset_status_caches()
 
     if action == "status":
-        snap = engine.risk_event_status()
+        snaps = [e.risk_event_status() for e in engines]
+        snap = snaps[0]
         return {
             "ok": True,
             "action": action,
@@ -1926,17 +2249,33 @@ async def risk_event(request: Request):
             "reason": snap.get("reason"),
             "flattened": [],
             "errors": [],
-            "active": snap.get("active"),
-            "open_positions": snap.get("open_positions"),
+            # Gömülü modda "aktif mi?" HERHANGİ bir motorda aktifse EVET'tir
+            # ve açık pozisyon sayısı TOPLAMDIR — operatör hesabın tamamını
+            # görmeli (tek motorlu kurulumda ikisi de eskisiyle aynı).
+            "active": any(bool(s.get("active")) for s in snaps),
+            "open_positions": sum(int(s.get("open_positions") or 0) for s in snaps),
         }
 
     if action == "resume":
+        # Çapraz kontrol (doğrulayıcı bulgusu): `halt` dalındaki simetrik
+        # kontrol `resume`'da YOKTU — takipçinin halt dosyası silinemezse yanıt
+        # `ok:true` derken takipçi HALT'ta kalırdı.
+        extra_resumes = [e.risk_event_resume() for e in engines[1:]]
         snap = engine.risk_event_resume()
+        if any(bool(x.get("active")) for x in extra_resumes):
+            app_logger.bind(trade=True).critical(
+                "🚨 /risk-event resume: takipçi motorunda halt HÂLÂ AKTİF "
+                "(dosya silinemedi?) — gömülü halkada AlgoPro girişleri kapalı "
+                "kalır. state/ dizinini ve disk iznini kontrol edin."
+            )
         # ok=False: dosya silinemediyse (OSError) halt file-derived olarak
         # AKTİF kalır (bkz. risk_event_resume) — yanıt bunu "başarılı resume"
         # gibi göstermemeli (I).
         return {
-            "ok": not snap.get("active"),
+            # `ok` ARTIK iki motoru da kapsar: biri halt'ta kaldıysa "resume
+            # başarılı" demek operatörü yanıltır.
+            "ok": not snap.get("active")
+            and not any(bool(x.get("active")) for x in extra_resumes),
             "action": action,
             "halted_until": snap.get("until_ts"),
             "reason": snap.get("reason"),
@@ -1945,9 +2284,24 @@ async def risk_event(request: Request):
         }
 
     if action == "halt":
+        # Takipçi ÖNCE durdurulur: scalper'ınki başarısız olsa bile
+        # (imkânsıza yakın) takipçi yeni pozisyon açmayı sürdürmesin.
+        extra_halts = [
+            await extra_engine.risk_event_halt(
+                reason=reason, source=source, ttl_minutes=ttl_minutes
+            )
+            for extra_engine in engines[1:]
+        ]
         snap = await engine.risk_event_halt(
             reason=reason, source=source, ttl_minutes=ttl_minutes
         )
+        if extra_halts and not all(
+            bool(s.get("active")) for s in extra_halts
+        ):  # pragma: no cover - savunmacı
+            app_logger.bind(trade=True).critical(
+                "🚨 /risk-event halt: takipçi motorunda halt AKTİF DEĞİL — "
+                "gömülü halkada yeni AlgoPro girişleri sürebilir!"
+            )
         # ok=snapshot.active: RAM latch sayesinde persist başarısız olsa
         # bile halt gerçekten etkilidir (D) — ok=False YALNIZ latch de
         # kurulamamışsa (ör. TTL<=0 gibi imkansız bir durum) döner.
@@ -1968,6 +2322,22 @@ async def risk_event(request: Request):
     result = await engine.risk_event_flatten(
         reason=reason, source=source, ttl_minutes=ttl_minutes
     )
+    flattened = list(result.get("flattened", []) or [])
+    errors = list(result.get("errors", []) or [])
+    # D20b: hesap ancak İKİ motorun pozisyonları da kapandığında FLAT'tir.
+    # Takipçininki sonra çalışır; scalper'ın yetim taraması onun
+    # pozisyonlarını zaten "yetim" saymaz (sahiplik kaydı).
+    for extra_engine in engines[1:]:
+        try:
+            extra = await extra_engine.risk_event_flatten(
+                reason=reason, source=source, ttl_minutes=ttl_minutes
+            )
+        except Exception as exc:  # pragma: no cover - savunmacı
+            errors.append(f"follower: {type(exc).__name__}: {exc}")
+            continue
+        flattened.extend(extra.get("flattened", []) or [])
+        errors.extend(extra.get("errors", []) or [])
+    result = {**result, "flattened": flattened, "errors": errors}
     halt_snap = result.get("halt") or {}
     # ok=False: bir veya daha fazla sembol borsa üzerinde doğrulanamadıysa
     # (fail-closed — SL/TP iptal edilmedi, izlemede kaldı) yanıt "flat"
@@ -2082,13 +2452,16 @@ async def follower_status():
     çalışıyor olabilir. Boş gövde artık YALNIZ takipçi modunda (motor henüz
     kurulmamışken) döner.
     """
-    if not settings.is_follower_mode:
+    # D20b: gömülü modda (FOLLOWER_EMBEDDED=true) bu süreçte GERÇEKTEN bir
+    # takipçi motoru vardır; 404 dönmek operatörü yanıltırdı.
+    if not settings.follower_active:
         raise HTTPException(
             status_code=404,
             detail=(
-                "Bu süreç takipçi halkası DEĞİL (BOT_MODE="
-                f"{settings.bot_mode}). Takipçi durumu kendi sürecindedir "
-                "(varsayılan :9093/follower/status)."
+                "Bu süreçte AlgoPro takipçisi YOK (BOT_MODE="
+                f"{settings.bot_mode}, FOLLOWER_EMBEDDED=false). Takipçi "
+                "durumu kendi sürecindedir (varsayılan :9093/follower/status) "
+                "ya da FOLLOWER_EMBEDDED=true ile bu süreçte açılır."
             ),
         )
     if not follower_engine:
@@ -2309,6 +2682,9 @@ _EMPTY_SCALPER_STATUS = {
     "virtual_capital_current_usdt": None,
     "virtual_capital_start_trade_id": 0,
     "symbol_reservations": {},
+    # D20b/Y8: gömülü modda hesabın ham günlük income'ı — YALNIZ BİLGİ
+    # (kesici defterden beslenir). Motor yokken de anahtar bulunmalı.
+    "daily_income_account": None,
 }
 
 
@@ -2364,8 +2740,19 @@ async def scalper_status(request: Request = None):
 
 
 @app.get("/scalper/stats")
-async def scalper_stats(db: AsyncSession = Depends(get_db)):
-    """Strateji bazlı ve toplam (combined) kapanmış scalp işlem istatistikleri."""
+async def scalper_stats(
+    db: AsyncSession = Depends(get_db), strategy: Optional[str] = None
+):
+    """Strateji bazlı ve toplam (combined) kapanmış scalp işlem istatistikleri.
+
+    D20b: `combined` VARSAYILAN OLARAK gömülü takipçinin (`strategy="AP"`)
+    satırlarını DIŞLAR — pano "TOPLAM" kartı, veri-kalitesi bandı ve lider
+    rozeti iki farklı defteri tek sayıda karıştırmamalıdır. `strategies`
+    sözlüğü her defteri AYRI anahtarla göstermeye devam eder (AP dahil).
+    `?strategy=AP` ile yalnız takipçinin defteri toplanır. Ayrı halkada DB'de
+    AP satırı olmadığı için varsayılan davranış bugünküyle birebir aynıdır.
+    """
+    wanted = (strategy or "").strip().upper() or None
     strategies: dict = {}
     if scalper_engine:
         strategies = await scalper_engine.tracker.stats()
@@ -2378,9 +2765,14 @@ async def scalper_stats(db: AsyncSession = Depends(get_db)):
                     strategy_stats.get("profit_factor")
                 )
 
-    result = await db.execute(
-        select(ScalpTradeModel).where(ScalpTradeModel.status == "CLOSED")
-    )
+    combined_stmt = select(ScalpTradeModel).where(ScalpTradeModel.status == "CLOSED")
+    if wanted:
+        combined_stmt = combined_stmt.where(ScalpTradeModel.strategy == wanted)
+    else:
+        combined_stmt = combined_stmt.where(
+            ScalpTradeModel.strategy != FOLLOWER_LEDGER_STRATEGY
+        )
+    result = await db.execute(combined_stmt)
     rows = list(result.scalars().all())
 
     n = len(rows)
@@ -2400,6 +2792,8 @@ async def scalper_stats(db: AsyncSession = Depends(get_db)):
         source_counts[ScalpTracker._pnl_source(getattr(row, "notes", None))] += 1
 
     combined = {
+        # Hangi defteri kapsıyor? Pano bunu kart başlığında gösterir.
+        "scope": wanted or f"!{FOLLOWER_LEDGER_STRATEGY}",
         "trades": n,
         "wins": len(wins),
         "winrate": (len(wins) / n * 100.0) if n else 0.0,
@@ -2545,7 +2939,9 @@ async def scalper_forensics_recent(limit: int = 50):
 
 @app.get("/scalper/forensics/summary")
 async def scalper_forensics_summary(
-    since: Optional[str] = None, until: Optional[str] = None
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    strategy: Optional[str] = None,
 ):
     """Etiket × sonuç tablosu — "neler etkiliyor" sorusunun cevabı.
 
@@ -2555,10 +2951,18 @@ async def scalper_forensics_summary(
     `since` verilmezse varsayılan pencere son `FORENSICS_DEFAULT_SINCE`'tır:
     "tüm zamanlar" hem DB'yi hem de okuyanı yanıltır (kayıt D21 ile başladı).
     Üst sınır `FORENSICS_MAX_WINDOW_DAYS`; aşan değer 400 döner.
+
+    D20b: gömülü takipçinin (`strategy="AP"`) satırları VARSAYILAN OLARAK
+    dışlanır — takipçide strateji göstergesi/rejim/lider kapısı YOKTUR ve
+    onun etiketleri scalper'ın "neler etkiliyor" tablosunu kirletirdi.
+    `?strategy=AP` ile takipçinin kendi tablosu çekilir.
     """
+    wanted = (strategy or "").strip().upper() or None
     return await ScalpTracker().forensics_summary(
         since=_parse_since(since or FORENSICS_DEFAULT_SINCE),
         until=_parse_since(until),
+        strategies=(wanted,) if wanted else None,
+        exclude_strategies=None if wanted else (FOLLOWER_LEDGER_STRATEGY,),
     )
 
 

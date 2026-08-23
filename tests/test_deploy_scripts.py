@@ -470,7 +470,9 @@ exec /bin/date "$@"
     return bin_dir, call_log
 
 
-def _make_ring_dir(tmp_path: Path, *, bot_mode=None, halt_file=None):
+def _make_ring_dir(
+    tmp_path: Path, *, bot_mode=None, halt_file=None, follower_embedded=None
+):
     repo = tmp_path / "repo"
     (repo / "state").mkdir(parents=True, exist_ok=True)
     (repo / "logs").mkdir(parents=True, exist_ok=True)
@@ -478,6 +480,8 @@ def _make_ring_dir(tmp_path: Path, *, bot_mode=None, halt_file=None):
     env_lines = ["BINANCE_API_KEY=x\n"]
     if bot_mode:
         env_lines.append(f"BOT_MODE={bot_mode}\n")
+    if follower_embedded is not None:
+        env_lines.append(f"FOLLOWER_EMBEDDED={follower_embedded}\n")
     (repo / ".env").write_text("".join(env_lines))
     if halt_file:
         (repo / halt_file).parent.mkdir(parents=True, exist_ok=True)
@@ -639,6 +643,32 @@ class TestServerDeployRingBinding:
         assert proc.returncode != 0
         assert "entry-halt aktif" in (proc.stdout + proc.stderr)
 
+    def test_embedded_follower_halt_blocks_testnet_deploy(self, tmp_path):
+        """D20b: gömülü takipçinin kilidi scalper halkasında da GÖRÜNÜR.
+
+        Düşmanca inceleme: `RING=testnet` yalnız `state/scalper_entry_halt.json`e
+        bakıyordu; gömülü takipçi korumasız pozisyon yüzünden kilitliyken deploy
+        ve restart SERBESTTİ (CLAUDE.md yasak #3 ihlali).
+        """
+        repo = _make_ring_dir(
+            tmp_path,
+            follower_embedded="true",
+            halt_file="state/follower_entry_halt.json",
+        )
+        bin_dir, _ = _make_server_bin(tmp_path)
+        proc = _run_server_deploy(tmp_path, repo, bin_dir)
+        assert proc.returncode != 0
+        assert "gömülü takipçi entry-halt aktif" in (proc.stdout + proc.stderr)
+
+    def test_follower_halt_does_not_block_when_embedded_is_off(self, tmp_path):
+        """Bayrak KAPALIYKEN dosya deploy'u engellemez (bugünkü davranış)."""
+        repo = _make_ring_dir(
+            tmp_path, halt_file="state/follower_entry_halt.json"
+        )
+        bin_dir, _ = _make_server_bin(tmp_path)
+        proc = _run_server_deploy(tmp_path, repo, bin_dir)
+        assert "gömülü takipçi entry-halt aktif" not in (proc.stdout + proc.stderr)
+
 
 class TestServerDeployRestartFailureRollsBack:
     """Ana oturum eki (B): `supervisorctl restart` hatası GERİ ALINIR."""
@@ -710,6 +740,18 @@ class TestRestartSafe:
         assert len(backups[0].name.split("-")[2]) == 6
         assert "supervisorctl restart tradingbot_v2" in call_log.read_text()
         assert "TAMAM" in proc.stdout
+
+    def test_embedded_follower_halt_blocks_the_restart(self, tmp_path):
+        """D20b: gömülü takipçinin kilidi testnet halkasında restart'ı durdurur."""
+        repo = _make_ring_dir(
+            tmp_path,
+            follower_embedded="true",
+            halt_file="state/follower_entry_halt.json",
+        )
+        bin_dir, _ = _make_server_bin(tmp_path)
+        proc = self._run(tmp_path, repo, bin_dir)
+        assert proc.returncode != 0
+        assert "gömülü takipçi entry-halt aktif" in (proc.stdout + proc.stderr)
 
     def test_entry_halt_blocks_the_restart(self, tmp_path):
         repo = _make_ring_dir(

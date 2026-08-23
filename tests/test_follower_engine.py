@@ -223,7 +223,9 @@ class TestGates:
         )
         result = await engine.handle_event(event)
         assert result["accepted"] is False
-        assert "evren" in result["reason"]
+        # D20b: TEK ret adı (köprü yolu ile aynı); insan-okur metin `detail`de.
+        assert result["reason"] == "symbol_not_in_follower_universe"
+        assert "evren" in result["detail"]
         engine.executor.open_position.assert_not_called()
 
     async def test_timeframe_mismatch_rejected(self, tmp_path):
@@ -1009,7 +1011,9 @@ class TestGatesDoNotBlockExits:
         engine = _make_engine(tmp_path, cfg)
         result = await engine.handle_event(parse_follower_event(SELL_ENTRY))
         assert result["accepted"] is False
-        assert "evren" in result["reason"]
+        # D20b: TEK ret adı (köprü yolu ile aynı); insan-okur metin `detail`de.
+        assert result["reason"] == "symbol_not_in_follower_universe"
+        assert "evren" in result["detail"]
 
 
 class TestStaleSignalGates:

@@ -206,7 +206,201 @@ redirect_stderr=true
 Uygulamanın kendi log dosyası (`logs/bot.log`, testnet'teki gibi) çalışma dizini `/opt/tradingbot-main`
 olduğu için otomatik olarak ayrı olur — testnet'in `logs/`'ıyla KARIŞMAZ.
 
-### AlgoPro takipçi halkası (D20, `BOT_MODE=follower`)
+### Gömülü takipçiyi açma (D20b — **TERCİH EDİLEN** kurulum)
+Kullanıcı kararı (2026-08-23): *"Yeni hesap yok, yeni panel yok."* AlgoPro takipçisi
+scalper ile **AYNI süreçte** (`tradingbot_v2`, :9091), **AYNI testnet hesabında** ve
+**AYNI panoda** çalışır; boyutlaması gerçek bakiyeye değil **1000 USD'lik SANAL
+deftere** dayanır. Aşağıdaki ayrı halka (`/opt/tradingbot-ap`) desteği KALDIRILMADI
+ama artık gerekli değildir — yeni kurulumlarda **bunu** kullan.
+
+**0) ÖNCE ayrı halkayı kapat** (D20 `tradingbot_ap` çalışıyorsa **ZORUNLU**).
+Gömülü mod açıldığı an AlgoPro gövdeleri SÜREÇ İÇİNDE tüketilir ve HTTP köprüsü
+HİÇ çağrılmaz: ayrı halka tek bir giriş/çıkış/TP/SL alarmı almaz ve AÇIK
+pozisyonlarına EXIT/flip komutu ULAŞMAZ (sessizce kendi SL/TP merdiveniyle
+taşınır). Startup bu durumu CRITICAL loglar ama kendiliğinden düzeltmez.
+```bash
+# a) ayrı halkayı DÜZLEŞTİR (açık pozisyon kalmasın)
+curl -sS -X POST http://127.0.0.1:9093/risk-event -H 'Content-Type: application/json' \
+  -d '{"secret":"<AP_RISK_EVENT_SECRET>","action":"flatten","reason":"gomulu-moda-gecis"}'
+# b) durdur
+ssh awa 'supervisorctl stop tradingbot_ap'
+# c) ana bottaki köprüyü BOŞALT (dolu kalırsa startup CRITICAL uyarır)
+ssh awa 'cd /opt/tradingbot-v2 && sed -i "s|^FOLLOWER_FORWARD_URL=.*|FOLLOWER_FORWARD_URL=|" .env'
+```
+
+**1) `.env` (sunucuda, yedek + doğrulama ile):**
+```ini
+FOLLOWER_EMBEDDED=true
+FOLLOWER_VIRTUAL_CAPITAL_USDT=1000
+FOLLOWER_SYMBOLS=<SEÇİLEN>          ; TEK coin (ör. ölçümle seçilen sembol)
+                                    ; boş bırakılırsa evren 8 majör olur ve
+                                    ; scalper'dan HİÇBİR sembol çıkarılmaz
+```
+Aynı `.env`'de scalper'ın evrenini de daralt (kod zaten otomatik dışlar; bu ikinci
+kayıt operatör için açıklıktır): `SCALPER_SYMBOL_ALLOWLIST` ve
+`SCALPER_TV_SYMBOL_ALLOWLIST` listelerinden `FOLLOWER_SYMBOLS`'daki sembolü ÇIKAR.
+
+Opsiyoneller: `FOLLOWER_MIN_TP1_FEE_RATIO` **varsayılan 1.0 = AÇIK** (D20a bulgu 3) —
+stop mesafesi ~%0.20'nin altındaki AlgoPro girişleri komisyonu ödeyemeyeceği için HİÇ
+açılmaz; kapatmak KULLANICI KARARIDIR (`=0`, o hâlde her girişte ⚠️ WARNING).
+`FOLLOWER_SL_MARGIN_PCT` (vars. 30, aralık 10–50) kaldıracın payıdır:
+`lev = clamp(round(FOLLOWER_SL_MARGIN_PCT / sl_pct), FOLLOWER_LEV_MIN,
+FOLLOWER_MAX_LEVERAGE)`. `RISK_EVENT_SECRET` gömülü modda ZORUNLU değildir ama
+boşsa `/risk-event` 503 döner ve startup WARNING loglar — **doldurulması şiddetle
+önerilir** (tek uzaktan `flatten` yolu odur).
+
+Reçete repo'nun **güvenli `.env` kalıbını** kullanır (satır VARSA değiştirir,
+YOKSA ekler). Körlemesine `>>` eklemek aynı anahtarı ikinci kez yazar ve
+dosyanın son satırında newline yoksa iki ayarı BİRLEŞTİRİR:
+```bash
+ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date -u +%Y%m%d-%H%M%S)-embedded \
+  && for kv in "FOLLOWER_EMBEDDED=true" "FOLLOWER_VIRTUAL_CAPITAL_USDT=1000" "FOLLOWER_SYMBOLS=<SEÇİLEN>"; do \
+       k="${kv%%=*}"; \
+       { grep -q "^$k=" .env && sed -i "s|^$k=.*|$kv|" .env || printf "\n%s\n" "$kv" >> .env; }; \
+     done \
+  && ./.venv/bin/python -c "from src.core.config import settings as s; \
+     assert s.follower_embedded, \"GÖMÜLÜ MOD AÇILMADI\"; \
+     assert s.follower_reserved_symbols == [\"<SEÇİLEN>\"], s.follower_reserved_symbols; \
+     assert float(s.follower_virtual_capital_usdt) == 1000.0; \
+     print(\"evren=\", s.follower_universe, \"ayrılmış=\", s.follower_reserved_symbols)"'
+```
+> `follower_reserved_symbols` YALNIZ `FOLLOWER_EMBEDDED=true` **ve**
+> `FOLLOWER_SYMBOLS` dolu iken doludur — tek assert iki ayarı birden doğrular.
+> (Eski reçetedeki `assert s.follower_universe` FOLLOWER_SYMBOLS hiç
+> yazılmasa da GEÇİYORDU: evren 8 majöre düşer ve hiçbir sembol scalper'dan
+> çıkarılmazdı.) Şu hatalı bileşimleri config startup'ta REDDEDER:
+> `FOLLOWER_VIRTUAL_CAPITAL_USDT<=0`, `SCALPER_ENABLED=false`,
+> `BOT_MODE=follower` ile birlikte, ve `SCALPER_SYMBOL_ALLOWLIST` DOLUYKEN
+> `FOLLOWER_SYMBOLS`'un o listeyi tamamen yutması.
+> ⚠️ `SCALPER_SYMBOL_ALLOWLIST` BOŞSA (canlı `.env`'de varsayılan durum) evren
+> `scanner`dan gelir ve config bunu göremez — o durumda kontrol **motor
+> başlangıcında** GERÇEK evrenle yapılır ve boşalma startup HATASI verir
+> (evren o an okunamazsa kontrol atlanır + WARNING; tarama turunda
+> `/scalper/status → scan_status=degraded:universe_empty` ile görünür).
+> ⚠️ Çıplak `supervisorctl restart` **YASAK** (D20a bulgu 4). Uygula:
+> `RESTART_LABEL=embedded-follower scripts/restart_safe.sh testnet`
+
+**2) Doğrulama (restart'tan sonra):**
+```bash
+ssh awa 'cd /opt/tradingbot-v2 && supervisorctl status tradingbot_v2 && \
+  curl -sS http://127.0.0.1:9091/follower/status | python3 -m json.tool | head -40'
+```
+Beklenen: `"embedded": true`, `"universe": ["<SEÇİLEN>"]`,
+`"virtual_ledger": {"enabled": true, "base_usdt": 1000.0, …}`,
+`"entries_ready": true`. Log satırları: `🤖 AlgoPro takipçi motoru başlatılıyor`,
+`🧩 GÖMÜLÜ mod (D20b): …`, scalper tarafında
+`🤖 Tarama evreninden çıkarıldı — AlgoPro takipçisine ayrılmış: <SEÇİLEN>`.
+Panoda (`/dashboard`) **"AlgoPro Takipçi"** kartı görünür: coin, sanal sermaye,
+güncel equity, günlük K/Z, açık pozisyonlar (giriş/SL/TP1-3/ROI), komisyon kapısı
+ret sayacı, son olay saati. "Son İşlemler" tablosunda AP satırları altın şeritlidir.
+
+**3) TV alarmları (ana oturum yapar — bu adım BOT tarafında değil TV'dedir):**
+Mevcut `AlgoPro SELL <COIN>` / `BUY` alarmlarının **URL'si AYNI KALIR**
+(`…/tv-signal?secret=…`). Yalnız iki alan düzenlenir:
+* **Koşul:** *"Herhangi bir alert() fonksiyonu çağrısı"* (Any alert() function call)
+* **Sıklık/aralık:** **1 dakika**
+
+Neden: alert() modunda mesajı script üretir ve **seviyeleri İÇERİR**
+(`SL/TP1/TP2/TP3` + `TQI`/`Score`) — takipçinin katı tanıyıcısı bu biçimi bekler.
+Eski özel mesaj biçimi (`BUY on {{ticker}} | TF: 5 | Price: …`) takipçiye GİTMEZ,
+ana botun sağlamasına oy vermeye devam eder (davranış değişmedi).
+> ⚠️ Alarm KLONLAMA deploy'dan ÖNCE yapılmaz: kod canlıda değilken gelen alarm
+> kaybolur (ya da 422 alır).
+
+**4) Günlük bakım / okuma:**
+```bash
+# durum + sanal defter
+curl -sS http://127.0.0.1:9091/follower/status | python3 -m json.tool
+# AP defteri (aynı DB, strateji etiketiyle ayrılır)
+python3 scripts/ledger_report.py --db tradingbot.db --strategy AP --since "<başlangıç>" --format md
+# iki defteri YAN YANA gör (3b bölümü)
+python3 scripts/ledger_report.py --db tradingbot.db --since "<başlangıç>" --format md
+```
+Komisyon kapısı retleri: `/follower/status → reject_counters.fee_gate` ve
+`state/follower_levels.jsonl` (`rejected: "fee_gate"`). Gerçek bakiye yetmediği için
+atlanan girişler: `reject_counters.insufficient_balance` + `logs/bot.log`'ta
+`⛔ Takipçi girişi atlandı: hesabın kullanılabilir bakiyesi …`.
+Takipçi evreni dışında kalan AlgoPro alarmları:
+`reject_counters.symbol_not_in_follower_universe` + `⚠️ AlgoPro girişi işlenmedi: …`
+(o alarmlar ana botun oy yoluna DA düşmez — TV'de kapatılmaları gerekir).
+Panoda **"Evren dışı alarm"** sayacı olarak görünür ve "Alarm olayı"/"Son olay"
+satırlarını da hareket ettirir.
+
+**Günlük kesici iki sayı gösterir (gömülü mod).** `/scalper/status →
+daily_pnl` KENDİ defterinden gelir (`daily_pnl_source="scalper_ledger"`);
+`daily_income_account` ise hesabın HAM günlük income'ıdır ve YALNIZ BİLGİDİR.
+İkisi arasındaki fark açık pozisyonların funding/komisyonu ve takipçinin
+işlemleridir — kesici o farkı GÖRMEZ (D20b sınırlılık i-d).
+
+**Sahipsiz pozisyon uyarısı.** Gömülü modda hiçbir motorun izlemediği ve rezerve
+etmediği bir açık pozisyon (elle ya da Telegram botuyla açılmış olabilir)
+`/follower/status → unknown_positions` ve panoda **SAHİPSİZ POZİSYON** satırında
+görünür. Takipçi ona **DOKUNMAZ**, girişlerini **DURDURMAZ** ve `/risk-event
+flatten` onu **KAPATMAZ** (ayrı halkada davranış D20a'daki gibi entry-halt
+olmaya devam eder). Kapatmak isteniyorsa ilgili motorun kendi flatten'ı ya da
+elle kapatma gerekir.
+
+**Kapasite.** Her motorun tavanı KENDİ pozisyonlarını sayar: scalper
+`SCALPER_MAX_POSITIONS`, takipçi `FOLLOWER_MAX_POSITIONS`. Yani hesapta
+eşzamanlı en çok `SCALPER_MAX_POSITIONS + FOLLOWER_MAX_POSITIONS` pozisyon
+olabilir ve `MAX_POSITIONS` bunları TOPLAMAZ (takipçi scalper'ın/Telegram'ın
+slotunu yemez, tersi de olmaz). Marj rekabeti gerçektir: takipçinin açık marjı
+hesabın `availableBalance`'ından düşer ve scalper'ın boyutlama tabanını
+küçültür — teşhis `/scalper/status → sizing.follower_embedded` ve takipçinin
+`virtual_ledger.exchange_available_usdt` alanındadır.
+
+**5) Acil durdurma / geri alma:**
+```bash
+# İKİ motoru da düzleştir (gömülü modda /risk-event ikisini de kapsar):
+curl -sS -X POST http://127.0.0.1:9091/risk-event \
+  -H 'Content-Type: application/json' \
+  -d '{"secret":"<RISK_EVENT_SECRET>","action":"flatten","reason":"<neden>"}'
+# Sonra kapat:
+ssh awa 'cd /opt/tradingbot-v2 && sed -i "s/^FOLLOWER_EMBEDDED=.*/FOLLOWER_EMBEDDED=false/" .env && \
+  RESTART_LABEL=embedded-off scripts/restart_safe.sh testnet'
+```
+> ⚠️ Bayrağı kapatmak AÇIK pozisyonu KAPATMAZ — yalnız yöneticisini ortadan
+> kaldırır. Önce `flatten`, sonra kapat.
+
+Ayrı halkaya (D20) GERİ dönülecekse sıra simetriktir: gömülü modu kapat →
+`FOLLOWER_FORWARD_URL`/`FOLLOWER_FORWARD_SECRET`'i doldur →
+`supervisorctl start tradingbot_ap` → `restart_safe.sh testnet`. İkisi AYNI
+ANDA açık bırakılmaz (köprü çağrılmaz, ayrı halka alarmsız kalır).
+
+#### Gömülü takipçiyi kapatma (SIRA ÖNEMLİ)
+`FOLLOWER_EMBEDDED=false` yapıp restart etmek AÇIK AP pozisyonunu **yönetimsiz**
+bırakır: takipçi hiç başlamaz, scalper da defter filtresi yüzünden `strategy=AP`
+satırını KURTARMAZ. Borsadaki SL/TP emirleri durur ama TP1→BE, EXIT/flip ve
+kapanış defteri ÇALIŞMAZ. Doğru sıra:
+```bash
+# 1) AP pozisyonlarını KAPAT (bayrak hâlâ AÇIKKEN)
+curl -sS -X POST http://127.0.0.1:9091/risk-event -H 'Content-Type: application/json' \
+  -d '{"secret":"<RISK_EVENT_SECRET>","action":"flatten","reason":"gomulu-kapatma"}'
+# 2) defterde açık AP satırı KALMADIĞINI doğrula
+ssh awa 'cd /opt/tradingbot-v2 && ./.venv/bin/python -c "
+import asyncio; from src.strategies.scalper.tracker import ScalpTracker
+rows = asyncio.run(ScalpTracker().open_trades(strategies=(\"AP\",)))
+print(\"acik AP:\", [(r.id, r.symbol) for r in rows]); assert not rows"'
+# 3) bayrağı kapat + korumalı restart
+ssh awa 'cd /opt/tradingbot-v2 && sed -i "s/^FOLLOWER_EMBEDDED=.*/FOLLOWER_EMBEDDED=false/" .env && \
+  RESTART_LABEL=embedded-off scripts/restart_safe.sh testnet'
+```
+Adım 2 atlanırsa startup CRITICAL loglar ve `/health` gövdesinde
+`follower="disabled_with_open_trades"` + `follower_details.open_trades` görünür
+(süreç KASTEN düşürülmez — hard fail pozisyonu kapatmaz, yalnız restart
+döngüsü doğururdu). O hâlde çözüm: `FOLLOWER_EMBEDDED=true` ile yeniden
+başlatıp adım 1'i uygulamak, ya da pozisyonları elle kapatıp `scalp_trades`
+satırlarını kapanmış işaretlemek.
+
+Takipçinin kendi fail-closed giriş kilidi `state/follower_entry_halt.json`'dur
+(scalper'ınkinden AYRI dosya): yetim pozisyon ya da korumasız pozisyon şüphesinde
+kurulur; açmak = dosyayı İNCELEYİP yeniden adlandırmak + restart.
+
+### AlgoPro takipçi halkası — AYRI HALKA (D20, `BOT_MODE=follower`)
+> **Not (D20b):** artık **tercih edilen kurulum GÖMÜLÜ moddur** (yukarı bak).
+> Bu bölüm ayrı hesap/süreç isteyen kurulum için KORUNMUŞTUR; ikisi AYNI ANDA
+> kullanılmaz (`BOT_MODE=follower` + `FOLLOWER_EMBEDDED=true` = startup HATASI).
+
 İKİNCİ ve BAĞIMSIZ bir testnet sistemi: **yalnız AlgoPro V1.6 sinyallerini** izler
 (scanner yok, strateji yok, TV sağlaması yok). Scalper halkası (`tradingbot_v2`) bundan
 HİÇ etkilenmez — ayrı dizin, ayrı süreç, ayrı Binance testnet hesabı, ayrı DB/state/log.

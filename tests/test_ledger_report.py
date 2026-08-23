@@ -470,8 +470,10 @@ class TestRenderers:
         text = lr.render_json(report)
         parsed = json.loads(text)
         assert set(parsed.keys()) == {
+            # D20b: "strategy" = strateji bazlı kırılım (C = scalper,
+            # AP = gömülü AlgoPro takipçisi; ikisi AYNI tabloya yazar).
             "meta", "regime_direction", "exit_reason_direction",
-            "symbol", "daily", "headline", "checklist", "notes",
+            "symbol", "strategy", "daily", "headline", "checklist", "notes",
         }
         assert parsed["headline"]["total_trades"] == 5
 

@@ -25,6 +25,7 @@ from src.strategies.scalper.executor import ScalpPosition
 from src.strategies.scalper.indicators import chandelier_stop
 from src.strategies.scalper.tracker import ScalpTracker
 from src.strategies.scalper.types import (
+    FOLLOWER_LEDGER_STRATEGY,
     Candle,
     Direction,
     ExitPlan,
@@ -2276,6 +2277,35 @@ class ExitManager:
     # Restart kurtarma
     # ------------------------------------------------------------------
 
+    def recovery_strategies(self):
+        """Bu motorun kurtarabileceği defter etiketleri (D20b).
+
+        Döner: ``(strategies, exclude_strategies)`` — `tracker.open_trades`
+        imzasıyla aynı sözleşme. Scalper gömülü takipçinin satırlarını
+        (``strategy="AP"``) DIŞLAR; ayrı halkada DB'de AP satırı olmadığı için
+        davranış birebir aynıdır. `FollowerExitManager` bunu ezer ve YALNIZ
+        AP'yi ister.
+        """
+        return None, (FOLLOWER_LEDGER_STRATEGY,)
+
+    def _recovery_row_is_mine(self, trade) -> bool:
+        """Defter satırı bu motora mı ait? (ikinci savunma; WARNING loglar)"""
+        wanted, unwanted = self.recovery_strategies()
+        strategy = str(getattr(trade, "strategy", "") or "").strip().upper()
+        allowed = True
+        if wanted:
+            allowed = strategy in {str(s).strip().upper() for s in wanted}
+        if allowed and unwanted:
+            allowed = strategy not in {str(s).strip().upper() for s in unwanted}
+        if not allowed:
+            self.logger.warning(
+                f"⚠️ recover(): #{getattr(trade, 'id', '?')} "
+                f"{getattr(trade, 'symbol', '?')} strategy='{strategy}' BU motorun "
+                f"defterine ait değil — kurtarma ATLANDI (D20b: sembol başına tek "
+                f"yönetici). Diğer motor onu kendi turunda kurtarır."
+            )
+        return allowed
+
     async def recover(self) -> bool:
         """DB'de status=OPEN olan scalp işlemlerini borsadaki gerçek pozisyonlarla
         eşleştirip izlemeye geri al.
@@ -2285,11 +2315,28 @@ class ExitManager:
         Borsa durumu veya koruma emirleri kesin okunamazsa ``False`` dönülür;
         çağıran bunu readiness başarısızlığı olarak ele almalıdır.
         """
+        # D20b (düşmanca inceleme, KRİTİK): gömülü modda iki motor AYNI
+        # `scalp_trades` tablosunu paylaşır. Her motor YALNIZ kendi defter
+        # etiketini kurtarır; `recovery_strategies()` alt sınıfta ezilir.
+        wanted, unwanted = self.recovery_strategies()
         try:
-            open_trades = await self.tracker.open_trades()
+            try:
+                open_trades = await self.tracker.open_trades(
+                    strategies=wanted, exclude_strategies=unwanted
+                )
+            except TypeError:
+                # Eski tracker çiftleri (test) filtreyi bilmiyor olabilir —
+                # aşağıdaki ikinci savunma katmanı yine de satırı eler.
+                open_trades = await self.tracker.open_trades()
         except Exception as e:
             self.logger.error(f"❌ recover(): açık scalp kayıtları okunamadı ({e})")
             return False
+
+        # İKİNCİ SAVUNMA: filtre bir yoldan atlanırsa (eski tracker çifti,
+        # ileride eklenecek bir çağrı yolu) satır BURADA elenir. Sessiz
+        # kalmaz: yabancı defter satırını kurtarmak, aynı pozisyona ikinci
+        # bir yönetici atamak demektir.
+        open_trades = [t for t in open_trades if self._recovery_row_is_mine(t)]
 
         if not open_trades:
             self.logger.info("ℹ️ recover(): DB'de açık scalp işlemi yok")

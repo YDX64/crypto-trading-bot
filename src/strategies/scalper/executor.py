@@ -54,6 +54,7 @@ from src.core.logger import app_logger
 from src.models.position import PositionModel, PositionStatus, PositionSide
 from src.strategies.scalper.tracker import ScalpTracker
 from src.strategies.scalper.types import (
+    FOLLOWER_LEDGER_STRATEGY,
     Direction,
     ExitPlan,
     Regime,
@@ -753,13 +754,31 @@ class ScalpExecutor:
             int(getattr(self.cfg, "scalper_virtual_capital_start_trade_id", 0) or 0),
         )
         try:
+            # D20b: gömülü takipçi (strategy="AP") AYNI DB'ye yazar. AP
+            # işlemleri scalper'ın sanal kasasını NE BÜYÜTÜR NE KÜÇÜLTÜR —
+            # iki defter ayrıdır. Ayrı halkada (bugünkü kurulum) DB'de hiç AP
+            # satırı yoktur, bu yüzden dışlama davranışı DEĞİŞTİRMEZ.
+            # `exclude_strategies` desteklemeyen eski test çiftleri için
+            # TypeError'da argümansız çağrıya düşülür.
             snapshot_method = getattr(self.tracker, "compounding_snapshot", None)
             if snapshot_method is not None:
-                tracker_snapshot = await snapshot_method(start_id)
+                try:
+                    tracker_snapshot = await snapshot_method(
+                        start_id, exclude_strategies=(FOLLOWER_LEDGER_STRATEGY,)
+                    )
+                except TypeError:
+                    tracker_snapshot = await snapshot_method(start_id)
                 eligible_pnl = float(tracker_snapshot["eligible_realized_pnl"])
             else:
                 eligible_method = getattr(self.tracker, "eligible_compounding_pnl")
-                eligible_pnl = float(await eligible_method(start_id))
+                try:
+                    eligible_pnl = float(
+                        await eligible_method(
+                            start_id, exclude_strategies=(FOLLOWER_LEDGER_STRATEGY,)
+                        )
+                    )
+                except TypeError:
+                    eligible_pnl = float(await eligible_method(start_id))
         except Exception as exc:
             # Sanal kasa doğrulanamıyorsa tam borsa bakiyesine sessizce dönmek,
             # kullanıcının 1000-USDT risk sınırını aşar. Giriş fail-closed.
@@ -781,6 +800,14 @@ class ScalpExecutor:
         effective = min(max(0.0, float(exchange_available)), virtual_capital)
         self._last_sizing_snapshot = {
             "mode": "virtual_compounding",
+            # D20b (düşmanca inceleme, teşhis): gömülü modda takipçinin AÇIK
+            # marjı hesabın `availableBalance`'ından DÜŞÜLMÜŞ olarak gelir —
+            # yani iki defter ayrı olsa da scalper'ın sizing tabanı takipçinin
+            # pozisyonlarından ETKİLENİR. Bu alan o etkiyi görünür kılar;
+            # hiçbir kapıya girmez.
+            "follower_embedded": bool(
+                getattr(self.cfg, "follower_embedded", False)
+            ),
             "exchange_available": float(exchange_available),
             "virtual_capital": virtual_capital,
             "eligible_realized_pnl": eligible_pnl,
@@ -2490,7 +2517,14 @@ class ScalpExecutor:
             return []
 
         try:
-            open_rows = await self.tracker.open_trades()
+            # D20b (doğrulayıcı bulgusu Y5): gömülü modda AP satırları da
+            # status='OPEN'dır; filtresiz okuma onları "bu sembol DB'de açık"
+            # sayıp scalper'ın maker journal'ını temizletiyordu — oysa exits
+            # recovery AP'yi artık dışlıyor, yani scalper'ın GERÇEK maker
+            # dolumu YÖNETİCİSİZ kalabilirdi.
+            open_rows = await self.tracker.open_trades(
+                exclude_strategies=(FOLLOWER_LEDGER_STRATEGY,)
+            )
         except Exception as e:
             raise PendingRecoveryError(
                 f"Maker recovery DB OPEN kayıtlarını okuyamadı: {e}"

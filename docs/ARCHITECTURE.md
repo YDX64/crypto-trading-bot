@@ -836,7 +836,18 @@ pencere tarihleri ve karar kuralı `docs/DECISIONS.md` P2'de.
   safety turunu şişirip watchdog restart tetiklediği 2026-08-14 olayından
   sonra eklendi (`engine.py:661` yorum + `return`).
 
-## 9b. İkinci çalışma modu: AlgoPro takipçi halkası (D20)
+## 9b. İkinci çalışma modu: AlgoPro takipçisi (D20 ayrı halka / **D20b gömülü**)
+
+> **D20b (TERCİH EDİLEN, kullanıcı kararı 2026-08-23):** `FOLLOWER_EMBEDDED=true`
+> ile takipçi AYRI süreç/hesap OLMADAN, scalper'ın YANINDA aynı süreçte ve aynı
+> Binance hesabında çalışır. Farklar: boyutlama **SANAL deftere** dayanır
+> (`FOLLOWER_VIRTUAL_CAPITAL_USDT`, equity = taban + `scalp_trades` AP net PnL),
+> AlgoPro gövdesi `/tv-signal`'dan HTTP köprüsü yerine **süreç içi** teslim edilir
+> (ve ana botun sağlamasına oy VERMEZ), sembol çakışması süreç-içi
+> `symbol_reservations` ile engellenir, `FOLLOWER_SYMBOLS` scalper'ın evreninden
+> otomatik düşülür ve `/risk-event` iki motoru da kapsar. Aşağıdaki akış AYRI
+> halka içindir; gömülü modda `F`/`E` adımlarının yerini tek bir süreç-içi çağrı
+> alır ve defter `tradingbot.db`'dir. Ayrıntı: `docs/DECISIONS.md` D20b.
 
 `BOT_MODE=follower` (varsayılan `scalper`) AYNI kod tabanını AYRI bir süreç/hesap
 olarak çalıştırır: **scanner, strateji C ve TV sağlaması KAPALIDIR**; giriş ve çıkış
