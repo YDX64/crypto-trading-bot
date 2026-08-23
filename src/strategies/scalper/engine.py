@@ -37,6 +37,11 @@ from src.strategies.scalper.data import KlineFetcher
 from src.strategies.scalper.executor import ScalpExecutor
 from src.strategies.scalper.exits import ExitManager
 from src.strategies.scalper.indicators import atr as compute_atr
+from src.strategies.scalper.market_gate import (
+    day_open_from_daily_closes,
+    evaluate_market_gate,
+    market_gate_metrics,
+)
 from src.strategies.scalper.regime import detect_regime
 from src.strategies.scalper.scanner import UniverseScanner
 from src.strategies.scalper.setups import apply_stop_policy, get_enabled
@@ -55,6 +60,13 @@ from src.trading.user_stream import BinanceUserDataStream
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _fmt_pct(value: Optional[float]) -> str:
+    """Log için yüzde biçimi; hesaplanamayan büyüklük '?' (0.0 DEĞİL)."""
+    if value is None:
+        return "?"
+    return f"{value:+.2f}%"
 
 
 class _ExternalSignalStrategy:
@@ -118,6 +130,13 @@ class ScalperEngine:
     # içinde halt/resume'u yansıtır (POST /risk-event canlı etkisi için
     # yeterince taze).
     _RISK_EVENT_HALT_CACHE_TTL = 1.0
+    # Lider piyasa kapısı (D15): sembol BAŞINA değil, LİDER başına tek
+    # anlık görüntü. 60 sn TTL — REST ağırlık diyeti (docs/RUNBOOK.md
+    # "418/ban" + docs/ARCHITECTURE.md ağırlık bölümü): tarama turu başına
+    # 20 sembol × 2 istek yerine dakikada 2 istek (1d limit≤100 → ağırlık 1,
+    # giriş TF limit≤100 → ağırlık 1). Tarama aralığı 60 sn olduğu için
+    # pratikte tur başına en çok bir tazeleme yapılır.
+    _MARKET_GATE_CACHE_TTL = 60.0
 
     def __init__(self) -> None:
         self.cfg = settings
@@ -156,6 +175,12 @@ class ScalperEngine:
         self._universe: List[str] = []
         self._regimes: Dict[str, str] = {}
         self._regime_cache: Dict[str, Tuple[Regime, float]] = {}
+        # Lider piyasa kapısı (D15): {lider: (anlık_görüntü, monotonic_ts)}.
+        # Anlık görüntü türetilmiş metrikleri de taşır ki senkron snapshot()
+        # hiç IO yapmadan /scalper/status'e yazabilsin.
+        self._market_gate_cache: Dict[str, Tuple[Dict[str, Any], float]] = {}
+        self._market_gate_rejects: Dict[str, int] = {}
+        self._market_gate_last_reason: Optional[str] = None
         self._balance_cache: Tuple[Optional[float], float] = (None, 0.0)
         self._daily_pnl: float = 0.0
         self._daily_pnl_source: str = "unavailable"
@@ -1217,6 +1242,25 @@ class ScalperEngine:
                         f"{kaynak} engellendi (SCALPER_REGIME_FILTER)"
                     )
                     continue
+            # 2026-08-23 (D15) lider piyasa kapısı: rejim kapısının HEMEN
+            # yanında, AYNI tek giriş noktasında — bu döngüden hem C taraması
+            # hem TV dış sinyali (external_signal → _evaluate_symbol) geçer,
+            # bu yüzden ayrı bir TV muafiyeti YOKTUR. Varsayılan kapalı.
+            market_reason = await self._market_gate_reason(sig.direction)
+            if market_reason is not None:
+                kaynak = "TV sinyali" if is_external else "girişi"
+                gate_status = self._market_gate_status()
+                yon = getattr(sig.direction, "value", str(sig.direction))
+                alt_kapi = (
+                    "gün-içi sapma" if market_reason == "market_gate_day" else "çok-günlük uzama"
+                )
+                self.logger.info(
+                    f"⛔ {symbol}: piyasa kapısı — {alt_kapi} ({gate_status.get('leader')} "
+                    f"gün {_fmt_pct(gate_status.get('day_drift_pct'))}, "
+                    f"koşu {_fmt_pct(gate_status.get('run_pct'))}) nedeniyle {yon} "
+                    f"{kaynak} engellendi (SCALPER_MARKET_GATE)"
+                )
+                continue
             # Ortak stop politikası: structural modda ATR tabanı, fixed_roi
             # modda marj-yüzdesi stopu. Backtest'te simulate_symbol aynı
             # dönüşümü uygular — canlı/backtest paritesi bozulmamalı.
@@ -1750,6 +1794,111 @@ class ScalperEngine:
         return regime
 
     # ------------------------------------------------------------------
+    # Lider piyasa kapısı (D15 — "ters-gün kapısı")
+    # ------------------------------------------------------------------
+
+    def _market_gate_leader(self) -> str:
+        raw = getattr(self.cfg, "scalper_market_gate_symbol", "") or ""
+        return str(raw).strip().upper() or "BTCUSDT"
+
+    async def _market_gate_reason(self, direction: Any) -> Optional[str]:
+        """Kapı bu yönü engelliyorsa neden dizesi, aksi hâlde None.
+
+        Kapı kapalıysa (varsayılan) HİÇ veri çekilmez — mevcut REST ağırlığı
+        birebir korunur. Lider verisi alınamazsa kapı UYGULANMAZ (fail-open,
+        spec §C) ve WARNING loglanır: lider verisinin gelmemesi bir risk
+        olayı değildir, giriş hattı bugünkü davranışını sürdürür.
+        """
+        if not bool(getattr(self.cfg, "scalper_market_gate", False)):
+            return None
+        snapshot = await self._leader_market_snapshot()
+        if snapshot is None:
+            return None
+        reason = evaluate_market_gate(
+            direction,
+            snapshot.get("day_open"),
+            snapshot.get("last_close"),
+            snapshot.get("daily_closes"),
+            self.cfg,
+        )
+        self._market_gate_last_reason = reason
+        if reason is not None:
+            self._market_gate_rejects[reason] = (
+                self._market_gate_rejects.get(reason, 0) + 1
+            )
+        return reason
+
+    async def _leader_market_snapshot(self) -> Optional[Dict[str, Any]]:
+        """Lider sembolün (günlük kapanışlar + giriş TF son kapanış) anlık
+        görüntüsü; `_MARKET_GATE_CACHE_TTL` boyunca yeniden çekilmez."""
+        leader = self._market_gate_leader()
+        now = time.monotonic()
+        cached = self._market_gate_cache.get(leader)
+        if cached is not None and (now - cached[1]) < self._MARKET_GATE_CACHE_TTL:
+            return cached[0]
+
+        try:
+            run_days = int(getattr(self.cfg, "scalper_market_gate_run_days", 3) or 3)
+        except (TypeError, ValueError):
+            run_days = 3
+        run_days = max(1, run_days)
+        # N günlük koşu N+1 TAMAMLANMIŞ kapanış ister; KlineFetcher oluşmakta
+        # olan günlük mumu attığı için (+1) bir mum daha istenir → N+2.
+        tf_entry = str(getattr(self.cfg, "scalper_tf_entry", "5m") or "5m")
+
+        try:
+            daily = await self.fetcher.get_klines(leader, "1d", run_days + 2)
+            entry = await self.fetcher.get_klines(leader, tf_entry, 3)
+        except Exception as e:
+            self.logger.warning(
+                f"⚠️ Piyasa kapısı: lider {leader} verisi alınamadı, kapı bu "
+                f"turda UYGULANMADI ({type(e).__name__}: {e})"
+            )
+            return None
+
+        daily_closes = [float(c.close) for c in daily]
+        day_open = day_open_from_daily_closes(daily_closes)
+        last_close = float(entry[-1].close) if entry else None
+        if day_open is None or last_close is None:
+            self.logger.warning(
+                f"⚠️ Piyasa kapısı: lider {leader} serisi yetersiz "
+                f"(1d={len(daily_closes)}, {tf_entry}={len(entry)}), kapı bu "
+                f"turda UYGULANMADI"
+            )
+            return None
+
+        snapshot: Dict[str, Any] = {
+            "leader": leader,
+            "day_open": day_open,
+            "last_close": last_close,
+            "daily_closes": daily_closes,
+            **market_gate_metrics(day_open, last_close, daily_closes, self.cfg),
+        }
+        self._market_gate_cache[leader] = (snapshot, now)
+        return snapshot
+
+    def _market_gate_status(self) -> Dict[str, Any]:
+        """`/scalper/status` alt-sözlüğü — SENKRON, hiç IO yapmaz (yalnız
+        önbellekteki son anlık görüntüyü okur).
+
+        getattr savunması: `object.__new__(ScalperEngine)` ile kurulan test
+        çiftleri (tests/test_runtime_liveness.py) __init__'i çalıştırmaz —
+        snapshot() bu yüzden AttributeError'a düşmemeli.
+        """
+        leader = self._market_gate_leader()
+        cache = getattr(self, "_market_gate_cache", {})
+        cached = cache.get(leader)
+        snapshot = cached[0] if cached is not None else {}
+        return {
+            "enabled": bool(getattr(self.cfg, "scalper_market_gate", False)),
+            "leader": leader,
+            "day_drift_pct": snapshot.get("day_drift_pct"),
+            "run_pct": snapshot.get("run_pct"),
+            "last_reason": getattr(self, "_market_gate_last_reason", None),
+            "rejects": dict(getattr(self, "_market_gate_rejects", {})),
+        }
+
+    # ------------------------------------------------------------------
     # Günlük zarar kesici
     # ------------------------------------------------------------------
 
@@ -1979,6 +2128,7 @@ class ScalperEngine:
             "health": self.health_snapshot(),
             "universe": list(self._universe),
             "regimes": dict(self._regimes),
+            "market_gate": self._market_gate_status(),
             "daily_pnl": self._daily_pnl,
             "daily_pnl_source": self._daily_pnl_source,
             "risk_ready": self._risk_ready,

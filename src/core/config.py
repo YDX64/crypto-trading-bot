@@ -164,6 +164,20 @@ class Settings(BaseSettings):
     # negatif); en kötüsü rejime ters 8 saatlik SHORT (SOL #92, −30.65).
     # False = eski davranış (TV muaf).
     scalper_tv_regime_filter: bool = True
+    # --- Lider piyasa kapısı ("ters-gün kapısı", D15 / spec §C) -----------
+    # Rejim kapısından (yukarıdaki scalper_regime_filter) FARKLI: o, sembolün
+    # KENDİ EMA50/200 trendine bakar; bu kapı yalnız LİDER sembole bakar ve
+    # kararı tüm evrene uygular. Varsayılan KAPALI — açmadan önce 3 rejim
+    # penceresinde backtest şart (CLAUDE.md yasak #1).
+    scalper_market_gate: bool = False
+    scalper_market_gate_symbol: str = "BTCUSDT"
+    # Gün-içi alt-kapısı (%; 0 = kapalı): lider gün açılışının ≥ bu kadar
+    # ALTINDAYSA yeni LONG, ≥ bu kadar ÜSTÜNDEYSE yeni SHORT açılmaz.
+    scalper_market_gate_day_pct: float = 1.0
+    # Uzama alt-kapısı (%; 0 = kapalı) ve gün sayısı: lider son N tamamlanmış
+    # günde ≥ +%Y koştuysa LONG, ≤ −%Y düştüyse SHORT açılmaz.
+    scalper_market_gate_run_pct: float = 15.0
+    scalper_market_gate_run_days: int = 3
     scalper_leverage: int = 20
     scalper_risk_percentage: float = 2.0       # işlem başına bakiye riski (C yarısını kullanır)
     scalper_max_positions: int = 3

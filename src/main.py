@@ -1043,6 +1043,16 @@ _EMPTY_SCALPER_STATUS = {
     "health": {"healthy": False, "running": False, "reason": "engine_not_created"},
     "universe": [],
     "regimes": {},
+    # D15 lider piyasa kapısı — engine yokken de aynı ŞEKİLLİ sözlük dönsün
+    # (dashboard alan yokluğunu "kapı yok" ile karıştırmasın).
+    "market_gate": {
+        "enabled": settings.scalper_market_gate,
+        "leader": (settings.scalper_market_gate_symbol or "BTCUSDT").strip().upper(),
+        "day_drift_pct": None,
+        "run_pct": None,
+        "last_reason": None,
+        "rejects": {},
+    },
     "daily_pnl": 0.0,
     "daily_pnl_source": "unavailable",
     "risk_ready": False,
