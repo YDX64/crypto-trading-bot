@@ -271,7 +271,17 @@ class Settings(BaseSettings):
     # farklı kaynak sayısı asla dolmaz. Bilinmeyen değer REDDEDİLMEZ
     # (erişilebilirlik > katılık) — "tv" jenerik kaynağına eşlenir ve
     # WARNING loglanır ki typo fark edilsin.
-    tv_source_allowlist: str = "luxosc,luxso,algopro,botv3,tv"
+    # 2026-08-23 (D19): olay kanalının dört kaynağı varsayılana EKLENDİ —
+    # `luxso_exit` (S&O "Exit Signal"), `luxso_trend` (S&O "Trend Catcher/
+    # Tracer Up|Down"), `pac_choch` (PAC "Bullish/Bearish S-CHOCH"),
+    # `algopro_tp1` (AlgoPro "🎯 TP1 Hit"). Ekleme SALT GENİŞLETMEDİR:
+    # bugüne kadar hiçbir alarm bu değerleri göndermiyordu, dolayısıyla
+    # mevcut 49 alarmın davranışı değişmez. ⚠️ Sunucu `.env`'i
+    # TV_SOURCE_ALLOWLIST'i AÇIKÇA set ediyorsa bu varsayılan devreye
+    # GİRMEZ — o satıra da eklenmeli (docs/RUNBOOK.md "TV olay kanalı").
+    tv_source_allowlist: str = (
+        "luxosc,luxso,algopro,botv3,tv,luxso_exit,luxso_trend,pac_choch,algopro_tp1"
+    )
     # Risk-olayı kanalı (2026-08-21, D10): haber/olay botlarının POST
     # /risk-event ile giriş durdur/devam et/her-şeyi-düzleştir diyebildiği
     # AYRI kanal — TV webhook'undan (yön önerisi) tamamen farklı amaç, o
@@ -340,6 +350,34 @@ class Settings(BaseSettings):
     # ikinci bir sınır: pozisyonun kilitlediği marj bunu aşamaz. Böylece aynı
     # anda birden çok işleme yer kalır ve likidasyon mesafesi hep uzak olur.
     scalper_max_margin_pct: float = 10.0
+    # --- TradingView olay kanalı (D19, 2026-08-23) — docs/INTEGRATIONS.md §7 ---
+    # `/tv-signal` gövdesinde `kind=exit|choch|trend|tp1` taşıyan istekler
+    # sağlamaya (TvConfluence) HİÇ girmez; `src/services/tv_events.py`'ye
+    # yapı/çıkış olayı olarak yazılır. Bu üç ayar YALNIZ motorun o olaylara
+    # verdiği tepkiyi belirler:
+    #   off    = olaylar kaydedilir, motor HİÇ etkilenmez (telemetri yalnız).
+    #   shadow = olaylar kaydedilir + "aktif olsaydı ne olurdu" loglanır ve
+    #            would_block/would_exit sayaçları artar; emir/stop DEĞİŞMEZ.
+    #   active = giriş kapısı + çıkış tetikleyicisi GERÇEKTEN uygulanır.
+    # Varsayılan `shadow`: yeni bir sinyal kaynağı canlıya ölçülmeden
+    # alınmaz (docs/INTEGRATIONS.md §4 terfi hattı, D14 gölge disiplini).
+    scalper_tv_events_mode: str = "shadow"
+    # Bir yapı/çıkış olayı bu kadar dakikadan eskiyse yok sayılır. TV
+    # alarmları 5 dakikalık grafiklerden gelir; 240 dk ≈ 48 mum.
+    scalper_tv_events_max_age_min: float = 240.0
+    # `active` modda açık pozisyona ne yapılır:
+    #   off   = hiçbir şey (yalnız giriş kapısı çalışır)
+    #   be    = stop BE'ye çekilir (mevcut BE mekanizması, yeni emir yolu yok)
+    #   close = reduce-only MARKET kapanış (reaper/flatten ile AYNI çağrı),
+    #           exit_reason="TV_EVENT"
+    scalper_tv_events_exit: str = "be"
+    # Yapı durumunu KARARA sokan kaynaklar (CSV). S&O trend'i ile PAC
+    # CHoCH'u ayrı `src` etiketleriyle tutulur ve ikisi de /scalper/status'ta
+    # görünür; hangisinin kapıyı/çıkışı tetikleyeceğini bu liste seçer.
+    scalper_tv_events_gate_sources: str = "pac_choch,luxso_trend"
+    # Olay defterinin restart'a dayanıklı durum dosyası (atomik yazım).
+    # Bozuk dosya = boş durum + WARNING (fail-closed DEĞİL — bkz. tv_events.py).
+    tv_events_state_path: str = "state/tv_events.json"
 
     @property
     def is_production(self) -> bool:
@@ -423,6 +461,33 @@ class Settings(BaseSettings):
                     f"{rr:.2f} < SCALPER_MIN_RR={self.scalper_min_rr} — RR kapısı "
                     f"HER sinyali reddeder. Bu modda SCALPER_MIN_RR=0 önerilir."
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_tv_events_settings(self) -> "Settings":
+        """TV olay kanalı (D19) ayarlarında yazım hatası startup'ta patlasın.
+
+        Sessiz düşürme (ör. "activee" → shadow) operatörün "kapı açık"
+        sandığı ama motorun hiç uygulamadığı bir duruma yol açardı —
+        `_validate_fixed_roi_stop_consistency` ile aynı fail-fast disiplini.
+        """
+        mode = str(self.scalper_tv_events_mode or "").strip().lower()
+        if mode not in ("off", "shadow", "active"):
+            raise ValueError(
+                f"SCALPER_TV_EVENTS_MODE geçersiz: {self.scalper_tv_events_mode!r} — "
+                "off | shadow | active olmalı (docs/INTEGRATIONS.md §7)"
+            )
+        action = str(self.scalper_tv_events_exit or "").strip().lower()
+        if action not in ("off", "be", "close"):
+            raise ValueError(
+                f"SCALPER_TV_EVENTS_EXIT geçersiz: {self.scalper_tv_events_exit!r} — "
+                "off | be | close olmalı (docs/INTEGRATIONS.md §7)"
+            )
+        if float(self.scalper_tv_events_max_age_min or 0.0) < 0:
+            raise ValueError(
+                "SCALPER_TV_EVENTS_MAX_AGE_MIN negatif olamaz "
+                f"({self.scalper_tv_events_max_age_min})"
+            )
         return self
 
     @model_validator(mode="after")

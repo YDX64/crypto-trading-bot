@@ -310,6 +310,95 @@ PF > 1.4 ama boğada toplam PnL tabanın ~%42'si (bilinçli tercih: "her rejimde
 "2026-08-23 02:57"`; değerlendirme ≥28 Ağu + ≥1 DOWN günü.
 **Geri alma:** `cp backups/env.bak-20260823-025623-riskpaketi .env && supervisorctl restart tradingbot_v2`.
 
+### D19 — TV olay kanalı: ÇIKIŞ + YAPI/DÖNÜŞ olayları (`kind=exit|choch|trend|tp1`) · 2026-08-23 · **GÖLGE (aktif DEĞİL)**
+**Ne:** TradingView'den bota bugüne kadar YALNIZ "gir" oyu geliyordu. Bu değişiklik
+göstergelerin ÇIKIŞ ve YAPI bilgisini de sokar: LuxAlgo S&O `Exit Signal` ve
+`Trend Catcher/Tracer Up|Down`, Price Action Concepts `Bullish/Bearish S-CHOCH`,
+AlgoPro `🎯 TP1 Hit`.
+- **Yönlendirme GÖVDEDEN** (`src/main.py`): JSON gövdede `src`/`source` + `kind` ALANLARI,
+  düz metinde `src=<token>` / `kind=<token>` BELİRTEÇLERİ (boşluk/virgül/`|` ayırıcı,
+  büyük-küçük harf duyarsız). Gerekçe: kullanıcı yeni alarmları MEVCUT alarmları
+  KLONLAYARAK kuruyor — webhook URL'si (secret + eski `?src=luxso`) değişmiyor.
+  Gövdedeki `src` **allowlist'teyse** `?src=`'i GEÇERSİZ KILAR; değilse WARNING +
+  bugünkü davranış (`body_src_rejected: true`).
+- **`kind` yoksa `entry`** → mevcut 49 alarmın davranışı BİREBİR korunur
+  (`tests/test_tv_signal_bridge.py` DEĞİŞMEDEN geçiyor). Tanınmayan `kind`
+  **422 ile reddedilir**, "entry"ye DÜŞÜRÜLMEZ: bir çıkış alarmının yazım hatası
+  yüzünden pozisyon açması kabul edilemez (bilinçli olarak `?src=` allowlist'inin
+  "reddetme, tv'ye eşle" davranışının tersi).
+- **`kind != entry` sağlamaya (TvConfluence) HİÇ girmez**, `external_signal` çağrılmaz;
+  `src/services/tv_events.py` defterine yazılır (RAM + `state/tv_events.json`, atomik;
+  bozuk dosya = boş durum + WARNING).
+- **Yön semantiği iki farklı şey:** `choch`/`trend` → yön YAPININ yönü
+  (`bullish`/`up`→BULL, `bearish`/`down`→BEAR, ZORUNLU); `exit`/`tp1` → yön (varsa)
+  KAPATILACAK POZİSYONUN yönü, yapı bilgisi DEĞİL. Gerçek alarm koşulları
+  (`Exit Signal`, `🎯 TP1 Hit`) YÖNSÜZDÜR → yön yoksa sembolde ne varsa ona uygulanır;
+  yön varsa ve uyuşmuyorsa uygulanmaz + loglanır. Yön sözlüğü up/down ile genişledi ve
+  bu yüzden olay tarafında **sözcük sınırıyla** eşleşir ("up" alt-dize olarak
+  "SETUP"/"SUPPORT" içinde geçer); GİRİŞ yolunun alt-dize taraması DEĞİŞMEDİ.
+- **Motor etkisi üç kademeli** (`SCALPER_TV_EVENTS_MODE=off|shadow|active`,
+  varsayılan **shadow**): `shadow` hiçbir emri/stopu değiştirmez, yalnız "ne olurdu"yu
+  loglar ve `would_block`/`would_exit` sayaçlarını artırır.
+  - Giriş kapısı (`active`): ters yapı + `SCALPER_TV_EVENTS_MAX_AGE_MIN` (240 dk) içinde
+    → giriş engellenir. Kapı **rejim kapısının hemen yanında**, `_evaluate_symbol`'ün TEK
+    giriş noktasında (C + TV sinyalleri aynı yerden geçer). Ret sayacı `tv_structure_gate`.
+    Kapıyı besleyen kaynaklar `SCALPER_TV_EVENTS_GATE_SOURCES` (varsayılan
+    `pac_choch,luxso_trend`); diğer kaynaklar yalnız telemetride görünür.
+  - Çıkış tetikleyicisi (`active`, `SCALPER_TV_EVENTS_EXIT=off|be|close`, varsayılan `be`):
+    `be` → `ExitManager.force_breakeven` (MEVCUT BE mekanizması: `pm.replace_stop_loss`
+    boşluksuz deseni + `_is_at_least_as_protective` gevşetme yasağı; YENİ EMİR YOLU YOK,
+    `tp1_done`/`trailing_active` BİLİNÇLİ olarak değiştirilmez — aksi halde pozisyon D4
+    reaper muafiyetine girer ve chandelier izi TP1 dolmadan başlardı).
+    `close` → reaper/risk-olayı `flatten` ile AYNI `_submit_reduce_only_market_close`
+    çağrısı, AYNI `force_fresh=True` doğrulaması, AYNI tek-finalizer kilidi (`_closing`,
+    D10 dersi #4), `exit_reason="TV_EVENT"` (`_close_position_market`'a `exit_reason`
+    parametresi eklendi; varsayılanı `RISK_EVENT` — D10 davranışı değişmedi).
+  - Bir olay **bir kez** tetikler (sembol başına olay-sırası imleci) ve **pozisyon
+    açılışından ÖNCEKİ olaylar sayılmaz** — aksi halde saatler önce gelmiş bir "exit"
+    alarmı yeni açılan pozisyonu doğduğu anda kapatırdı.
+- **FAIL-OPEN (bilinçli):** bu bir SİNYAL kanalıdır — defter bozuk/okunamaz olsa bile
+  girişler DURMAZ, pozisyon KAPANMAZ. Risk kapıları (risk-olayı halt, kill switch, entry
+  latch) fail-CLOSED'dır; bu değil.
+- **Telemetri:** `/scalper/status` → `tv_events` (mode/exit_action/max_age/gate_sources/
+  counters/symbols; secret YOK). Log: `🧭 TV olayı: SYMBOL kind=… dir=… ← src`.
+- `TV_SOURCE_ALLOWLIST` kod varsayılanına dört olay kaynağı EKLENDİ
+  (`luxso_exit,luxso_trend,pac_choch,algopro_tp1`) — salt genişletme, mevcut alarmların
+  davranışı değişmez. ⚠️ Sunucu `.env`'i bu değişkeni AÇIKÇA set ediyorsa varsayılan
+  devreye girmez; `docs/RUNBOOK.md` "TV olay kanalı" reçetesi bunu kontrol ettiriyor.
+
+**Neden:** D16 geri alınırken kullanıcı kararı netti — "ayarlardan ziyade doğru sinyali
+bulmak veya üretmek". E8 sinyal otopsisi de aynı yere işaret etti (giriş kalitesi).
+Bugüne kadar göstergelerin ÇIKIŞ bilgisi (S&O mavi X, PAC CHoCH, AlgoPro TP1) hiç
+kullanılmıyordu; kanal onu ölçülebilir hale getiriyor.
+
+**Kanıt:** `tests/test_tv_events.py` — 68 test: gövde yönlendirme (JSON/düz metin,
+ayırıcılar, gömülü benzer belirteç, secret sıyırma, query-vs-gövde önceliği, allowlist
+dışı gövde src, `kind` yok = mevcut davranış, tanınmayan `kind` = 422), olay alma/yapı
+haritalama/tazelik/kalıcılık/bozuk dosya, gölgede motor davranışının DEĞİŞMEDİĞİ
+(gerçek `_evaluate_symbol` üzerinden `try_open` çağrıldı), aktifte kapının engellemesi +
+`tv_structure_gate` sayacı, BE ve reduce-only kapanış yollarının doğru çağrıları
+(`forced_exit_reason="TV_EVENT"`, `force_fresh=True`), yön uyuşmazlığı, pozisyon
+öncesi olay, max-age, secret'ın hiçbir log/status/yanıtta görünmediği.
+`python3 -m pytest tests -q` → **744 passed, 1 skipped** (önceki taban: 676 passed,
+1 skipped — `tests/test_tv_signal_bridge.py` tek satır değişmeden geçiyor).
+
+**Backtest paritesi — bilinçli boşluk:** TV olayları geçmişte YOKTUR (alarm geçmişi
+indirilemez); `backtest.py`'ye DOKUNULMADI. Bu kanal **"yalnız canlı"**dır — D10
+risk-olayı kanalıyla AYNI gerekçe ve aynı kabul. Terfi hattı bu yüzden
+`docs/INTEGRATIONS.md` §7.6'da yeniden yazıldı: gölge (≥5 gün) → defter ölçümü
+(rejime bölünmüş) → `active` + `be` → gerekirse `close`. **Bu commit hiçbir kapıyı
+aktif etmez.**
+
+**Geri alma:** `.env`'den `SCALPER_TV_EVENTS_*`'i kaldır → varsayılan `shadow` (motor
+davranışı zaten değişmez); tamamen kapatmak için `SCALPER_TV_EVENTS_MODE=off`.
+Kodun tamamını geri almak gerekirse bu commit'teki `src/services/tv_events.py` (yeni),
+`src/main.py` (gövde yönlendirme + `_handle_tv_event` + `/scalper/status` tv_events),
+`src/core/config.py` (`scalper_tv_events_*`, `tv_events_state_path`,
+`_validate_tv_events_settings`, `tv_source_allowlist` genişletmesi),
+`src/strategies/scalper/engine.py` (TV olay bölümü + `_evaluate_symbol` kapısı +
+`_safety_tick` çağrısı + `_close_position_market` `exit_reason` parametresi),
+`src/strategies/scalper/exits.py` (`force_breakeven`) değişikliklerini revert et.
+
 ## Reddedilen kararlar (kanıtla)
 
 | Fikir | Tarih | Sonuç | Neden reddedildi |

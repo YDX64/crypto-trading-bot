@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from src.core.config import settings
 from src.core.logger import app_logger
+from src.services.tv_events import tv_events as _tv_events_singleton
 from src.strategies.scalper.data import KlineFetcher
 from src.strategies.scalper.executor import ScalpExecutor
 from src.strategies.scalper.exits import ExitManager
@@ -199,6 +200,14 @@ class ScalperEngine:
             else None
         )
         self._risk_event_halt_cache: Optional[Tuple[float, Dict[str, Any]]] = None
+        # TV olay kanalı (D19). Süreç-tekili defteri motor DEĞİŞTİRMEZ,
+        # yalnız okur ve telemetri sayaçlarını artırır; testler bu alanı
+        # kendi TvEvents örnekleriyle değiştirebilir.
+        self.tv_events = _tv_events_singleton
+        # Sembol başına "en son TÜKETİLEN" olay sırası: aynı olay her safety
+        # turunda yeniden BE/kapanış tetiklemesin.
+        self._tv_exit_seen: Dict[str, int] = {}
+        self._tv_struct_seen: Dict[str, int] = {}
         # RAM latch (D): dosya yazımı BAŞARISIZ olsa bile halt RAM'de
         # otoriter kalır — bkz. _persist_risk_event_halt / risk_event_halt.
         self._risk_event_halt_ram: Optional[Dict[str, Any]] = None
@@ -906,6 +915,11 @@ class ScalperEngine:
         # Artık tüm yeni dolumlar korumalı ve izleniyor: açık pozisyon çıkış
         # yönetimi ile gerçek günlük risk kapısı bundan sonra çalışabilir.
         await self.exits.step()
+        # TV olay çıkışları (D19) — exits.step()'ten SONRA: normal SL/TP/
+        # trailing yolu her zaman önce işler, TV olayı yalnız hâlâ AÇIK olan
+        # pozisyonlara bakar. Reaper'dan ÖNCE: bir olay varsa kapanış nedeni
+        # "yaş" değil "TV_EVENT" olarak etiketlenmeli.
+        await self._apply_tv_event_exits()
         await self._reap_aged_positions()
         self._sync_scalper_reservations()
         was_blocked = self._kill_switch or self._entry_halted
@@ -996,8 +1010,15 @@ class ScalperEngine:
             signed=True,
         )
 
-    async def _close_position_market(self, symbol: str, sp: Any) -> bool:
+    async def _close_position_market(
+        self, symbol: str, sp: Any, *, exit_reason: str = "RISK_EVENT"
+    ) -> bool:
         """Bir pozisyonu reduce-only MARKET ile kapat ve borsada DOĞRULA.
+
+        `exit_reason`: deftere yazılacak kapanış etiketi. Varsayılan
+        `RISK_EVENT` (D10 flatten'ı — davranış değişmedi); TV olay kanalı
+        (D19) `TV_EVENT` geçer. Emir yolu, doğrulama ve tek-finalizer
+        kilidi HER İKİSİNDE DE aynıdır — yeni bir kapanış yolu YAZILMADI.
 
         Reaper'dan farkı: reaper "gönder ve bir sonraki safety turunda
         exits.step() algılasın" der (tur başına tek kapanış disiplini).
@@ -1025,7 +1046,7 @@ class ScalperEngine:
         if amt == 0:
             # Zaten flat: emir gönderme, yalnız SL/TP temizliği + ledger.
             await self.exits._handle_closed(
-                symbol, sp, forced_exit_reason="RISK_EVENT"
+                symbol, sp, forced_exit_reason=exit_reason
             )
             return True
         close_side = "SELL" if amt > 0 else "BUY"
@@ -1039,7 +1060,7 @@ class ScalperEngine:
             amt2 = abs(float(pos_info.get("positionAmt", 0))) if pos_info else 0.0
             if amt2 == 0:
                 await self.exits._handle_closed(
-                    symbol, sp, forced_exit_reason="RISK_EVENT"
+                    symbol, sp, forced_exit_reason=exit_reason
                 )
                 return True
         return False
@@ -1217,6 +1238,13 @@ class ScalperEngine:
                         f"{kaynak} engellendi (SCALPER_REGIME_FILTER)"
                     )
                     continue
+            # TV yapı kapısı (D19): rejim kapısının HEMEN yanında, AYNI tek
+            # giriş noktasında — C stratejisi de TV dış sinyali de buradan
+            # geçer. `shadow` (varsayılan) modda yalnız loglar/sayar, hiçbir
+            # sinyali düşürmez; `active` modda BEAR yapıda LONG / BULL yapıda
+            # SHORT girişini engeller (bkz. _tv_structure_gate_blocks).
+            if self._tv_structure_gate_blocks(symbol, sig.direction):
+                continue
             # Ortak stop politikası: structural modda ATR tabanı, fixed_roi
             # modda marj-yüzdesi stopu. Backtest'te simulate_symbol aynı
             # dönüşümü uygular — canlı/backtest paritesi bozulmamalı.
@@ -1356,6 +1384,309 @@ class ScalperEngine:
         """
         if bool(getattr(self.cfg, "scalper_shadow_mode", False)):
             self.logger.warning("⚠️ GÖLGE MODU AÇIK — emir gönderilmez")
+
+    # ------------------------------------------------------------------
+    # TV olay kanalı (D19, 2026-08-23) — docs/INTEGRATIONS.md §7
+    # ------------------------------------------------------------------
+    # `/tv-signal` gövdesinde `kind=exit|choch|trend|tp1` taşıyan istekler
+    # sağlamaya HİÇ girmez; `src/services/tv_events.py` defterine yazılır.
+    # Motor o defteri İKİ yerde okur:
+    #   1) `_evaluate_symbol` — giriş kapısı (rejim kapısının hemen yanında,
+    #      TEK giriş noktası: C stratejisi VE TV dış sinyali aynı yerden geçer)
+    #   2) `_safety_tick` — açık pozisyonda BE/kapanış tetikleyicisi
+    # `SCALPER_TV_EVENTS_MODE` üç kademelidir; `shadow` (varsayılan) hiçbir
+    # emri/stopu DEĞİŞTİRMEZ, yalnız "ne olurdu"yu loglar ve sayar.
+    # FAIL-OPEN İLKESİ: bu kanalın KENDİ hatası (bozuk defter, beklenmeyen
+    # istisna) asla girişleri durdurmaz ve asla pozisyon kapatmaz — risk
+    # kapıları (risk-event halt, kill switch, entry latch) fail-CLOSED'dır,
+    # bu ise bir SİNYAL kanalıdır: veri yoksa bugünkü davranış aynen sürer.
+
+    def _tv_events_mode(self) -> str:
+        mode = str(
+            getattr(self.cfg, "scalper_tv_events_mode", "shadow") or "shadow"
+        ).strip().lower()
+        return mode if mode in ("off", "shadow", "active") else "shadow"
+
+    def _tv_events_exit_action(self) -> str:
+        action = str(
+            getattr(self.cfg, "scalper_tv_events_exit", "be") or "be"
+        ).strip().lower()
+        return action if action in ("off", "be", "close") else "be"
+
+    def _tv_ledger(self) -> Optional[Any]:
+        """Olay defteri (yoksa None).
+
+        `getattr(..., None)`: repo konvansiyonu — `ScalperEngine.__new__` ile
+        kurulan eski test çiftlerinde bu alan bulunmayabilir; olmayan defter
+        "olay yok" demektir, hata değil (fail-open ilkesi).
+        """
+        return getattr(self, "tv_events", None)
+
+    def _tv_note(self, counter: str) -> None:
+        """Telemetri sayacı — defter yoksa/hata verirse akışı bozma."""
+        ledger = self._tv_ledger()
+        if ledger is None:
+            return
+        try:
+            ledger.note(counter)
+        except Exception:
+            pass
+
+    def _count_engine_reject(self, reason: str) -> None:
+        """Kapı ret sayacını executor'ın sayaç sözlüğüne yaz (geriye uyumlu).
+
+        `/scalper/status` → `entry_rejects` altında görünür; "bot healthy
+        ama hiç işlem açmıyor" teşhisinde HANGİ kapının reddettiğini söyler.
+        """
+        counter = getattr(self.executor, "_count_reject", None)
+        if not callable(counter):
+            return
+        try:
+            counter(reason)
+        except Exception as e:  # sayaç asla akışı bozmasın
+            self.logger.debug(f"ret sayacı yazılamadı ({reason}): {e}")
+
+    def _tv_structure_block(
+        self, symbol: str, direction: Any
+    ) -> Optional[Dict[str, Any]]:
+        """Sinyale TERS ve TAZE bir TV yapı durumu varsa onu döndür.
+
+        Yalnız `SCALPER_TV_EVENTS_GATE_SOURCES` içindeki kaynaklar sayılır.
+        Kaynaklar çelişirse (biri BULL biri BEAR) ters olan ENGELLER —
+        çelişkide "temiz sinyal yok" kabulü (TvConfluence'ın ters-oy
+        kuralıyla aynı ruh).
+        """
+        ledger = self._tv_ledger()
+        if ledger is None or self._tv_events_mode() == "off":
+            return None
+        yon = getattr(direction, "value", str(direction))
+        opposing = "BEAR" if yon == "LONG" else "BULL"
+        try:
+            rows = ledger.fresh_gate_structures(symbol)
+        except Exception as e:
+            self.logger.error(f"⚠️ {symbol}: TV yapı durumu okunamadı ({e}); kapı atlandı")
+            return None
+        for row in rows:
+            if row.get("structure") == opposing:
+                return row
+        return None
+
+    def _tv_structure_gate_blocks(self, symbol: str, direction: Any) -> bool:
+        """Giriş kapısı: `active` modda True dönerse sinyal AÇILMAZ."""
+        row = self._tv_structure_block(symbol, direction)
+        if row is None:
+            return False
+        mode = self._tv_events_mode()
+        yon = getattr(direction, "value", str(direction))
+        detail = (
+            f"{row.get('structure')} yapısı ← {row.get('source')} "
+            f"({row.get('kind')}, {float(row.get('age_s') or 0.0):.0f}s)"
+        )
+        if mode == "active":
+            self._count_engine_reject("tv_structure_gate")
+            self._tv_note("blocked")
+            self.logger.info(
+                f"⛔ {symbol}: TV yapı kapısı — {detail}; ters yönlü {yon} "
+                f"girişi engellendi (SCALPER_TV_EVENTS_MODE=active)"
+            )
+            return True
+        self._tv_note("would_block")
+        self.logger.info(
+            f"👻 {symbol}: TV yapı kapısı GÖLGE — {detail}; aktif olsaydı {yon} "
+            f"girişi engellenecekti (davranış DEĞİŞMEDİ)"
+        )
+        return False
+
+    @staticmethod
+    def _position_opened_epoch(sp: Any) -> Optional[float]:
+        """Pozisyonun açılış anı (epoch). Çözülemezse None."""
+        opened = getattr(getattr(sp, "position", None), "opened_at", None)
+        if opened is None:
+            return None
+        try:
+            if opened.tzinfo is None:
+                opened = opened.replace(tzinfo=timezone.utc)
+            return float(opened.timestamp())
+        except Exception:
+            return None
+
+    def _advance_tv_seen(self) -> None:
+        """Olay imleçlerini en son sıraya taşı (aksiyon almadan tüket).
+
+        `off` modda ya da `SCALPER_TV_EVENTS_EXIT=off` iken çağrılır: kanal
+        sonradan açıldığında geçmiş olayların TOPLU tetiklenmesini önler.
+        """
+        ledger = self._tv_ledger()
+        if ledger is None:
+            return
+        if not hasattr(self, "_tv_exit_seen"):
+            self._tv_exit_seen = {}
+        if not hasattr(self, "_tv_struct_seen"):
+            self._tv_struct_seen = {}
+        try:
+            symbols = ledger.symbols()
+        except Exception:
+            return
+        for symbol in symbols:
+            try:
+                seqs = ledger.latest_seq(symbol)
+            except Exception:
+                continue
+            self._tv_exit_seen[symbol] = max(
+                self._tv_exit_seen.get(symbol, 0), int(seqs.get("exit") or 0)
+            )
+            self._tv_struct_seen[symbol] = max(
+                self._tv_struct_seen.get(symbol, 0), int(seqs.get("structure") or 0)
+            )
+
+    def _tv_exit_event_for(self, symbol: str, sp: Any) -> Optional[Dict[str, Any]]:
+        """Açık pozisyonu kapatmayı gerektiren, HENÜZ TÜKETİLMEMİŞ olay.
+
+        İki kaynak:
+          * `exit`/`tp1` — LuxAlgo S&O "Exit Signal" ve AlgoPro "🎯 TP1 Hit"
+            koşulları YÖNSÜZDÜR: yön yoksa sembolde ne varsa ona uygulanır;
+            yön VARSA ve açık pozisyonla uyuşmuyorsa UYGULANMAZ + loglanır.
+          * `choch`/`trend` — yalnız kapı kaynaklarından ve yalnız pozisyona
+            TERS yönde (BULL yapı + SHORT pozisyon gibi).
+
+        POZİSYON AÇILIŞINDAN ÖNCEKİ olaylar sayılmaz: aksi halde 3 saat
+        önce gelmiş bir "exit" alarmı, yeni açılan pozisyonu doğduğu anda
+        kapatırdı.
+        """
+        now = time.time()
+        if not hasattr(self, "_tv_exit_seen"):
+            self._tv_exit_seen = {}
+        if not hasattr(self, "_tv_struct_seen"):
+            self._tv_struct_seen = {}
+        opened_ts = self._position_opened_epoch(sp)
+        pos_dir = getattr(
+            getattr(sp, "signal", None), "direction", None
+        )
+        pos_dir = getattr(pos_dir, "value", str(pos_dir)) if pos_dir else ""
+        opposing = "BEAR" if pos_dir == "LONG" else "BULL"
+
+        ledger = self._tv_ledger()
+        if ledger is None:
+            return None
+        row = ledger.pending_exit(symbol, now=now)
+        if row is not None:
+            seq = int(row.get("seq") or 0)
+            ts = float(row.get("ts") or 0.0)
+            if seq > self._tv_exit_seen.get(symbol, 0) and (
+                opened_ts is None or ts >= opened_ts
+            ):
+                self._tv_exit_seen[symbol] = seq
+                event_dir = row.get("direction")
+                if event_dir and event_dir != pos_dir:
+                    self.logger.info(
+                        f"🧭 {symbol}: TV {row.get('kind')} olayı {event_dir} "
+                        f"pozisyon içindi (← {row.get('source')}); açık pozisyon "
+                        f"{pos_dir} — uygulanmadı"
+                    )
+                else:
+                    return {
+                        "kind": row.get("kind"),
+                        "source": row.get("source"),
+                        "direction": event_dir,
+                        "detail": f"{row.get('kind')} ← {row.get('source')}",
+                    }
+
+        for struct_row in ledger.fresh_gate_structures(symbol, now=now):
+            seq = int(struct_row.get("seq") or 0)
+            if seq <= self._tv_struct_seen.get(symbol, 0):
+                continue
+            ts = now - float(struct_row.get("age_s") or 0.0)
+            if opened_ts is not None and ts < opened_ts:
+                continue
+            self._tv_struct_seen[symbol] = max(
+                self._tv_struct_seen.get(symbol, 0), seq
+            )
+            if struct_row.get("structure") == opposing:
+                return {
+                    "kind": struct_row.get("kind"),
+                    "source": struct_row.get("source"),
+                    "direction": None,
+                    "detail": (
+                        f"{struct_row.get('structure')} yapısı "
+                        f"({struct_row.get('kind')} ← {struct_row.get('source')})"
+                    ),
+                }
+        return None
+
+    async def _apply_tv_event_exits(self) -> None:
+        """Safety turunda TV olaylarını açık pozisyonlara uygula (D19).
+
+        `be`    → `ExitManager.force_breakeven` (MEVCUT BE mekanizması,
+                  `pm.replace_stop_loss` boşluksuz deseni; yeni emir yolu YOK)
+        `close` → `_close_position_market` (reaper/risk-olayı flatten ile
+                  AYNI reduce-only MARKET çağrısı, `force_fresh` doğrulaması,
+                  `_closing` tek-finalizer kilidi) + `exit_reason="TV_EVENT"`
+        """
+        mode = self._tv_events_mode()
+        action = self._tv_events_exit_action()
+        if self._tv_ledger() is None:
+            return
+        if mode == "off" or action == "off":
+            self._advance_tv_seen()
+            return
+
+        for symbol in list(self.exits.tracked_symbols()):
+            sp = self.exits._positions.get(symbol)
+            if sp is None:
+                continue
+            try:
+                event = self._tv_exit_event_for(symbol, sp)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger.error(
+                    f"❌ {symbol}: TV olay çıkış değerlendirmesi hata verdi ({e})",
+                    exc_info=True,
+                )
+                continue
+            if event is None:
+                continue
+
+            if mode == "shadow":
+                self._tv_note("would_exit")
+                self.logger.info(
+                    f"👻 {symbol}: TV olay çıkışı GÖLGE — {event['detail']}; aktif "
+                    f"olsaydı '{action}' uygulanacaktı (emir/stop DEĞİŞMEDİ)",
+                    extra={"trade": True},
+                )
+                continue
+
+            try:
+                if action == "be":
+                    ok = await self.exits.force_breakeven(
+                        symbol, reason=f"TV olayı: {event['detail']}"
+                    )
+                    if ok:
+                        self._tv_note("exits_applied")
+                else:
+                    closed = await self._close_position_market(
+                        symbol, sp, exit_reason="TV_EVENT"
+                    )
+                    if closed:
+                        self._tv_note("exits_applied")
+                        self.logger.info(
+                            f"🧭 {symbol}: TV olayı ({event['detail']}) ile "
+                            f"reduce-only kapanış doğrulandı (exit_reason=TV_EVENT)",
+                            extra={"trade": True},
+                        )
+                    else:
+                        self.logger.warning(
+                            f"⚠️ {symbol}: TV olay kapanışı borsada DOĞRULANAMADI; "
+                            f"SL/TP dokunulmadı, izleme sürüyor"
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Bu kanal bir SİNYAL kanalıdır: kendi hatası koruma
+                # döngüsünü (exits.step / kill switch) düşürmemeli.
+                self.logger.error(
+                    f"❌ {symbol}: TV olay çıkışı uygulanamadı ({e})", exc_info=True
+                )
 
     def _executor_entry_blocked(self, symbol: str) -> bool:
         """Executor'ın sembol cooldown kapısını güvenli/geriye uyumlu oku."""
@@ -1890,6 +2221,17 @@ class ScalperEngine:
     # API için anlık durum
     # ------------------------------------------------------------------
 
+    def _tv_events_snapshot(self) -> Dict[str, Any]:
+        """`/scalper/status` için TV olay defteri telemetrisi (secret YOK)."""
+        ledger = self._tv_ledger()
+        if ledger is None:
+            return {}
+        try:
+            return ledger.snapshot()
+        except Exception as e:
+            self.logger.error(f"TV olay telemetrisi okunamadı: {e}")
+            return {"error": f"{type(e).__name__}"}
+
     def snapshot(self) -> Dict[str, Any]:
         tracked = []
         # ExitManager sembol->ScalpPosition eşlemesini herkese açık bir
@@ -1991,6 +2333,7 @@ class ScalperEngine:
             "entry_halt_reason": self._entry_halt_reason,
             "entry_halted_at": self._entry_halted_at,
             "risk_event": self.risk_event_status(),
+            "tv_events": self._tv_events_snapshot(),
             "signals_today": self._signals_today,
             "last_scan_at": self._last_scan_at,
             "tracked": tracked,

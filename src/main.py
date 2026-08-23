@@ -32,6 +32,7 @@ from src.models.waiting_signal import WaitingSignalModel, WaitingStatus
 from src.models.scalp_trade import ScalpTradeModel
 from src.services.telegram_bot import TelegramBotService
 from src.services.orchestrator import TradingOrchestrator
+from src.services.tv_events import EVENT_KINDS, STRUCTURE_KINDS, tv_events
 from src.strategies.scalper.engine import ScalperEngine
 from src.strategies.scalper.tracker import ScalpTracker
 
@@ -593,6 +594,33 @@ _TV_SECRET_RE = re.compile(r"secret[=:]\s*([^\s\"',}]+)")
 _TV_LONG_WORDS = ("buy", "long", "bull")
 _TV_SHORT_WORDS = ("sell", "short", "bear")
 
+# ---------------------------------------------------------------------------
+# D19 — gövde yönlendirmesi (TV olay kanalı)
+# ---------------------------------------------------------------------------
+# Kullanıcı yeni alarmları TV'de MEVCUT alarmları KLONLAYARAK kuruyor: webhook
+# URL'si (secret + eski `?src=luxso` gibi) değişmiyor, yalnız alarm koşulu ve
+# MESAJ GÖVDESİ değişiyor. Bu yüzden yönlendirme GÖVDEDEN yapılır:
+#   * JSON gövde  → `src`/`source` ve `kind` ALANLARI
+#   * düz metin   → `src=<token>` / `kind=<token>` BELİRTEÇLERİ
+# Ayırıcı boşluk, virgül ve `|` olabilir (token karakter kümesi bunların
+# hiçbirini içermez). Lookbehind, "mysrc=x" gibi gömülü eşleşmeleri eler.
+_TV_BODY_SRC_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:src|source)\s*=\s*([A-Za-z0-9_\-]{1,32})", re.IGNORECASE
+)
+_TV_BODY_KIND_RE = re.compile(
+    r"(?<![A-Za-z0-9_])kind\s*=\s*([A-Za-z0-9_\-]{1,32})", re.IGNORECASE
+)
+# Olay yönü SÖZCÜK SINIRIYLA aranır — `resolve_tv_signal`'ın alt-dize
+# taraması burada KULLANILAMAZ: olay sözlüğüne "up"/"down" da girdi ve "up"
+# alt-dize olarak "SUPPORT", "SETUP" gibi masum kelimelerde geçer.
+# Giriş yolunun (49 alarm) sözlüğü ve tarama biçimi DEĞİŞMEDİ.
+_TV_EVENT_LONG_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:buy|long|bull|bullish|up)(?![A-Za-z0-9_])", re.IGNORECASE
+)
+_TV_EVENT_SHORT_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:sell|short|bear|bearish|down)(?![A-Za-z0-9_])", re.IGNORECASE
+)
+
 
 def _tv_source_allowlist() -> set:
     """?src= için izinli kaynak kümesi (küçük harf, boşluksuz)."""
@@ -625,6 +653,200 @@ def resolve_tv_source(raw_src_param: Optional[str], raw_body: str):
     return source, False
 
 
+def _tv_payload(raw: str) -> dict:
+    """Gövde JSON nesnesi ise sözlük olarak döndür, değilse boş sözlük."""
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _tv_provided_secret(payload: dict, raw: str, url_secret: str) -> str:
+    """Secret'ı gövde alanı → metin içi `secret=` → `?secret=` sırasıyla bul.
+
+    `resolve_tv_signal` ve `resolve_tv_event` AYNI sırayı kullanmak
+    ZORUNDADIR (iki ayrı kopya, iki ayrı davranış demektir) — bu yüzden tek
+    yerde. Karşılaştırma sabit-zamanlıdır ve ÇAĞIRANDA yapılır.
+    """
+    provided = str(payload.get("secret") or "")
+    if not provided:
+        match = _TV_SECRET_RE.search(raw)
+        provided = match.group(1) if match else ""
+    if not provided:
+        provided = str(url_secret or "")
+    return provided
+
+
+def _tv_symbol(payload: dict, raw: str) -> str:
+    """Sembolü `symbol` alanından veya metinden çöz. Hata → 422."""
+    symbol = str(payload.get("symbol") or "").upper().strip()
+    symbol = symbol.split(":")[-1]  # "BINANCE:BTCUSDT" → "BTCUSDT"
+    if symbol.endswith(".P"):
+        symbol = symbol[:-2]
+    if not symbol:
+        match = _TV_SYMBOL_RE.search(raw.upper())
+        symbol = match.group(1) if match else ""
+    if not symbol.endswith("USDT"):
+        raise HTTPException(
+            status_code=422,
+            detail="Sembol çözülemedi — 'symbol' alanı veya metinde BTCUSDT gibi bir parite gerekli",
+        )
+    return symbol
+
+
+def resolve_tv_body_fields(raw: str, *, secret: str = "") -> dict:
+    """Gövdeden `src`/`source` ve `kind` oku (JSON alanı VEYA düz metin belirteci).
+
+    Neden gövde: kullanıcı yeni alarmları MEVCUT alarmları klonlayarak
+    kuruyor — webhook URL'si (secret ve eski `?src=`) aynen kalıyor, yalnız
+    koşul ve mesaj değişiyor. Bu yüzden yeni yönlendirme bilgisi URL'de
+    DEĞİL gövdede taşınmak zorunda.
+
+    JSON alanları önceliklidir; alan yoksa aynı gövde düz metin gibi
+    taranır (JSON içinde `"note": "kind=exit"` yazan bir kullanıcı da
+    çalışsın). Tarama öncesi secret metinden ÇIKARILIR (yön taramasındaki
+    ilkeyle aynı: secret'ın içeriği hiçbir zaman anlamlı belirteç sayılmaz).
+
+    Dönüş: yalnız BULUNAN anahtarları taşıyan sözlük ({} = hiçbiri yok =
+    bugünkü davranış).
+    """
+    payload = _tv_payload(raw)
+    src = str(payload.get("src") or payload.get("source") or "").strip().lower()
+    kind = str(payload.get("kind") or "").strip().lower()
+
+    if not src or not kind:
+        scan = raw
+        if secret:
+            scan = scan.replace(secret, "")
+        if not src:
+            match = _TV_BODY_SRC_RE.search(scan)
+            if match:
+                src = match.group(1).strip().lower()
+        if not kind:
+            match = _TV_BODY_KIND_RE.search(scan)
+            if match:
+                kind = match.group(1).strip().lower()
+
+    fields = {}
+    if src:
+        fields["src"] = src
+    if kind:
+        fields["kind"] = kind
+    return fields
+
+
+def resolve_tv_kind(raw_kind) -> str:
+    """Gövdedeki `kind`i doğrula. Yoksa "entry" (bugünkü davranış).
+
+    Tanınmayan bir `kind` "entry"ye DÜŞMEZ, 422 ile REDDEDİLİR: bir çıkış
+    alarmının yazım hatası yüzünden GİRİŞ oyuna dönüşmesi (pozisyon açması)
+    kabul edilemez. Bu, `?src=` allowlist'inin "reddetme, tv'ye eşle"
+    davranışının BİLİNÇLİ tersidir — orada en kötü sonuç bir oyun
+    sayılmaması, burada istenmeyen bir işlemdir.
+    """
+    kind = str(raw_kind or "").strip().lower()
+    if not kind:
+        return "entry"
+    if kind not in EVENT_KINDS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Geçersiz kind — "
+                f"{sorted(EVENT_KINDS)} değerlerinden biri olmalı"
+            ),
+        )
+    return kind
+
+
+def resolve_tv_source_with_body(raw_src_param, body_src, raw_body: str):
+    """Kaynak etiketi: GÖVDEDEKİ `src` allowlist'teyse `?src=`'i geçersiz kılar.
+
+    Klon senaryosu: alarm URL'si eski `?src=luxso`yu taşımaya devam eder ama
+    gövde `src=luxso_exit` der — kaynak gövdeninkidir. Gövdedeki değer
+    allowlist DIŞINDAysa geçersiz kılma YAPILMAZ (WARNING + bugünkü
+    `?src=` davranışı) ki bir yazım hatası kaynak kimliğini sessizce
+    bozmasın.
+
+    Dönüş: (source, source_raw_rejected, body_src_rejected).
+    """
+    body_src = str(body_src or "").strip().lower()
+    if body_src and body_src in _tv_source_allowlist():
+        return body_src, False, False
+    source, source_raw_rejected = resolve_tv_source(raw_src_param, raw_body)
+    return source, source_raw_rejected, bool(body_src)
+
+
+def resolve_tv_event_direction(payload: dict, raw: str, provided_secret: str):
+    """Olay yönünü çöz — belirsiz/yoksa None (istisna FIRLATMAZ).
+
+    `resolve_tv_signal`'ın sözlüğü (buy/long/bull ↔ sell/short/bear) burada
+    up/down ile genişletilir çünkü S&O trend koşullarının adı "Trend Catcher
+    Up"/"Down"dur. Eşleşme SÖZCÜK SINIRIYLA yapılır (bkz. _TV_EVENT_*_RE).
+
+    Metin taramasından secret ve `src=`/`kind=` belirteçleri ÇIKARILIR —
+    kaynak adı (`luxso_exit`) ya da secret içeriği yön sanılmasın.
+    """
+    from src.strategies.scalper.types import Direction
+
+    side_text = str(
+        payload.get("side")
+        or payload.get("action")
+        or payload.get("direction")
+        or ""
+    ).lower()
+
+    scan_text = raw.lower()
+    if provided_secret:
+        scan_text = scan_text.replace(provided_secret.lower(), "")
+    scan_text = _TV_BODY_SRC_RE.sub(" ", scan_text)
+    scan_text = _TV_BODY_KIND_RE.sub(" ", scan_text)
+
+    for source in (side_text, scan_text):
+        if not source:
+            continue
+        is_long = bool(_TV_EVENT_LONG_RE.search(source))
+        is_short = bool(_TV_EVENT_SHORT_RE.search(source))
+        if is_long and not is_short:
+            return Direction.LONG
+        if is_short and not is_long:
+            return Direction.SHORT
+        if is_long and is_short:
+            return None  # çelişki: yönsüz say (exit/tp1) ya da 422 (choch/trend)
+    return None
+
+
+def resolve_tv_event(raw: str, configured_secret: str, kind: str, url_secret: str = ""):
+    """Yapı/çıkış olayını çöz ve doğrula. Dönüş: (symbol, direction|None).
+
+    Secret doğrulaması `resolve_tv_signal` ile AYNI yardımcıyı kullanır
+    (403). Sembol aynı yardımcıyla çözülür (422).
+
+    Yön:
+      * `choch`/`trend` → ZORUNLU (yapının yönü); çözülemezse 422. Yapı
+        durumu yönsüz güncellenemez.
+      * `exit`/`tp1`   → OPSİYONEL. LuxAlgo S&O "Exit Signal" ve AlgoPro
+        "🎯 TP1 Hit" koşulları YÖNSÜZDÜR; None = "sembolde açık pozisyon
+        hangi yöndeyse ona uygulanır".
+    """
+    payload = _tv_payload(raw)
+    provided_secret = _tv_provided_secret(payload, raw, url_secret)
+    if not _constant_time_equals(provided_secret, configured_secret):
+        raise HTTPException(status_code=403, detail="Geçersiz webhook secret")
+
+    symbol = _tv_symbol(payload, raw)
+    direction = resolve_tv_event_direction(payload, raw, provided_secret)
+    if direction is None and kind in STRUCTURE_KINDS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"kind={kind} için yön zorunlu — mesajda "
+                "bullish/bearish (veya up/down, long/short) gerekli"
+            ),
+        )
+    return symbol, direction
+
+
 def resolve_tv_signal(raw: str, configured_secret: str, url_secret: str = ""):
     """TradingView alert gövdesini (JSON veya düz metin) çöz ve doğrula.
 
@@ -641,35 +863,12 @@ def resolve_tv_signal(raw: str, configured_secret: str, url_secret: str = ""):
     """
     from src.strategies.scalper.types import Direction
 
-    payload: dict = {}
-    try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict):
-            payload = parsed
-    except ValueError:
-        pass
-
-    provided_secret = str(payload.get("secret") or "")
-    if not provided_secret:
-        match = _TV_SECRET_RE.search(raw)
-        provided_secret = match.group(1) if match else ""
-    if not provided_secret:
-        provided_secret = str(url_secret or "")
+    payload = _tv_payload(raw)
+    provided_secret = _tv_provided_secret(payload, raw, url_secret)
     if not _constant_time_equals(provided_secret, configured_secret):
         raise HTTPException(status_code=403, detail="Geçersiz webhook secret")
 
-    symbol = str(payload.get("symbol") or "").upper().strip()
-    symbol = symbol.split(":")[-1]  # "BINANCE:BTCUSDT" → "BTCUSDT"
-    if symbol.endswith(".P"):
-        symbol = symbol[:-2]
-    if not symbol:
-        match = _TV_SYMBOL_RE.search(raw.upper())
-        symbol = match.group(1) if match else ""
-    if not symbol.endswith("USDT"):
-        raise HTTPException(
-            status_code=422,
-            detail="Sembol çözülemedi — 'symbol' alanı veya metinde BTCUSDT gibi bir parite gerekli",
-        )
+    symbol = _tv_symbol(payload, raw)
 
     side_text = str(payload.get("side") or payload.get("action") or "").lower()
     # Secret metni yanlışlıkla yön kelimesi içerebilir — aramadan önce çıkar.
@@ -701,6 +900,11 @@ async def tradingview_webhook(request: Request):
     Dış sinyal yalnız YÖN + ZAMANLAMA sağlar; stop politikası, risk
     boyutlama, TP/BE/chandelier, cooldown ve kapasite kapıları scalper'ın
     kendi ayarlarıyla aynen uygulanır.
+
+    D19 (2026-08-23): gövdede `kind=exit|choch|trend|tp1` varsa istek bir
+    GİRİŞ OYU DEĞİL, bir YAPI/ÇIKIŞ OLAYIDIR — sağlamaya (TvConfluence)
+    HİÇ girmez, `src/services/tv_events.py`'ye yazılır. `kind` yoksa
+    davranış bugünküyle birebir aynıdır (mevcut 49 alarm).
     """
     configured = (settings.tv_webhook_secret or "").strip()
     if not configured:
@@ -712,6 +916,21 @@ async def tradingview_webhook(request: Request):
     if not raw or len(raw) > 8192:
         raise HTTPException(status_code=422, detail="Geçersiz gövde")
 
+    # Gövde yönlendirmesi (D19). Ayrıştırma yan etkisizdir; her iki dal da
+    # secret'ı KENDİ içinde doğrular (resolve_tv_signal / resolve_tv_event).
+    body_fields = resolve_tv_body_fields(raw, secret=configured)
+    kind = resolve_tv_kind(body_fields.get("kind"))
+    raw_src_param = request.query_params.get("src")
+    if kind != "entry":
+        return await _handle_tv_event(
+            raw=raw,
+            configured=configured,
+            kind=kind,
+            body_src=body_fields.get("src"),
+            raw_src_param=raw_src_param,
+            url_secret=request.query_params.get("secret") or "",
+        )
+
     symbol, direction = resolve_tv_signal(
         raw, configured, url_secret=request.query_params.get("secret") or ""
     )
@@ -719,22 +938,33 @@ async def tradingview_webhook(request: Request):
     if not scalper_engine:
         raise HTTPException(status_code=503, detail="Scalper hazır değil")
 
-    # Kaynak etiketi: alarm URL'sindeki ?src=... öncelikli; yoksa AlgoPro'nun
-    # varsayılan mesaj biçimi ("BUY on X | TF: 1 | Price: ...") parmak iziyle
-    # tanınır; kalan her şey "tv". Sağlama FARKLI kaynak sayar. Bilinmeyen
-    # ?src= REDDEDİLMEZ, "tv"ye eşlenir ve WARNING loglanır (bkz.
-    # resolve_tv_source / config.py tv_source_allowlist yorumu).
-    raw_src_param = request.query_params.get("src")
-    source, source_raw_rejected = resolve_tv_source(raw_src_param, raw)
+    # Kaynak etiketi: GÖVDEDEKİ `src` (allowlist'teyse) `?src=`'i geçersiz
+    # kılar (klon senaryosu, D19); yoksa alarm URL'sindeki ?src=... geçerli;
+    # o da yoksa AlgoPro'nun varsayılan mesaj biçimi ("BUY on X | TF: 1 |
+    # Price: ...") parmak iziyle tanınır; kalan her şey "tv". Sağlama FARKLI
+    # kaynak sayar. Bilinmeyen ?src= REDDEDİLMEZ, "tv"ye eşlenir ve WARNING
+    # loglanır (bkz. resolve_tv_source / config.py tv_source_allowlist yorumu).
+    source, source_raw_rejected, body_src_rejected = resolve_tv_source_with_body(
+        raw_src_param, body_fields.get("src"), raw
+    )
     if source_raw_rejected:
         app_logger.warning(
             f"TV webhook: allowlist dışı ?src='{str(raw_src_param)[:32]}' — "
             f"'tv' olarak eşleştirildi (yazım hatası ya da tanınmayan entegrasyon olabilir)"
         )
+    if body_src_rejected:
+        app_logger.warning(
+            f"TV webhook: allowlist dışı gövde src='{str(body_fields.get('src'))[:32]}' — "
+            f"yok sayıldı, kaynak '{source}' (?src=/parmak izi) olarak kaldı"
+        )
 
     source_fields = {"source": source}
     if source_raw_rejected:
         source_fields["source_raw_rejected"] = True
+    if body_src_rejected:
+        source_fields["body_src_rejected"] = True
+    elif body_fields.get("src"):
+        source_fields["source_from_body"] = True
 
     required = max(1, int(getattr(settings, "tv_confluence_required", 1) or 1))
     if required > 1:
@@ -758,6 +988,64 @@ async def tradingview_webhook(request: Request):
 
     result = await scalper_engine.external_signal(symbol, direction)
     return {"symbol": symbol, "direction": direction.value, **source_fields, **result}
+
+
+async def _handle_tv_event(
+    *,
+    raw: str,
+    configured: str,
+    kind: str,
+    body_src,
+    raw_src_param,
+    url_secret: str,
+):
+    """`kind != entry` dalı — YAPI/ÇIKIŞ olayı (D19).
+
+    Bu dal SAĞLAMAYA (TvConfluence) HİÇ girmez ve `external_signal`
+    ÇAĞIRMAZ; yalnız `tv_events` defterine yazar. Motor hazır olmasa bile
+    olay kaydedilir (503 dönmez): olayın değeri motordan bağımsızdır ve
+    restart penceresinde kaybolması istenmez.
+    """
+    symbol, direction = resolve_tv_event(raw, configured, kind, url_secret=url_secret)
+    source, source_raw_rejected, body_src_rejected = resolve_tv_source_with_body(
+        raw_src_param, body_src, raw
+    )
+    if source_raw_rejected:
+        app_logger.warning(
+            f"TV olayı: allowlist dışı ?src='{str(raw_src_param)[:32]}' — "
+            f"'tv' olarak eşleştirildi"
+        )
+    if body_src_rejected:
+        app_logger.warning(
+            f"TV olayı: allowlist dışı gövde src='{str(body_src)[:32]}' — "
+            f"yok sayıldı, kaynak '{source}' olarak kaldı"
+        )
+
+    direction_value = direction.value if direction is not None else None
+    state = tv_events.ingest(
+        symbol=symbol, kind=kind, direction=direction_value, source=source
+    )
+    app_logger.info(
+        f"🧭 TV olayı: {symbol} kind={kind} dir={direction_value or '-'} ← {source}"
+    )
+
+    response = {
+        "symbol": symbol,
+        "kind": kind,
+        "direction": direction_value,
+        "routed": "event",
+        "source": source,
+        "mode": tv_events.mode(),
+        "structure": state.get("structure"),
+        "state": state,
+    }
+    if source_raw_rejected:
+        response["source_raw_rejected"] = True
+    if body_src_rejected:
+        response["body_src_rejected"] = True
+    elif body_src:
+        response["source_from_body"] = True
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -1072,7 +1360,11 @@ _EMPTY_SCALPER_STATUS = {
 async def scalper_status():
     """Scalper motorunun anlık durumu (tarama evreni, rejimler, izlenen pozisyonlar)."""
     if not scalper_engine:
-        return dict(_EMPTY_SCALPER_STATUS)
+        empty = dict(_EMPTY_SCALPER_STATUS)
+        # Olay defteri motordan BAĞIMSIZ doldurulur (bkz. _handle_tv_event) —
+        # motor ayakta değilken de görünmeli.
+        empty["tv_events"] = tv_events.snapshot()
+        return empty
     return scalper_engine.snapshot()
 
 

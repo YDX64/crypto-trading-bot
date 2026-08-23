@@ -139,6 +139,10 @@ parmak iziyle) → `TvConfluence.vote` (2 farklı kaynak, 420 sn, ters oy sıfı
 (D9) beri `TV_SOURCE_ALLOWLIST`'e karşı doğrulanır — bilinmeyen değer "tv"ye eşlenir ve
 WARNING loglanır (sessiz hayalet kaynak artık yok, ama sinyal yine de reddedilmez).
 TV Desktop MCP ile ölçüm reçetesi: awa-brain `ops-gotchas/tradingview-desktop-mcp-luxalgo.md`.
+⚠️ 2026-08-23'ten (D19) beri AYNI uç nokta ikinci bir yol taşıyor: gövdesinde
+`kind=exit|choch|trend|tp1` olan istekler GİRİŞ OYU DEĞİLDİR, sağlamaya hiç girmez —
+bkz. aşağıdaki "TV olay kanalı". Bu 49 alarmın hiçbirinin mesajında `kind` yoktur,
+davranışları değişmedi.
 
 ## Risk-olayı kanalı (haber/olay botları, D10)
 `POST /risk-event` — TV webhook'undan AYRI amaç (yön DEĞİL, giriş durdur/devam et/her-şeyi-
@@ -234,6 +238,86 @@ Varsayılan zaten kapalı (satırı silmek de eşdeğerdir). Restart sonrası ay
 Mainnet'te (testnet DEĞİLKEN) gölge KAPALIYSA `RISK_EVENT_SECRET`, `TV_WEBHOOK_SECRET` ve
 `SCALPER_SYMBOL_ALLOWLIST` boş (veya yalnız boşluk/virgül) OLAMAZ — `_validate_binance_environment`
 startup'ta reddeder (docs/MAINNET_PLAN.md §5.3); doldurmadan kapatamazsın.
+
+## TV olay kanalı (`kind=exit|choch|trend|tp1`, D19) — allowlist, mod, doğrulama
+
+**Ne yapar:** TradingView'in ÇIKIŞ ve YAPI/DÖNÜŞ alarmlarını (S&O `Exit Signal` /
+`Trend Catcher-Tracer Up|Down`, PAC `Bullish/Bearish S-CHOCH`, AlgoPro `🎯 TP1 Hit`)
+bota sokar. Bu alarmlar **giriş oyu DEĞİLDİR**: sağlamaya (TvConfluence) hiç girmez,
+`state/tv_events.json` defterine yazılır. Alarm mesaj şablonları ve koşul adları:
+`docs/INTEGRATIONS.md` §7.2. Varsayılan mod **`shadow`** — motor davranışı DEĞİŞMEZ.
+
+**1) Alarmları kur (TV'de, mevcut alarmı KLONLAYARAK):** webhook URL'sine DOKUNMA
+(secret ve eski `?src=` kalsın); yalnız **koşulu** ve **mesajı** değiştir. Mesaj tek
+satır düz metin olmalı ve `{{ticker}}` içermek ZORUNDA, ör.
+`src=luxso_exit kind=exit {{ticker}}`.
+
+**2) `src` allowlist'ini DOĞRULA (sık atlanan adım):** kod varsayılanı dört olay
+kaynağını içerir, ama `.env` bu değişkeni AÇIKÇA set ediyorsa varsayılan devreye
+GİRMEZ:
+```bash
+ssh awa 'cd /opt/tradingbot-v2 && grep -n "^TV_SOURCE_ALLOWLIST=" .env || echo "SATIR YOK -> kod varsayilani gecerli, ekleme gerekmez"'
+```
+Satır VARSA (yedek + ekleme + restart öncesi geri-okuma):
+```bash
+ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date +%Y%m%d)-tvevents && sed -i "s/^TV_SOURCE_ALLOWLIST=.*/&,luxso_exit,luxso_trend,pac_choch,algopro_tp1/" .env'
+ssh awa 'cd /opt/tradingbot-v2 && ./.venv/bin/python -c "
+from src.core.config import settings as s
+have = {x.strip() for x in s.tv_source_allowlist.split(\",\")}
+missing = {\"luxso_exit\",\"luxso_trend\",\"pac_choch\",\"algopro_tp1\"} - have
+assert not missing, missing
+print(\"allowlist OK\")"'
+```
+
+**3) Modu seç** (`off` | `shadow` | `active`) — gölge modun `sed` tuzağıyla AYNI grup
+deseni (bkz. "Gölge modu"; `sed -i` eşleşme bulamazsa exit 0 verir, `||` sağı hiç
+çalışmaz):
+```bash
+ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date +%Y%m%d)-tvmode && { grep -q "^SCALPER_TV_EVENTS_MODE=" .env && sed -i "s/^SCALPER_TV_EVENTS_MODE=.*/SCALPER_TV_EVENTS_MODE=shadow/" .env || echo "SCALPER_TV_EVENTS_MODE=shadow" >> .env; }'
+ssh awa 'cd /opt/tradingbot-v2 && ./.venv/bin/python -c "
+from src.core.config import settings as s
+assert s.scalper_tv_events_mode == \"shadow\", s.scalper_tv_events_mode
+print(\"mode=\", s.scalper_tv_events_mode)" && supervisorctl restart tradingbot_v2'
+```
+`active`'e geçerken aynı komutlarda `shadow`→`active` yaz. ⚠️ **`active`'e yalnız gölge
+ölçümü sonrası geçilir** (`docs/INTEGRATIONS.md` §7.6 terfi hattı) ve önce
+`SCALPER_TV_EVENTS_EXIT=be` ile (yalnız stop sıkışır, geri alınabilir); `close`
+(reduce-only MARKET kapanış) AYRI bir karardır.
+
+Geçersiz değer startup'ta **ValueError** ile reddedilir
+(`config._validate_tv_events_settings`) — yazım hatası sessizce `shadow`a DÜŞMEZ,
+süreç hiç kalkmaz. Restart sonrası `supervisorctl status tradingbot_v2` FATAL
+gösteriyorsa `logs/bot.log`'un ilk satırlarına bak.
+
+**4) Doğrulama (restart'tan ~90 sn sonra):**
+```bash
+curl -sS http://127.0.0.1:9091/scalper/status | python3 -c "import sys,json; d=json.load(sys.stdin)['tv_events']; print(d['mode'], d['exit_action'], d['gate_sources'], d['counters'])"
+ssh awa 'grep -a "TV olayı" /opt/tradingbot-v2/logs/bot.log | tail -20'
+```
+Elle sağlama (secret'ı komut satırına YAZMA — `.env`'den oku):
+```bash
+ssh awa 'cd /opt/tradingbot-v2 && S=$(grep ^TV_WEBHOOK_SECRET= .env | cut -d= -f2-) && curl -sS -X POST "http://127.0.0.1:9091/tv-signal?secret=$S" -d "src=pac_choch kind=choch bearish BTCUSDT" | python3 -m json.tool'
+```
+Beklenen: `"routed": "event"`, `"kind": "choch"`, `"structure": "BEAR"` ve **hiçbir işlem
+açılmaması** (yanıtta `accepted` alanı YOKTUR — olay yolu sağlamaya hiç girmez).
+
+**Ne görürsün:**
+- Her olayda: `🧭 TV olayı: <SEMBOL> kind=… dir=… ← <src>`
+- Gölgede: `👻 <SEMBOL>: TV yapı kapısı GÖLGE — …; aktif olsaydı LONG girişi engellenecekti`
+  ve `👻 <SEMBOL>: TV olay çıkışı GÖLGE — exit ← luxso_exit; aktif olsaydı 'be' uygulanacaktı`
+- Aktifte: `⛔ … TV yapı kapısı — … engellendi` + `/scalper/status` →
+  `entry_rejects.tv_structure_gate`; ve `🛡️ … SL ücret-dahil BE'ye çekildi`.
+
+**Arıza/geri alma:**
+- Kanalı anında sustur: `.env` `SCALPER_TV_EVENTS_MODE=off` + restart (alarmlar gelmeye
+  devam eder, yalnız deftere yazılır; motor hiç bakmaz).
+- `state/tv_events.json` bozulursa **fail-OPEN**: bot boş durumla devam eder ve WARNING
+  loglar — girişler DURMAZ, pozisyon KAPANMAZ. ⚠️ `state/risk_event_halt.json`'ın
+  fail-CLOSED davranışıyla KARIŞTIRMA. Dosyayı silmek güvenlidir ve restart gerektirmez.
+- Olay geldiği halde kapı/çıkış çalışmıyorsa sırayla bak: (a) `tv_events.mode`,
+  (b) `gate_sources` o kaynağı içeriyor mu, (c) olayın `age_s` < `max_age_minutes`,
+  (d) `structures` altında beklenen `src` var mı — yoksa adım (2) atlanmıştır ve kaynak
+  `tv`/eski `?src=` değerine eşlenmiştir.
 
 ## Güvenlik borçları
 1. Webhook düz HTTP + IP, secret sorgu dizesinde. Erişim logu kısmı ÇÖZÜLDÜ (D9,

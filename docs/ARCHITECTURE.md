@@ -78,6 +78,14 @@ vermeli; ters yön oyu geldiğinde HER İKİ tarafın oyları silinir (`vote()`,
 satır 56-63). `?src=` yoksa kaynak, AlgoPro'nun varsayılan mesaj biçiminden
 ("`| TF:`"/"`| Price:`") tahmin edilir, yoksa `"tv"` (`main.py:645-647`).
 
+**İKİNCİ TV yolu (D19, 2026-08-23):** aynı `/tv-signal` uç noktası, gövdesinde
+`kind=exit|choch|trend|tp1` taşıyan istekleri **sağlamaya HİÇ sokmadan**
+`src/services/tv_events.py` defterine yazar (`_handle_tv_event`). O defter
+motorun İKİ yerinde okunur: `_evaluate_symbol`'deki yapı kapısı (rejim
+kapısının hemen yanında) ve `_safety_tick`'teki BE/kapanış tetikleyicisi.
+Üç kademeli (`SCALPER_TV_EVENTS_MODE=off|shadow|active`, varsayılan `shadow` =
+davranış değişmez). Ayrıntı: `docs/INTEGRATIONS.md` §7, `docs/DECISIONS.md` D19.
+
 ## 3. Modül haritası
 
 | Dosya | Sorumluluk | Anahtar semboller |
@@ -95,7 +103,8 @@ satır 56-63). `?src=` yoksa kaynak, AlgoPro'nun varsayılan mesaj biçiminden
 | `src/strategies/scalper/types.py` | Ortak veri sözleşmesi (saf, IO'suz) | `Regime:21`, `StrategyContext:59`, `ScalpSignal:77`, `ExitPlan:101`, `resolve_trail_mult:152`, `fee_aware_breakeven_price:176` |
 | `src/strategies/scalper/backtest.py` | Tarihsel simülasyon + CLI | `_build_arg_parser:1348`, `main_async:1372`, `print_report:902` |
 | `src/strategies/scalper/indicators.py` | Saf gösterge fonksiyonları (RSI/BB/ATR/MFI/chandelier/OB/EQH-EQL...) | `chandelier_stop:280`, `equilibrium:549`, `rsi_series:58` |
-| `src/services/tv_confluence.py` | Çoklu-kaynak TV sağlama motoru | `TvConfluence.vote:45` |
+| `src/services/tv_confluence.py` | Çoklu-kaynak TV sağlama motoru (yalnız GİRİŞ oyları) | `TvConfluence.vote:45` |
+| `src/services/tv_events.py` | TV ÇIKIŞ + YAPI/DÖNÜŞ olay defteri (D19; sağlamaya GİRMEZ) | `TvEvents.ingest`, `fresh_gate_structures`, `pending_exit`, `snapshot`; süreç-tekili `tv_events` |
 | `src/trading/binance_client_improved.py` | İmzalı/imzasız REST istemcisi, okuma önbellekleri, ağırlık telemetrisi | `_get_account:711`, `get_position_risk:1360`, `get_all_positions:1424`, `_request_with_retry:329` (weight header, satır 391-415), `_invalidate_read_caches:161` |
 | `src/trading/position_manager.py` | Güvenli pozisyon açma/kapama, boşluksuz SL değişimi, acil kapatma | `UnprotectedPositionError:32`, `open_position:63`, `_emergency_close:416`, `replace_stop_loss:803` |
 | `src/models/scalp_trade.py` | `scalp_trades` ORM modeli | `ScalpTradeModel:16` |
@@ -109,6 +118,10 @@ satır 56-63). `?src=` yoksa kaynak, AlgoPro'nun varsayılan mesaj biçiminden
 | `scalper_tv_symbol_allowlist` | `""` | TV dış sinyaline sembol filtresi (OSC kanıtı olan sembollerle sınırlamak için) |
 | `scalper_regime_filter` | `True` | Rejim kapısını (§4) aç/kapat |
 | `scalper_tv_regime_filter` | `True` | Rejim kapısının TV sinyaline de uygulanıp uygulanmayacağı |
+| `scalper_tv_events_mode` | `"shadow"` | TV olay kanalı (D19): `off`/`shadow`/`active` — `shadow` motor davranışını DEĞİŞTİRMEZ |
+| `scalper_tv_events_exit` | `"be"` | `active` modda açık pozisyona uygulanan aksiyon: `off`/`be`/`close` |
+| `scalper_tv_events_max_age_min` | `240.0` | Olayın tazelik penceresi (dk) — kapı ve çıkış tetiği için |
+| `scalper_tv_events_gate_sources` | `"pac_choch,luxso_trend"` | Yapı durumunu KARARA sokan kaynaklar (diğerleri yalnız telemetri) |
 | `scalper_tf_entry/context/regime` | `5m/15m/4h` | Giriş/bağlam/rejim zaman dilimleri |
 | `scalper_c_rsi_long_max/short_min` | `25.0/75.0` | C'nin RSI uç eşiği |
 | `scalper_c_require_divergence` | `True` | C'de RSI diverjans şartı |

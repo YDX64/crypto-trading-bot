@@ -429,6 +429,66 @@ class ExitManager:
         else:
             self.logger.warning(f"⚠️ {symbol}: trailing SL güncellenemedi, eski SL korunuyor")
 
+    async def force_breakeven(self, symbol: str, *, reason: str) -> bool:
+        """Dış tetikleyiciyle (TV olayı, D19) stopu ücret-dahil BE'ye çek.
+
+        MEVCUT BE mekanizmasını kullanır — `_check_tp1` ile AYNI hedef
+        (`sp.plan.breakeven_price`), AYNI gevşetme koruması
+        (`_is_at_least_as_protective`) ve AYNI boşluksuz emir yolu
+        (`pm.replace_stop_loss`: önce yeni reduceOnly SL, sonra eskisi
+        iptal). YENİ BİR EMİR YOLU YAZILMADI.
+
+        BİLİNÇLİ SINIR — `tp1_done`/`trailing_active` DEĞİŞTİRİLMEZ:
+          * `trailing_active=True` yapmak pozisyonu reaper'dan MUAF kılardı
+            (D4) ve chandelier izini TP1 dolmadan başlatırdı; ikisi de bu
+            değişikliğin kapsamı dışında sessiz davranış değişiklikleridir.
+          * TP1 sonradan gerçekten dolarsa `_check_tp1` zaten `already_
+            tighter` yolundan geçer (fazladan emir göndermez) ve bayrakları
+            normal akışta kurar.
+        Yani buradaki tek etki: stop SIKILAŞIR, asla gevşemez.
+
+        Dönüş: stop BE'de mi (zaten öyleyse de True), değiştirilemediyse False.
+        """
+        sp = self._positions.get(symbol)
+        if sp is None:
+            return False
+        closing = getattr(self, "_closing", None)
+        if closing and symbol in closing:
+            # Tek-finalizer kilidi (D10 dersi): kapanış işlenirken SL
+            # değiştirmek, iptal edilmek üzere olan emirle yarışır.
+            self.logger.debug(f"{symbol}: kapanış işleniyor, BE tetiği atlandı")
+            return False
+        try:
+            target = float(getattr(sp.plan, "breakeven_price", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            target = 0.0
+        if target <= 0.0:
+            self.logger.warning(
+                f"⚠️ {symbol}: BE fiyatı yok/geçersiz — {reason} için stop taşınamadı"
+            )
+            return False
+
+        current_sl = sp.position.current_stoploss
+        if self._is_at_least_as_protective(sp.signal.direction, current_sl, target):
+            self.logger.info(
+                f"🛡️ {symbol}: {reason} — stop zaten BE'de veya daha koruyucu "
+                f"(SL={current_sl}), değişiklik yok"
+            )
+            return True
+
+        ok = await self.pm.replace_stop_loss(sp.position, target)
+        if ok:
+            sp.position.current_stoploss = target
+            self.logger.info(
+                f"🛡️ {symbol}: {reason} — SL ücret-dahil BE'ye çekildi (SL={target})",
+                extra={"trade": True},
+            )
+        else:
+            self.logger.warning(
+                f"⚠️ {symbol}: {reason} — SL BE'ye taşınamadı, eski SL korunuyor"
+            )
+        return ok
+
     @staticmethod
     def _active_runner_floor(sp: ScalpPosition) -> float:
         """BE tabanı; TP2 gerçek fill sonrası en az TP1 seviyesine yükselir."""
