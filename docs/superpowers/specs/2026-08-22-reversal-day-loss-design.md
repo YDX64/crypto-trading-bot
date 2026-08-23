@@ -22,7 +22,7 @@
 | `SCALPER_TP1_ROI` | 10 | 8 | D12: 3 rejimde PF↑ DD↓ |
 Uygulama: `backups/env.bak-<tarih>-riskpaketi` + `supervisorctl restart tradingbot_v2` + 240 sn
 sağlık + config read-back. Soak: D6+A demet olarak (atıf bilinçli olarak ayrılmıyor).
-**UYGULANDI 02:56 → GERİ ALINDI 03:10 UTC (kullanıcı kararı): A kapsam DIŞI. Kural: işlem başına %10 ve yüksek TP1 korunur; çözüm yalnız SİNYAL kalitesinde aranır (C ve yeni sinyal araştırması).**
+**UYGULANDI 02:56 → GERİ ALINDI 03:10 sunucu saati (01:10 UTC) (kullanıcı kararı): A kapsam DIŞI. Kural: işlem başına %10 ve yüksek TP1 korunur; çözüm yalnız SİNYAL kalitesinde aranır (C ve yeni sinyal araştırması).**
 
 ## B — Hızlı rejim (env): `SCALPER_TF_REGIME=5m` — E6a: **RED** (AYI PF 1.01, BOĞA >%20 kayıp).
 

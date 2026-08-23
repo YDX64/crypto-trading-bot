@@ -245,7 +245,7 @@ startup'ta reddeder (docs/MAINNET_PLAN.md §5.3); doldurmadan kapatamazsın.
    Geri alma: `mv .venv .venv-failed && mv .venv-old .venv && supervisorctl restart tradingbot_v2`.
    `.venv-old` 1 hafta sonra silinebilir. Reçete: yeni venv → test → swap → restart → sağlık yokla.
 
-## A-plus risk paketi (D16) — 02:56 UTC uygulandı, **03:10 UTC GERİ ALINDI** (kullanıcı kararı: ayar değil sinyal)
+## A-plus risk paketi (D16) — 02:56 sunucu saati (00:56 UTC) uygulandı, **03:10 sunucu saati (01:10 UTC) GERİ ALINDI** (kullanıcı kararı: ayar değil sinyal)
 Canlı taban yeniden 10/50/10/10. Aşağıdaki satırlar tarihçe içindir; geçerli değerler `.env`.
 `SCALPER_MAX_MARGIN_PCT=5`, `SCALPER_FIXED_STOP_ROI_PCT=40`, `SCALPER_TP1_ROI=8`,
 `SCALPER_DAILY_LOSS_LIMIT_PCT=6` (önce 10/50/10/10). Yeni giriş: stop = 20x'te %2.0 fiyat, SL =

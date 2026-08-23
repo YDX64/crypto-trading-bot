@@ -281,7 +281,7 @@ tekilleştirme bloğu + `shadow_active_count`, engine.py'deki kapasite dalı, co
 `.strip()`/allowlist filtresi ve RUNBOOK.md "Gölge modu" bölümünü bu commit'ten önceki
 haline döndür — üçü de bağımsız, birbirine muhtaç değil.
 
-### D16 — A-plus risk paketi (marj %5 · stop ROI %40 · TP1 %8 · günlük kesici %6) · 2026-08-23 · **GERİ ALINDI 03:10 UTC (kullanıcı kararı)**
+### D16 — A-plus risk paketi (marj %5 · stop ROI %40 · TP1 %8 · günlük kesici %6) · 2026-08-23 · **GERİ ALINDI 03:10 sunucu saati (01:10 UTC) (kullanıcı kararı)**
 **Geri alma gerekçesi (kullanıcı, 2026-08-23):** "yüzde 10'u kullanacaksın her işlem için ve TP1 yüksek olacak;
 yapman gereken ayarlardan ziyade doğru sinyali bulmak veya üretmek." Boyut/TP/stop ayarlarıyla kaybı
 küçültmek KABUL EDİLMEZ; çözüm giriş SİNYALİ kalitesidir (lider-kapısı D15 adayı, yeni sinyal kaynakları).
@@ -289,7 +289,7 @@ küçültmek KABUL EDİLMEZ; çözüm giriş SİNYALİ kalitesidir (lider-kapıs
 10/50/10/10). E6e ölçümü bilgi olarak kalır; uygulanmaz.
 
 **Ne:** sunucu `.env`: `SCALPER_MAX_MARGIN_PCT 10→5`, `SCALPER_FIXED_STOP_ROI_PCT 50→40`,
-`SCALPER_TP1_ROI 10→8`, `SCALPER_DAILY_LOSS_LIMIT_PCT 10→6`; 02:56 UTC `supervisorctl restart
+`SCALPER_TP1_ROI 10→8`, `SCALPER_DAILY_LOSS_LIMIT_PCT 10→6`; 02:56 sunucu saati (00:56 UTC) `supervisorctl restart
 tradingbot_v2` (pid 1401284, sağlık 80 sn, read-back 5/40/8/6, 3 açık pozisyon `recover()` ile
 devralındı — eski pozisyonlar eski SL'lerini korur).
 **Neden:** 22 Ağu dönüş günü −133 (4 SL × ≈−83). Kök: (1) ödeme asimetrisi — defter TRAIL ort.
@@ -306,7 +306,7 @@ küçültmek yalnız erken BE ile birlikte çalışır. Günlük kesici harness'
 `docs/superpowers/specs/2026-08-22-reversal-day-loss-design.md`.
 **Beklenti:** SL = sermayenin %2'si; kazançlar yarı ölçek; 22 Ağu benzeri gün ≈ −50; her rejimde
 PF > 1.4 ama boğada toplam PnL tabanın ~%42'si (bilinçli tercih: "her rejimde ayakta kal").
-**Soak:** D6+D16 DEMET; başlangıç 2026-08-23 02:57 UTC → `scripts/ledger_report.py --since
+**Soak:** D6+D16 DEMET; başlangıç 2026-08-23 02:57 sunucu saati (00:57 UTC) → `scripts/ledger_report.py --since
 "2026-08-23 02:57"`; değerlendirme ≥28 Ağu + ≥1 DOWN günü.
 **Geri alma:** `cp backups/env.bak-20260823-025623-riskpaketi .env && supervisorctl restart tradingbot_v2`.
 
