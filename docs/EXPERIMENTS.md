@@ -422,6 +422,15 @@ Taban koşular (sunucu env kopyası `scripts/.scalper_env_snapshot.txt`, C-only,
 AYI 213 işlem +584.4 / PF 1.04 (D12'nin "yeni taban 1.04/DD 3683"i ile birebir) ·
 YATAY 145 +2392.3 / 1.29 · BOĞA 90 +3901.7 / 2.43.
 
+> **SONRADAN GÜNCELLENDİ (aynı gün, D15 ajanı — bkz. `docs/EXPERIMENTS.md` §E7 ve D15):**
+> aşağıdaki gün-kapısı sayıları MOTOR-İÇİ kapıyla yeniden ölçüldü ve bu bölümdeki post-hoc
+> sayıları **geçersiz kılar**. Eşik %1.3 önerisi doğrulandı (AYI +2999→+3812, PF 1.33→1.43;
+> BOĞA kaybı −%4.5→−%2.7), ama YATAY %1.0'da işaret bile değişti (post-hoc **−487.3** →
+> motor-içi **+201**): engellenen sinyal motor-içi kapıda kapasiteyi serbest bırakıyor ve
+> boşalan slota sonraki sinyal giriyor. Aşağıdaki "alt sınır" uyarısı tam da bu yüzden
+> konmuştu; **karar için §E7'nin sayıları kullanılmalı**, buradakiler yöntem karşılaştırması
+> olarak bırakıldı.
+
 **Yöntem sınırı (önemli):** kapı **post-hoc** uygulandı — harness JSON'undaki her işlem giriş
 zamanıyla yeniden zenginleştirilip filtrelendi. Engellenen bir işlem harness'ta
 kapasite/sembol-içi tekillik kısıtını serbest BIRAKMAZ, yani yerine başka bir sinyal geçmez.
@@ -492,6 +501,13 @@ Mevcut `SCALPER_*` anahtarlarıyla ölçülemeyenler ve neden:
    **iki yönlü, eşik %1.3** (spec'teki varsayılan %1.0 da P2'yi geçiyor ama YATAY'da −%20).
    Alt-kapı önerisi: **SHORT bacağı %1.0, LONG bacağı %1.3** (kanıt ayrık — E8.6).
 2. **Lider N-günlük koşu alt-kapısı** (`_RUN_PCT/_RUN_DAYS`) — **varsayılan 0 (KAPALI) kalsın.**
+   (D15 ajanının bağımsız ölçümü aynı yöne çıktı: harness'ta yalnız AYI'da ve TEK lider
+   olayında tetikleniyor, %15 ile %20 birebir aynı sonucu veriyor, gün-kapısıyla birlikte
+   katkısı sıfır — V3 ≡ V1. **Ek uyarı (E8):** kod varsayılanı hâlâ 15; bu, kapı açıldığında
+   ÖLÇÜLMEMİŞ değil, canlı defterde NEGATİF ölçülmüş bir alt-kapıyı devreye sokar — 7–22 Ağu
+   defterinde %15 eşiği **35 işlemde tetiklenir ve net −152.7 eder** (12 DOWN-günü işlemi
+   engelleyip +137.9 kurtarır, 23 UP-günü kazananı engelleyip −290.6 kaybettirir).
+   Harness'ın "üç pencerede inert" hükmü bugünkü piyasaya taşınmıyor.)
    Canlı defterde net **−152.7** (LONG eşik 12'de −382.9; 50 kazanan engelliyor), harness'ta
    yalnız AYI'da tetikleniyor (+2453, 13 işlem), YATAY/BOĞA'da hiç tetiklenmiyor. Tek pencerede
    parlayan aday = P2'ye göre red. Spec'teki "lider koştuysa o yöne girme" hipotezinin
