@@ -3237,7 +3237,10 @@ class ScalperEngine:
         # (`cutoff_ms`) türetilir; duvar saati yeni güne geçtiği andan itibaren
         # içerik de geçene kadar tazelemeye devam edilir.
         wall_day = utc_day_start_ms(int(time.time() * 1000))
-        cached = self._market_gate_cache.get(leader)
+        cache = getattr(self, "_market_gate_cache", None)
+        if cache is None:  # __init__ atlanmış (test/araç) — tembel başlat
+            cache = self._market_gate_cache = {}
+        cached = cache.get(leader)
         if (
             cached is not None
             and (now - cached[1]) < ttl

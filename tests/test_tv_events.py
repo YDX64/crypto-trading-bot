@@ -69,8 +69,15 @@ class _CfgProxy:
     yolu yürür.
     """
 
+    # Diğer giriş kapıları (lider piyasa kapısı D15, yapı kapısı D18) sunucu
+    # .env'inde AÇIK olabilir — bu testler yalnız TV yapı kapısını ölçer; o
+    # kapılar burada daima KAPALI (env-bağımsız test; deploy 2026-08-23 dersi).
+    _ISOLATION = {"scalper_market_gate": False, "scalper_structure_gate": False}
+
     def __init__(self, **overrides):
-        self._overrides = overrides
+        merged = dict(self._ISOLATION)
+        merged.update(overrides)
+        self._overrides = merged
 
     def __getattr__(self, name):
         overrides = object.__getattribute__(self, "_overrides")

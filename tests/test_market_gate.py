@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
+import os
 import pytest
 
 import src.strategies.scalper.backtest as backtest_module
@@ -957,6 +958,12 @@ class TestMarketGateSettings:
     def _settings(monkeypatch, **env: str) -> Settings:
         """Env değişkenlerinden parse — zorunlu alanlar (anahtarlar) sabit
         yer tutucularla verilir (tests/test_shadow_mode.py ile aynı desen)."""
+        # Süreç env'inde (ör. sunucuda deploy testleri, .env kapı AÇIK)
+        # bulunan SCALPER_MARKET_GATE* değişkenleri varsayılan testini
+        # kirletmesin — yalnız bu testin verdiği env kalsın (2026-08-23 deploy dersi).
+        for key in list(os.environ):
+            if key.startswith("SCALPER_MARKET_GATE"):
+                monkeypatch.delenv(key, raising=False)
         for key, value in env.items():
             monkeypatch.setenv(key, value)
         return Settings(
