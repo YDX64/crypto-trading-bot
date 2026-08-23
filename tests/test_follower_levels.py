@@ -167,17 +167,51 @@ class TestGuards:
         assert levels.tp1 == pytest.approx(100.5)
         assert any("tp1" in w for w in levels.warnings)
 
-    def test_out_of_order_tp_replaced(self):
+    def test_out_of_order_tp_repaired_when_repair_restores_order(self):
+        """Onarım SIRALAMAYI GERİ GETİRİYORSA giriş sürer (yalnız uyarı)."""
         levels = resolve_levels(
             entry=100.0,
             direction=Direction.LONG,
-            message=MessageLevels(sl=99.0, tp1=101.0, tp2=100.5, tp3=102.0),
+            # tp2 girişin yanlış tarafında → hesaplanan (1.0 × 1.0 = 101.0)
+            # kullanılır ve merdiven 100.5 < 101.0 < 102.0 olarak DÜZELİR.
+            message=MessageLevels(sl=99.0, tp1=100.5, tp2=99.5, tp3=102.0),
             atr_value=None,
             cfg=_cfg(),
         )
-        assert levels.tp1 == pytest.approx(101.0)
-        assert levels.tp2 == pytest.approx(101.0)  # hesaplanan (1.0 × 1.0)
-        assert any("sıralamayı bozuyor" in w for w in levels.warnings)
+        assert levels.tp1 == pytest.approx(100.5)
+        assert levels.tp2 == pytest.approx(101.0)  # hesaplanan
+        assert levels.tp3 == pytest.approx(102.0)
+        assert any("tp2" in w for w in levels.warnings)
+
+    def test_unrepairable_tp_ladder_is_fail_closed(self):
+        """Onarım sonrası TP1 == TP2 kalıyorsa GİRİŞ YAPILMAZ.
+
+        Aynı tetikte iki `TAKE_PROFIT_MARKET` 3 kademeli çıkışı yok eder ve
+        `_check_tp_telemetry`'nin `consumed` aritmetiğini bozar. Hesaplanan
+        değeri koymak sıralamayı GARANTİ ETMEZ: mesajdan gelen tp1 (101.0)
+        hesaplanan tp2 (1.0 × 1.0 = 101.0) ile ÇAKIŞIR.
+        """
+        with pytest.raises(FollowerRejected) as exc:
+            resolve_levels(
+                entry=100.0,
+                direction=Direction.LONG,
+                message=MessageLevels(sl=99.0, tp1=101.0, tp2=100.5, tp3=102.0),
+                atr_value=None,
+                cfg=_cfg(),
+            )
+        assert exc.value.code == "tp_order"
+
+    def test_non_monotonic_rr_config_is_fail_closed(self):
+        """RR çarpanları artan değilse (env hatası) merdiven kurulamaz."""
+        with pytest.raises(FollowerRejected) as exc:
+            resolve_levels(
+                entry=100.0,
+                direction=Direction.LONG,
+                message=MessageLevels(sl=99.0),
+                atr_value=None,
+                cfg=_cfg(follower_tp_rr1=1.5, follower_tp_rr2=1.0, follower_tp_rr3=0.5),
+            )
+        assert exc.value.code == "tp_order"
 
     def test_stop_band_too_tight_rejected(self):
         with pytest.raises(FollowerRejected) as exc:

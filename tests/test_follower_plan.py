@@ -16,6 +16,7 @@ from src.strategies.follower.levels import resolve_levels
 from src.strategies.follower.plan import (
     build_plan,
     parse_brackets,
+    roundtrip_fee_roi_pct,
     raw_target_leverage,
     resolve_leverage,
     select_bracket,
@@ -60,6 +61,17 @@ FREE_BRACKET = [
         notional_cap=float("inf"),
     )
 ]
+
+
+def _levels(sl_pct: float, entry: float = 100_000.0, cfg=None):
+    """Verilen stop yüzdesini üreten LONG seviye kümesi."""
+    return resolve_levels(
+        entry=entry,
+        direction=Direction.LONG,
+        message=MessageLevels(sl=entry * (1.0 - sl_pct / 100.0)),
+        atr_value=None,
+        cfg=cfg or _cfg(),
+    )
 
 
 class TestUserExamples:
@@ -357,3 +369,94 @@ class TestParseBrackets:
 
     def test_non_list_payload(self):
         assert parse_brackets("boom") == []
+
+
+class TestFeeThreshold:
+    """ÜCRET EŞİĞİ — ölçüm (kapı varsayılan KAPALI, bkz. D20).
+
+    `sl_roi = lev × sl_pct`, `tp1_roi = RR1 × sl_roi`. Kaldıraç LEV_MAX'e
+    KIRPILDIĞINDA `tp1_roi` gidiş-dönüş komisyonun altına düşer. Bu bir
+    boyutlama tercihi değil, aritmetik bir sonuçtur; testler kullanıcının
+    kendi örnekleriyle sayısal olarak kilitler.
+    """
+
+    def test_fee_roi_scales_with_leverage(self):
+        cfg = _cfg()
+        assert roundtrip_fee_roi_pct(100, cfg) == pytest.approx(10.0)
+        assert roundtrip_fee_roi_pct(50, cfg) == pytest.approx(5.0)
+        assert roundtrip_fee_roi_pct(3, cfg) == pytest.approx(0.3)
+
+    @pytest.mark.parametrize(
+        "sl_pct,lev,tp1_roi,fee_roi,covers",
+        [
+            # BTC örneği: hedef 375 → tavan 100 → TP1 %4 < komisyon %10
+            (0.08, 100, 4.0, 10.0, False),
+            # DOGE örneği: hedef tam 100 → TP1 %15 > komisyon %10
+            (0.30, 100, 15.0, 10.0, True),
+            # Daha geniş stop: 50x → TP1 %15 > komisyon %5
+            (0.60, 50, 15.0, 5.0, True),
+        ],
+    )
+    def test_user_examples_against_the_fee_floor(
+        self, sl_pct, lev, tp1_roi, fee_roi, covers
+    ):
+        cfg = _cfg()
+        plan = build_plan(
+            symbol="BTCUSDT",
+            direction=Direction.LONG,
+            levels=_levels(sl_pct),
+            equity_usdt=1000.0,
+            brackets=FREE_BRACKET,
+            cfg=cfg,
+        )
+        assert plan.leverage == lev
+        assert plan.tp_roi_pct[0] == pytest.approx(tp1_roi)
+        assert plan.roundtrip_fee_roi_pct == pytest.approx(fee_roi)
+        assert plan.as_dict()["tp1_covers_fees"] is covers
+
+    def test_gate_is_disabled_by_default(self):
+        plan = build_plan(
+            symbol="BTCUSDT",
+            direction=Direction.LONG,
+            levels=_levels(0.08),
+            equity_usdt=1000.0,
+            brackets=FREE_BRACKET,
+            cfg=_cfg(),
+        )
+        assert plan.tp_roi_pct[0] < plan.roundtrip_fee_roi_pct  # yine de açılır
+
+    def test_gate_rejects_when_enabled(self):
+        with pytest.raises(FollowerRejected) as exc:
+            build_plan(
+                symbol="BTCUSDT",
+                direction=Direction.LONG,
+                levels=_levels(0.08),
+                equity_usdt=1000.0,
+                brackets=FREE_BRACKET,
+                cfg=_cfg(follower_min_tp1_fee_ratio=1.0),
+            )
+        assert exc.value.code == "fee_threshold"
+
+    def test_gate_passes_when_tp1_covers_fees(self):
+        plan = build_plan(
+            symbol="BTCUSDT",
+            direction=Direction.LONG,
+            levels=_levels(0.30),
+            equity_usdt=1000.0,
+            brackets=FREE_BRACKET,
+            cfg=_cfg(follower_min_tp1_fee_ratio=1.0),
+        )
+        assert plan.leverage == 100
+
+    def test_ledger_note_carries_the_fee_ratio(self):
+        plan = build_plan(
+            symbol="BTCUSDT",
+            direction=Direction.LONG,
+            levels=_levels(0.08),
+            equity_usdt=1000.0,
+            brackets=FREE_BRACKET,
+            cfg=_cfg(),
+        )
+        note = plan.ledger_note()
+        assert "tp1_roi=4.00" in note
+        assert "fee_roi=10.00" in note

@@ -85,10 +85,17 @@ class TestFollowerEventAuth:
         assert result["symbol"] == "BTCUSDT"
         follower_ready.handle_event.assert_awaited_once()
 
-    async def test_query_secret_accepted(self, follower_ready):
+    async def test_query_secret_is_rejected(self, follower_ready):
+        """`?secret=` BİLİNÇLİ olarak desteklenmez.
+
+        uvicorn erişim logu (logs/supervisor.log) query string'i düz metin
+        yazar ve rotasyonla yedeklere yayılır — secret asla oraya düşmemeli
+        (CLAUDE.md kural 5). Köprü zaten `X-Follower-Secret` başlığını kullanır.
+        """
         request = _FakeRequest(REAL_SELL.encode(), query={"secret": SECRET})
-        result = await main_module.follower_event(request)
-        assert result["accepted"] is True
+        with pytest.raises(HTTPException) as exc:
+            await main_module.follower_event(request)
+        assert exc.value.status_code == 403
 
     async def test_body_secret_accepted_for_template_form(self, follower_ready):
         body = f"secret={SECRET} kind=exit BTCUSDT tf=1 px=100"

@@ -728,15 +728,20 @@ class TestTelemetry:
 
 
 class _ExitFakeClient:
-    def __init__(self, live_qty: float):
+    # SHORT pozisyon: BE stopu (77080.0) bir BUY STOP'tur ve piyasanın
+    # ÜSTÜNDE olmalıdır. Varsayılan fiyat BE'nin ALTINDADIR (77070) — yani
+    # işlem ücret eşiğini geçmiş, BE fiilen konulabilir durumdadır
+    # (%0.02 yerleştirme payı dahil: 77080 >= 77050 + 15.4).
+    def __init__(self, live_qty: float, price: float = 77050.0):
         self.live_qty = live_qty
+        self.price = price
         self.calls: list = []
 
     async def get_position_risk(self, symbol, force_fresh=False):
         return {"positionAmt": -self.live_qty}
 
     async def get_current_price(self, symbol):
-        return 77100.0
+        return self.price
 
     async def get_algo_order(self, algo_id=None, client_algo_id=None):
         self.calls.append(("get_algo_order", algo_id))
@@ -759,8 +764,8 @@ class _ExitFakeClient:
 
 
 class TestExitManagerBreakEven:
-    def _manager(self, live_qty):
-        client = _ExitFakeClient(live_qty)
+    def _manager(self, live_qty, price: float = 77050.0):
+        client = _ExitFakeClient(live_qty, price=price)
         pm = SimpleNamespace(replace_stop_loss=AsyncMock(return_value=True))
         tracker = SimpleNamespace(record_close=AsyncMock(), close_seq=0)
         manager = FollowerExitManager(client, pm, tracker, _cfg())
@@ -787,6 +792,53 @@ class TestExitManagerBreakEven:
         await manager._step_one("BTCUSDT", sp)
         assert sp.tp1_done is False
         pm.replace_stop_loss.assert_not_called()
+
+    async def test_unreachable_breakeven_never_sends_the_order(self):
+        """BE piyasanın yanlış tarafındaysa emir GÖNDERİLMEZ.
+
+        `pm._replace_stop_loss` `-2021` alırsa pozisyonu ACİL KAPATIR. Takipçide
+        ücret-farkında BE mesafesi (~%0.15) TP1'den (RR1 × sl_pct) uzak olduğu
+        her işlemde bu durum KURALDIR — kalan 2/3 zorla düzleştirilirdi.
+        """
+        # SHORT, BE=77080 (BUY STOP): piyasa 77100'de, yani stop'un ÜSTÜNDE →
+        # emir anında tetiklenirdi.
+        manager, client, pm = self._manager(live_qty=0.08, price=77100.0)
+        sp = _fake_position(qty=0.12)
+        manager.track(sp)
+
+        await manager._step_one("BTCUSDT", sp)
+
+        pm.replace_stop_loss.assert_not_called()
+        assert sp.tp1_done is False
+        assert sp.position.current_stoploss == pytest.approx(77167.77)  # eski SL
+        assert client.calls == []  # pahalı fill doğrulaması da yapılmadı
+
+    async def test_unreachable_breakeven_warns_only_once(self):
+        manager, client, pm = self._manager(live_qty=0.08, price=77100.0)
+        sp = _fake_position(qty=0.12)
+        manager.track(sp)
+
+        await manager._step_one("BTCUSDT", sp)
+        await manager._step_one("BTCUSDT", sp)
+
+        warnings = [
+            c for c in manager.logger.warning.call_args_list
+            if "break-even seviyesi" in str(c)
+        ]
+        assert len(warnings) == 1
+
+    async def test_missing_price_skips_breakeven(self):
+        """Fiyat okunamadıysa 'bilinmiyor' ASLA 'konulabilir' sayılmaz."""
+        manager, client, pm = self._manager(live_qty=0.08)
+        client.get_current_price = AsyncMock(side_effect=RuntimeError("ağ"))
+        sp = _fake_position(qty=0.12)
+        sp.position.current_price = 0.0
+        manager.track(sp)
+
+        await manager._step_one("BTCUSDT", sp)
+
+        pm.replace_stop_loss.assert_not_called()
+        assert sp.tp1_done is False
 
     async def test_no_action_while_quantity_unchanged(self):
         manager, client, pm = self._manager(live_qty=0.12)

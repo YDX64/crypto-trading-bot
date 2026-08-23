@@ -170,6 +170,29 @@ def resolve_leverage(
     return int(leverage), int(target), reason, float(mmr)
 
 
+def roundtrip_fee_roi_pct(leverage: int, cfg: Any) -> float:
+    """Gidiş-dönüş komisyonun MARJA oranı (%), config oranlarıyla (IO yok).
+
+    Takipçide iki bacak da taker'dır (giriş MARKET, çıkış MARKET/koşullu emir),
+    bu yüzden muhafazakâr oran ``max(taker, maker)``tır — scalper ile aynı ilke.
+    ``ROI = lev × 2 × oran × 100``: 100x'te %0.05 taker → marjın %10'u.
+
+    NEDEN ÖNEMLİ: ``sl_roi_pct = lev × sl_pct`` ve ``tp1_roi = RR1 × sl_roi``.
+    Kaldıraç LEV_MAX'e KIRPILDIĞINDA (raw hedef > 100, yani sl_pct < ~%0.30)
+    ``tp1_roi`` bu eşiğin ALTINA düşer: BTC örneğinde (sl_pct %0.08) TP1 = marjın
+    %4'ü, komisyon %10'u → üç TP de dolsa işlem NET NEGATİFTİR. Bu bir
+    boyutlama sorunu değil, ölçülebilir bir gerçektir; bkz. docs/DECISIONS.md
+    D20 "ücret eşiği" ve varsayılan KAPALI ``FOLLOWER_MIN_TP1_FEE_RATIO``.
+    """
+    rate = max(
+        _cfg_float(cfg, "scalper_taker_fee_pct", 0.05),
+        _cfg_float(cfg, "scalper_maker_fee_pct", 0.02),
+    ) / 100.0
+    if rate <= 0:
+        return 0.0
+    return float(leverage) * 2.0 * rate * 100.0
+
+
 def split_three_quantities(total: float, step: float) -> Tuple[float, float, float]:
     """Miktarı 1/3'er üç parçaya böl; YUVARLAMA ARTIĞI SON PARÇAYA gider.
 
@@ -241,6 +264,19 @@ def build_plan(
     )
     tp_roi = (rr[0] * sl_roi_pct, rr[1] * sl_roi_pct, rr[2] * sl_roi_pct)
 
+    fee_roi = roundtrip_fee_roi_pct(leverage, cfg)
+    # VARSAYILAN KAPALI (0.0): kullanıcı kararı (2026-08-23) "boyut/TP1/stop
+    # ile kayıp küçültme YASAK — çözüm sinyal kalitesi". Bu kapı boyut
+    # DEĞİŞTİRMEZ, yalnız komisyonu ödeyemeyeceği ölçülmüş bir işleme HİÇ
+    # girmemeyi sağlar. Açmak ayrı bir kullanıcı kararıdır.
+    min_ratio = _cfg_float(cfg, "follower_min_tp1_fee_ratio", 0.0)
+    if min_ratio > 0 and fee_roi > 0 and tp_roi[0] < min_ratio * fee_roi:
+        raise FollowerRejected(
+            f"TP1 ROI (%{tp_roi[0]:.2f}) gidiş-dönüş komisyonun "
+            f"({min_ratio:g}×%{fee_roi:.2f}) altında — giriş yapılmadı",
+            code="fee_threshold",
+        )
+
     return FollowerPlan(
         symbol=symbol,
         direction=direction,
@@ -257,6 +293,7 @@ def build_plan(
         tp_quantities=split_three_quantities(quantity, step_size),
         equity_usdt=float(equity_usdt),
         maint_margin_ratio=mmr,
+        roundtrip_fee_roi_pct=fee_roi,
     )
 
 
@@ -265,6 +302,7 @@ def with_exchange_quantity(
 ) -> FollowerPlan:
     """Borsa yuvarlaması sonrası miktarı ve 3 parçayı yeniden kur."""
     parts: Tuple[float, float, float] = split_three_quantities(quantity, step_size)
+    notional = float(quantity) * plan.levels.entry
     return FollowerPlan(
         symbol=plan.symbol,
         direction=plan.direction,
@@ -275,12 +313,17 @@ def with_exchange_quantity(
         sl_pct=plan.sl_pct,
         sl_roi_pct=plan.sl_roi_pct,
         tp_roi_pct=plan.tp_roi_pct,
-        margin_usdt=plan.margin_usdt,
-        notional_usdt=quantity * plan.levels.entry,
+        # GERÇEK marj: `quantize_quantity` miktarı AŞAĞI yuvarlar, bu yüzden
+        # planlanan marj daima fiilî marjdan büyüktür. Defter ve
+        # /follower/status gerçeği göstermeli (`notional = margin × lev`
+        # özdeşliği korunur), aksi halde sonraki PF/risk analizi bozulur.
+        margin_usdt=notional / max(1, plan.leverage),
+        notional_usdt=notional,
         quantity=float(quantity),
         tp_quantities=parts,
         equity_usdt=plan.equity_usdt,
         maint_margin_ratio=plan.maint_margin_ratio,
+        roundtrip_fee_roi_pct=plan.roundtrip_fee_roi_pct,
     )
 
 

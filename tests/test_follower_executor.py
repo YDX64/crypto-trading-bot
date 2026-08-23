@@ -28,6 +28,7 @@ from src.strategies.follower.types import (
     MessageLevels,
 )
 from src.strategies.scalper.types import Direction
+from src.trading.binance_client_improved import BinanceAPIError
 
 FREE_BRACKET = [LeverageBracket(125, 0.0, 0.0, float("inf"))]
 
@@ -335,6 +336,171 @@ class TestFailClosedGates:
         )
         assert position is None
         tracker.record_open.assert_not_called()
+
+
+class TestSafetyBudgetAndFeeThreshold:
+    """Düşmanca inceleme (2026-08-23) — koruma aritmetiği regresyonları."""
+
+    async def test_reanchor_budget_respects_the_mmr_gate(self):
+        """Bütçe artık mmr kapısının fiyat karşılığını da içerir.
+
+        100x + mmr 0.004 → likidasyon mesafesi (1/lev − mmr) yalnız %0.60;
+        yalnız liq_guard kullanılsaydı yeniden çapalama stopu %0.50'ye kadar
+        açılabilir, likidasyonun 0.1 puan yakınına taşınırdı. mmr kapısı
+        (`(1/lev − mmr)/safety_mult`) %0.30'da keser.
+        """
+        cfg = _cfg(follower_max_sl_pct=5.0)
+        brackets = [LeverageBracket(125, 0.004, 0.0, float("inf"))]
+        executor, client, pm, _ = _make_executor(cfg, brackets=brackets)
+
+        await executor.open_position(
+            event=parse_follower_event(SELL_ENTRY),
+            levels=_levels(cfg),
+            equity_usdt=1000.0,
+        )
+
+        leverage = 100
+        assert pm.sl_kwargs["max_distance_pct"] == pytest.approx(
+            100.0 * (1.0 / leverage - 0.004) / 2.0
+        )
+        assert pm.sl_kwargs["max_distance_pct"] < 50.0 / leverage
+
+    async def test_slippage_tightens_the_stop_never_widens_it(self):
+        """Dolum kayması stop mesafesini bütçenin üstüne çıkarırsa SIKILAŞTIR.
+
+        `sl_pct` SİNYAL fiyatından hesaplanır; MARKET girişte kayma gerçek
+        mesafeyi büyütür ve planlanan risk sessizce likidasyon bölgesine
+        kayabilir.
+        """
+        cfg = _cfg()
+        executor, client, pm, _ = _make_executor(cfg)
+        # Aleyhe kayma: SHORT girişi 77000'den doldu, AlgoPro stopu 77167.77
+        # → gerçek mesafe %0.218, bütçe (liq_guard/lev = 50/100) %0.50 değil,
+        # mmr kapısı 0 mmr'de %0.50 → bütçeyi daraltıp kırpmayı zorla.
+        cfg.follower_lev_liq_guard_pct = 10.0  # bütçe %0.10
+        pm.resolve_fill = AsyncMock(return_value=(77000.0, 0.129))
+
+        position = await executor.open_position(
+            event=parse_follower_event(SELL_ENTRY),
+            levels=_levels(cfg),
+            equity_usdt=1000.0,
+        )
+
+        assert position is not None
+        clamped = pm.sl_kwargs["stop_price"]
+        assert clamped < 77167.77  # SIKILAŞTIRILDI (girişe yaklaştı)
+        assert clamped == pytest.approx(77000.0 * (1 + 0.10 / 100.0))
+        assert position.position.current_stoploss == pytest.approx(clamped)
+        assert executor.logger.warning.called
+
+    async def test_stop_is_never_widened_when_inside_budget(self):
+        cfg = _cfg()
+        executor, client, pm, _ = _make_executor(cfg)
+
+        await executor.open_position(
+            event=parse_follower_event(SELL_ENTRY),
+            levels=_levels(cfg),
+            equity_usdt=1000.0,
+        )
+
+        assert pm.sl_kwargs["stop_price"] == pytest.approx(77167.77)
+
+    async def test_tp1_failure_is_retried_once_then_counted(self):
+        """TP1 yoksa break-even HİÇ kurulamaz — sessiz kalmak yasak."""
+        executor, client, pm, _ = _make_executor()
+        client.tp_error = BinanceAPIError(400, -2021, "Order would immediately trigger")
+
+        position = await executor.open_position(
+            event=parse_follower_event(SELL_ENTRY),
+            levels=_levels(),
+            equity_usdt=1000.0,
+        )
+
+        assert position is not None  # SL var, pozisyon iptal EDİLMEZ
+        # 3 kademe + TP1 için 1 yeniden deneme
+        assert client.calls.count("place_take_profit") == 4
+        assert executor.reject_snapshot().get("tp1_missing") == 1
+        assert executor.logger.critical.called
+
+    async def test_successful_tp1_is_not_retried(self):
+        executor, client, pm, _ = _make_executor()
+
+        await executor.open_position(
+            event=parse_follower_event(SELL_ENTRY),
+            levels=_levels(),
+            equity_usdt=1000.0,
+        )
+
+        assert client.calls.count("place_take_profit") == 3
+        assert "tp1_missing" not in executor.reject_snapshot()
+
+    async def test_fee_roi_is_recorded_and_warned(self):
+        """Kaldıraç tavana dayandığında TP1 ROI komisyonun ALTINDA kalır."""
+        executor, client, pm, tracker = _make_executor()
+
+        position = await executor.open_position(
+            event=parse_follower_event(SELL_ENTRY),
+            levels=_levels(),
+            equity_usdt=1000.0,
+        )
+
+        plan_meta = position.meta["plan"]
+        # 100x, muhafazakâr taker %0.05 → gidiş-dönüş = marjın %10'u
+        assert plan_meta["roundtrip_fee_roi_pct"] == pytest.approx(10.0)
+        assert plan_meta["fee_roi_real_pct"] == pytest.approx(10.0)
+        assert plan_meta["tp1_covers_fees"] is False
+        # sl_pct %0.054 → tp1_roi = 0.5 × 100 × 0.054 = %2.70 < %10
+        assert plan_meta["tp_roi_pct"][0] < plan_meta["roundtrip_fee_roi_pct"]
+        assert any(
+            "komisyonun" in str(c) for c in executor.logger.warning.call_args_list
+        )
+        reason = tracker.record_open.await_args.kwargs["signal"].reason
+        assert "fee_roi=" in reason and "sl_pct_fill=" in reason
+
+    async def test_optional_fee_gate_blocks_entry_when_enabled(self):
+        """Varsayılan KAPALI kapı açıldığında giriş REDDEDİLİR (emir yok)."""
+        cfg = _cfg(follower_min_tp1_fee_ratio=1.0)
+        executor, client, pm, _ = _make_executor(cfg)
+
+        with pytest.raises(FollowerRejected) as exc:
+            await executor.open_position(
+                event=parse_follower_event(SELL_ENTRY),
+                levels=_levels(cfg),
+                equity_usdt=1000.0,
+            )
+
+        assert exc.value.code == "fee_threshold"
+        assert not any(c.startswith("open_market_order") for c in client.calls)
+
+    async def test_fee_gate_is_disabled_by_default(self):
+        executor, client, pm, _ = _make_executor()
+        position = await executor.open_position(
+            event=parse_follower_event(SELL_ENTRY),
+            levels=_levels(),
+            equity_usdt=1000.0,
+        )
+        assert position is not None
+
+    async def test_ledger_margin_matches_the_exchange_quantity(self):
+        """`quantize_quantity` AŞAĞI yuvarlar — defterdeki marj GERÇEK olmalı."""
+        executor, client, pm, _ = _make_executor()
+
+        position = await executor.open_position(
+            event=parse_follower_event(SELL_ENTRY),
+            levels=_levels(),
+            equity_usdt=1000.0,
+        )
+
+        plan_meta = position.meta["plan"]
+        # `notional = margin × lev` ÖZDEŞLİĞİ borsa miktarından sonra da
+        # korunmalı; aksi halde defterdeki marj planlanan (yuvarlama öncesi)
+        # değerde kalır ve sonraki PF/risk analizi bozulur.
+        assert plan_meta["notional_usdt"] == pytest.approx(
+            plan_meta["margin_usdt"] * plan_meta["leverage"]
+        )
+        assert plan_meta["margin_usdt"] == pytest.approx(
+            plan_meta["quantity"] * 77126.08 / plan_meta["leverage"]
+        )
 
 
 class TestCooldown:

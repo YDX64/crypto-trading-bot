@@ -357,7 +357,12 @@ class Settings(BaseSettings):
     # Takipçi kanalının secret'ı — TV_WEBHOOK_SECRET ve RISK_EVENT_SECRET'tan
     # AYRI. Boş = `/follower/event` 503 ile kapalı (aynı fail-closed desen).
     follower_forward_secret: str = Field(default="", repr=False)
-    follower_forward_timeout_seconds: float = 2.0
+    # 20 sn: `/follower/event` yanıtı, olay TAMAMEN işlendikten sonra döner ve
+    # bir giriş ~10 ardışık Binance çağrısı + SL + 3 TP emri sürer (3-6 sn).
+    # 2 sn'lik eski değer her BAŞARILI girişte sahte "iletemedi" uyarısı
+    # üretiyordu. Köprü ayrı task olduğu için uzun timeout ana motoru
+    # BLOKLAMAZ ve `_post` yeniden deneme YAPMAZ (çift giriş riski yok).
+    follower_forward_timeout_seconds: float = 20.0
 
     # Takipçi evreni ve olay filtreleri.
     follower_symbol_allowlist: str = (
@@ -389,6 +394,13 @@ class Settings(BaseSettings):
     follower_mmr_safety_mult: float = 2.0
     # Borsa kaldıraç dilimi (/fapi/v1/leverageBracket) önbellek ömrü.
     follower_bracket_cache_ttl_seconds: float = 21600.0
+    # ÜCRET EŞİĞİ KAPISI — varsayılan 0.0 = KAPALI (kullanıcı kararı
+    # 2026-08-23: "boyut/TP1/stop ile kayıp küçültme YASAK"). Açılırsa TP1
+    # ROI'si gidiş-dönüş komisyonun bu KATININ altında kalan işleme HİÇ
+    # girilmez (boyut değişmez, işlem hiç açılmaz). Aritmetik: kaldıraç
+    # LEV_MAX'e kırpıldığında (sl_pct < ~%0.30) TP1 ROI komisyonun altına
+    # düşer — bkz. docs/DECISIONS.md D20 "ücret eşiği".
+    follower_min_tp1_fee_ratio: float = 0.0
 
     # --- Seviye motoru ---
     # Öncelik: (a) AlgoPro mesajındaki sl/tp1/tp2/tp3, (b) hesaplanan kural.
@@ -534,6 +546,21 @@ class Settings(BaseSettings):
            verilmiş olsa bile) yüksek sesle uyarı basılır — geliştirme/test
            ortamında gerçek parayla işlem açma riskine dikkat çekmek için.
         """
+        if self.is_follower_mode and not (self.risk_event_secret or "").strip():
+            # TESTNET DAHİL zorunludur: takipçi halkasının TEK uzaktan durdurma
+            # yolu /risk-event'tir. Telegram YOKTUR, scanner YOKTUR ve köprüyü
+            # kapatmak yalnız YENİ sinyali keser — AÇIK pozisyonu kapatmaz.
+            # Marj %10 + ≤100x kaldıraçlı bir halkanın "durdurulamaz" olarak
+            # başlaması kabul edilemez (mainnet kill-switch kuralıyla aynı ilke,
+            # docs/MAINNET_PLAN.md §6).
+            raise ValueError(
+                "GÜVENLİK HATASI: BOT_MODE=follower için RISK_EVENT_SECRET "
+                "ZORUNLUDUR. Takipçi halkasının tek acil durdurma/flatten yolu "
+                "POST /risk-event'tir (Telegram yok). .env'e güçlü bir rastgele "
+                "değer ekleyin (bkz. docs/RUNBOOK.md 'AlgoPro takipçi halkası' "
+                "kurulum adım 2)."
+            )
+
         if not self.is_testnet:
             # binance_base_url bilinen bir testnet host'u değil -> mainnet
             # veya bilinmeyen/özel bir host. Güvenlik açısından mainnet

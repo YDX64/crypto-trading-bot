@@ -132,8 +132,16 @@ HİÇ etkilenmez — ayrı dizin, ayrı süreç, ayrı Binance testnet hesabı, 
    DATABASE_URL=sqlite:///./tradingbot_ap.db
    API_PORT=9093
    FOLLOWER_FORWARD_SECRET=<ana bottakiyle AYNI güçlü rastgele değer>
-   TELEGRAM_BOT_TOKEN=<ayrı bot>      ; TELEGRAM_CHAT_ID=<ayrı kanal>
+   RISK_EVENT_SECRET=<AYRI güçlü rastgele değer>   ; ZORUNLU (aşağıya bak)
+   TELEGRAM_BOT_TOKEN=x               ; TELEGRAM_CHAT_ID=x   (KULLANILMAZ)
    ```
+   ⚠️ **`RISK_EVENT_SECRET` ZORUNLUDUR** — boşsa süreç BAŞLAMAZ (config
+   fail-fast). Takipçinin tek uzaktan durdurma/flatten yolu `POST /risk-event`
+   tir; köprüyü kapatmak yalnız YENİ sinyali keser, AÇIK pozisyonu kapatmaz.
+   ⚠️ **Takipçi Telegram bildirimi GÖNDERMEZ.** `BOT_MODE=follower`'da
+   `TelegramBotService` hiç başlatılmaz (orchestrator da yok); alanlar yalnız
+   config doğrulaması için doldurulur — ayrı bir bot açmaya GEREK YOK. Durum
+   `/follower/status`, `logs/bot.log` ve `logs/trades.log`'tadır.
    (Diğer `FOLLOWER_*` varsayılanları `env.example`'da; hepsi opsiyoneldir.)
 3. supervisord program tanımı:
    ```ini
@@ -199,12 +207,32 @@ bu 422'den ÖNCE çalıştığı için takipçi olayı yine de alır. Ana botta 
 gövde-yönlendirme ayrı bir çalışmadadır; o merge edilmeden alarm sayısını artırma.
 
 **Akış:** TV → ana bot `/tv-signal` (secret doğrulanır) → `src=algopro` ise gövde
-`FOLLOWER_FORWARD_URL`'e İLETİLİR (ayrı task, 2 sn timeout, hata yalnız loglanır) →
+`FOLLOWER_FORWARD_URL`'e İLETİLİR (ayrı task, 20 sn timeout, hata yalnız loglanır) →
 takipçi `/follower/event` (secret `X-Follower-Secret` başlığında) → `FollowerEngine`.
+
+⚠️ **`/follower/event` `?secret=` KABUL ETMEZ** (403). Erişim logu query string'i
+düz metin yazar; secret yalnız `X-Follower-Secret` başlığında ya da gövdede
+(`secret=… kind=…`) taşınır. Elle test:
+`curl -sS -H 'X-Follower-Secret: <SECRET>' --data-binary '<gövde>' http://127.0.0.1:9093/follower/event`
+
+⚠️ **Deploy ÖNCESİ doğrula — `?src=` olmayan alarmlar:** `resolve_tv_source`,
+`?src=` taşımayan bir gövdeyi `| TF:` / `| Price:` damgalarına bakarak "algopro"
+sayabilir. TradingView'daki mevcut alarmların webhook URL'lerini tara: `?src=`
+İÇERMEYEN bir alarmın gövdesinde bu iki damga geçiyorsa o olay da takipçiye
+iletilir ve takipçi hesabında pozisyon açabilir. (Bu parmak izi bugün de TV
+sağlaması için kullanılıyor — yani yanlış sınıflandırma yeni bir risk değil,
+ama takipçide sonucu POZİSYON açmaktır.)
 
 **Ne görürsün:**
 - `logs/bot.log`: `🤖 AlgoPro takipçi motoru başlatılıyor`, her girişte
   `🎯 <SEMBOL>: AlgoPro <YÖN> girişi açıldı (lev=..x, sl_pct=%.., sl_roi=%.., marj=..)`.
+- ⚠️ `TP1 ROI ... gidiş-dönüş komisyonun ... ALTINDA`: kaldıraç 100x tavanına
+  dayanmış demektir (dar stop). Bu işlemde üç TP de dolsa sonuç net negatif
+  olabilir ve break-even KURULAMAZ (`break-even seviyesi ... yanlış tarafında`
+  uyarısı bunun devamıdır — pozisyon acil KAPATILMAZ, AlgoPro stopu kalır).
+  Kapı varsayılan KAPALI: `FOLLOWER_MIN_TP1_FEE_RATIO`. Bkz. D20 "ücret eşiği".
+- 🚨 `TP1 emri KONULAMADI`: o pozisyonda break-even hiç kurulamaz;
+  `/follower/status → reject_counters.tp1_missing` sayacında görünür.
 - `GET /follower/status` → izlenen pozisyonlar (lev/sl_pct/sl_roi/marj/TP1-2-3 durumu),
   cooldown'lar, kill switch, risk-olayı halt'ı, son 50 olay ve ret sayaçları.
 - Defter: `sqlite3 tradingbot_ap.db "SELECT symbol,direction,leverage,signal_reason,exit_reason,realized_pnl FROM scalp_trades ORDER BY id DESC LIMIT 20"`
@@ -218,7 +246,10 @@ görünür (motor yok — bu bir arıza DEĞİL). Takipçinin durumu `/follower/
 
 **Arıza/durdurma:**
 - Girişleri durdur / her şeyi kapat: `POST http://127.0.0.1:9093/risk-event`
-  (D10 ile AYNI sözleşme, `RISK_EVENT_SECRET` takipçinin kendi `.env`'inden).
+  (D10 ile AYNI sözleşme, `RISK_EVENT_SECRET` takipçinin kendi `.env`'inden —
+  ZORUNLU alan, bkz. kurulum adım 2). `action=flatten` halt'ı ÖNCE kurar, sonra
+  `_entry_lock` altında tüm izlenen pozisyonları reduce-only MARKET ile kapatır;
+  o anda uçuşta olan bir giriş de kilit sayesinde YAKALANIR.
 - Köprüyü kapat (takipçi sinyal ALMASIN): ana bottan `FOLLOWER_FORWARD_URL`'i boşalt +
   `supervisorctl restart tradingbot_v2`. Takipçi süreci açık kalır, açık pozisyonları
   yönetmeye devam eder.

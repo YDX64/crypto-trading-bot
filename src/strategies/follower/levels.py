@@ -192,6 +192,25 @@ def resolve_levels(
             resolved[index] = computed_tps[index]
             tp_from_message[index] = False
 
+    # ONARIM DOĞRULAMASI (fail-closed). Hesaplanan değeri koymak sıralamayı
+    # GARANTİ ETMEZ: mesajdan gelen bir önceki TP hesaplananın ötesinde
+    # olabilir (ör. tp1=101 mesajdan, computed tp2=101 → İKİSİ AYNI FİYAT).
+    # Aynı tetikte iki TAKE_PROFIT_MARKET, 3 kademeli çıkışı yok eder ve
+    # `_check_tp_telemetry`'nin `consumed` aritmetiğini bozar; ters sıralı
+    # merdiven ise en büyük dilimi en yakın hedeften çıkarır. Onarılamayan
+    # merdivenle GİRİŞ YAPILMAZ — para riske girmeden reddedilir.
+    for index in range(1, 3):
+        previous, current = resolved[index - 1], resolved[index]
+        ordered = current > previous if direction == Direction.LONG else current < previous
+        if not ordered:
+            raise FollowerRejected(
+                f"TP merdiveni onarılamadı (tp{index}={previous:g}, "
+                f"tp{index + 1}={current:g}, yön={direction.value}) — "
+                f"RR çarpanları ({', '.join(f'{r:g}' for r in rr)}) artan olmalı; "
+                f"giriş yapılmadı",
+                code="tp_order",
+            )
+
     if stop_from_message and all(tp_from_message):
         source = LEVEL_SOURCE_MESSAGE
     elif stop_from_message or any(tp_from_message):

@@ -186,6 +186,10 @@ class FollowerPlan:
     tp_quantities: Tuple[float, float, float]
     equity_usdt: float
     maint_margin_ratio: float
+    # Gidiş-dönüş komisyonun MARJA oranı (%): ``lev × (giriş+çıkış oranı) × 100``.
+    # Kaldıraç LEV_MAX'e kırpıldığında TP ROI'leri bunun ALTINA düşebilir —
+    # yapısal negatif beklenti (bkz. docs/DECISIONS.md D20 "ücret eşiği").
+    roundtrip_fee_roi_pct: float = 0.0
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -203,6 +207,10 @@ class FollowerPlan:
             "tp_quantities": list(self.tp_quantities),
             "equity_usdt": self.equity_usdt,
             "mmr": self.maint_margin_ratio,
+            "roundtrip_fee_roi_pct": self.roundtrip_fee_roi_pct,
+            "tp1_covers_fees": bool(
+                self.tp_roi_pct[0] > self.roundtrip_fee_roi_pct > 0
+            ),
             "levels": self.levels.as_dict(),
         }
 
@@ -215,7 +223,9 @@ class FollowerPlan:
         """
         return (
             f"follower;lev={self.leverage};sl_pct={self.sl_pct:.4f};"
-            f"sl_roi={self.sl_roi_pct:.2f};margin={self.margin_usdt:.4f};"
+            f"sl_roi={self.sl_roi_pct:.2f};tp1_roi={self.tp_roi_pct[0]:.2f};"
+            f"fee_roi={self.roundtrip_fee_roi_pct:.2f};"
+            f"margin={self.margin_usdt:.4f};"
             f"lev_target={self.leverage_target};lev_cap={self.leverage_cap_reason};"
             f"levels={self.levels.source}"
         )

@@ -296,17 +296,57 @@ class FollowerExecutor:
             getattr(self.cfg, "follower_lev_liq_guard_pct", 50.0) or 50.0
         )
         band_pct = float(getattr(self.cfg, "follower_max_sl_pct", 0.0) or 0.0)
+        # ÜÇÜNCÜ aday: bakım marjı kapısının (plan.py `_guards_ok`) fiyat
+        # mesafesi karşılığı. Yalnız liq_guard kullanmak TUTARSIZDI: 100x'te
+        # liq_guard %0.50'ye izin verirken mmr kapısı %0.30'da kesiyor ve
+        # likidasyon mesafesi (1/lev − mmr) yalnız %0.60 — yeniden çapalama
+        # stopu likidasyonun 0.1 puan yakınına taşıyabilirdi.
+        mmr = float(plan.maint_margin_ratio or 0.0)
+        safety_mult = float(getattr(self.cfg, "follower_mmr_safety_mult", 2.0) or 0.0)
+        mmr_cap_pct = (
+            100.0 * (1.0 / max(1, plan.leverage) - mmr) / safety_mult
+            if safety_mult > 0
+            else 0.0
+        )
         budget_candidates = [
             value
-            for value in (band_pct, liq_guard_pct / max(1, plan.leverage))
+            for value in (
+                band_pct,
+                liq_guard_pct / max(1, plan.leverage),
+                mmr_cap_pct,
+            )
             if value > 0
         ]
+        stop_budget_pct = min(budget_candidates) if budget_candidates else None
+
+        # GERÇEK dolum fiyatına göre stop mesafesini yeniden ölç. `sl_pct`
+        # SİNYAL fiyatından hesaplanmıştı; MARKET girişte kayma bu oranı
+        # büyütebilir ve planlanan risk (marjın %8'i) sessizce likidasyon
+        # bölgesine kayabilir. Kapı yalnız SIKILAŞTIRIR — AlgoPro'nun stopu
+        # asla GENİŞLETİLMEZ.
+        stop_target = float(levels.stop)
+        fill_sl_pct = abs(entry_price - stop_target) / entry_price * 100.0
+        if stop_budget_pct is not None and fill_sl_pct > stop_budget_pct:
+            clamped = (
+                entry_price * (1.0 - stop_budget_pct / 100.0)
+                if direction == Direction.LONG
+                else entry_price * (1.0 + stop_budget_pct / 100.0)
+            )
+            self.logger.warning(
+                f"⚠️ {symbol}: dolum kayması stop mesafesini %{fill_sl_pct:.4f}'e "
+                f"çıkardı (bütçe %{stop_budget_pct:.4f}, lev={plan.leverage}x) — "
+                f"stop {stop_target} -> {clamped} olarak SIKILAŞTIRILDI",
+                extra={"trade": True},
+            )
+            stop_target = clamped
+            fill_sl_pct = stop_budget_pct
+
         sl_order = await self.pm.place_stop_loss_or_close(
             symbol=symbol,
             sl_side=sl_side,
-            stop_price=levels.stop,
+            stop_price=stop_target,
             reference_price=entry_price,
-            max_distance_pct=min(budget_candidates) if budget_candidates else None,
+            max_distance_pct=stop_budget_pct,
         )
         if sl_order is None:
             self.logger.error(
@@ -323,7 +363,7 @@ class FollowerExecutor:
             )
             return None
 
-        stop_price = levels.stop
+        stop_price = stop_target
         effective_stop = self._coerce_price(sl_order.get("effectiveStopPrice"))
         if effective_stop is not None and effective_stop != stop_price:
             self.logger.warning(
@@ -341,9 +381,55 @@ class FollowerExecutor:
                 await self._place_tp_safely(symbol, sl_side, price, qty, f"TP{index}")
             )
 
+        # TP1 KRİTİKTİR: break-even yalnız TP1'in GERÇEK fill'iyle kanıtlanır
+        # (`exits._check_tp1_breakeven` → `_confirmed_algo_fill`). TP1 emri
+        # yoksa BE hiç kurulamaz ve pozisyon tam risk stopuna kadar taşınır.
+        # Bir kez yeniden dene; olmazsa SESSİZ KALMA: sayaç + CRITICAL.
+        if algo_ids[0] is None and parts[0] > 0 and tp_prices[0] > 0:
+            algo_ids[0] = await self._place_tp_safely(
+                symbol, sl_side, tp_prices[0], parts[0], "TP1 (2. deneme)"
+            )
+        if algo_ids[0] is None:
+            self.count_reject("tp1_missing")
+            self.logger.critical(
+                f"🚨 {symbol}: TP1 emri KONULAMADI — break-even bu pozisyonda "
+                f"HİÇ kurulamayacak, işlem tam risk stopuyla taşınıyor. "
+                f"/follower/status → reject_counters.tp1_missing",
+                extra={"trade": True},
+            )
+
+        if min(parts[0], parts[1]) <= 0:
+            # Kısmi dolum, planlanan miktarın 3'e bölünemeyeceği kadar küçük
+            # kaldı (MARKET emirlerde nadir). TP1 yok → BE yok; sessiz kalma.
+            self.logger.warning(
+                f"⚠️ {symbol}: gerçek dolum ({filled_qty}) 3 parçaya bölünemedi "
+                f"(stepSize={step_size}) — TP kademeleri eksik, break-even yok"
+            )
+            self.count_reject("partial_fill_split")
+
         entry_fee_rate, exit_fee_rate, fee_rate_source = await self._resolve_fee_rates(
             symbol
         )
+
+        # ÜCRET EŞİĞİ (ölçüm, kapı DEĞİL — bkz. docs/DECISIONS.md D20).
+        # `sl_roi = lev × sl_pct` tavana kırpıldığında (sl_pct < ~%0.30 → lev
+        # 100) TP1 ROI gidiş-dönüş komisyonun ALTINA düşer: BTC örneğinde
+        # TP1 = marjın %4'ü, komisyon %10'u → üç TP de dolsa NET NEGATİF.
+        # Ayrıca ücret-farkında break-even seviyesi TP1'in ÖTESİNDE kalır ve
+        # bu yüzden hiç kurulamaz (bkz. exits._check_tp1_breakeven).
+        real_fee_roi = (
+            (float(entry_fee_rate) + float(exit_fee_rate)) * plan.leverage * 100.0
+        )
+        if real_fee_roi > 0 and plan.tp_roi_pct[0] <= real_fee_roi:
+            self.logger.warning(
+                f"⚠️ {symbol}: TP1 ROI (marjın %{plan.tp_roi_pct[0]:.2f}'i) "
+                f"gidiş-dönüş komisyonun (%{real_fee_roi:.2f}) ALTINDA — "
+                f"lev={plan.leverage}x, sl_pct=%{plan.sl_pct:.4f}. Üç TP de "
+                f"dolsa işlem net negatif olabilir ve break-even kurulamaz. "
+                f"(Kapı varsayılan KAPALI: FOLLOWER_MIN_TP1_FEE_RATIO)",
+                extra={"trade": True},
+            )
+
         breakeven_price = fee_aware_breakeven_price(
             entry=entry_price,
             direction=direction,
@@ -358,7 +444,10 @@ class FollowerExecutor:
             direction=direction,
             entry_price=entry_price,
             stop_price=stop_price,
-            reason=f"algopro:{event.kind};tf={event.timeframe};{plan.ledger_note()}"[:480],
+            reason=(
+                f"algopro:{event.kind};tf={event.timeframe};{plan.ledger_note()};"
+                f"sl_pct_fill={fill_sl_pct:.4f};fee_roi_real={real_fee_roi:.2f}"
+            )[:480],
             regime=Regime.UNKNOWN,
             atr_5m=float(levels.atr_value or 0.0),
             leverage=plan.leverage,
@@ -445,7 +534,15 @@ class FollowerExecutor:
             plan=exit_plan,
             entry_candle_time=int(time.time() * 1000),
             meta={
-                "plan": plan.as_dict(),
+                "plan": {
+                    **plan.as_dict(),
+                    # GERÇEK (dolum sonrası) değerler — planlananla karışmasın.
+                    "sl_pct_fill": fill_sl_pct,
+                    "fee_roi_real_pct": real_fee_roi,
+                    "tp1_covers_fees_real": bool(
+                        plan.tp_roi_pct[0] > real_fee_roi > 0
+                    ),
+                },
                 "event": event.as_dict(),
                 "opened_at": datetime.now(timezone.utc).isoformat(),
             },

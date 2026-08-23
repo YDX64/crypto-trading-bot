@@ -51,11 +51,13 @@ class TestBotModeValidation:
         assert settings.is_follower_mode is False
 
     def test_follower_mode_recognized(self):
-        settings = _settings(bot_mode="follower")
+        settings = _settings(bot_mode="follower", risk_event_secret="r")
         assert settings.is_follower_mode is True
 
     def test_case_and_whitespace_normalized(self):
-        assert _settings(bot_mode="  Follower ").is_follower_mode is True
+        assert _settings(
+            bot_mode="  Follower ", risk_event_secret="r"
+        ).is_follower_mode is True
 
     def test_typo_is_rejected_fail_fast(self):
         """`BOT_MODE=folower` sessizce scalper'a düşerse İKİ motor aynı
@@ -82,7 +84,7 @@ class TestFollowerNeverOnMainnet:
             )
 
     def test_testnet_follower_allowed(self):
-        settings = _settings(bot_mode="follower")
+        settings = _settings(bot_mode="follower", risk_event_secret="r")
         assert settings.is_follower_mode is True
         assert settings.is_testnet is True
 
@@ -96,6 +98,30 @@ class TestFollowerNeverOnMainnet:
             tv_webhook_secret="t",
             scalper_symbol_allowlist="BTCUSDT",
         )
+        assert settings.is_follower_mode is False
+
+
+class TestFollowerRequiresAKillSwitch:
+    """Takipçi TESTNET'te bile RISK_EVENT_SECRET olmadan başlayamaz.
+
+    Halkanın tek uzaktan durdurma yolu `POST /risk-event`tir: Telegram yok,
+    scanner yok ve köprüyü kapatmak yalnız YENİ sinyali keser — açık pozisyonu
+    kapatmaz. Marj %10 + ≤100x kaldıraçlı bir halkanın "durdurulamaz"
+    başlaması kabul edilemez.
+    """
+
+    def test_follower_without_risk_event_secret_is_rejected(self):
+        with pytest.raises(ValueError, match="RISK_EVENT_SECRET"):
+            _settings(bot_mode="follower")
+
+    def test_blank_risk_event_secret_is_rejected(self):
+        with pytest.raises(ValueError, match="RISK_EVENT_SECRET"):
+            _settings(bot_mode="follower", risk_event_secret="   ")
+
+    def test_scalper_ring_is_unaffected(self):
+        """Scalper testnet'te BUGÜNKÜ gibi secret'sız başlayabilir."""
+        settings = _settings()
+        assert settings.risk_event_secret == ""
         assert settings.is_follower_mode is False
 
 

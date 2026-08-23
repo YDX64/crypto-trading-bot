@@ -393,19 +393,24 @@ startup HATASI** (docs/MAINNET_PLAN.md §6).
 (scalper modunda `scalper_engine` — aynı yol), `/health` ve `/api/status`'a yalnız
 takipçi modunda çalışan erken dallar.
 
-**Kanıt:** 223 yeni takipçi testi — `tests/test_follower_parser.py` (52, TV'den
-alınan GERÇEK gövdeler: SELL dizisi, BUY→TP1→TP2→TP3 dizisi, SL HIT + seviye sırası
-kapısı), `test_follower_levels.py` (16), `test_follower_plan.py` (27, kullanıcının üç
-örneği birebir), `test_follower_brackets.py` (16, kaldıraç dilimi önbelleği:
-fail-closed / bayat kayıt / tek uçuş), `test_follower_executor.py` (16, korumalı
-açılış disiplini + yeniden çapalama bütçesi), `test_follower_engine.py` (45,
-kapılar/flip/exit/HIT çapraz doğrulaması + İDEMPOTANS (aynı alarmın ikinci teslimi) +
-gerçek `FollowerExitManager` ile uçtan uca giriş→TP1→BE→EXIT),
-`test_follower_forwarder.py` (19), `test_follower_endpoint.py` (19, 403/422/503 +
-köprü çağrı yeri), `test_follower_mode.py` (13, BOT_MODE fail-fast + mainnet yasağı +
-scalper nötrlüğü); ayrıca `test_deploy_scripts.py` (+6 halka) ve
-`test_ledger_report.py` (+4 `--strategy`).
-`python3 -m pytest tests -q` → **909 passed, 1 skipped** (önceki: 676 passed, 1 skipped).
+**Kanıt:** 259 takipçi testi — `tests/test_follower_parser.py` (52, TV'den alınan
+GERÇEK gövdeler: SELL dizisi, BUY→TP1→TP2→TP3 dizisi, SL HIT + seviye sırası
+kapısı), `test_follower_levels.py` (18, mesaj>ATR önceliği + onarılamayan TP
+merdiveninin fail-closed reddi), `test_follower_plan.py` (35, kullanıcının üç örneği
+birebir + ücret eşiği aritmetiği), `test_follower_brackets.py` (16, kaldıraç dilimi
+önbelleği: fail-closed / bayat kayıt / tek uçuş), `test_follower_executor.py` (25,
+korumalı açılış disiplini + mmr'li yeniden çapalama bütçesi + kayma sıkılaştırması +
+TP1 yeniden denemesi + ücret telemetrisi), `test_follower_engine.py` (53,
+kapılar/flip/exit/HIT çapraz doğrulaması + İDEMPOTANS + EŞZAMANLILIK kapıları +
+ulaşılamayan break-even + gerçek `FollowerExitManager` ile uçtan uca
+giriş→TP1→BE→EXIT), `test_follower_recovery.py` (6, restart kurtarmasında parça
+aritmetiği ve BE uzlaştırması), `test_follower_forwarder.py` (19),
+`test_follower_endpoint.py` (19, 403/422/503 + `?secret=` reddi + köprü çağrı yeri),
+`test_follower_mode.py` (16, BOT_MODE fail-fast + mainnet yasağı + RISK_EVENT_SECRET
+zorunluluğu + scalper nötrlüğü); ayrıca `test_scalper_pnl_recovery.py` (+2
+tek-finalizer), `test_deploy_scripts.py` (+6 halka) ve `test_ledger_report.py`
+(+4 `--strategy`).
+`python3 -m pytest tests -q` → **947 passed, 1 skipped** (önceki: 676 passed, 1 skipped).
 Backtest harness'e DOKUNULMADI — takipçi yalnız canlı olay hattında çalışır ve strateji
 C'yi hiç kullanmaz (CLAUDE.md kural 2 kapsamı dışında).
 
@@ -415,6 +420,72 @@ yeniden çapalama bütçesi `FOLLOWER_MAX_SL_PCT` (%5) yerine
 ötesindeydi; (2) girişten hemen önce `get_position_risk(force_fresh=True)` ile
 "izlenmeyen ama borsada açık pozisyon" kapısı eklendi (fail-closed) — aksi halde
 `record_open` DB hatası sonrası ikinci bir giriş pozisyonu ikiye katlardı.
+
+**Düşmanca inceleme düzeltmeleri (çok-mercekli, 2026-08-23; her biri
+regresyon testiyle kilitli — testlerin düzeltme olmadan KIRMIZI olduğu
+doğrulandı):**
+
+*Yarış koşulları:* (a) `ExitManager._handle_closed`'un `finally`'si koşulsuz
+`_positions.pop` yapıyordu; `_finalize_close` saniyeler sürdüğü için (cancel_all
++ userTrades + income merdiveni) flip yolunun izlemeye aldığı YENİ pozisyon
+siliniyordu → borsada açık, motorun bilmediği pozisyon. Artık pop KİMLİK
+kontrollüdür (scalper davranışı aynı: izlenen sembole ikinci giriş yapmaz).
+(b) Aynı yarışın emir-iptali tarafı için yeni kapı: sembol `exits._closing`
+içindeyse GİRİŞ YOK (`close_in_flight`). (c) `risk_event_flatten` artık
+`_entry_lock` altında çalışır — halt anında UÇUŞTA olan giriş henüz
+`tracked_symbols()`'a girmemiş olur ve "hiç pozisyon yok" raporundan sonra
+aktif halt altında açık pozisyon kalırdı. (d) `_close_tracked` emir reddini
+artık "pozisyon açık" saymıyor: TP3/SL eşzamanlı dolduğunda gelen -2022'de bir
+kez taze okunur. (e) `_update_kill_switch` ayrı `try`'a alındı ve
+`_entries_ready()` artık safety turunun TAZELİĞİNİ de arar (fail-closed).
+
+*Koruma aritmetiği:* (f) **Break-even artık ULAŞILAMIYORSA gönderilmiyor.**
+`pm._replace_stop_loss` `-2021` alırsa pozisyonu ACİL KAPATIR; takipçide bu
+İSTİSNA DEĞİL KURALDI: ücret-farkında BE mesafesi ≈ giriş+çıkış+tampon ≈ %0.15
+iken TP1 mesafesi `RR1 × sl_pct`tir ve kaldıraç tavana dayanan HER işlemde
+(sl_pct < ~%0.30) TP1 bu payın içinde kalır → her TP1 dolumu kalan 2/3'ü zorla
+düzleştirirdi. Artık BE piyasanın yanlış tarafındaysa emir hiç gönderilmez,
+AlgoPro stopu yerinde kalır, pozisyon başına BİR KEZ uyarılır. (g) Yeniden
+çapalama bütçesine mmr kapısının fiyat karşılığı eklendi
+(`(1/lev − mmr)/MMR_SAFETY_MULT`): 100x + mmr 0.004'te liq_guard %0.50'ye izin
+verirken likidasyon mesafesi yalnız %0.60'tı. (h) Stop, GERÇEK dolum fiyatına
+göre yeniden ölçülüp bütçe aşılıyorsa SIKILAŞTIRILIR (asla genişletilmez) —
+MARKET girişteki kayma planlanan riski sessizce likidasyon bölgesine
+kaydırabiliyordu; deftere `sl_pct_fill` yazılır. (i) TP merdiveni onarımı artık
+DOĞRULANIYOR: hesaplanan değeri koymak sıralamayı garanti etmiyordu (TP1==TP2
+kalabiliyordu) → onarılamayan merdivenle GİRİŞ YAPILMAZ (`tp_order`).
+(j) TP1 emri konulamazsa bir kez yeniden denenir; olmazsa `tp1_missing` sayacı
++ CRITICAL (TP1 yoksa BE hiç kurulamaz). (k) Kurtarma yolu parçaları artık
+canlı yolla AYNI kuralla (`split_three_quantities` + `stepSize`) kurulur —
+`quantity/3` varsayımı küçük adım sayılarında BE eşiğini hiç geçirmiyordu; ve
+`tp1_done=True` kurtarılırken canlı stop BE'den gevşekse bayrak düşürülür
+(takipçide trailing yok, telafi eden ikinci yol yoktu).
+
+*İşletim/güvenlik:* (l) `BOT_MODE=follower` + boş `RISK_EVENT_SECRET` artık
+TESTNET'te de startup HATASI — halkanın tek uzaktan durdurma yolu odur
+(Telegram yok; köprüyü kapatmak açık pozisyonu kapatmaz). (m) `/follower/event`
+`?secret=` KABUL ETMİYOR (403): erişim logu query string'i düz metin yazar.
+(n) `FOLLOWER_FORWARD_TIMEOUT_SECONDS` 2 → 20 sn: yanıt olay işlendikten sonra
+döndüğü için 2 sn her BAŞARILI girişte sahte "iletemedi" uyarısı üretiyordu
+(`_post` yeniden deneme yapmaz — çift giriş riski yoktu).
+
+**Ücret eşiği (ÖLÇÜM — kapı varsayılan KAPALI, kullanıcı kararı gerekir):**
+`sl_roi = lev × sl_pct`, `tp1_roi = RR1 × sl_roi`, gidiş-dönüş komisyon
+ROI'si = `lev × 2 × oran × 100`. Kaldıraç LEV_MAX'e KIRPILDIĞINDA (raw hedef
+> 100, yani `sl_pct < ~%0.30`) TP1 ROI komisyonun ALTINA düşer. Kullanıcının
+kendi BTC örneğiyle: `sl_pct %0.08 → lev 100 → TP1 = marjın %4'ü`, komisyon
+(taker %0.05 × 2 × 100) = **marjın %10'u** → üç TP de dolsa (%4+%8+%12)/3 = %8
+brüt < %10 komisyon, yani **yapısal negatif beklenti**; SL ise −%8 −%10 = −%18.
+DOGE örneği (`sl_pct %0.30 → TP1 %15`) ve `sl_pct %0.60 → 50x → TP1 %15` bu
+eşiğin ÜSTÜNDEDİR. Bu bir boyutlama tercihi değil aritmetiktir, ama düzeltmesi
+TP1/kaldıraç/boyut değiştirmeyi gerektirir — kullanıcının 2026-08-23 kararı
+(*"boyut/TP1/stop ile kayıp küçültme YASAK; çözüm sinyal kalitesi"*) bunu
+YASAKLAR. Bu yüzden davranış DEĞİŞMEDİ; yapılanlar: her girişte WARNING,
+deftere (`signal_reason`: `tp1_roi=`, `fee_roi=`, `fee_roi_real=`) ve
+`/follower/status`'a (`roundtrip_fee_roi_pct`, `tp1_covers_fees`) yazım, ve
+VARSAYILAN KAPALI `FOLLOWER_MIN_TP1_FEE_RATIO` kapısı. Canlı defter hakemdir:
+`ledger_report.py --db tradingbot_ap.db --strategy AP` sonucu bu aritmetiği
+doğrular ya da çürütür.
 
 **Beklenti:** YOK. Bu halka bir hipotez testidir: "AlgoPro'nun kendi seviyeleriyle,
 kendi giriş/çıkış komutlarıyla, 1m'de kâr edilebilir mi?" Kanıt canlı defterden

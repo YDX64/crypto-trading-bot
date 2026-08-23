@@ -22,6 +22,7 @@ from datetime import timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from src.strategies.follower.executor import FOLLOWER_STRATEGY, FollowerPosition
+from src.strategies.follower.plan import split_three_quantities
 from src.strategies.scalper.exits import ExitManager
 from src.strategies.scalper.executor import ScalpPosition
 from src.strategies.scalper.tracker import ScalpTracker
@@ -35,6 +36,12 @@ from src.strategies.scalper.types import (
 from src.models.position import PositionModel, PositionSide, PositionStatus
 from src.trading.binance_client_improved import BinanceAPIError, ImprovedBinanceClient
 from src.trading.position_manager import PositionManager, UnprotectedPositionError
+
+
+# Fiyat okuması ile emrin borsaya varması arasındaki boşluk payı (%).
+# Break-even stopu bu payın içindeyse KONULMAZ: `-2021` (emir anında
+# tetiklenir) `PositionManager._replace_stop_loss`'ta ACİL KAPATMAYA döner.
+_BE_PLACEMENT_MARGIN_PCT = 0.02
 
 
 async def _no_klines(*_args: Any, **_kwargs: Any) -> List[Any]:
@@ -140,6 +147,25 @@ class FollowerExitManager(ExitManager):
         # fill kanıtı _confirmed_algo_fill'dir (scalper ile aynı ilke).
         if live_qty > filled - expected * 0.9:
             return
+
+        target = sp.plan.breakeven_price
+        current_sl = sp.position.current_stoploss
+        already_tighter = self._is_at_least_as_protective(
+            sp.signal.direction, current_sl, target
+        )
+        # KRİTİK: BE seviyesi piyasanın YANLIŞ tarafındaysa emir gönderme.
+        # `pm._replace_stop_loss` `-2021` alırsa "koruma kararını uygula"
+        # diyerek pozisyonu ACİL KAPATIR. Takipçide bu durum İSTİSNA DEĞİL
+        # KURALDIR: ücret-farkında BE mesafesi ≈ giriş+çıkış+tampon ≈ %0.15
+        # iken TP1 mesafesi `RR1 × sl_pct`tir; kaldıraç tavana dayandığı her
+        # işlemde (sl_pct < ~%0.30) TP1 %0.15'in İÇİNDE kalır → her TP1
+        # dolumu kalan 2/3'ü zorla düzleştirirdi. Doğru davranış: BE'yi
+        # atlamak ve eski (AlgoPro) stopunu korumak.
+        if not already_tighter and not self._be_target_placeable(
+            sp.signal.direction, target, sp.position.current_price
+        ):
+            self._log_be_unreachable(symbol, sp, target)
+            return
         if not await self._confirmed_algo_fill(
             symbol=symbol,
             algo_id=getattr(sp.plan, "tp1_algo_id", None),
@@ -151,12 +177,6 @@ class FollowerExitManager(ExitManager):
                 f"salt miktar azalması break-even tetiklemeyecek"
             )
             return
-
-        target = sp.plan.breakeven_price
-        current_sl = sp.position.current_stoploss
-        already_tighter = self._is_at_least_as_protective(
-            sp.signal.direction, current_sl, target
-        )
         ok = already_tighter or await self.pm.replace_stop_loss(sp.position, target)
         if not ok:
             self.logger.warning(
@@ -170,6 +190,37 @@ class FollowerExitManager(ExitManager):
         self.logger.info(
             f"✅ {symbol}: TP1 doğrulandı — ücret-dahil break-even aktif "
             f"(SL={sp.position.current_stoploss})",
+            extra={"trade": True},
+        )
+
+    @staticmethod
+    def _be_target_placeable(
+        direction: Direction, target: Optional[float], live_price: Optional[float]
+    ) -> bool:
+        """BE stopu piyasanın GÜVENLİ tarafında mı? (fiyat yoksa: hayır)
+
+        LONG'da SELL STOP piyasanın ALTINDA olmalı, SHORT'ta ÜSTÜNDE. Fiyat
+        okunamadıysa `False` — "bilinmiyor" ASLA "konulabilir" sayılmaz.
+        """
+        if not target or target <= 0 or not live_price or live_price <= 0:
+            return False
+        margin = float(live_price) * _BE_PLACEMENT_MARGIN_PCT / 100.0
+        if direction == Direction.LONG:
+            return float(target) <= float(live_price) - margin
+        return float(target) >= float(live_price) + margin
+
+    def _log_be_unreachable(self, symbol: str, sp: ScalpPosition, target: float) -> None:
+        """Ulaşılamayan BE'yi POZİSYON BAŞINA BİR KEZ uyar (log seli yok)."""
+        meta = getattr(sp, "meta", None)
+        if isinstance(meta, dict):
+            if meta.get("be_unreachable_logged"):
+                return
+            meta["be_unreachable_logged"] = True
+        self.logger.warning(
+            f"⚠️ {symbol}: break-even seviyesi ({target}) güncel fiyatın "
+            f"({sp.position.current_price}) yanlış tarafında — stop TAŞINMADI. "
+            f"Ücret-farkında BE, TP1'den uzaksa bu kalıcıdır (bkz. D20 'ücret "
+            f"eşiği'); AlgoPro stopu yerinde kalır, pozisyon acil KAPATILMAZ.",
             extra={"trade": True},
         )
 
@@ -286,25 +337,40 @@ class FollowerExitManager(ExitManager):
             )
 
         quantity = float(trade.quantity)
-        third = quantity / 3.0
+        # Parçalar `quantity/3` DEĞİL, canlı yolda kullanılan AYNI kuralla
+        # (stepSize'a AŞAĞI yuvarlama + artık son parçaya) yeniden kurulur.
+        # Aksi halde `_check_tp1_breakeven`'in miktar-azalma eşiği
+        # (`live_qty > filled - expected*0.9`) küçük adım sayılarında HİÇ
+        # geçilmez ve restart sonrası break-even KALICI olarak ölür
+        # (ör. 11 adım: gerçek parçalar 3/3/5, quantity/3 = 3.67).
+        try:
+            filters = await self.client.get_symbol_filters(symbol)
+            step_size = float(filters.get("stepSize") or 0.0)
+        except Exception as exc:
+            step_size = 0.0
+            self.logger.warning(
+                f"⚠️ recover(): {symbol} borsa filtreleri okunamadı ({exc}); "
+                f"TP parçaları 1/3 varsayımıyla kuruluyor"
+            )
+        part1, part2, part3 = split_three_quantities(quantity, step_size)
         tp_prices = self._live_tp_prices(algo_orders, direction, trade.entry_price)
 
         tp1_done = await self._confirmed_algo_fill(
             symbol=symbol,
             algo_id=trade.tp1_algo_id,
-            expected_quantity=third,
+            expected_quantity=part1,
             label="TP1/recovery",
         )
         tp2_done = await self._confirmed_algo_fill(
             symbol=symbol,
             algo_id=trade.tp2_algo_id,
-            expected_quantity=third,
+            expected_quantity=part2,
             label="TP2/recovery",
         )
         tp3_done = await self._confirmed_algo_fill(
             symbol=symbol,
             algo_id=getattr(trade, "tp3_algo_id", None),
-            expected_quantity=third,
+            expected_quantity=part3,
             label="TP3/recovery",
         )
 
@@ -318,6 +384,22 @@ class FollowerExitManager(ExitManager):
             exit_fee_rate=exit_fee_rate,
             buffer_pct=float(getattr(self.cfg, "scalper_breakeven_buffer_pct", 0.05)),
         )
+
+        # TP1 dolmuş ama CANLI stop hâlâ break-even'den GEVŞEKSE, süreç
+        # `replace_stop_loss` ile BE arasında yeniden başlamış demektir.
+        # `tp1_done=True` ile kurtarırsak `_check_tp1_breakeven` bir daha HİÇ
+        # çağrılmaz (takipçide trailing yoktur, telafi eden ikinci yol yok) ve
+        # pozisyonun 2/3'ü tam risk stopuyla taşınır. Bayrağı düşürerek BE'yi
+        # yeniden denenebilir kıl — fill kanıtı zaten her turda aranıyor.
+        if tp1_done and not self._is_at_least_as_protective(
+            direction, current_stop, breakeven_price
+        ):
+            self.logger.warning(
+                f"⚠️ recover(): {symbol} TP1 dolmuş ama canlı stop ({current_stop}) "
+                f"break-even'den ({breakeven_price}) gevşek — BE yeniden denenecek",
+                extra={"trade": True},
+            )
+            tp1_done = False
 
         signal = ScalpSignal(
             strategy=trade.strategy or FOLLOWER_STRATEGY,
@@ -345,7 +427,7 @@ class FollowerExitManager(ExitManager):
             initial_stoploss=current_stop,
             current_stoploss=current_stop,
             first_tp_price=tp_prices[0],
-            first_tp_quantity=third,
+            first_tp_quantity=part1,
             targets=str(list(tp_prices)),
             status=PositionStatus.OPEN,
             entry_order_id=str(getattr(trade, "entry_order_id", "") or ""),
@@ -359,9 +441,9 @@ class FollowerExitManager(ExitManager):
 
         plan = ExitPlan(
             tp1_price=tp_prices[0],
-            tp1_quantity=third,
+            tp1_quantity=part1,
             tp2_price=tp_prices[1],
-            tp2_quantity=third,
+            tp2_quantity=part2,
             runner_quantity=0.0,
             initial_stop=current_stop,
             breakeven_price=breakeven_price,
@@ -376,7 +458,7 @@ class FollowerExitManager(ExitManager):
             tp1_algo_id=trade.tp1_algo_id,
             tp2_algo_id=trade.tp2_algo_id,
             tp3_price=tp_prices[2],
-            tp3_quantity=quantity - 2 * third,
+            tp3_quantity=part3,
             tp3_algo_id=getattr(trade, "tp3_algo_id", None),
         )
 

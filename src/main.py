@@ -1125,12 +1125,15 @@ async def follower_event(request: Request):
         raise HTTPException(status_code=422, detail="Gövde çok büyük (>4KB)")
     raw = raw_bytes.decode("utf-8", errors="replace").strip()
 
+    # Secret YALNIZ başlıkta ya da gövdede taşınır. `?secret=` BİLİNÇLİ olarak
+    # DESTEKLENMEZ: uvicorn erişim logu (logs/supervisor.log) query string'i
+    # düz metin yazar ve rotasyonla yedeklere yayılır (CLAUDE.md kural 5).
+    # Köprü zaten `X-Follower-Secret` başlığını kullanır; elle test için
+    # `-H 'X-Follower-Secret: …'` ya da gövdede `secret=…`.
     provided = str(request.headers.get(_FOLLOWER_SECRET_HEADER) or "")
     if not provided:
         match = _FOLLOWER_BODY_SECRET_RE.search(raw)
         provided = match.group(1) if match else ""
-    if not provided:
-        provided = str(request.query_params.get("secret") or "")
     if not _constant_time_equals(provided, configured):
         raise HTTPException(status_code=403, detail="Geçersiz takipçi secret")
 
