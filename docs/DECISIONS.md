@@ -360,7 +360,14 @@ parametresi, snapshot `structure` alanı) + `src/strategies/scalper/exits.py`
 `OpenPosition.signal_close_time`/`structure_be_applied`, `simulate_symbol` yapı kapısı,
 `manage_position` `structure_feed` parametresi, `_process_candle_exits` STRUCT_BE etiketi)
 + `src/main.py` (`_EMPTY_SCALPER_STATUS["structure"]`) + `tests/test_structure.py`.
-### D15 — Lider piyasa kapısı ("ters-gün kapısı") · 2026-08-23 · ADAY, UYGULANMADI (varsayılan KAPALI)
+### D15 — Lider piyasa kapısı ("ters-gün kapısı") · 2026-08-23 · **AKTİF (testnet, 11:14 UTC)** — kod varsayılanı KAPALI, sunucu `.env` ile açık
+**Uygulama:** kullanıcının tam yetkisiyle (2026-08-23, "kendin onayladıktan sonra yayına al"): merge 6f54c3a (876 test, CI yeşil) →
+`scripts/deploy.sh awa` (pid 2473476, sağlık 75 sn) → `.env`: `SCALPER_MARKET_GATE=true`, `_SYMBOL=BTCUSDT`, `_DAY_PCT=1.3`,
+`_RUN_PCT=0` (yedek `backups/env.bak-20260823-1311*-marketgate`) → restart pid 2491624, sağlık 65 sn → `/scalper/status.market_gate`:
+`gate_effective=true, stale=false, leader_ok=true, day_open_source=intraday_open, thresholds={1.3,0,3}`; 3 açık pozisyon `recover()` ile
+devralındı. Lider verisi şimdilik testnet host'undan (`leader_source_host=testnet.binancefuture.com`) — D17 açılınca mainnet.
+Geri alma: RUNBOOK "Lider piyasa kapısı" kapatma komutu.
+
 **Ne:** `SCALPER_MARKET_GATE` (varsayılan `false`) ile iki BAĞIMSIZ alt-kapı
 (`src/strategies/scalper/market_gate.py`, saf fonksiyon, IO yok):
 1. **gün-içi** (`SCALPER_MARKET_GATE_DAY_PCT`, varsayılan **1.3**): lider sembolün

@@ -235,7 +235,7 @@ Mainnet'te (testnet DEĞİLKEN) gölge KAPALIYSA `RISK_EVENT_SECRET`, `TV_WEBHOO
 `SCALPER_SYMBOL_ALLOWLIST` boş (veya yalnız boşluk/virgül) OLAMAZ — `_validate_binance_environment`
 startup'ta reddeder (docs/MAINNET_PLAN.md §5.3); doldurmadan kapatamazsın.
 
-## Lider piyasa kapısı (`SCALPER_MARKET_GATE`, D15) — ADAY, HENÜZ ONAYLANMADI
+## Lider piyasa kapısı (`SCALPER_MARKET_GATE`, D15) — AKTİF (testnet, 2026-08-23 11:14 UTC; eşik 1.3 / uzama 0)
 Liderin (varsayılan BTCUSDT) gün-içi sapmasına bakıp o yöne yeni giriş kapatan kapı
 (ayrıntı: `docs/ARCHITECTURE.md` §4.1, ölçüm: `docs/EXPERIMENTS.md` E7). **Varsayılan
 kapalı ve canlıya UYGULANMADI** — bu bölüm, kullanıcı onayı geldiğinde doğru değerlerle
