@@ -170,11 +170,18 @@ def resolve_leverage(
     return int(leverage), int(target), reason, float(mmr)
 
 
-def roundtrip_fee_roi_pct(leverage: int, cfg: Any) -> float:
-    """Gidiş-dönüş komisyonun MARJA oranı (%), config oranlarıyla (IO yok).
+def roundtrip_fee_roi_pct(
+    leverage: int, cfg: Any, fee_rate: Optional[float] = None
+) -> float:
+    """Gidiş-dönüş komisyonun MARJA oranı (%). IO YOK — oran DIŞARIDAN gelir.
+
+    ``fee_rate``: borsadan okunan GERÇEK taker oranı (ondalık, ör. 0.0005).
+    Verilmezse config'in muhafazakâr oranına (``max(taker, maker)``) düşülür —
+    executor bu oranı ``/fapi/v1/commissionRate``'ten okuyup GEÇİRİR
+    (düşmanca inceleme bulgu 3: kapı gerçek komisyonla çalışmalı).
 
     Takipçide iki bacak da taker'dır (giriş MARKET, çıkış MARKET/koşullu emir),
-    bu yüzden muhafazakâr oran ``max(taker, maker)``tır — scalper ile aynı ilke.
+    bu yüzden config fallback'ı ``max(taker, maker)``tır — scalper ile aynı ilke.
     ``ROI = lev × 2 × oran × 100``: 100x'te %0.05 taker → marjın %10'u.
 
     NEDEN ÖNEMLİ: ``sl_roi_pct = lev × sl_pct`` ve ``tp1_roi = RR1 × sl_roi``.
@@ -184,10 +191,13 @@ def roundtrip_fee_roi_pct(leverage: int, cfg: Any) -> float:
     boyutlama sorunu değil, ölçülebilir bir gerçektir; bkz. docs/DECISIONS.md
     D20 "ücret eşiği" ve varsayılan KAPALI ``FOLLOWER_MIN_TP1_FEE_RATIO``.
     """
-    rate = max(
-        _cfg_float(cfg, "scalper_taker_fee_pct", 0.05),
-        _cfg_float(cfg, "scalper_maker_fee_pct", 0.02),
-    ) / 100.0
+    if fee_rate is not None and math.isfinite(float(fee_rate)) and fee_rate > 0:
+        rate = float(fee_rate)
+    else:
+        rate = max(
+            _cfg_float(cfg, "scalper_taker_fee_pct", 0.05),
+            _cfg_float(cfg, "scalper_maker_fee_pct", 0.02),
+        ) / 100.0
     if rate <= 0:
         return 0.0
     return float(leverage) * 2.0 * rate * 100.0
@@ -227,8 +237,13 @@ def build_plan(
     brackets: Sequence[LeverageBracket],
     cfg: Any,
     step_size: float = 0.0,
+    fee_rate: Optional[float] = None,
 ) -> FollowerPlan:
-    """Tam pozisyon planını kur (miktar HAM — borsa yuvarlaması executor'da)."""
+    """Tam pozisyon planını kur (miktar HAM — borsa yuvarlaması executor'da).
+
+    ``fee_rate``: borsadan okunan gerçek taker oranı (ondalık). Ücret eşiği
+    kapısı bu oranla çalışır; verilmezse config'in muhafazakâr oranı.
+    """
     if not math.isfinite(equity_usdt) or equity_usdt <= 0:
         raise FollowerRejected(
             f"Sermaye bilinmiyor veya sıfır ({equity_usdt}) — giriş yapılmadı",
@@ -264,17 +279,23 @@ def build_plan(
     )
     tp_roi = (rr[0] * sl_roi_pct, rr[1] * sl_roi_pct, rr[2] * sl_roi_pct)
 
-    fee_roi = roundtrip_fee_roi_pct(leverage, cfg)
-    # VARSAYILAN KAPALI (0.0): kullanıcı kararı (2026-08-23) "boyut/TP1/stop
-    # ile kayıp küçültme YASAK — çözüm sinyal kalitesi". Bu kapı boyut
-    # DEĞİŞTİRMEZ, yalnız komisyonu ödeyemeyeceği ölçülmüş bir işleme HİÇ
-    # girmemeyi sağlar. Açmak ayrı bir kullanıcı kararıdır.
-    min_ratio = _cfg_float(cfg, "follower_min_tp1_fee_ratio", 0.0)
+    fee_roi = roundtrip_fee_roi_pct(leverage, cfg, fee_rate)
+    # VARSAYILAN AÇIK (1.0) — düşmanca inceleme 2026-08-23: ölçülen AlgoPro
+    # seviyeleriyle (BTC 1m SL %0.07, TP1 0.5×) HER SONUÇ negatifti. Kapı
+    # boyut/TP1/stop DEĞİŞTİRMEZ (kullanıcının yasağı korunur); yalnız
+    # komisyonu ödeyemeyeceği ARİTMETİK OLARAK kanıtlı bir işleme hiç
+    # girmez. Aritmetik kaldıraçtan bağımsızdır:
+    #   RR1 × lev × sl_pct ≥ ratio × lev × 2 × oran × 100
+    #   → sl_pct ≥ ratio × 2 × oran × 100 / RR1  (0.5 / %0.05 → %0.20)
+    # 0.0 = KAPALI (ayrı kullanıcı kararı; bkz. docs/DECISIONS.md D20).
+    min_ratio = _cfg_float(cfg, "follower_min_tp1_fee_ratio", 1.0)
     if min_ratio > 0 and fee_roi > 0 and tp_roi[0] < min_ratio * fee_roi:
         raise FollowerRejected(
             f"TP1 ROI (%{tp_roi[0]:.2f}) gidiş-dönüş komisyonun "
-            f"({min_ratio:g}×%{fee_roi:.2f}) altında — giriş yapılmadı",
-            code="fee_threshold",
+            f"({min_ratio:g}×%{fee_roi:.2f}) altında — giriş yapılmadı "
+            f"(lev={leverage}x, sl_pct=%{levels.sl_pct:.4f}; kapıyı kapatmak "
+            f"için FOLLOWER_MIN_TP1_FEE_RATIO=0)",
+            code="fee_gate",
         )
 
     return FollowerPlan(
@@ -358,7 +379,13 @@ def parse_brackets(payload: Any) -> List[LeverageBracket]:
                 cap = float(cap_raw) if cap_raw is not None else float("inf")
             except (KeyError, TypeError, ValueError):
                 continue
-            if max_lev <= 0 or not math.isfinite(mmr) or mmr < 0:
+            # mmr == 0 GEÇERSİZDİR: Binance'in hiçbir gerçek diliminde bakım
+            # marjı sıfır değildir; sıfır bir dilim `_guards_ok`'un mmr
+            # kapısını (1/lev − mmr > mult × sl_pct/100) DİŞSİZ bırakır ve
+            # 100x'te likidasyon mesafesini olduğundan büyük gösterir.
+            # Ayrıştırılamayan/anlamsız satır listeye HİÇ girmez; hepsi
+            # elenirse çağıran fail-closed davranır (bkz. resolve_leverage).
+            if max_lev <= 0 or not math.isfinite(mmr) or mmr <= 0:
                 continue
             out.append(
                 LeverageBracket(

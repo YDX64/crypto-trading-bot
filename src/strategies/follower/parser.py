@@ -54,6 +54,34 @@ Elle kurulan alarmlar, curl testleri ve ileride başka bir kaynak için::
     src=algopro kind=entry buy BTCUSDT tf=1 px=77126.08 sl=… tp1=… tp2=… tp3=…
 
 ``kind=`` görülürse bu biçim kullanılır; aksi halde birincil (AlgoPro) yol.
+Bu yol yalnız ELLE (secret ile) kurulan isteklerde geçerlidir — köprü asla
+bu biçimde bir gövde İLETMEZ. ``kind=entry`` için alan şartı birincil yolla
+AYNIDIR: ``px`` + ``sl`` + ``tp1`` + ``tp2`` + ``tp3`` zorunludur.
+
+## KATI TANIYICI (düşmanca inceleme, 2026-08-23 — bulgu 2 ve 5)
+
+Eski davranış FAIL-OPEN'dı: tanınmayan bir gövdede yalnızca bir yön kelimesi
+("bullish", "long", …) geçmesi GİRİŞ olayı üretiyordu. Serbest metin, LuxAlgo
+şablonu ya da bozulmuş bir AlgoPro mesajı böylece POZİSYON açtırabilirdi.
+
+Artık bir gövde ancak AŞAĞIDAKİLERİN HEPSİNİ taşıyorsa AlgoPro V1.6 alarmı
+sayılır (``algopro_alert_kind`` — köprü de AYNI tanıyıcıyı kullanır):
+
+1. **BAŞLIKTA** (ilk ``|`` bölümünde) olay anahtarı: ``BUY``/``SELL`` (giriş)
+   ya da ``EXIT`` / ``TP1|TP2|TP3 HIT`` / ``SL HIT``;
+2. borsa nitelikli sembol bölümü: ``| BINANCE:<SEMBOL>USDT[.P] |``;
+3. ``| TF: <değer>`` alanı;
+4. ``| Price: <pozitif sayı>`` alanı;
+5. **giriş olaylarında ayrıca** dört seviyenin HEPSİ: ``SL:``, ``TP1:``,
+   ``TP2:``, ``TP3:`` (pozitif ve sonlu) + yöne uygun sıralama.
+
+Eksik alan → ``FollowerParseError`` (HTTP 422) + WARNING. "Bir seviyeyi
+yanlış yorumlayıp ters tarafa emir koymaktansa işlemi kaçırmak doğrudur."
+
+⚠️ SONUÇ: ``levels.py``'deki k×ATR yedek kuralı GİRİŞLER İÇİN ARTIK
+ULAŞILAMAZ (mesajda SL olmayan bir giriş 422 alır). Kural, mesajdaki bir
+seviyenin girişin yanlış tarafında kalması hâlinde ikinci savunma katmanı
+olarak KORUNUR (bkz. ``levels.resolve_levels``).
 
 Fail-closed: ``kind`` çözülemezse ``FollowerParseError`` (HTTP 422) — bir alarm
 mesajı beklenmedik biçimdeyse "yön sinyali" sanıp işlem açmaktansa reddetmek
@@ -82,6 +110,13 @@ from src.strategies.scalper.types import Direction
 
 _SYMBOL_TOKEN_RE = re.compile(r"^([A-Z0-9]{2,15}USDT)(?:\.P)?$")
 _SYMBOL_ANY_RE = re.compile(r"\b([A-Z0-9]{2,15}USDT)(?:\.P)?\b")
+# Katı AlgoPro parmak izi: borsa nitelikli sembol bölümü (`| BINANCE:BTCUSDT |`).
+# `{{exchange}}:{{ticker}}` AlgoPro V1.6'nın kendi alert() metninden gelir;
+# elle yazılmış LuxAlgo/BotV3 şablonlarında ve serbest metinde BULUNMAZ.
+_ALGOPRO_SYMBOL_RE = re.compile(
+    r"(?:^|\|)\s*BINANCE\s*:\s*([A-Z0-9]{2,15}USDT)(?:\.P)?\s*(?=\||$)",
+    re.IGNORECASE,
+)
 _WORD_RE = re.compile(r"[A-Z]+[0-9]*")
 
 _LONG_WORDS = frozenset({"buy", "long", "bull", "bullish"})
@@ -227,6 +262,30 @@ def _validate_entry_level_order(
             )
 
 
+def _require_entry_levels(levels: MessageLevels) -> None:
+    """Giriş olayında DÖRT seviyenin de bulunmasını şart koş (fail-closed).
+
+    Eksik seviye = eksik merdiven. Eskiden eksik TP'ler RR kuralıyla,
+    eksik SL k×ATR ile TÜRETİLİYORDU; bu, biçimi bozulmuş (ya da AlgoPro'ya
+    ait olmayan) bir gövdeyle POZİSYON açmanın kapısıydı.
+    """
+    missing = [
+        label
+        for label, value in (
+            ("SL", levels.sl),
+            ("TP1", levels.tp1),
+            ("TP2", levels.tp2),
+            ("TP3", levels.tp3),
+        )
+        if value is None
+    ]
+    if missing:
+        raise FollowerParseError(
+            f"Giriş olayında zorunlu seviye(ler) eksik: {', '.join(missing)} "
+            f"— AlgoPro V1.6 girişleri DÖRT seviyeyi de taşır; giriş reddedildi"
+        )
+
+
 def _parse_key_value_template(text: str) -> Optional[FollowerEvent]:
     """İkincil biçim: ``kind=… src=… px=…``. ``kind=`` yoksa None döner."""
     tokens = text.split()
@@ -268,6 +327,11 @@ def _parse_key_value_template(text: str) -> Optional[FollowerEvent]:
         tp3=_parse_positive_float(fields.get("tp3")),
     )
     if kind == KIND_ENTRY:
+        if price is None:
+            raise FollowerParseError(
+                "Giriş olayında 'px=' alanı yok ya da geçersiz — giriş reddedildi"
+            )
+        _require_entry_levels(levels)
         _validate_entry_level_order(direction, price, levels)
 
     return FollowerEvent(
@@ -285,19 +349,20 @@ def _parse_key_value_template(text: str) -> Optional[FollowerEvent]:
 
 
 def _parse_algopro_message(text: str) -> FollowerEvent:
-    """Birincil biçim: AlgoPro V1.6'nın ``|`` ayraçlı kendi mesajı."""
+    """Birincil biçim: AlgoPro V1.6'nın ``|`` ayraçlı kendi mesajı (KATI).
+
+    Modül başlığındaki 5 koşulun hepsi aranır; biri eksikse gövde AlgoPro
+    V1.6 alarmı DEĞİLDİR ve ``FollowerParseError`` ile reddedilir.
+    """
     segments = [seg.strip() for seg in text.split("|")]
     if len(segments) > _MAX_SEGMENTS:
         raise FollowerParseError(f"Gövde çok fazla alan içeriyor (>{_MAX_SEGMENTS})")
 
     fields: Dict[str, str] = {}
-    symbol_candidates: List[str] = []
     for segment in segments:
         if not segment:
             continue
-        symbol = _normalize_symbol(segment)
-        if symbol:
-            symbol_candidates.append(symbol)
+        if _normalize_symbol(segment):
             continue
         key, sep, value = segment.partition(":")
         if sep:
@@ -305,51 +370,50 @@ def _parse_algopro_message(text: str) -> FollowerEvent:
             if normalized:
                 fields[normalized] = value.strip()
 
-    # Çözüm SIRASI önemlidir (yanlış sınıflandırma = yanlış işlem):
-    #   1) BAŞLIKTA olay anahtarı (SL HIT / TPn HIT / EXIT)
-    #   2) BAŞLIKTA yön (BUY/SELL) → giriş
-    #   3) GÖVDEDE olay anahtarı — başlık tanınmadıysa son çare
-    #   4) GÖVDEDE yön → giriş
-    # 2. adım 3. adımdan ÖNCE gelir: ileride giriş mesajına "Exit: trailing"
-    # gibi bir ALAN eklenirse gövde taraması girişi "exit" sanardı.
-    upper = text.upper()
+    # (2) Borsa nitelikli sembol — parmak izinin ANA direği. Çıplak "BTCUSDT"
+    # geçen serbest metin bu kapıdan geçemez.
+    symbol_match = _ALGOPRO_SYMBOL_RE.search(text)
+    if symbol_match is None:
+        raise FollowerParseError(
+            "AlgoPro V1.6 biçimi değil: '| BINANCE:<SEMBOL>USDT |' bölümü yok "
+            "— gövde iletilmedi/işlenmedi (alert biçimini doğrula)"
+        )
+    symbol = symbol_match.group(1).upper()
+
+    # (1) Olay anahtarı YALNIZ BAŞLIKTAN okunur. Gövde taraması KALDIRILDI:
+    # "Exit: trailing" gibi bir ALAN ya da serbest metindeki bir yön kelimesi
+    # olay türünü sessizce değiştiremesin (fail-open kapatıldı).
     header = segments[0].upper() if segments else ""
     header_words = [word.lower() for word in _WORD_RE.findall(header)]
 
     kind: Optional[str] = None
-    direction: Optional[Direction] = None
-
     for keyword, mapped in _KIND_KEYWORDS:
         if keyword in header:
             kind = mapped
             break
-
+    # HIT/EXIT olaylarında yön mesajda varsa taşınır (zorunlu değil).
+    direction = _resolve_direction(header_words, "")
     if kind is None:
-        direction = _resolve_direction(header_words, "")
-        if direction is not None:
-            kind = KIND_ENTRY
-    else:
-        # HIT/EXIT olaylarında yön mesajda varsa taşınır (zorunlu değil).
-        direction = _resolve_direction(header_words, "")
-
-    if kind is None:
-        for keyword, mapped in _KIND_KEYWORDS:
-            if keyword in upper:
-                kind = mapped
-                break
-
-    if kind is None:
-        direction = _resolve_direction([], text.lower())
         if direction is None:
             raise FollowerParseError(
-                "Olay türü çözülemedi — gövdede BUY/SELL/EXIT/TP HIT/SL HIT yok "
-                "(AlgoPro alert biçimi değişmiş olabilir)"
+                "AlgoPro V1.6 biçimi değil: başlıkta olay anahtarı yok "
+                "(BUY/SELL/EXIT/TP1|TP2|TP3 HIT/SL HIT) — alert biçimi "
+                "değişmiş olabilir"
             )
         kind = KIND_ENTRY
 
-    symbol = _resolve_symbol(symbol_candidates, text)
-
+    # (3) ve (4): TF + Price her AlgoPro olayında vardır (ölçüldü).
+    timeframe = str(fields.get("tf", "")).strip()
+    if not timeframe:
+        raise FollowerParseError(
+            "AlgoPro V1.6 biçimi değil: '| TF: …' alanı yok"
+        )
     price = _parse_positive_float(fields.get("price"))
+    if price is None:
+        raise FollowerParseError(
+            "AlgoPro V1.6 biçimi değil: '| Price: …' alanı yok ya da geçersiz"
+        )
+
     levels = MessageLevels(
         sl=_parse_positive_float(fields.get("sl")),
         tp1=_parse_positive_float(fields.get("tp1")),
@@ -357,13 +421,14 @@ def _parse_algopro_message(text: str) -> FollowerEvent:
         tp3=_parse_positive_float(fields.get("tp3")),
     )
     if kind == KIND_ENTRY:
+        _require_entry_levels(levels)
         _validate_entry_level_order(direction, price, levels)
 
     return FollowerEvent(
         kind=kind,
         symbol=symbol,
         direction=direction,
-        timeframe=str(fields.get("tf", "")).strip(),
+        timeframe=timeframe,
         price=price,
         ts=str(fields.get("time", "") or fields.get("t", "")).strip()[:64],
         levels=levels,
@@ -371,6 +436,26 @@ def _parse_algopro_message(text: str) -> FollowerEvent:
         tqi=_parse_finite_float(fields.get("tqi")),
         source="algopro",
     )
+
+
+def algopro_alert_kind(raw: str) -> Optional[str]:
+    """Gövde GERÇEK bir AlgoPro V1.6 alarmı mı? Öyleyse ``kind``, değilse None.
+
+    Köprü (``src/services/follower_forwarder.py``) ve takipçi girişi AYNI
+    tanıyıcıyı kullanır: iki yerde iki farklı "AlgoPro mı?" kuralı olması,
+    ana botun ilettiği bir gövdenin takipçide 422 alması (ya da tersi)
+    demektir. ``?src=`` / ``TV_SOURCE_ALLOWLIST`` bu karara GİRMEZ — karar
+    yalnız GÖVDENİN biçimine dayanır.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        return _parse_algopro_message(text).kind
+    except FollowerParseError:
+        return None
+    except Exception:  # savunmacı: tanıyıcı ASLA çağıranı düşürmez
+        return None
 
 
 def parse_follower_event(raw: str) -> FollowerEvent:

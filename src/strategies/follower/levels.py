@@ -68,6 +68,47 @@ def _tp_on_correct_side(direction: Direction, entry: float, tp: float) -> bool:
     return tp > entry if direction == Direction.LONG else tp < entry
 
 
+# Public sarmalayıcılar: aynı taraf kuralını executor/engine de kullanır —
+# ikinci bir kopya, iki farklı "hangi taraf?" tanımı demektir.
+def stop_on_correct_side(
+    direction: Direction, reference: float, stop: float
+) -> bool:
+    """Stop, ``reference`` fiyatının KORUYUCU tarafında mı?
+
+    LONG'da stop ALTINDA, SHORT'ta ÜSTÜNDE olmalıdır. ``reference`` sinyal
+    fiyatı DEĞİL, kararın verildiği andaki fiyattır (canlı fiyat ya da gerçek
+    dolum): AlgoPro'nun stopu, dolum o seviyeyi GEÇTİKTEN sonra artık bir
+    stop değil, "zaten vurulmuş" bir seviyedir.
+    """
+    if not _is_finite_positive(reference) or not _is_finite_positive(stop):
+        return False
+    return _stop_on_correct_side(direction, float(reference), float(stop))
+
+
+def tp_on_correct_side(direction: Direction, reference: float, tp: float) -> bool:
+    """TP, ``reference`` fiyatının KÂR tarafında mı? (LONG: üstünde)"""
+    if not _is_finite_positive(reference) or not _is_finite_positive(tp):
+        return False
+    return _tp_on_correct_side(direction, float(reference), float(tp))
+
+
+def signal_drift_limit_pct(sl_pct: float, cfg: Any) -> float:
+    """Alarm fiyatı ile canlı fiyat arasında izin verilen azami sapma (%).
+
+    ``FOLLOWER_MAX_SIGNAL_DRIFT_PCT`` > 0 ise o; aksi halde TÜRETİLMİŞ
+    varsayılan: stop mesafesinin YARISI. Gerekçe: AlgoPro'nun SL/TP'leri
+    alarm fiyatına göre çizilir; fiyat stop mesafesinin yarısını geçmişse
+    RR merdiveni artık mesajdaki merdiven değildir (TP1 = 0.5×SL mesafesi
+    olduğu için TP1 fiilen ARKAMIZDA kalabilir).
+    """
+    configured = _cfg_float(cfg, "follower_max_signal_drift_pct", 0.0)
+    if configured > 0:
+        return configured
+    if not _is_finite_positive(sl_pct):
+        return 0.0
+    return float(sl_pct) * 0.5
+
+
 def rr_multipliers(cfg: Any) -> Tuple[float, float, float]:
     """TP'lerin SL mesafesine oranı (varsayılan 0.5 / 1.0 / 1.5)."""
     return (

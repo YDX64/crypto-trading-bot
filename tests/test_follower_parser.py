@@ -171,13 +171,14 @@ class TestRealEntryThenTpHitSequence:
 class TestToleranceAndNormalization:
     def test_symbol_prefix_and_perp_suffix(self):
         event = parse_follower_event(
-            "🟢 BUY | BINANCE:SOLUSDT.P | TF: 1 | Price: 150.5 | SL: 149.0"
+            "🟢 BUY | BINANCE:SOLUSDT.P | TF: 1 | Price: 150.5 | SL: 149.0 "
+            "| TP1: 151.25 | TP2: 152.0 | TP3: 152.75"
         )
         assert event.symbol == "SOLUSDT"
 
     def test_case_and_spacing_tolerant(self):
         event = parse_follower_event(
-            "sell|binance:btcusdt|tf:1|price:100|sl:101".upper()
+            "sell|binance:btcusdt|tf:1|price:100|sl:101|tp1:99|tp2:98|tp3:97".upper()
         )
         assert event.kind == "entry"
         assert event.direction == Direction.SHORT
@@ -190,18 +191,28 @@ class TestToleranceAndNormalization:
         )
         assert event.kind == "sl"
 
-    def test_negative_or_zero_levels_ignored(self):
+    def test_negative_or_zero_levels_are_ignored_on_hit_events(self):
+        """HIT olaylarında bozuk seviye alanı yok sayılır (giriş DEĞİL)."""
         event = parse_follower_event(
-            "🟢 BUY | BINANCE:BTCUSDT | TF: 1 | Price: 100 | SL: 0 | TP1: -5"
+            "🎯 TP1 HIT | BINANCE:BTCUSDT | TF: 1 | Price: 100 | SL: 0 | TP1: -5"
         )
         assert event.levels.sl is None
         assert event.levels.tp1 is None
 
-    def test_nan_level_ignored(self):
-        event = parse_follower_event(
-            "🟢 BUY | BINANCE:BTCUSDT | TF: 1 | Price: 100 | SL: nan"
-        )
-        assert event.levels.sl is None
+    def test_negative_or_zero_levels_reject_an_entry(self):
+        """GİRİŞTE bozuk seviye "eksik" demektir → 422 (katı tanıyıcı)."""
+        with pytest.raises(FollowerParseError, match="zorunlu seviye"):
+            parse_follower_event(
+                "🟢 BUY | BINANCE:BTCUSDT | TF: 1 | Price: 100 | SL: 0 "
+                "| TP1: -5 | TP2: 110 | TP3: 115"
+            )
+
+    def test_nan_level_rejects_an_entry(self):
+        with pytest.raises(FollowerParseError, match="zorunlu seviye"):
+            parse_follower_event(
+                "🟢 BUY | BINANCE:BTCUSDT | TF: 1 | Price: 100 | SL: nan "
+                "| TP1: 101 | TP2: 102 | TP3: 103"
+            )
 
 
 class TestKeyValueTemplate:
@@ -223,8 +234,9 @@ class TestKeyValueTemplate:
     )
     def test_all_kinds(self, kind):
         direction = "sell" if kind == "entry" else ""
+        levels = " sl=101 tp1=99 tp2=98 tp3=97" if kind == "entry" else ""
         event = parse_follower_event(
-            f"src=algopro kind={kind} {direction} BTCUSDT tf=1 px=100"
+            f"src=algopro kind={kind} {direction} BTCUSDT tf=1 px=100{levels}"
         )
         assert event.kind == kind
 
@@ -354,7 +366,8 @@ class TestEntryLevelOrdering:
     def test_long_with_tp_below_price_rejected(self):
         with pytest.raises(FollowerParseError, match="Seviye sırası"):
             parse_follower_event(
-                "🟢 BUY | BINANCE:BTCUSDT | TF: 1 | Price: 100 | SL: 99 | TP1: 98"
+                "🟢 BUY | BINANCE:BTCUSDT | TF: 1 | Price: 100 | SL: 99 "
+                "| TP1: 98 | TP2: 110 | TP3: 115"
             )
 
     def test_swapped_tp2_tp3_rejected(self):
@@ -376,31 +389,105 @@ class TestEntryLevelOrdering:
         """Sıfır mesafeli seviye emir olarak konulamaz — eşitlik tutarsızlıktır."""
         with pytest.raises(FollowerParseError, match="Seviye sırası"):
             parse_follower_event(
-                "🟢 BUY | BINANCE:BTCUSDT | TF: 1 | Price: 100 | SL: 100 | TP1: 101"
+                "🟢 BUY | BINANCE:BTCUSDT | TF: 1 | Price: 100 | SL: 100 "
+                "| TP1: 101 | TP2: 102 | TP3: 103"
             )
 
-    def test_missing_levels_do_not_break_the_chain(self):
-        """TP2 yoksa zincir TP1→TP3 olarak kurulur ve geçerli kalır."""
-        event = parse_follower_event(
-            "🟢 BUY | BINANCE:BTCUSDT | TF: 1 | Price: 100 | SL: 99 "
-            "| TP1: 101 | TP3: 103"
-        )
-        assert event.kind == "entry"
-        assert event.levels.tp2 is None
+    def test_missing_level_rejects_the_entry(self):
+        """TP2 yoksa merdiven eksiktir → giriş 422 (eski davranış: türetilirdi)."""
+        with pytest.raises(FollowerParseError, match="zorunlu seviye"):
+            parse_follower_event(
+                "🟢 BUY | BINANCE:BTCUSDT | TF: 1 | Price: 100 | SL: 99 "
+                "| TP1: 101 | TP3: 103"
+            )
 
-    def test_price_only_entry_is_accepted(self):
-        """Seviyesiz giriş (ATR yedek yoluna düşer) doğrulamaya takılmaz."""
-        event = parse_follower_event("🟢 BUY | BINANCE:BTCUSDT | TF: 1 | Price: 100")
-        assert event.kind == "entry"
-        assert event.levels.has_any is False
+    def test_price_only_entry_is_rejected(self):
+        """Seviyesiz giriş ARTIK kabul edilmez (katı AlgoPro tanıyıcısı)."""
+        with pytest.raises(FollowerParseError, match="zorunlu seviye"):
+            parse_follower_event("🟢 BUY | BINANCE:BTCUSDT | TF: 1 | Price: 100")
 
     def test_ordering_applies_to_key_value_template_too(self):
         with pytest.raises(FollowerParseError, match="Seviye sırası"):
             parse_follower_event(
-                "kind=entry buy BTCUSDT tf=1 px=100 sl=101 tp1=105"
+                "kind=entry buy BTCUSDT tf=1 px=100 sl=101 tp1=105 tp2=110 tp3=115"
             )
 
     def test_hit_events_are_not_order_checked(self):
         """HIT/EXIT olaylarında yön yoktur; sıra doğrulaması UYGULANMAZ."""
         assert parse_follower_event(REAL_BUY_SL_HIT).kind == "sl"
         assert parse_follower_event(EXIT).kind == "exit"
+
+
+class TestStrictAlgoproRecognizer:
+    """Düşmanca inceleme bulgu 2 + 5: FAIL-OPEN kapatıldı.
+
+    Eski davranış: tanınmayan bir gövdede yalnız bir YÖN KELİMESİ geçmesi
+    (LuxAlgo şablonu, serbest metin, bozulmuş AlgoPro mesajı) `kind=entry`
+    üretiyor ve POZİSYON açtırabiliyordu. Bu testler düzeltme olmadan
+    KIRMIZIDIR (o gövdeler eskiden `entry` dönerdi).
+    """
+
+    FAIL_OPEN_BODIES = [
+        # Serbest metin + yön kelimesi (eski: entry).
+        "Bullish reversal detected on BTCUSDT",
+        # LuxAlgo şablonu (borsa niteliği ve TF/Price alanları yok).
+        "src=luxosc BTCUSDT long confirmation 4h",
+        # AlgoPro'ya benzeyen ama borsa niteliği OLMAYAN gövde.
+        "🟢 BUY | BTCUSDT | TF: 1 | Price: 100 | SL: 99 | TP1: 101 | TP2: 102 | TP3: 103",
+        # Başka bir borsa (takipçi Binance futures'ta işlem yapar).
+        "🟢 BUY | BYBIT:BTCUSDT | TF: 1 | Price: 100 | SL: 99 | TP1: 101 | TP2: 102 | TP3: 103",
+        # TF alanı yok.
+        "🟢 BUY | BINANCE:BTCUSDT | Price: 100 | SL: 99 | TP1: 101 | TP2: 102 | TP3: 103",
+        # Price alanı yok.
+        "🟢 BUY | BINANCE:BTCUSDT | TF: 1 | SL: 99 | TP1: 101 | TP2: 102 | TP3: 103",
+        # Olay anahtarı BAŞLIKTA değil, gövdenin ortasında (eski: son çare taraması).
+        "BINANCE:BTCUSDT | TF: 1 | Price: 100 | note: SL HIT",
+    ]
+
+    @pytest.mark.parametrize("body", FAIL_OPEN_BODIES)
+    def test_non_algopro_bodies_are_rejected(self, body):
+        with pytest.raises(FollowerParseError):
+            parse_follower_event(body)
+
+    @pytest.mark.parametrize("body", FAIL_OPEN_BODIES)
+    def test_recognizer_says_not_algopro(self, body):
+        from src.strategies.follower.parser import algopro_alert_kind
+
+        assert algopro_alert_kind(body) is None
+
+    @pytest.mark.parametrize(
+        "body,kind",
+        [
+            (REAL_SELL, "entry"),
+            (REAL_BUY, "entry"),
+            (REAL_TP1_HIT_2, "tp1"),
+            (REAL_TP2_HIT_2, "tp2"),
+            (REAL_TP3_HIT_2, "tp3"),
+            (REAL_BUY_SL_HIT, "sl"),
+            (EXIT, "exit"),
+        ],
+    )
+    def test_real_bodies_are_recognized(self, body, kind):
+        from src.strategies.follower.parser import algopro_alert_kind
+
+        assert algopro_alert_kind(body) == kind
+
+    def test_recognizer_never_raises(self):
+        from src.strategies.follower.parser import algopro_alert_kind
+
+        for body in ("", "   ", None, "|" * 200, "🟢 BUY |" + "x" * 5000):
+            assert algopro_alert_kind(body) is None or isinstance(
+                algopro_alert_kind(body), str
+            )
+
+    def test_template_form_is_not_recognized_as_algopro(self):
+        """`kind=` şablonu ELLE test yoludur — köprü onu İLETMEZ."""
+        from src.strategies.follower.parser import algopro_alert_kind
+
+        assert (
+            algopro_alert_kind(
+                "src=algopro kind=entry buy BTCUSDT tf=1 px=100 sl=99 "
+                "tp1=101 tp2=102 tp3=103"
+            )
+            is None
+        )

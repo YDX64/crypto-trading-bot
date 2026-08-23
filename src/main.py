@@ -13,6 +13,7 @@ import math
 import os
 import re
 import signal
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
@@ -933,20 +934,23 @@ def resolve_tv_source(raw_src_param: Optional[str], raw_body: str):
 
 
 def _maybe_forward_to_follower(request: Request, raw: str) -> None:
-    """AlgoPro kaynaklı TV olayını takipçi halkasına ilet (fire-and-forget).
+    """GERÇEK AlgoPro gövdesini takipçi halkasına ilet (fire-and-forget).
 
-    Ana motorun akışını ETKİLEMEZ: ayrı task, 2 sn timeout, her hata loglanır
-    ve yutulur (bkz. `src/services/follower_forwarder.py`). Kaynak tespiti
-    mevcut `resolve_tv_source` ile AYNIDIR — yeni bir parmak izi mantığı
-    yazılmadı; yalnız "algopro" olarak çözülen olaylar iletilir.
+    Ana motorun akışını ETKİLEMEZ: ayrı task, kısa bağlantı timeout'u, her
+    hata loglanır ve yutulur (bkz. `src/services/follower_forwarder.py`).
 
-    Bu fonksiyon BİLİNÇLİ olarak ayrı tutulmuştur: `/tv-signal`'a paralel
-    çalışan başka bir değişiklik (gövde-yönlendirme) ile çakışma yüzeyini tek
-    satıra indirir.
+    D20a (düşmanca inceleme bulgu 5): iletim kararı ARTIK `resolve_tv_source`
+    ile VERİLMEZ. O çözücü `?src=` yoksa gövdede `"| TF:"` ya da `"| Price:"`
+    görmesi yeterli sayıyordu — elle yazılmış bir LuxAlgo/BotV3 şablonu bu
+    parmak izini taşıyabilir ve takipçide sonucu POZİSYON açmaktır. Karar
+    artık gövdenin KENDİSİNE bakan katı tanıyıcıdadır
+    (`follower/parser.algopro_alert_kind`) ve `TV_SOURCE_ALLOWLIST`'ten
+    BAĞIMSIZDIR; `?src=` yalnız telemetri/log olarak taşınır.
     """
     try:
-        source, _ = resolve_tv_source(request.query_params.get("src"), raw)
-        maybe_forward_algopro_event(raw, source)
+        maybe_forward_algopro_event(
+            raw, str(request.query_params.get("src") or "")
+        )
     except Exception as exc:  # savunmacı: köprü ana akışı ASLA düşürmez
         app_logger.warning(f"⚠️ Takipçi köprüsü çağrılamadı ({exc})")
 
@@ -1894,6 +1898,10 @@ async def follower_event(request: Request):
             detail="Takipçi kanalı devre dışı — .env'e FOLLOWER_FORWARD_SECRET ekleyin",
         )
 
+    # Olay YAŞI buradan ölçülür (D20a bulgu 6): motor, global `_entry_lock`
+    # kuyruğunda beklemiş bayat bir sinyalle giriş AÇMAMALIDIR.
+    received_monotonic = time.monotonic()
+
     raw_bytes = await request.body()
     if len(raw_bytes) > _FOLLOWER_EVENT_MAX_BODY_BYTES:
         raise HTTPException(status_code=422, detail="Gövde çok büyük (>4KB)")
@@ -1926,7 +1934,9 @@ async def follower_event(request: Request):
     if not follower_engine:
         raise HTTPException(status_code=503, detail="Takipçi motoru hazır değil")
 
-    result = await follower_engine.handle_event(event)
+    result = await follower_engine.handle_event(
+        event, received_monotonic=received_monotonic
+    )
     return {
         "ok": True,
         "kind": event.kind,
@@ -1938,10 +1948,40 @@ async def follower_event(request: Request):
 
 @app.get("/follower/status")
 async def follower_status():
-    """Takipçi motorunun anlık durumu (pozisyonlar, boyutlama, son olaylar)."""
+    """Takipçi motorunun anlık durumu (pozisyonlar, boyutlama, son olaylar).
+
+    MOD İZOLASYONU: scalper halkasında (`BOT_MODE=scalper`) bu uç nokta
+    **404** döner. Eskiden boş bir "takipçi durumu" gövdesi dönüyordu ve
+    yanlış halkaya bakan bir operatör "takipçi çalışmıyor / pozisyon yok"
+    sonucunu çıkarabiliyordu — oysa takipçi BAŞKA bir süreçte (:9093)
+    çalışıyor olabilir. Boş gövde artık YALNIZ takipçi modunda (motor henüz
+    kurulmamışken) döner.
+    """
+    if not settings.is_follower_mode:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Bu süreç takipçi halkası DEĞİL (BOT_MODE="
+                f"{settings.bot_mode}). Takipçi durumu kendi sürecindedir "
+                "(varsayılan :9093/follower/status)."
+            ),
+        )
     if not follower_engine:
         return dict(_EMPTY_FOLLOWER_STATUS)
     return follower_engine.snapshot()
+
+
+@app.get("/follower/forwarder")
+async def follower_forwarder_stats():
+    """Köprü sayaçları — ANA BOTTA (scalper halkası) okunur.
+
+    "Sessiz kalmaz" ilkesinin sayaç tarafı: kaç gövde iletildi, kaçı AlgoPro
+    biçiminde olmadığı için ATLANDI, kaçı taşıma hatası aldı. Secret İÇERMEZ
+    (`forwarder_stats` yalnız gövdenin ilk 80 karakterini teşhis için taşır).
+    """
+    from src.services.follower_forwarder import forwarder_stats
+
+    return forwarder_stats()
 
 
 @app.post("/signal", dependencies=[Depends(require_api_key)])

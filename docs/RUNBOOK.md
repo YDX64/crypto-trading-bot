@@ -76,9 +76,23 @@ başlayan TÜM anahtarlar (yani `SCALPER_TV_EVENTS_*`, `SCALPER_STRUCTURE_*`,
 `APP_ENV`, `LOG_LEVEL` — halkaların ayrıştığını doğrularken bunlara ELLE bak.
 
 `.env` değişikliği deploy'dan AYRI bir adımdır:
+temiz ağaç, yerel HEAD == origin/main, **`.env` `BOT_MODE`'u halkayla uyumlu** (D20a bulgu 4:
+`RING=testnet/mainnet` + `BOT_MODE=follower` = deploy REDDEDİLİR; `RING=follower` +
+`BOT_MODE=follower` YOKSA da reddedilir). `RING` artık `REPO_DIR`/`PROGRAM`/`HEALTH_URL`/
+entry-halt dosyasının TEK KAYNAĞIDIR; uyumsuz override `die` eder.
+
+### Güvenli yeniden başlatma (`scripts/restart_safe.sh`)
+`.env` değişikliği deploy'dan AYRI bir adımdır ve **çıplak `supervisorctl restart`
+KULLANILMAZ** — o yol ban penceresini, entry-halt kilidini, `.env` yedeğini ve sağlık
+yoklamasını ATLAR. Bunun yerine:
 ```bash
-ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date +%Y%m%d)-<etiket> && sed -i "s/^ANAHTAR=.*/ANAHTAR=deger/" .env && ./.venv/bin/python -c "from src.core.config import settings as s; print(s.<alan>)" && supervisorctl restart tradingbot_v2'
+ssh awa 'cd /opt/tradingbot-v2 && cp .env "backups/env.bak-$(date -u +%Y%m%d-%H%M%S)-<etiket>" && sed -i "s/^ANAHTAR=.*/ANAHTAR=deger/" .env && ./.venv/bin/python -c "from src.core.config import settings as s; print(s.<alan>)" && RESTART_LABEL=<etiket> scripts/restart_safe.sh testnet'
 ```
+`restart_safe.sh <testnet|follower|mainnet>` sırayla: halka↔`BOT_MODE` kontrolü →
+entry-halt kontrolü → ban penceresi (son 15 dk `HTTP 418|banned`) → **saniye damgalı**
+`.env` yedeği (aynı gün ikinci uygulama temiz yedeği EZMEZ) → `.env` parse doğrulaması →
+restart → sağlık yoklaması (240 sn'ye kadar). Herhangi biri başarısızsa restart YAPILMAZ
+ve yedek yolu log satırında verilir.
 Restart'ı kanıtla: `ps -o etimes= -p $(supervisorctl pid tradingbot_v2)` küçük olmalı.
 **Açılış süresi:** port 9091, restart'tan ~90 sn sonra açılır (Binance init + pozisyon devralma); deploy
 script'i bu yüzden 240 sn'ye kadar yoklar (`HEALTH_TIMEOUT`). 2026-08-21'de 30 sn'lik sabit bekleme
@@ -189,7 +203,7 @@ HİÇ etkilenmez — ayrı dizin, ayrı süreç, ayrı Binance testnet hesabı, 
    ```
 4. **Ana bota köprüyü aç** (scalper halkasının `.env`'i — deploy'dan AYRI adım):
    ```bash
-   ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date +%Y%m%d)-follower && { grep -q "^FOLLOWER_FORWARD_URL=" .env && sed -i "s|^FOLLOWER_FORWARD_URL=.*|FOLLOWER_FORWARD_URL=http://127.0.0.1:9093/follower/event|" .env || echo "FOLLOWER_FORWARD_URL=http://127.0.0.1:9093/follower/event" >> .env; } && { grep -q "^FOLLOWER_FORWARD_SECRET=" .env && sed -i "s|^FOLLOWER_FORWARD_SECRET=.*|FOLLOWER_FORWARD_SECRET=<SECRET>|" .env || echo "FOLLOWER_FORWARD_SECRET=<SECRET>" >> .env; } && ./.venv/bin/python -c "from src.core.config import settings as s; assert s.follower_forward_url and s.follower_forward_secret, \"KÖPRÜ AÇILMADI\"; print(\"forward_url=\", s.follower_forward_url)" && supervisorctl restart tradingbot_v2'
+   ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date -u +%Y%m%d-%H%M%S)-follower && { grep -q "^FOLLOWER_FORWARD_URL=" .env && sed -i "s|^FOLLOWER_FORWARD_URL=.*|FOLLOWER_FORWARD_URL=http://127.0.0.1:9093/follower/event|" .env || echo "FOLLOWER_FORWARD_URL=http://127.0.0.1:9093/follower/event" >> .env; } && { grep -q "^FOLLOWER_FORWARD_SECRET=" .env && sed -i "s|^FOLLOWER_FORWARD_SECRET=.*|FOLLOWER_FORWARD_SECRET=<SECRET>|" .env || echo "FOLLOWER_FORWARD_SECRET=<SECRET>" >> .env; } && ./.venv/bin/python -c "from src.core.config import settings as s; assert s.follower_forward_url and s.follower_forward_secret, \"KÖPRÜ AÇILMADI\"; print(\"forward_url=\", s.follower_forward_url)" && RESTART_LABEL=bridge-on scripts/restart_safe.sh testnet'
    ```
    ⚠️ `sed -i` eşleşme bulamazsa 0 ile çıkar — bu yüzden `{ grep -q … && sed … || echo …; }`
    grubu ve restart'tan ÖNCE `assert`'li geri-okuma ZORUNLUDUR (bkz. "Gölge modu" uyarısı).
@@ -233,31 +247,54 @@ mesajları yön kelimesi taşımadığı için ana botta **422** alır (işlem A
 bu 422'den ÖNCE çalıştığı için takipçi olayı yine de alır. Ana botta `kind` bazlı
 gövde-yönlendirme ayrı bir çalışmadadır; o merge edilmeden alarm sayısını artırma.
 
-**Akış:** TV → ana bot `/tv-signal` (secret doğrulanır) → `src=algopro` ise gövde
-`FOLLOWER_FORWARD_URL`'e İLETİLİR (ayrı task, 20 sn timeout, hata yalnız loglanır) →
-takipçi `/follower/event` (secret `X-Follower-Secret` başlığında) → `FollowerEngine`.
+**Akış:** TV → ana bot `/tv-signal` (secret doğrulanır) → gövde **KATI AlgoPro V1.6
+tanıyıcısından** geçerse `FOLLOWER_FORWARD_URL`'e İLETİLİR (ayrı task; bağlantı 2 sn,
+okuma `FOLLOWER_FORWARD_TIMEOUT_SECONDS`=20 sn; hata yalnız loglanır) → takipçi
+`/follower/event` (secret `X-Follower-Secret` başlığında) → `FollowerEngine`.
+
+⚠️ **D20a: iletim kararı `?src=`'e DEĞİL GÖVDEYE bakar.** Bir gövdenin iletilmesi için
+başlıkta olay anahtarı (`BUY`/`SELL`/`EXIT`/`TPn HIT`/`SL HIT`) + `| BINANCE:<SEMBOL> |`
++ `| TF:` + `| Price:` (girişlerde ayrıca DÖRT seviye) ŞARTTIR. LuxAlgo/BotV3/serbest
+metin — `?src=algopro` yazsa bile — ASLA iletilmez. Sayaçlar:
+`curl -sS http://127.0.0.1:9091/follower/forwarder | python3 -m json.tool`
+(`counters.forwarded`, `counters.skipped_not_algopro`, `counters.transport_error`,
+`suppressed_warnings`; `last_skipped.body_head` secret MASKELİDİR). Başarısız iletim
+uyarıları dakikada 1 ile sınırlıdır — sayaç artıyorsa log satırı olmasa da arıza vardır.
 
 ⚠️ **`/follower/event` `?secret=` KABUL ETMEZ** (403). Erişim logu query string'i
 düz metin yazar; secret yalnız `X-Follower-Secret` başlığında ya da gövdede
 (`secret=… kind=…`) taşınır. Elle test:
 `curl -sS -H 'X-Follower-Secret: <SECRET>' --data-binary '<gövde>' http://127.0.0.1:9093/follower/event`
 
-⚠️ **Deploy ÖNCESİ doğrula — `?src=` olmayan alarmlar:** `resolve_tv_source`,
-`?src=` taşımayan bir gövdeyi `| TF:` / `| Price:` damgalarına bakarak "algopro"
-sayabilir. TradingView'daki mevcut alarmların webhook URL'lerini tara: `?src=`
-İÇERMEYEN bir alarmın gövdesinde bu iki damga geçiyorsa o olay da takipçiye
-iletilir ve takipçi hesabında pozisyon açabilir. (Bu parmak izi bugün de TV
-sağlaması için kullanılıyor — yani yanlış sınıflandırma yeni bir risk değil,
-ama takipçide sonucu POZİSYON açmaktır.)
+✅ **(D20a'da KAPATILDI)** Eski uyarı: `?src=` taşımayan bir gövde `| TF:` / `| Price:`
+damgalarıyla "algopro" sayılabiliyordu. Artık iletim için borsa nitelikli sembol
+(`| BINANCE:<SEMBOL> |`) ve başlıkta olay anahtarı da şart — elle yazılmış bir LuxAlgo
+şablonu bu kapıdan GEÇEMEZ. `?src=` etiketi TV sağlaması (TvConfluence) için hâlâ
+anlamlıdır ve o tarafta DEĞİŞMEDİ.
 
 **Ne görürsün:**
 - `logs/bot.log`: `🤖 AlgoPro takipçi motoru başlatılıyor`, her girişte
   `🎯 <SEMBOL>: AlgoPro <YÖN> girişi açıldı (lev=..x, sl_pct=%.., sl_roi=%.., marj=..)`.
-- ⚠️ `TP1 ROI ... gidiş-dönüş komisyonun ... ALTINDA`: kaldıraç 100x tavanına
-  dayanmış demektir (dar stop). Bu işlemde üç TP de dolsa sonuç net negatif
-  olabilir ve break-even KURULAMAZ (`break-even seviyesi ... yanlış tarafında`
-  uyarısı bunun devamıdır — pozisyon acil KAPATILMAZ, AlgoPro stopu kalır).
-  Kapı varsayılan KAPALI: `FOLLOWER_MIN_TP1_FEE_RATIO`. Bkz. D20 "ücret eşiği".
+- 🚫 `TP1 ROI (%..) gidiş-dönüş komisyonun (1×%..) altında — giriş yapılmadı`:
+  **ücret eşiği kapısı** (D20a bulgu 3, varsayılan AÇIK). Stop mesafesi %0.20'nin
+  altındaysa (taker %0.05, RR1 0.5) işlem aritmetik olarak negatiftir ve HİÇ açılmaz.
+  Sayaç: `/follower/status → reject_counters.fee_gate`; defter satırı:
+  `state/follower_levels.jsonl` (`rejected: "fee_gate"`). Kapatmak KULLANICI
+  KARARIDIR: `FOLLOWER_MIN_TP1_FEE_RATIO=0` (o hâlde her girişte ⚠️ WARNING
+  loglanır ve break-even çoğu işlemde KURULAMAZ).
+- 🚫 `AlgoPro stopu (..) canlı fiyatın (..) yanlış tarafında` / `sinyal fiyatı bayat`
+  / `olay bayat (.. sn > 20 sn)`: sinyal ile emir arasında fiyat kaçmış demektir —
+  giriş YAPILMADI (D20a bulgu 1/6). Sayaçlar: `stop_already_passed`, `signal_drift`,
+  `event_age`.
+- 🚨 `dolum (..) AlgoPro stopunu (..) ZATEN GEÇMİŞ`: MARKET dolumu stopun ötesine
+  kaymış; pozisyon reduce-only MARKET ile KAPATILDI ve stop yeniden ÇAPALANMADI.
+  Defterde `follower_stop_already_passed` notuyla görünür.
+- 🚨 `TAKİPÇİ YETİM POZİSYON(LAR)`: borsada açık ama motor izlemiyor (D20a bulgu 8).
+  Girişler DURDURULDU (entry-halt). Kapatmak: `POST /risk-event {"action":"flatten"}`
+  — yetimleri de kapatır; sonra `state/follower_entry_halt.json` incelenip
+  yeniden adlandırılır ve süreç yeniden başlatılır.
+- 🔧 `EKSİK TPn yeniden kondu`: merdiven bacağı borsada yoktu (restart / iptal turu);
+  yeniden konuldu. Sayaçlar: `/follower/status → tp_repair`.
 - 🚨 `TP1 emri KONULAMADI`: o pozisyonda break-even hiç kurulamaz;
   `/follower/status → reject_counters.tp1_missing` sayacında görünür.
 - `GET /follower/status` → izlenen pozisyonlar (lev/sl_pct/sl_roi/marj/TP1-2-3 durumu),
@@ -278,8 +315,10 @@ görünür (motor yok — bu bir arıza DEĞİL). Takipçinin durumu `/follower/
   `_entry_lock` altında tüm izlenen pozisyonları reduce-only MARKET ile kapatır;
   o anda uçuşta olan bir giriş de kilit sayesinde YAKALANIR.
 - Köprüyü kapat (takipçi sinyal ALMASIN): ana bottan `FOLLOWER_FORWARD_URL`'i boşalt +
-  `supervisorctl restart tradingbot_v2`. Takipçi süreci açık kalır, açık pozisyonları
-  yönetmeye devam eder.
+  `cd /opt/tradingbot-v2 && RESTART_LABEL=bridge-off scripts/restart_safe.sh testnet`.
+  Takipçi süreci açık kalır, açık pozisyonları yönetmeye devam eder.
+  ⚠️ Çıplak `supervisorctl restart` KULLANMA: ban penceresi, entry-halt ve `.env`
+  yedeği kontrolleri atlanır (bkz. "Güvenli yeniden başlatma").
 - Takipçi giriş kilidi: `state/follower_entry_halt.json` (fail-closed, `scalper_entry_halt`
   ile KARIŞTIRMA). Açmak = nedeni anla → dosyayı `.cleared-<tarih>` yap → restart.
 - Deploy ön koşulu: bu dosya varken `scripts/deploy.sh awa --ring follower` REDDEDİLİR.
@@ -391,7 +430,7 @@ alma" bölümü) aynı disiplin.
 
 **Açmak:**
 ```bash
-ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date +%Y%m%d)-shadow && { grep -q "^SCALPER_SHADOW_MODE=" .env && sed -i "s/^SCALPER_SHADOW_MODE=.*/SCALPER_SHADOW_MODE=true/" .env || echo "SCALPER_SHADOW_MODE=true" >> .env; } && ./.venv/bin/python -c "from src.core.config import settings as s; assert s.scalper_shadow_mode, \"GÖLGE AÇILMADI — .env yazılmadı\"; print(\"shadow_mode=\", s.scalper_shadow_mode)" && supervisorctl restart tradingbot_v2'
+ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date -u +%Y%m%d-%H%M%S)-shadow && { grep -q "^SCALPER_SHADOW_MODE=" .env && sed -i "s/^SCALPER_SHADOW_MODE=.*/SCALPER_SHADOW_MODE=true/" .env || echo "SCALPER_SHADOW_MODE=true" >> .env; } && ./.venv/bin/python -c "from src.core.config import settings as s; assert s.scalper_shadow_mode, \"GÖLGE AÇILMADI — .env yazılmadı\"; print(\"shadow_mode=\", s.scalper_shadow_mode)" && RESTART_LABEL=shadow scripts/restart_safe.sh testnet'
 ```
 **ZORUNLU doğrulama — soak bu ikisi geçmeden BAŞLAMIŞ SAYILMAZ:**
 1. Yukarıdaki komutun kendi `assert`'i restart'tan ÖNCE `shadow_mode= True` basmalı (basmazsa
@@ -416,7 +455,7 @@ ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date +%Y%m%d)-shadow
 
 **Kapatmak:**
 ```bash
-ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date +%Y%m%d)-shadow-off && { grep -q "^SCALPER_SHADOW_MODE=" .env && sed -i "s/^SCALPER_SHADOW_MODE=.*/SCALPER_SHADOW_MODE=false/" .env || echo "SCALPER_SHADOW_MODE=false" >> .env; } && ./.venv/bin/python -c "from src.core.config import settings as s; assert not s.scalper_shadow_mode, \"GÖLGE HÂLÂ AÇIK — .env yazılmadı\"; print(\"shadow_mode=\", s.scalper_shadow_mode)" && supervisorctl restart tradingbot_v2'
+ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date -u +%Y%m%d-%H%M%S)-shadow-off && { grep -q "^SCALPER_SHADOW_MODE=" .env && sed -i "s/^SCALPER_SHADOW_MODE=.*/SCALPER_SHADOW_MODE=false/" .env || echo "SCALPER_SHADOW_MODE=false" >> .env; } && ./.venv/bin/python -c "from src.core.config import settings as s; assert not s.scalper_shadow_mode, \"GÖLGE HÂLÂ AÇIK — .env yazılmadı\"; print(\"shadow_mode=\", s.scalper_shadow_mode)" && RESTART_LABEL=shadow-off scripts/restart_safe.sh testnet'
 ```
 Varsayılan zaten kapalı (satırı silmek de eşdeğerdir). Restart sonrası aynı iki doğrulamayı
 (python `assert` + `GET /scalper/status`) `shadow_mode: false` bekleyerek tekrarla. ⚠️
@@ -448,7 +487,7 @@ değildir** (D14 review bulgusu #4 emsali) — değeri komutta açıkça `0` yaz
 
 **Açmak (yalnız kullanıcı onayıyla):**
 ```bash
-ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date +%Y%m%d)-marketgate && for kv in "SCALPER_MARKET_GATE=true" "SCALPER_MARKET_GATE_SYMBOL=BTCUSDT" "SCALPER_MARKET_GATE_DAY_PCT=1.3" "SCALPER_MARKET_GATE_RUN_PCT=0"; do k="${kv%%=*}"; { grep -q "^$k=" .env && sed -i "s|^$k=.*|$kv|" .env || echo "$kv" >> .env; }; done && ./.venv/bin/python -c "from src.core.config import settings as s; assert s.scalper_market_gate, \"KAPI AÇILMADI\"; assert s.scalper_market_gate_day_pct == 1.3, f\"DAY_PCT={s.scalper_market_gate_day_pct}\"; assert s.scalper_market_gate_run_pct == 0, f\"RUN_PCT={s.scalper_market_gate_run_pct} — uzama alt-kapısı KAPALI olmalı\"; print(\"gate=\", s.scalper_market_gate, \"day=\", s.scalper_market_gate_day_pct, \"run=\", s.scalper_market_gate_run_pct)" && supervisorctl restart tradingbot_v2'
+ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date -u +%Y%m%d-%H%M%S)-marketgate && for kv in "SCALPER_MARKET_GATE=true" "SCALPER_MARKET_GATE_SYMBOL=BTCUSDT" "SCALPER_MARKET_GATE_DAY_PCT=1.3" "SCALPER_MARKET_GATE_RUN_PCT=0"; do k="${kv%%=*}"; { grep -q "^$k=" .env && sed -i "s|^$k=.*|$kv|" .env || echo "$kv" >> .env; }; done && ./.venv/bin/python -c "from src.core.config import settings as s; assert s.scalper_market_gate, \"KAPI AÇILMADI\"; assert s.scalper_market_gate_day_pct == 1.3, f\"DAY_PCT={s.scalper_market_gate_day_pct}\"; assert s.scalper_market_gate_run_pct == 0, f\"RUN_PCT={s.scalper_market_gate_run_pct} — uzama alt-kapısı KAPALI olmalı\"; print(\"gate=\", s.scalper_market_gate, \"day=\", s.scalper_market_gate_day_pct, \"run=\", s.scalper_market_gate_run_pct)" && RESTART_LABEL=marketgate scripts/restart_safe.sh testnet'
 ```
 `sed -i` eşleşme bulamazsa 0 ile çıkar — bu yüzden her anahtar `{ grep -q && sed || echo; }`
 grubuyla yazılır ve restart'tan ÖNCE `assert`'li config geri-okuması yapılır (D14 review
@@ -525,7 +564,7 @@ KORUMA yoktur. Sırayla bak:
 
 **Kapatmak:**
 ```bash
-ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date +%Y%m%d)-marketgate-off && { grep -q "^SCALPER_MARKET_GATE=" .env && sed -i "s/^SCALPER_MARKET_GATE=.*/SCALPER_MARKET_GATE=false/" .env || echo "SCALPER_MARKET_GATE=false" >> .env; } && ./.venv/bin/python -c "from src.core.config import settings as s; assert not s.scalper_market_gate, \"KAPI HÂLÂ AÇIK\"; print(\"gate=\", s.scalper_market_gate)" && supervisorctl restart tradingbot_v2'
+ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date -u +%Y%m%d-%H%M%S)-marketgate-off && { grep -q "^SCALPER_MARKET_GATE=" .env && sed -i "s/^SCALPER_MARKET_GATE=.*/SCALPER_MARKET_GATE=false/" .env || echo "SCALPER_MARKET_GATE=false" >> .env; } && ./.venv/bin/python -c "from src.core.config import settings as s; assert not s.scalper_market_gate, \"KAPI HÂLÂ AÇIK\"; print(\"gate=\", s.scalper_market_gate)" && RESTART_LABEL=marketgate-off scripts/restart_safe.sh testnet'
 ```
 Varsayılan zaten kapalı (satırı silmek de eşdeğerdir); kod geri alınmasına gerek yok.
 ## Kline kaynağını mainnet'e alma (`SCALPER_MARKET_DATA_BASE_URL`, D17)
@@ -550,7 +589,7 @@ sembol atlanır).
 ⚠️ `sed -i` eşleşme bulamazsa 0 ile çıkar (gölge modu bölümündeki tuzağın aynısı) — bu yüzden
 `{ grep -q ... && sed ... || echo ...; }` grubu + restart'tan ÖNCE `assert`'li geri-okuma:
 ```bash
-ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date -u +%Y%m%d-%H%M%S)-klinesrc && { grep -q "^SCALPER_MARKET_DATA_BASE_URL=" .env && sed -i "s#^SCALPER_MARKET_DATA_BASE_URL=.*#SCALPER_MARKET_DATA_BASE_URL=https://fapi.binance.com#" .env || echo "SCALPER_MARKET_DATA_BASE_URL=https://fapi.binance.com" >> .env; } && ./.venv/bin/python -c "from src.core.config import settings as s; assert s.kline_source == \"separate\", \"KLINE KAYNAĞI DEĞİŞMEDİ — .env yazılmadı\"; print(\"market_data=\", s.market_data_base_url, \"| trading=\", s.binance_base_url)" && supervisorctl restart tradingbot_v2'
+ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date -u +%Y%m%d-%H%M%S)-klinesrc && { grep -q "^SCALPER_MARKET_DATA_BASE_URL=" .env && sed -i "s#^SCALPER_MARKET_DATA_BASE_URL=.*#SCALPER_MARKET_DATA_BASE_URL=https://fapi.binance.com#" .env || echo "SCALPER_MARKET_DATA_BASE_URL=https://fapi.binance.com" >> .env; } && ./.venv/bin/python -c "from src.core.config import settings as s; assert s.kline_source == \"separate\", \"KLINE KAYNAĞI DEĞİŞMEDİ — .env yazılmadı\"; print(\"market_data=\", s.market_data_base_url, \"| trading=\", s.binance_base_url)" && RESTART_LABEL=klinesrc scripts/restart_safe.sh testnet'
 ```
 (Yedek damgası saat-dakika-saniye içerir — `server_deploy.sh`'nin `STAMP` deseni:
 `date +%Y%m%d` kullanılsaydı aynı gün ikinci koşu TEMİZ yedeği ezerdi ve ertesi gün
@@ -599,7 +638,7 @@ tercihtir; acil deploy gerekiyorsa önce ayarı geri al, 15 dk bekle. Tek başı
 
 **Geri alma (tek satır, restart dahil — YEDEK DOSYASINA BAĞLI DEĞİL):**
 ```bash
-ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date -u +%Y%m%d-%H%M%S)-klinesrc-off && { grep -q "^SCALPER_MARKET_DATA_BASE_URL=" .env && sed -i "s#^SCALPER_MARKET_DATA_BASE_URL=.*#SCALPER_MARKET_DATA_BASE_URL=#" .env || true; } && ./.venv/bin/python -c "from src.core.config import settings as s; assert s.kline_source == \"trading_host\", \"KLINE KAYNAĞI HÂLÂ AYRI — .env yazılmadı\"; print(\"kline_source=\", s.kline_source)" && supervisorctl restart tradingbot_v2'
+ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date -u +%Y%m%d-%H%M%S)-klinesrc-off && { grep -q "^SCALPER_MARKET_DATA_BASE_URL=" .env && sed -i "s#^SCALPER_MARKET_DATA_BASE_URL=.*#SCALPER_MARKET_DATA_BASE_URL=#" .env || true; } && ./.venv/bin/python -c "from src.core.config import settings as s; assert s.kline_source == \"trading_host\", \"KLINE KAYNAĞI HÂLÂ AYRI — .env yazılmadı\"; print(\"kline_source=\", s.kline_source)" && RESTART_LABEL=klinesrc-off scripts/restart_safe.sh testnet'
 ```
 Bilinçli olarak `cp backups/env.bak-...` KULLANILMAZ: soak günlerce sürer, "bugünün"
 yedeği ertesi gün yoktur ve acil geri alma tam da o anda `cp: No such file` ile ölürdü.
@@ -631,7 +670,7 @@ ssh awa 'cd /opt/tradingbot-v2 && grep -n "^TV_SOURCE_ALLOWLIST=" .env || echo "
 ```
 Satır VARSA (yedek + ekleme + restart öncesi geri-okuma):
 ```bash
-ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date +%Y%m%d)-tvevents && sed -i "s/^TV_SOURCE_ALLOWLIST=.*/&,luxso_exit,luxso_trend,pac_choch,algopro_tp1/" .env'
+ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date -u +%Y%m%d-%H%M%S)-tvevents && sed -i "s/^TV_SOURCE_ALLOWLIST=.*/&,luxso_exit,luxso_trend,pac_choch,algopro_tp1/" .env'
 ssh awa 'cd /opt/tradingbot-v2 && ./.venv/bin/python -c "
 from src.core.config import settings as s
 have = {x.strip() for x in s.tv_source_allowlist.split(\",\")}
@@ -644,11 +683,11 @@ print(\"allowlist OK\")"'
 deseni (bkz. "Gölge modu"; `sed -i` eşleşme bulamazsa exit 0 verir, `||` sağı hiç
 çalışmaz):
 ```bash
-ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date +%Y%m%d)-tvmode && { grep -q "^SCALPER_TV_EVENTS_MODE=" .env && sed -i "s/^SCALPER_TV_EVENTS_MODE=.*/SCALPER_TV_EVENTS_MODE=shadow/" .env || echo "SCALPER_TV_EVENTS_MODE=shadow" >> .env; }'
+ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date -u +%Y%m%d-%H%M%S)-tvmode && { grep -q "^SCALPER_TV_EVENTS_MODE=" .env && sed -i "s/^SCALPER_TV_EVENTS_MODE=.*/SCALPER_TV_EVENTS_MODE=shadow/" .env || echo "SCALPER_TV_EVENTS_MODE=shadow" >> .env; }'
 ssh awa 'cd /opt/tradingbot-v2 && ./.venv/bin/python -c "
 from src.core.config import settings as s
 assert s.scalper_tv_events_mode == \"shadow\", s.scalper_tv_events_mode
-print(\"mode=\", s.scalper_tv_events_mode)" && supervisorctl restart tradingbot_v2'
+print(\"mode=\", s.scalper_tv_events_mode)" && RESTART_LABEL=tv-events scripts/restart_safe.sh testnet'
 ```
 `active`'e geçerken aynı komutlarda `shadow`→`active` yaz. ⚠️ **`active`'e yalnız gölge
 ölçümü sonrası geçilir** (`docs/INTEGRATIONS.md` §7.6 terfi hattı) ve önce
@@ -695,7 +734,7 @@ sonraki olayda dosyayı geri yazar. İki doğru reçete var:
 # (a) süreci durdurmadan: reset uç noktası
 ssh awa 'cd /opt/tradingbot-v2 && S=$(grep ^TV_WEBHOOK_SECRET= .env | cut -d= -f2-) && curl -sS -X POST "http://127.0.0.1:9091/tv-events/reset?secret=$S" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[\"reset\"], d[\"cleared_symbols\"], d[\"persisted\"])"'
 # (b) bakım penceresinde: dosyayı sil + restart (SIRA ÖNEMLİ)
-ssh awa 'cd /opt/tradingbot-v2 && rm -f state/tv_events.json && supervisorctl restart tradingbot_v2'
+ssh awa 'cd /opt/tradingbot-v2 && rm -f state/tv_events.json && RESTART_LABEL=tv-events-reset scripts/restart_safe.sh testnet'
 ```
 Defteri boşaltmak bir RİSK kapısını açmaz: en kötü sonucu kapı/çıkış tetiğinin
 yeni olay gelene kadar sessizleşmesidir (fail-open, `docs/INTEGRATIONS.md` §7.4).
@@ -764,7 +803,7 @@ Canlı taban yeniden 10/50/10/10. Aşağıdaki satırlar tarihçe içindir; geç
 `SCALPER_MAX_MARGIN_PCT=5`, `SCALPER_FIXED_STOP_ROI_PCT=40`, `SCALPER_TP1_ROI=8`,
 `SCALPER_DAILY_LOSS_LIMIT_PCT=6` (önce 10/50/10/10). Yeni giriş: stop = 20x'te %2.0 fiyat, SL =
 sermayenin %2'si; günlük kesici ≈ 3 net SL. Geri alma:
-`cp backups/env.bak-20260823-025623-riskpaketi .env && supervisorctl restart tradingbot_v2`
+`cp backups/env.bak-20260823-025623-riskpaketi .env && RESTART_LABEL=rollback scripts/restart_safe.sh testnet`
 (+240 sn sağlık). Soak raporu: `scripts/ledger_report.py --since "2026-08-23 02:57"`.
 Backtest/autoresearch tabanı: `scripts/.scalper_env_snapshot.txt` güncellendi — eski sayılarla
 (E4/E5/E6 tabanı) karşılaştırırken ölçek farkını (marj %10→5 = PnL/DD ×0.5) hesaba kat.

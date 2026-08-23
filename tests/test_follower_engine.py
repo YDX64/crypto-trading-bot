@@ -142,7 +142,15 @@ def _fake_position(symbol="BTCUSDT", direction=Direction.SHORT, qty=0.12):
     )
 
 
-def _make_engine(tmp_path, cfg=None, *, positions=None, position_amt=0.0):
+def _make_engine(
+    tmp_path,
+    cfg=None,
+    *,
+    positions=None,
+    position_amt=0.0,
+    live_price=77126.08,
+    all_positions=None,
+):
     engine = object.__new__(FollowerEngine)
     # Kapanış doğrulama merdiveni testte GERÇEK uyku yapmasın.
     engine._CLOSE_VERIFY_DELAYS = (0.0, 0.0)
@@ -164,6 +172,8 @@ def _make_engine(tmp_path, cfg=None, *, positions=None, position_amt=0.0):
     engine._daily_pnl = 0.0
     engine._daily_loss_threshold_usdt = None
     engine._risk_equity_usdt = None
+    engine._orphans = []
+    engine._orphans_checked_at = None
     engine._events = deque(maxlen=50)
     engine._event_counters = {}
     engine._reject_counters = {}
@@ -176,9 +186,12 @@ def _make_engine(tmp_path, cfg=None, *, positions=None, position_amt=0.0):
     tracked = dict(positions or {})
     engine.exits = SimpleNamespace(
         _positions=tracked,
+        _closing=set(),
         tracked_symbols=lambda: set(tracked.keys()),
         track=lambda sp: tracked.__setitem__(sp.position.symbol, sp),
         _handle_closed=AsyncMock(),
+        ensure_tp_orders=AsyncMock(return_value=0),
+        tp_repair_snapshot=MagicMock(return_value={}),
     )
     engine.executor = SimpleNamespace(
         is_entry_blocked=MagicMock(return_value=False),
@@ -188,11 +201,13 @@ def _make_engine(tmp_path, cfg=None, *, positions=None, position_amt=0.0):
         reject_snapshot=MagicMock(return_value={}),
     )
     engine.client = SimpleNamespace(
-        get_current_price=AsyncMock(return_value=77126.08),
+        get_current_price=AsyncMock(return_value=live_price),
         get_account_balance=AsyncMock(return_value=1000.0),
         get_position_risk=AsyncMock(return_value={"positionAmt": position_amt}),
         quantize_quantity=AsyncMock(side_effect=lambda symbol, qty: qty),
         _request_with_retry=AsyncMock(return_value={}),
+        # Yetim denetimi (bulgu 8) borsanın TÜM pozisyonlarını okur.
+        get_all_positions=AsyncMock(return_value=list(all_positions or [])),
     )
     engine.fetcher = SimpleNamespace(get_klines=AsyncMock(return_value=[]))
     engine.brackets = SimpleNamespace(snapshot=MagicMock(return_value={}))
@@ -203,7 +218,8 @@ class TestGates:
     async def test_symbol_outside_universe_rejected(self, tmp_path):
         engine = _make_engine(tmp_path)
         event = parse_follower_event(
-            "🟢 BUY | BINANCE:SOLUSDT | TF: 1 | Price: 150 | SL: 149"
+            "🟢 BUY | BINANCE:SOLUSDT | TF: 1 | Price: 150 | SL: 149 "
+            "| TP1: 150.5 | TP2: 151.0 | TP3: 151.5"
         )
         result = await engine.handle_event(event)
         assert result["accepted"] is False
@@ -213,7 +229,8 @@ class TestGates:
     async def test_timeframe_mismatch_rejected(self, tmp_path):
         engine = _make_engine(tmp_path)
         event = parse_follower_event(
-            "🟢 BUY | BINANCE:BTCUSDT | TF: 5 | Price: 100 | SL: 99.9"
+            "🟢 BUY | BINANCE:BTCUSDT | TF: 5 | Price: 100 | SL: 99.9 "
+            "| TP1: 100.05 | TP2: 100.1 | TP3: 100.15"
         )
         result = await engine.handle_event(event)
         assert result["accepted"] is False
@@ -222,7 +239,8 @@ class TestGates:
     async def test_1m_alias_accepted(self, tmp_path):
         engine = _make_engine(tmp_path)
         event = parse_follower_event(
-            "🔴 SELL | BINANCE:BTCUSDT | TF: 1m | Price: 77126.08 | SL: 77167.77"
+            "🔴 SELL | BINANCE:BTCUSDT | TF: 1m | Price: 77126.08 | SL: 77167.77 "
+            "| TP1: 77105.23 | TP2: 77084.39 | TP3: 77063.54"
         )
         result = await engine.handle_event(event)
         assert result["accepted"] is True
@@ -285,9 +303,10 @@ class TestGates:
         assert "aynı yönde" in result["reason"]
 
     async def test_stop_band_rejection_is_reported(self, tmp_path):
-        engine = _make_engine(tmp_path)
+        engine = _make_engine(tmp_path, live_price=100.0)
         event = parse_follower_event(
-            "🟢 BUY | BINANCE:BTCUSDT | TF: 1 | Price: 100 | SL: 99.9999"
+            "🟢 BUY | BINANCE:BTCUSDT | TF: 1 | Price: 100 | SL: 99.9999 "
+            "| TP1: 100.00005 | TP2: 100.0001 | TP3: 100.00015"
         )
         result = await engine.handle_event(event)
         assert result["accepted"] is False
@@ -345,14 +364,19 @@ class TestEntryFlow:
         assert result["reason"] == "borsa dilimi okunamadı"
         assert engine._reject_counters["no_bracket"] == 1
 
-    async def test_missing_price_falls_back_to_live_price(self, tmp_path):
-        engine = _make_engine(tmp_path)
-        event = parse_follower_event(
-            "🔴 SELL | BINANCE:BTCUSDT | TF: 1 | SL: 77167.77"
-        )
-        result = await engine.handle_event(event)
+    async def test_sizing_always_uses_the_live_price(self, tmp_path):
+        """Bulgu 6: seviyeler/boyutlama ASLA bayat alarm fiyatından.
+
+        Düzeltme olmadan KIRMIZI: eski kod `event.price` varsa canlı fiyatı
+        HİÇ okumuyor ve `sl_pct`i (kaldıraç formülünün paydası) bayat
+        fiyattan hesaplıyordu.
+        """
+        engine = _make_engine(tmp_path, live_price=77128.0)
+        result = await engine.handle_event(parse_follower_event(SELL_ENTRY))
         assert result["accepted"] is True
         engine.client.get_current_price.assert_awaited()
+        levels = engine.executor.open_position.await_args.kwargs["levels"]
+        assert levels.entry == pytest.approx(77128.0)
 
     async def test_atr_fallback_only_when_message_has_no_sl(self, tmp_path):
         engine = _make_engine(tmp_path)
@@ -721,8 +745,9 @@ class TestTelemetry:
         assert position["fee_roi_pct"] == pytest.approx(10.0)
         assert position["tp1_covers_fees"] is False
         assert position["sl_pct_fill"] == pytest.approx(0.054)
-        # Kapı varsayılan KAPALI olmalı.
-        assert snapshot["sizing"]["min_tp1_fee_ratio"] == 0.0
+        # Kapı varsayılan AÇIK olmalı (bulgu 3).
+        assert snapshot["sizing"]["min_tp1_fee_ratio"] == 1.0
+        assert snapshot["orphan_positions"] == []
 
     async def test_unexpected_error_is_contained(self, tmp_path):
         engine = _make_engine(tmp_path)
@@ -821,7 +846,12 @@ class TestExitManagerBreakEven:
         pm.replace_stop_loss.assert_not_called()
         assert sp.tp1_done is False
         assert sp.position.current_stoploss == pytest.approx(77167.77)  # eski SL
-        assert client.calls == []  # pahalı fill doğrulaması da yapılmadı
+        # BULGU 9 (bilinçli değişiklik): fill KANITI artık BE denemesinden
+        # ÖNCE alınır. Eskiden ulaşılamayan BE'de erken dönülüyordu ve
+        # `tp1_filled` hiç işaretlenmiyordu → TP2/TP3 doğrulaması ÖLÜYDÜ.
+        # Dolum bir OLGUDUR; BE'nin konulabilirliğinden bağımsızdır.
+        assert sp.tp1_filled is True
+        assert ("get_algo_order", 501) in client.calls
 
     async def test_unreachable_breakeven_warns_only_once(self):
         manager, client, pm = self._manager(live_qty=0.08, price=77100.0)
@@ -934,3 +964,421 @@ class TestExitManagerBreakEven:
         )
         manager._maybe_start_loss_cooldown("BTCUSDT", "TP_LADDER", 12.5, 0.0)
         assert cooldowns == ["BTCUSDT"]
+
+
+# ---------------------------------------------------------------------------
+# D20a — düşmanca inceleme regresyonları (bulgu 6, 7, 8, 9)
+# ---------------------------------------------------------------------------
+
+
+class TestGatesDoNotBlockExits:
+    """Bulgu 9: min_score/allowlist/TF kapıları ÇIKIŞI bloklamamalı.
+
+    Düzeltme olmadan KIRMIZI: kapılar `_dispatch`in başındaydı ve EXIT/HIT
+    olayları da onlardan geçiyordu — allowlist'ten çıkarılan bir sembolün
+    AÇIK pozisyonu AlgoPro'nun EXIT komutunu HİÇ görmezdi.
+    """
+
+    async def test_exit_ignores_symbol_allowlist(self, tmp_path):
+        cfg = _cfg(follower_symbol_allowlist="ETHUSDT")  # BTC evren DIŞINDA
+        engine = _make_engine(
+            tmp_path, cfg, positions={"BTCUSDT": _fake_position()}
+        )
+        result = await engine.handle_event(parse_follower_event(EXIT_EVENT))
+        assert result["accepted"] is True
+        assert result["reason"] == "pozisyon kapatıldı"
+
+    async def test_exit_ignores_timeframe_mismatch(self, tmp_path):
+        cfg = _cfg(follower_timeframe="5")
+        engine = _make_engine(
+            tmp_path, cfg, positions={"BTCUSDT": _fake_position()}
+        )
+        result = await engine.handle_event(parse_follower_event(EXIT_EVENT))
+        assert result["accepted"] is True
+
+    async def test_hit_ignores_symbol_allowlist(self, tmp_path):
+        cfg = _cfg(follower_symbol_allowlist="ETHUSDT")
+        engine = _make_engine(
+            tmp_path, cfg, positions={"BTCUSDT": _fake_position()}
+        )
+        result = await engine.handle_event(parse_follower_event(SL_HIT))
+        assert result["accepted"] is True
+
+    async def test_entry_is_still_gated(self, tmp_path):
+        cfg = _cfg(follower_symbol_allowlist="ETHUSDT")
+        engine = _make_engine(tmp_path, cfg)
+        result = await engine.handle_event(parse_follower_event(SELL_ENTRY))
+        assert result["accepted"] is False
+        assert "evren" in result["reason"]
+
+
+class TestStaleSignalGates:
+    """Bulgu 6: bayat olay/fiyat ile giriş yok."""
+
+    async def test_event_age_blocks_entry(self, tmp_path):
+        engine = _make_engine(tmp_path)
+        stale = time.monotonic() - 60.0
+        result = await engine.handle_event(
+            parse_follower_event(SELL_ENTRY), received_monotonic=stale
+        )
+        assert result["accepted"] is False
+        assert "bayat" in result["reason"]
+        assert engine._reject_counters["event_age"] == 1
+        engine.executor.open_position.assert_not_called()
+
+    async def test_fresh_event_passes_the_age_gate(self, tmp_path):
+        engine = _make_engine(tmp_path)
+        result = await engine.handle_event(
+            parse_follower_event(SELL_ENTRY), received_monotonic=time.monotonic()
+        )
+        assert result["accepted"] is True
+
+    async def test_age_gate_can_be_disabled(self, tmp_path):
+        engine = _make_engine(tmp_path, _cfg(follower_max_event_age_sec=0.0))
+        result = await engine.handle_event(
+            parse_follower_event(SELL_ENTRY),
+            received_monotonic=time.monotonic() - 600.0,
+        )
+        assert result["accepted"] is True
+
+    async def test_signal_drift_blocks_entry(self, tmp_path):
+        # sl_pct(mesaj) ≈ %0.0541 → sınır ≈ %0.027 (≈ 20.8 birim); 30 birim aşar.
+        engine = _make_engine(tmp_path, live_price=77126.08 - 30.0)
+        result = await engine.handle_event(parse_follower_event(SELL_ENTRY))
+        assert result["accepted"] is False
+        assert "sapma" in result["reason"]
+        assert engine._reject_counters["signal_drift"] == 1
+        engine.executor.open_position.assert_not_called()
+
+    async def test_stop_already_passed_blocks_entry(self, tmp_path):
+        # SHORT stopu 77167.77; canlı fiyat onun ÜSTÜNDE → tez ölü.
+        # Sapma kapısı BİLİNÇLİ olarak gevşetildi: varsayılan (SL mesafesinin
+        # %50'si) zaten daha erken tetiklenir; bu test ikinci savunma
+        # katmanının (taraf kontrolü) tek başına da çalıştığını kanıtlar.
+        engine = _make_engine(
+            tmp_path, _cfg(follower_max_signal_drift_pct=1.0), live_price=77200.0
+        )
+        result = await engine.handle_event(parse_follower_event(SELL_ENTRY))
+        assert result["accepted"] is False
+        assert "yanlış tarafında" in result["reason"]
+        assert engine._reject_counters["stop_already_passed"] == 1
+        engine.executor.open_position.assert_not_called()
+
+
+class TestTerminalHitClosesOpenPosition:
+    """Bulgu 7: SL/TP3 HIT + borsada AÇIK pozisyon = telemetri DEĞİL, ARIZA."""
+
+    def _engine_with_open_position(self, tmp_path, amounts):
+        engine = _make_engine(
+            tmp_path, positions={"BTCUSDT": _fake_position()}
+        )
+        engine.client.get_position_risk = AsyncMock(
+            side_effect=[{"positionAmt": amount} for amount in amounts]
+        )
+        return engine
+
+    async def test_sl_hit_with_open_position_closes_it(self, tmp_path):
+        # SHORT pozisyon: borsada positionAmt NEGATİFTİR.
+        engine = self._engine_with_open_position(tmp_path, [-0.12, -0.12, 0.0])
+        result = await engine.handle_event(parse_follower_event(SL_HIT))
+        assert result["accepted"] is True
+        engine.client._request_with_retry.assert_awaited()
+        params = engine.client._request_with_retry.await_args.kwargs["params"]
+        assert params["reduceOnly"] == "true"
+        assert params["side"] == "BUY"  # SHORT pozisyonu kapatır
+        engine.exits._handle_closed.assert_awaited()
+        assert (
+            engine.exits._handle_closed.await_args.kwargs["forced_exit_reason"]
+            == "ALGOPRO_SL"
+        )
+
+    async def test_tp3_hit_with_open_position_closes_remainder(self, tmp_path):
+        engine = self._engine_with_open_position(tmp_path, [-0.04, -0.04, 0.0])
+        tp3_hit = "🏆 TP3 HIT | BINANCE:BTCUSDT | TF: 1 | Price: 77063.54"
+        result = await engine.handle_event(parse_follower_event(tp3_hit))
+        assert result["accepted"] is True
+        assert (
+            engine.exits._handle_closed.await_args.kwargs["forced_exit_reason"]
+            == "ALGOPRO_TP3"
+        )
+
+    async def test_unverified_close_is_fail_closed(self, tmp_path):
+        engine = _make_engine(
+            tmp_path, positions={"BTCUSDT": _fake_position()}, position_amt=0.12
+        )
+        result = await engine.handle_event(parse_follower_event(SL_HIT))
+        assert result["accepted"] is False
+        assert "DOĞRULANAMADI" in result["reason"]
+        engine.exits._handle_closed.assert_not_awaited()
+
+    async def test_non_terminal_hit_repairs_missing_tp_orders(self, tmp_path):
+        engine = _make_engine(
+            tmp_path, positions={"BTCUSDT": _fake_position()}, position_amt=0.08
+        )
+        result = await engine.handle_event(parse_follower_event(TP1_HIT))
+        assert result["accepted"] is True
+        engine.exits.ensure_tp_orders.assert_awaited_once()
+
+    async def test_identity_change_is_not_reported_as_accepted(self, tmp_path):
+        """Bulgu 9: `_handle_closed` çağrılmadıysa `accepted` TRUE OLAMAZ."""
+        engine = _make_engine(
+            tmp_path, positions={"BTCUSDT": _fake_position()}, position_amt=0.0
+        )
+        original = engine.exits._positions["BTCUSDT"]
+
+        async def _swap(symbol, force_fresh=False):
+            # Bu await sırasında başka bir yol pozisyonu değiştirdi.
+            engine.exits._positions["BTCUSDT"] = _fake_position()
+            assert engine.exits._positions["BTCUSDT"] is not original
+            return {"positionAmt": 0.0}
+
+        engine.client.get_position_risk = _swap
+        result = await engine.handle_event(parse_follower_event(SL_HIT))
+        assert result["accepted"] is False
+        engine.exits._handle_closed.assert_not_awaited()
+
+
+class TestOrphanPositions:
+    """Bulgu 8: borsada AÇIK ama izlenmeyen pozisyon = ENTRY-HALT + CRITICAL."""
+
+    async def test_untracked_open_position_latches_entry_halt(self, tmp_path):
+        engine = _make_engine(
+            tmp_path, all_positions=[{"symbol": "ETHUSDT", "positionAmt": "0.5"}]
+        )
+        orphans = await engine._check_orphans()
+        assert orphans == ["ETHUSDT"]
+        assert engine._entry_halted is True
+        assert engine._entries_ready() is False
+        assert engine.snapshot()["orphan_positions"] == ["ETHUSDT"]
+
+    async def test_tracked_position_is_not_an_orphan(self, tmp_path):
+        engine = _make_engine(
+            tmp_path,
+            positions={"BTCUSDT": _fake_position()},
+            all_positions=[{"symbol": "BTCUSDT", "positionAmt": "0.12"}],
+        )
+        assert await engine._check_orphans() == []
+        assert engine._entry_halted is False
+
+    async def test_closing_position_is_not_an_orphan(self, tmp_path):
+        engine = _make_engine(
+            tmp_path, all_positions=[{"symbol": "BTCUSDT", "positionAmt": "0.12"}]
+        )
+        engine.exits._closing.add("BTCUSDT")
+        assert await engine._check_orphans() == []
+        assert engine._entry_halted is False
+
+    async def test_in_flight_entry_is_not_an_orphan(self, tmp_path):
+        """Kilit tutuluyorsa uçuşta bir giriş var; henüz `track` edilmemiştir."""
+        engine = _make_engine(
+            tmp_path, all_positions=[{"symbol": "ETHUSDT", "positionAmt": "0.5"}]
+        )
+        async with engine._entry_lock:
+            assert await engine._check_orphans() == []
+        assert engine._entry_halted is False
+
+    async def test_recovery_not_ready_skips_the_check(self, tmp_path):
+        engine = _make_engine(
+            tmp_path, all_positions=[{"symbol": "ETHUSDT", "positionAmt": "0.5"}]
+        )
+        engine._recovery_ready = False
+        assert await engine._check_orphans() == []
+        assert engine._entry_halted is False
+
+    async def test_stale_snapshot_alone_never_latches(self, tmp_path):
+        """Geri alınamaz karar (entry-halt) TAZE okumayla doğrulanır."""
+        engine = _make_engine(tmp_path)
+        engine.client.get_all_positions = AsyncMock(
+            side_effect=[
+                [{"symbol": "ETHUSDT", "positionAmt": "0.5"}],  # bayat görüntü
+                [],  # taze: pozisyon yok
+            ]
+        )
+        assert await engine._check_orphans() == []
+        assert engine._entry_halted is False
+
+    async def test_flatten_also_closes_orphans(self, tmp_path):
+        engine = _make_engine(
+            tmp_path, all_positions=[{"symbol": "ETHUSDT", "positionAmt": "0.5"}]
+        )
+        result = await engine.risk_event_flatten(
+            reason="test", source="test", ttl_minutes=5
+        )
+        assert result["flattened"] == ["ETHUSDT"]
+        assert result["errors"] == []
+        params = engine.client._request_with_retry.await_args.kwargs["params"]
+        assert params["symbol"] == "ETHUSDT"
+        assert params["side"] == "SELL"  # LONG yetimi kapatır
+        assert params["reduceOnly"] == "true"
+
+    async def test_flatten_reports_unverified_orphan_close(self, tmp_path):
+        engine = _make_engine(
+            tmp_path,
+            position_amt=0.5,  # kapanış doğrulanamıyor
+            all_positions=[{"symbol": "ETHUSDT", "positionAmt": "0.5"}],
+        )
+        result = await engine.risk_event_flatten(
+            reason="test", source="test", ttl_minutes=5
+        )
+        assert result["flattened"] == []
+        assert any("yetim" in message for message in result["errors"])
+
+
+class TestLadderStateFromExchangeFills:
+    """Bulgu 9: TP2/TP3 doğrulaması `tp1_done`un ARKASINDA DEĞİL.
+
+    `tp1_done` "stop break-even'e taşındı" demektir ve ücret-farkında BE
+    ulaşılamadığı her işlemde (D20 "ücret eşiği") YAPISAL OLARAK False kalır
+    → eski kodda TP2/TP3 dolumu HİÇ doğrulanmazdı. Merdiven artık BORSA
+    DOLUMUNA (`tp1_filled`) bağlıdır.
+    """
+
+    def _manager(self, live_qty, price: float = 77050.0):
+        client = _ExitFakeClient(live_qty, price=price)
+        pm = SimpleNamespace(replace_stop_loss=AsyncMock(return_value=True))
+        tracker = SimpleNamespace(record_close=AsyncMock(), close_seq=0)
+        manager = FollowerExitManager(client, pm, tracker, _cfg())
+        manager.logger = MagicMock()
+        return manager, client, pm
+
+    async def test_tp2_is_verified_even_when_breakeven_is_unreachable(self):
+        # price=77100 → BE (77080) piyasanın YANLIŞ tarafında → tp1_done False.
+        manager, client, pm = self._manager(live_qty=0.04, price=77100.0)
+        sp = _fake_position(qty=0.12)
+        manager.track(sp)
+
+        await manager._step_one("BTCUSDT", sp)
+
+        assert sp.tp1_done is False  # BE konulamadı (bilinçli)
+        assert sp.tp1_filled is True  # ama DOLUM bir olgudur
+        assert sp.tp2_done is True  # ve merdiven ilerledi
+
+    async def test_tp3_follows_tp2(self):
+        manager, client, pm = self._manager(live_qty=0.001, price=77100.0)
+        sp = _fake_position(qty=0.12)
+        sp.tp1_filled = True
+        sp.tp2_done = True
+        manager.track(sp)
+
+        await manager._step_one("BTCUSDT", sp)
+
+        assert sp.tp3_done is True
+
+
+class TestMissingTpRepair:
+    """Bulgu 7/9: eksik TP bacakları yeniden konur (takipçide TP = ÇIKIŞ)."""
+
+    def _manager(self, *, algo_orders, live_qty=0.12, price=77100.0):
+        client = _ExitFakeClient(live_qty, price=price)
+        client.get_open_algo_orders = AsyncMock(return_value=algo_orders)
+        client.place_take_profit = AsyncMock(return_value={"algoId": 777})
+        pm = SimpleNamespace(replace_stop_loss=AsyncMock(return_value=True))
+        tracker = SimpleNamespace(record_close=AsyncMock(), close_seq=0)
+        manager = FollowerExitManager(client, pm, tracker, _cfg())
+        manager.logger = MagicMock()
+        return manager, client
+
+    async def test_missing_leg_is_replaced(self):
+        # TP1/TP2 canlı, TP3 (algoId 503) borsada YOK.
+        manager, client = self._manager(
+            algo_orders=[{"algoId": 501}, {"algoId": 502}]
+        )
+        sp = _fake_position(qty=0.12)
+        placed = await manager.ensure_tp_orders("BTCUSDT", sp)
+        assert placed == 1
+        assert client.place_take_profit.await_args.kwargs["stop_price"] == (
+            pytest.approx(77063.54)
+        )
+        assert sp.plan.tp3_algo_id == "777"
+        assert manager.tp_repair_snapshot()["replaced"] == 1
+
+    async def test_live_legs_are_not_duplicated(self):
+        manager, client = self._manager(
+            algo_orders=[{"algoId": 501}, {"algoId": 502}, {"algoId": 503}]
+        )
+        sp = _fake_position(qty=0.12)
+        assert await manager.ensure_tp_orders("BTCUSDT", sp) == 0
+        client.place_take_profit.assert_not_called()
+
+    async def test_filled_legs_are_not_replaced(self):
+        manager, client = self._manager(algo_orders=[])
+        sp = _fake_position(qty=0.12)
+        sp.tp1_filled = True
+        sp.tp2_done = True
+        sp.tp3_done = True
+        assert await manager.ensure_tp_orders("BTCUSDT", sp) == 0
+        client.place_take_profit.assert_not_called()
+
+    async def test_wrong_side_leg_is_never_replaced(self):
+        """Tetik fiyatı fiyatın gerisindeyse emir ANINDA tetiklenirdi."""
+        # SHORT, fiyat 77090 → TP1 (77105.23) artık fiyatın ÜSTÜNDE (geride).
+        manager, client = self._manager(algo_orders=[], price=77090.0)
+        sp = _fake_position(qty=0.12)
+        placed = await manager.ensure_tp_orders("BTCUSDT", sp)
+        # TP1 atlandı; TP2/TP3 (77084.39 / 77063.54) hâlâ ileride.
+        assert placed == 2
+        assert manager.tp_repair_snapshot()["skipped_wrong_side"] == 1
+
+    async def test_total_quantity_never_exceeds_the_live_position(self):
+        """Reduce-only TP toplamı canlı miktarı AŞAMAZ (-2022 riski)."""
+        manager, client = self._manager(algo_orders=[], live_qty=0.05)
+        sp = _fake_position(qty=0.12)  # her bacak 0.04
+        placed = await manager.ensure_tp_orders("BTCUSDT", sp)
+        sizes = [
+            call.kwargs["quantity"]
+            for call in client.place_take_profit.await_args_list
+        ]
+        assert placed >= 1
+        assert sum(sizes) <= 0.05 + 1e-9
+
+    async def test_missing_price_blocks_repair(self):
+        manager, client = self._manager(algo_orders=[])
+        client.get_current_price = AsyncMock(return_value=None)
+        sp = _fake_position(qty=0.12)
+        assert await manager.ensure_tp_orders("BTCUSDT", sp) == 0
+        client.place_take_profit.assert_not_called()
+        assert manager.tp_repair_snapshot()["no_price"] == 1
+
+    async def test_flat_position_is_never_repaired(self):
+        manager, client = self._manager(algo_orders=[], live_qty=0.0)
+        sp = _fake_position(qty=0.12)
+        assert await manager.ensure_tp_orders("BTCUSDT", sp) == 0
+        client.place_take_profit.assert_not_called()
+
+
+class TestFeeGateIsRecorded:
+    """Bulgu 3: kapıda reddedilen giriş DEFTERE yazılır + sayaçta görünür."""
+
+    async def test_rejected_entry_is_written_to_the_calibration_ledger(
+        self, tmp_path
+    ):
+        import json
+
+        ledger = tmp_path / "follower_levels.jsonl"
+        engine = _make_engine(
+            tmp_path, _cfg(follower_levels_log_path=str(ledger))
+        )
+        engine.executor.open_position = AsyncMock(
+            side_effect=FollowerRejected(
+                "TP1 ROI komisyonun altında", code="fee_gate"
+            )
+        )
+        result = await engine.handle_event(parse_follower_event(SELL_ENTRY))
+
+        assert result["accepted"] is False
+        assert engine._reject_counters["fee_gate"] == 1
+        assert engine.snapshot()["reject_counters"]["fee_gate"] == 1
+        rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+        assert rows[-1]["rejected"] == "fee_gate"
+        assert "komisyon" in rows[-1]["rejected_reason"]
+
+    async def test_accepted_entry_has_no_rejection_field(self, tmp_path):
+        import json
+
+        ledger = tmp_path / "follower_levels.jsonl"
+        engine = _make_engine(
+            tmp_path, _cfg(follower_levels_log_path=str(ledger))
+        )
+        await engine.handle_event(parse_follower_event(SELL_ENTRY))
+        rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+        assert "rejected" not in rows[-1]

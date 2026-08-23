@@ -26,11 +26,15 @@ Yeni sinyal kaynağı (haber botu vb.) eklemek: `docs/INTEGRATIONS.md`. Otomatik
 - **Canlı süreç (TESTNET):** supervisord programı `tradingbot_v2`
   (`/opt/tradingbot-v2/.venv/bin/python -m uvicorn src.main:app :9091`).
   `systemctl`'deki `live-bot.service` **trading botu DEĞİLDİR** (futbol botu).
-- **İkinci halka (D20, TESTNET):** `BOT_MODE=follower` — AlgoPro takipçisi,
+- **İkinci halka (D20 + D20a, TESTNET):** `BOT_MODE=follower` — AlgoPro takipçisi,
   `/opt/tradingbot-ap`, supervisord `tradingbot_ap`, port 9093, AYRI Binance testnet
   hesabı/DB/state/log. Scanner ve strateji C KAPALI; giriş/çıkış yalnız AlgoPro V1.6
   alarmlarından. Deploy: `scripts/deploy.sh awa --ring follower`. Mainnet'e ÇIKAMAZ
-  (config fail-fast). Ayrıntı: `docs/RUNBOOK.md` "AlgoPro takipçi halkası", D20.
+  (config fail-fast). **D20 ile çelişirse D20a bağlayıcıdır** (19-ajan düşmanca
+  inceleme): köprü ve giriş yalnız KATI AlgoPro biçimini kabul eder, ücret eşiği kapısı
+  `FOLLOWER_MIN_TP1_FEE_RATIO=1.0` VARSAYILAN AÇIKTIR (stop ≥ ~%0.20), dolum stopu
+  geçtiyse pozisyon kapatılır (yeniden çapalama YOK), yetim pozisyon = entry-halt.
+  Ayrıntı: `docs/RUNBOOK.md` "AlgoPro takipçi halkası", D20/D20a.
 - **Ayarlar:** `/opt/tradingbot-v2/.env` (commit'lenmez; her değişiklikte
   `backups/env.bak-<tarih>-<etiket>` yedeği). Varsayılanlar `src/core/config.py`.
   Kapalı duran kanallar: `RISK_EVENT_SECRET` (boş = /risk-event 503), `SCALPER_SHADOW_MODE=false`,
@@ -41,10 +45,12 @@ Yeni sinyal kaynağı (haber botu vb.) eklemek: `docs/INTEGRATIONS.md`. Otomatik
 
 ## Nasıl çalıştırılır / test edilir / deploy edilir
 ```bash
-python3 -m pytest tests -q                      # 640+ test, ~20 sn — her değişiklikten önce
+python3 -m pytest tests -q                      # 1580 test, ~35 sn — her değişiklikten önce
 scripts/deploy.sh awa                           # push edilmiş main'i sunucuya uygula (test + restart + sağlık + otomatik geri alma)
 DEPLOY_NO_RESTART=1 scripts/deploy.sh awa       # yalnız kod/test; süreci yeniden başlatma
 scripts/deploy.sh awa <önceki-commit>           # geri alma (backups/commit.prev-*)
+# SUNUCUDA, yalnız .env değiştiyse (çıplak `supervisorctl restart` YASAK — D20a):
+# RESTART_LABEL=<etiket> scripts/restart_safe.sh testnet|follower|mainnet
 ```
 Backtest DAİMA sunucu env'iyle:
 ```bash
