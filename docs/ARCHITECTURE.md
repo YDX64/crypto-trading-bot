@@ -133,11 +133,14 @@ ikisi de NO-OP → canlı davranış birebir korunur):
    SHORT stop üstünde olmalıdır. Değilse emir **hiç gönderilmez**. Gönderilseydi
    Binance -2021 verir ve `position_manager._replace_stop_loss` bunu bir çıkış
    kararı sayıp pozisyonu PİYASA emriyle kapatırdı.
-   **D22'den beri kapı İKİ HOST'ta da uygulanır, ama SONUCU farklıdır** (bkz.
-   §5.2): ayrı host'ta yanlış taraf borsalar-arası BAZ hatası olabilir → tur
-   atlanır, eski SL yerinde kalır (`trailing_skips.protective_gate_skips`);
-   AYNI host'ta baz diye bir şey yoktur → "iz çoktan tetiklendi" demektir ve
-   pozisyon bilinçli reduce-only MARKET ile kapatılır (`TRAIL_MARKET`).
+   **Kapı YALNIZ ayrı market-data host'unda uygulanır** (tur atlanır, eski SL
+   yerinde kalır, `trailing_skips.protective_gate_skips`): oradaki "yanlış
+   taraf" borsalar-arası bir BAZ ÖLÇÜM hatası olabilir ve kârlı bir koşucuyu
+   ölçüm hatasıyla kapatmak yanlıştır. **Aynı host'ta kapı YOKTUR ve
+   olmamalıdır** (D22 daraltması): stop borsaya gönderilir, hükmü BORSA verir
+   (`-2021`) ve mevcut `_emergency_close` çalışır — bot kendi fiyat okumasına
+   dayanarak geri alınamaz bir piyasa emri göndermez. Kapanışın deftere nasıl
+   yazıldığı §5.0'dadır.
 
 `_delay_adjusted_stop` ile **desen** aynıdır (mutlak seviyeyi ötele, mesafeyi
 koru) ama referansları farklıdır ve olmalıdır: oradaki öteleme TEK SEFERLİK bir
@@ -263,7 +266,7 @@ sağlamaya giremez. Yardımcı uçlar: `POST /tv-signal?dry_run=1` (doğrula, ya
 Ayrıntı: `docs/INTEGRATIONS.md` §7, `docs/DECISIONS.md` D19 + **D19a** (24 düşmanca
 inceleme bulgusu; çelişki görürsen D19a bağlayıcıdır).
 
-### İmzalı REST ağırlık bütçesi ve istek önceliği (D22)
+### İmzalı REST ağırlık bütçesi ve istek önceliği (D22 — varsayılan KAPALI)
 
 Yukarıdaki tablo **public** (imzasız) kline yolunu anlatır; imzalı yolun
 (`ImprovedBinanceClient`) kendi bütçesi vardır: Binance IP ağırlık sınırı
@@ -273,11 +276,17 @@ tüketir (`BINANCE_BIND_IP` bu yüzden vardır). Her yanıtın
 aşarsa **o takvim dakikasının sonuna kadar** geri çekilme penceresi açılır
 (Binance 1M sayacı orada sıfırlanır).
 
-| Kademe | Eşik (varsayılan) | Kritik OLMAYAN istek | Kritik istek |
+**Geri çekilme VARSAYILAN OLARAK KAPALIDIR** (`BINANCE_WEIGHT_SOFT_LIMIT=0`,
+`BINANCE_WEIGHT_HARD_LIMIT=0`); ölçüm ve telemetri her zaman çalışır. Gerekçe
+ölçümdür: testnet'te bu başlığın günlük MEDYANI 2373'tü (>2000), yani ilk
+tasarımın eşikleriyle tarama KALICI dururdu. Eşik önce ölçülür, sonra açılır
+(`docs/RUNBOOK.md`).
+
+| Kademe | Eşik | Kritik OLMAYAN istek | Kritik istek |
 |---|---|---|---|
-| off | < `BINANCE_WEIGHT_SOFT_LIMIT` (2000) | gider | gider |
-| soft | ≥ 2000 | **gitmez**; önbellek varsa BAYAT servis | gider |
-| hard | ≥ `BINANCE_WEIGHT_HARD_LIMIT` (2300) | **gitmez** + CRITICAL ≤1/dk | gider |
+| off (varsayılan) | eşik 0 = kapalı, ya da ölçüm < soft | gider | gider |
+| soft | ≥ `BINANCE_WEIGHT_SOFT_LIMIT` | **gitmez**; önbellek varsa BAYAT servis | gider |
+| hard | ≥ `BINANCE_WEIGHT_HARD_LIMIT` | **gitmez** + CRITICAL ≤1/dk | gider |
 
 `_request_with_retry(..., priority=...)` varsayılanı `"critical"`tir: bir çağrı
 yolu işaretlenmeyi unutursa güvenli tarafta kalır. Kritik olmayan olarak
@@ -292,10 +301,20 @@ Geri çekilme sırasında önbellekten servis KOŞULLUDUR ve yalnız kritik olma
 yola açıktır (`_get_account`, `get_current_price`): bayat bir bakiye
 göstermek, bütçeyi 418'e taşımaktan iyidir; koruma yolu bayat veri görmez.
 
-Pano tarafı: `/api/status` sunucuda **≥10 sn**, `/scalper/status` **≥5 sn**
-önbelleklenir ve pano yolundan `force_fresh` İSTENMEZ (2026-08-18 rate-limiter
-açlığı). Motor YOKKEN `/scalper/status` önbelleklenmez (REST yapmaz, olay
-defteri taze olmalıdır). Telemetri: `/scalper/status.rest_weight`.
+Pencere ASLA `max()` ile kilitlenmez: daima içinde bulunulan takvim
+dakikasının sonudur (`min(..., now+60)` ikinci kemer) ve okuma tarafında bir
+dakikadan uzağa işaret eden bir damga geçersiz sayılıp temizlenir — ileri bir
+saat sıçraması (NTP/VM suspend) botu süresiz durdurmamalıdır.
+
+Pano tarafı: `/api/status` ve `/scalper/status` sunucuda **5 sn**
+önbelleklenir (pano da 5 sn'de bir yokluyor) ve pano yolundan `force_fresh`
+İSTENMEZ (2026-08-18 rate-limiter açlığı). Yanıttaki `as_of` gövdenin
+KURULDUĞU andır — pano "son güncelleme"yi ondan yazar, yoksa bayat bir tablo
+her tikte taze görünürdü. Durum DEĞİŞTİREN uçlar (`/risk-event`,
+`/tv-events/reset`) önbelleği düşürür; sorgu dizesi anahtarın parçasıdır.
+Motor YOKKEN `/scalper/status` önbelleklenmez (REST yapmaz, olay defteri taze
+olmalıdır). Telemetri: `/scalper/status.rest_weight` — `max_1m` DAKİKA
+DİLİMLİDİR (içinde bulunulan takvim dakikasının tepesi).
 
 ## 3. Modül haritası
 
@@ -526,39 +545,51 @@ için `_step_one` çağırır (`exits.py:133-181`):
    negatif kapanışta sembolü `scalper_loss_cooldown_minutes` süre kilitler;
    mevcut daha uzun bir cooldown asla kısaltılmaz (`_set_cooldown:548-560`).
 
-### 5.0 Trailing kararının uygulanması: `TRAIL_MARKET` (D22)
+### 5.0 `-2021` sonrası acil kapanışın kaydı: `TRAIL_MARKET` / `BE_MARKET` (D22)
 
-Chandelier bir SEVİYE üretir; bu seviyeyi borsaya `STOP_MARKET` olarak koymak
-her zaman mümkün değildir. Piyasa seviyeyi çoktan geçmişse Binance
-`-2021 Order would immediately trigger` döner ve
-`position_manager._replace_stop_loss` bunu bir çıkış kararı sayıp pozisyonu
-reduce-only MARKET ile kapatır (kanıta dayalı, korunan bir davranış). Kusur
-uygulamadaydı: exits bunu `False` diye okuyup "eski SL korunuyor" logluyor,
-kapanış ise sonraki turda `TRAIL` olarak deftere giriyordu (2026-08-23,
-3 olay).
+Koruyucu stop bir SEVİYE üretir (chandelier izi, runner tabanı, break-even);
+bu seviyeyi borsaya `STOP_MARKET` olarak koymak her zaman mümkün değildir.
+Piyasa seviyeyi çoktan geçmişse Binance `-2021 Order would immediately
+trigger` döner ve `position_manager._replace_stop_loss` bunu bir çıkış kararı
+sayıp `_emergency_close` ile pozisyonu reduce-only MARKET ile kapatır — **bu
+davranış D22'den ÖNCE de vardı ve korunmuştur.** Kusur KAYITTAYDI: exits bunu
+`False` diye okuyup "eski SL korunuyor" logluyor, kapanış ise sonraki turda
+`TRAIL` olarak deftere giriyordu (2026-08-23, 3 olay).
 
-Akış artık şudur (`exits._update_trailing`):
+Akış artık şudur (`exits._update_trailing`, `_check_tp1`, `_check_tp2`,
+`force_breakeven`, `force_stop_to`, takipçi `_check_tp1_breakeven`):
 
 ```
-chandelier → floor/mandal → [aynı host] fiyat TAZE mi? (≤30 sn)
-    hayır → tur atla (stale_price_skips), emir YOK, kapanış YOK
-    evet  → koruma tarafında mı?
-              hayır → algoOrder GÖNDERİLMEZ; _close_position_market
-                      (reaper/flatten ile AYNI yol: tek-finalizer kilidi,
-                      force_fresh doğrulama) → exit_reason=TRAIL_MARKET
-              evet  → pm.replace_stop_loss_result(...)
-                        replaced         → SL güncellendi
-                        emergency_closed → (yarış) TRAIL_MARKET ile finalize
-                        no_position      → sessiz (pozisyon zaten yok)
-                        failed           → "eski SL korunuyor" (TEK doğru yer)
+seviye → [ayrı host] koruma tarafında mı?  hayır → tur atla (emir YOK)
+       → pm.replace_stop_loss_result(...)
+            replaced         → SL güncellendi
+            no_position      → sessiz (pozisyon zaten yok)
+            failed           → "eski SL korunuyor" (TEK doğru yer)
+            emergency_closed → pozisyon ZATEN kapandı (pm, MARKET):
+                 1. sayaç market_exits++, log "ACİL KAPANIŞ GERÇEKLEŞTİ"
+                 2. etiket sp.pending_exit_reason'a ÇİVİLENİR
+                    (TRAIL_MARKET | BE_MARKET)
+                 3. kapanış emrinin kimliği/fiyatı sp'ye yazılır
+                 4. _finalize_market_exit: SADECE flat doğrulaması
+                    (get_position_risk force_fresh) → _handle_closed
+                    ** İKİNCİ MARKET EMRİ YOK ** (-2022 yarışı)
+                    doğrulanamazsa: SL/TP'ye DOKUNULMAZ, etiket kalır,
+                    sonraki safety turu aynı etiketle finalize eder
 ```
 
-`StopReplaceResult` (`position_manager.py`) `__bool__` ile eski `bool`
-sözleşmesini korur — tüm mevcut çağıranlar ve test çiftleri değişmeden çalışır.
-`TRAIL_MARKET` **TRAIL ailesindendir** (`forensics.exit_reason_family`) ama
-defter/raporda **ayrı sayılır**; sayısının artması "iz piyasa hızının
-gerisinde" demektir. Telemetri: `/scalper/status.trailing_skips` =
-`{price_space_skips, protective_gate_skips, stale_price_skips, market_exits}`.
+`StopReplaceResult` ve `EmergencyCloseResult` (`position_manager.py`)
+`__bool__` ile eski `bool` sözleşmesini korur — tüm mevcut çağıranlar ve test
+çiftleri değişmeden çalışır. Kapanış FİYATI da tahmin edilmez:
+`_verified_close_ledger` yalnız ALGO adaylarına baktığı için düz MARKET
+kapanışını göremez; `_market_close_exit_price` emrin `userTrades` VWAP'ını
+(yoksa `avgPrice`i) okur ve notu `exit_fill=market_close_order` olur. Income
+doğrulama merdiveni DEĞİŞMEDİ.
+
+`TRAIL_MARKET`/`BE_MARKET` **TRAIL ailesindendir**
+(`forensics.exit_reason_family`) ama defter/raporda **ayrı sayılır**;
+sayılarının artması "stop kararı piyasa hızının gerisinde" demektir.
+Telemetri: `/scalper/status.trailing_skips` =
+`{price_space_skips, protective_gate_skips, market_exits}`.
 
 ### 5.1 İşlem adli kaydı (trade forensics, D21) — YALNIZ GÖZLEM
 

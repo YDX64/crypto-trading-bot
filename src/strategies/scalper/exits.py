@@ -49,17 +49,26 @@ KlineFetch = Callable[[str, str, int], Awaitable[List[Candle]]]
 # Opsiyoneldir: verilmezse ayrı-host çevirisi baz ölçemez ve turu atlar
 # (fail-closed) — aynı host'ta (varsayılan) HİÇ çağrılmaz.
 PriceFetch = Callable[[str], Awaitable[float]]
-# Pozisyonu reduce-only MARKET ile kapatan çağrı (engine `_close_position_market`);
-# reaper/risk-olayı flatten ile AYNI yol. Opsiyonel: bağlı değilse D22 trailing
-# piyasa çıkışı YAPILMAZ (eski davranış: emir gönderilmez, SL yerinde kalır).
-MarketCloseCb = Callable[..., Awaitable[bool]]
 
-# D22: trailing kararı borsaya koşullu emirle uygulanamadığında (seviye piyasa
-# tarafından geçilmiş) pozisyon reduce-only MARKET ile kapatılır ve defterde bu
-# etiketle görünür. TRAIL AİLESİNDENDİR (aynı çıkış kararı) ama AYRI sayılır:
-# sayısı artıyorsa chandelier mesafesi piyasa hızının gerisinde kalıyordur.
+# D22 (daraltılmış): bot KENDİ İSTEĞİYLE piyasa emri GÖNDERMEZ. Bu etiketler
+# yalnız ŞU durumda yazılır: koruyucu stop borsaya gönderildi, Binance -2021
+# ("Order would immediately trigger") döndürdü ve `position_manager` mevcut
+# (D22 ÖNCESİ de var olan) `_emergency_close` yolunu çalıştırıp pozisyonu
+# reduce-only MARKET ile kapattı. Yani etiket YENİ BİR DAVRANIŞ DEĞİL, zaten
+# olan bir kapanışın DÜRÜST ADIDIR — eskiden bu kapanış deftere "TRAIL"
+# yazılıyor ve log "eski SL korunuyor" diyordu (2026-08-23: DOGE/BNB/ETH).
+#
+#   TRAIL_MARKET → trailing / runner-tabanı kararı böyle uygulandı
+#   BE_MARKET    → TP1 sonrası break-even kararı böyle uygulandı
+#
+# İkisi de TRAIL ailesindendir (stop kararının piyasa emriyle uygulanmış hâli)
+# ama AYRI SAYILIR: sayıları artıyorsa stop kararı piyasa hızının gerisinde
+# kalıyordur.
 EXIT_REASON_TRAIL_MARKET = "TRAIL_MARKET"
+EXIT_REASON_BE_MARKET = "BE_MARKET"
 TRAIL_EXIT_REASONS = frozenset({"TRAIL", EXIT_REASON_TRAIL_MARKET})
+# -2021 sonrası acil kapanışla sonlanan etiketler (defter/telemetri ortak).
+MARKET_EXIT_REASONS = frozenset({EXIT_REASON_TRAIL_MARKET, EXIT_REASON_BE_MARKET})
 
 # --- D17: ayrı market-data host'unda fiyat uzayı çevirisi ----------------
 # Chandelier seviyesi VERİ host'unun mumlarından çıkar ama emir İŞLEM host'una
@@ -121,7 +130,6 @@ class ExitManager:
         loss_cooldown_cb: Optional[Callable[[str], None]] = None,
         data_price_fetch: Optional[PriceFetch] = None,
         forensics_context_cb: Optional[Callable[[str], Dict[str, Any]]] = None,
-        market_close_cb: Optional[MarketCloseCb] = None,
     ):
         self.client = client
         self.pm = pm
@@ -159,13 +167,9 @@ class ExitManager:
         self._trailing_space_skips: int = 0    # baz ölçülemedi
         self._trailing_gate_skips: int = 0     # koruma-tarafı kapısı reddetti
         self._trailing_skip_log_at: Dict[str, float] = {}
-        # D22 (aynı host): işlem fiyatı BAYAT olduğu için ne emir gönderildi
-        # ne de kapanış yapıldı; ve trailing kararı piyasa emriyle uygulandı.
-        self._trailing_stale_price_skips: int = 0
+        # D22: koruyucu stop -2021 aldı ve `position_manager._emergency_close`
+        # pozisyonu piyasa emriyle kapattı (bot kendiliğinden emir GÖNDERMEZ).
         self._trailing_market_exits: int = 0
-        # D22: reduce-only MARKET kapanış yolu (engine `_close_position_market`).
-        # Reaper/flatten ile AYNI çağrı — burada YENİ emir yolu yazılmadı.
-        self.market_close_cb = market_close_cb
         # D17-R3: sembol başına veri host'u canlı fiyatı okuma hatasının
         # oran-sınırlı loglanması (`_log_trailing_skip` ile aynı disiplin).
         self._data_price_error_log_at: Dict[str, float] = {}
@@ -286,15 +290,28 @@ class ExitManager:
         # TP1 dolum kontrolü → break-even
         if not sp.tp1_done:
             await self._check_tp1(symbol, sp, amt)
+            # D22: TP1 yolunda -2021 → acil kapanış olmuş olabilir. Kapanmış
+            # bir pozisyonda TP2/trailing turuna devam etmek boşa REST
+            # harcar ve yanıltıcı log üretir.
+            if self._position_finalized(symbol, sp):
+                return
 
         # TP2 yalnız gerçek algo fill + gerçek futures trade satırlarıyla
         # doğrulanır; ardından runner tabanı sabit TP1 fiyatına yükseltilir.
         if not sp.tp2_done:
             await self._check_tp2(symbol, sp, amt)
+            if self._position_finalized(symbol, sp):
+                return
 
         # Chandelier trailing
         if sp.trailing_active:
             await self._update_trailing(symbol, sp)
+
+    def _position_finalized(self, symbol: str, sp: ScalpPosition) -> bool:
+        """Bu adım sırasında pozisyon kapanıp deftere yazıldı mı? (D22)"""
+        if getattr(sp, "close_recorded", False):
+            return True
+        return self._positions.get(symbol) is not sp
 
     async def _check_tp1(self, symbol: str, sp: ScalpPosition, live_qty: float) -> None:
         filled = sp.position.quantity
@@ -348,13 +365,13 @@ class ExitManager:
             )
         elif result.outcome == "emergency_closed":
             # D22: "eski SL korunuyor" YALNIZ pozisyon gerçekten açıksa
-            # yazılır. Burada -2021 sonrası pozisyon PİYASA emriyle kapandı;
-            # kapanış bir sonraki safety turunda deftere işlenir.
-            self.logger.warning(
-                f"🔻 {symbol}: BE seviyesi piyasa tarafından geçilmiş (-2021); "
-                f"pozisyon acil kapatıldı — kapanış bir sonraki turda deftere "
-                f"yazılacak",
-                extra={"trade": True},
+            # yazılır. Burada -2021 sonrası pozisyon PİYASA emriyle kapandı.
+            await self._on_emergency_closed(
+                symbol,
+                sp,
+                result,
+                exit_reason=EXIT_REASON_BE_MARKET,
+                what=f"BE seviyesi ({target})",
             )
         elif result.outcome == "no_position":
             self.logger.debug(
@@ -399,11 +416,12 @@ class ExitManager:
         )
         if not result.ok:
             if result.outcome == "emergency_closed":
-                self.logger.warning(
-                    f"🔻 {symbol}: runner tabanı piyasa tarafından geçilmiş "
-                    f"(-2021); pozisyon acil kapatıldı — kapanış bir sonraki "
-                    f"turda deftere yazılacak",
-                    extra={"trade": True},
+                await self._on_emergency_closed(
+                    symbol,
+                    sp,
+                    result,
+                    exit_reason=EXIT_REASON_TRAIL_MARKET,
+                    what=f"runner tabanı ({floor})",
                 )
             elif result.outcome == "no_position":
                 self.logger.debug(
@@ -706,13 +724,9 @@ class ExitManager:
             "protective_gate_skips": int(
                 getattr(self, "_trailing_gate_skips", 0) or 0
             ),
-            # D22: bayat işlem fiyatı yüzünden atlanan tur (ne emir ne kapanış).
-            "stale_price_skips": int(
-                getattr(self, "_trailing_stale_price_skips", 0) or 0
-            ),
-            # D22: trailing kararı reduce-only MARKET ile uygulandı
-            # (exit_reason=TRAIL_MARKET). Artıyorsa iz, piyasa hızının
-            # gerisinde kalıyordur.
+            # D22: koruyucu stop -2021 aldı → acil kapanış (TRAIL_MARKET /
+            # BE_MARKET). Artıyorsa stop kararı piyasa hızının gerisinde
+            # kalıyordur. Bot kendiliğinden piyasa emri GÖNDERMEZ.
             "market_exits": int(getattr(self, "_trailing_market_exits", 0) or 0),
         }
 
@@ -828,56 +842,30 @@ class ExitManager:
         if not should_update:
             return
 
-        current_price = float(getattr(sp.position, "current_price", 0.0) or 0.0)
-
-        # KORUMA-TARAFI KAPISI — seviye, işlem host'unun GÜNCEL fiyatına göre
-        # yanlış taraftaysa koşullu emri HİÇ GÖNDERME. İki host için iki AYRI
-        # doğru davranış vardır:
+        # KORUMA-TARAFI KAPISI (YALNIZ ayrı market-data host'unda — D17):
+        # seviye işlem host'unun GÜNCEL fiyatına göre yanlış taraftaysa emri
+        # hiç gönderme. Oradaki yanlış taraf borsalar arası BAZ hatası
+        # olabilir; kârlı bir koşucuyu ölçüm hatası yüzünden kapatmak
+        # yanlıştır — tur atlanır ve borsadaki SL yerinde kalır.
         #
-        #   * AYRI market-data host'u (D17): yanlış taraf, borsalar arası BAZ
-        #     hatası olabilir — kârlı bir koşucuyu ölçüm hatası yüzünden
-        #     kapatmak yanlıştır. Tur atlanır, borsadaki SL yerinde kalır.
-        #   * AYNI host (varsayılan, D22): baz diye bir şey yoktur. "Stop
-        #     güncel fiyatın yanlış tarafında" = TRAILING STOP ÇOKTAN
-        #     TETİKLENMİŞ demektir. Eskiden emir yine de gönderiliyordu;
-        #     Binance -2021 veriyor, `position_manager._replace_stop_loss`
-        #     pozisyonu PİYASA emriyle KAPATIYOR ama buradaki log "eski SL
-        #     korunuyor" diyordu ve kapanış bir sonraki turda TRAIL olarak
-        #     yazılıyordu (2026-08-23: DOGE/BNB/ETH). Artık başarısız
-        #     olacağı bilinen algoOrder çağrısı hiç yapılmaz: çıkış kararı
-        #     BİLİNÇLİ bir reduce-only MARKET kapanışıyla uygulanır
-        #     (reaper/flatten ile aynı yol) ve `TRAIL_MARKET` yazılır.
-        separate_host = self._market_data_is_separate()
-        if not separate_host:
-            # (c) Bayat fiyatla NE emir NE kapanış: geri alınamaz bir kapanış
-            # kararı 30 sn'lik bir fiyatla verilemez (D10 dersi #2).
-            if current_price <= 0 or not self._trading_price_is_fresh(symbol):
-                self._trailing_stale_price_skips = (
-                    int(getattr(self, "_trailing_stale_price_skips", 0) or 0) + 1
-                )
-                self._log_trailing_skip(
-                    symbol,
-                    f"⚠️ {symbol}: işlem fiyatı bayat/eksik "
-                    f"({current_price or 'yok'}); trailing bu turda ne "
-                    f"gönderildi ne kapatıldı, eski SL ({current_sl}) korunuyor",
-                )
-                return
-
-        if not self._is_protective_side(direction, new_stop, current_price):
-            if separate_host:
-                self._trailing_gate_skips = (
-                    int(getattr(self, "_trailing_gate_skips", 0) or 0) + 1
-                )
-                self._log_trailing_skip(
-                    symbol,
-                    f"⚠️ {symbol}: hesaplanan trailing SL ({new_stop}) işlem "
-                    f"host'unun güncel fiyatına ({sp.position.current_price}) göre "
-                    f"koruma tarafında değil; emir GÖNDERİLMEDİ, eski SL "
-                    f"({current_sl}) korunuyor",
-                )
-                return
-            await self._trailing_market_exit(
-                symbol, sp, new_stop=new_stop, current_price=current_price
+        # AYNI host'ta kapı UYGULANMAZ (D22 daraltması, 12-ajan incelemesi):
+        # gönderilmeyen emir yerine ÖNDEN piyasa kapanışı yapmak, botun
+        # kendi fiyat okumasına dayanarak geri alınamaz bir emir göndermesi
+        # demekti. Stop borsaya gönderilir; Binance -2021 derse mevcut
+        # `position_manager._emergency_close` (D22 ÖNCESİ de vardı) çalışır
+        # ve kapanış aşağıda DÜRÜST etiketiyle deftere yazılır.
+        if self._market_data_is_separate() and not self._is_protective_side(
+            direction, new_stop, float(sp.position.current_price or 0.0)
+        ):
+            self._trailing_gate_skips = (
+                int(getattr(self, "_trailing_gate_skips", 0) or 0) + 1
+            )
+            self._log_trailing_skip(
+                symbol,
+                f"⚠️ {symbol}: hesaplanan trailing SL ({new_stop}) işlem "
+                f"host'unun güncel fiyatına ({sp.position.current_price}) göre "
+                f"koruma tarafında değil; emir GÖNDERİLMEDİ, eski SL "
+                f"({current_sl}) korunuyor",
             )
             return
 
@@ -892,19 +880,16 @@ class ExitManager:
                 pass
             self.logger.info(f"📈 {symbol}: chandelier trailing SL güncellendi -> {new_stop}")
         elif result.outcome == "emergency_closed":
-            # (b) YARIŞ: kapı geçildi ama emir borsaya varana kadar fiyat
-            # stopu geçti. `position_manager` pozisyonu zaten acil kapattı;
-            # burada "eski SL korunuyor" demek YANLIŞ olurdu.
-            self._trailing_market_exits = (
-                int(getattr(self, "_trailing_market_exits", 0) or 0) + 1
+            # Seviye borsaya varmadan piyasa tarafından geçildi (-2021) ve
+            # `position_manager` pozisyonu ACİL KAPATTI. "Eski SL korunuyor"
+            # demek burada düpedüz yanlış olurdu: pozisyon YOK.
+            await self._on_emergency_closed(
+                symbol,
+                sp,
+                result,
+                exit_reason=EXIT_REASON_TRAIL_MARKET,
+                what=f"trailing SL ({new_stop})",
             )
-            self.logger.warning(
-                f"🔻 {symbol}: trailing SL ({new_stop}) borsaya varmadan piyasa "
-                f"tarafından geçildi (-2021); pozisyon PİYASA emriyle kapatıldı "
-                f"— defterde {EXIT_REASON_TRAIL_MARKET}",
-                extra={"trade": True},
-            )
-            await self._finalize_market_exit(symbol, sp)
         elif result.outcome == "no_position":
             self.logger.debug(
                 f"{symbol}: trailing güncellenmedi — borsada pozisyon kalmamış"
@@ -912,78 +897,105 @@ class ExitManager:
         else:
             self.logger.warning(f"⚠️ {symbol}: trailing SL güncellenemedi, eski SL korunuyor")
 
-    async def _trailing_market_exit(
-        self, symbol: str, sp: ScalpPosition, *, new_stop: float, current_price: float
+    async def _on_emergency_closed(
+        self,
+        symbol: str,
+        sp: ScalpPosition,
+        result: "StopReplaceResult",
+        *,
+        exit_reason: str,
+        what: str,
     ) -> None:
-        """Trailing stop çoktan tetiklenmiş: kararı PİYASA emriyle uygula (D22).
+        """Koruyucu stop -2021 aldı → pozisyon acil kapatıldı: DÜRÜST kayıt.
 
-        `market_close_cb` engine'in `_close_position_market`ıdır: reaper ve
-        risk-olayı `flatten` ile AYNI reduce-only MARKET çağrısı, AYNI
-        `force_fresh` doğrulaması ve AYNI tek-finalizer kilidi. Burada YENİ
-        bir emir yolu YOKTUR.
-
-        Geri çağrı bağlı değilse (eski kurulum/test çifti) hiçbir şey
-        yapılmaz: emir de gönderilmez, kapanış da denenmez — eski davranışın
-        güvenli yarısı korunur ve sayaç `protective_gate_skips`e yazılır.
+        D22'nin tek davranışsal iddiası budur: kapanış ZATEN olmuştur
+        (`position_manager._emergency_close`, D22 öncesinden beri). Burada
+        yapılan üç şey de yalnız DOĞRU KAYITTIR:
+          1. log "acil kapanış gerçekleşti" der — ASLA "eski SL korunuyor",
+          2. kapanışı yapan emrin kimliği/fiyatı `sp`ye yazılır (defter
+             kapanış fiyatını tahmin etmesin),
+          3. etiket (`TRAIL_MARKET`/`BE_MARKET`) `sp`ye ÇİVİLENİR ve kapanış
+             finalize edilir. Etiket, finalize bu turda başarısız olsa bile
+             kaybolmaz — sonraki safety turu aynı etiketi kullanır.
         """
-        cb = getattr(self, "market_close_cb", None)
-        if cb is None:
-            self._trailing_gate_skips = (
-                int(getattr(self, "_trailing_gate_skips", 0) or 0) + 1
-            )
-            self._log_trailing_skip(
-                symbol,
-                f"⚠️ {symbol}: trailing SL ({new_stop}) güncel fiyatın "
-                f"({current_price}) koruma tarafında değil ve piyasa kapanış "
-                f"yolu bağlı değil; emir GÖNDERİLMEDİ, eski SL korunuyor",
-            )
-            return
-
         self._trailing_market_exits = (
             int(getattr(self, "_trailing_market_exits", 0) or 0) + 1
         )
+        self._note_market_close(sp, result, exit_reason)
         self.logger.warning(
-            f"🔻 {symbol}: trailing SL ({new_stop}) güncel fiyatın "
-            f"({current_price}) koruma tarafında DEĞİL — stop çoktan "
-            f"tetiklenmiş sayılır; koşullu emir gönderilmedi, pozisyon "
-            f"reduce-only MARKET ile kapatılıyor ({EXIT_REASON_TRAIL_MARKET})",
+            f"🔻 {symbol}: {what} piyasa tarafından geçilmiş (-2021); "
+            f"ACİL KAPANIŞ GERÇEKLEŞTİ (reduce-only MARKET) — eski SL "
+            f"KORUNMUYOR, defterde {exit_reason}",
             extra={"trade": True},
         )
-        try:
-            closed = await cb(symbol, sp, exit_reason=EXIT_REASON_TRAIL_MARKET)
-        except Exception as e:
-            self.logger.error(
-                f"❌ {symbol}: trailing piyasa kapanışı başarısız ({e}); "
-                f"borsadaki SL yerinde, sonraki tur tekrar denenecek"
-            )
-            return
-        if not closed:
-            self.logger.error(
-                f"🚨 {symbol}: trailing piyasa kapanışı BORSADA DOĞRULANAMADI; "
-                f"koruma emirleri iptal EDİLMEDİ, sonraki tur tekrar denenecek"
-            )
+        await self._finalize_market_exit(symbol, sp, exit_reason=exit_reason)
 
-    async def _finalize_market_exit(self, symbol: str, sp: ScalpPosition) -> None:
-        """-2021 acil kapanışı sonrası kapanışı `TRAIL_MARKET` ile deftere yaz.
+    @staticmethod
+    def _note_market_close(
+        sp: ScalpPosition, result: Any, exit_reason: str
+    ) -> None:
+        """Acil kapanışın kimliğini/fiyatını ve etiketini `sp`ye çivile.
 
-        `market_close_cb` bağlıysa oradan geçilir: pozisyon gerçekten sıfır mı
-        (`force_fresh`) diye BAKAR, sıfırsa doğrudan `_handle_closed`a gider,
-        değilse kalanı reduce-only MARKET ile kapatıp doğrular. Bağlı değilse
-        doğrudan `_handle_closed` çağrılır (tek-finalizer kilidi kendi içinde).
+        `pending_exit_reason` ETİKET SİGORTASIDIR: finalize bu turda
+        doğrulanamazsa (borsa hâlâ miktar gösteriyor, -2022 yarışı, REST
+        hatası) kapanışı sonraki turda hangi yol yakalarsa yakalasın deftere
+        AYNI etiket yazılır. Etiketin kaybolması, D22'nin düzeltmek için var
+        olduğu kusurun ta kendisidir.
         """
-        cb = getattr(self, "market_close_cb", None)
         try:
-            if cb is not None:
-                await cb(symbol, sp, exit_reason=EXIT_REASON_TRAIL_MARKET)
-            else:
-                await self._handle_closed(
-                    symbol, sp, forced_exit_reason=EXIT_REASON_TRAIL_MARKET
+            sp.pending_exit_reason = exit_reason
+            order_id = getattr(result, "close_order_id", None)
+            if order_id:
+                sp.market_close_order_id = str(order_id)
+            price = getattr(result, "close_price", None)
+            if price:
+                sp.market_close_price = float(price)
+        except Exception:  # pragma: no cover - SimpleNamespace fixture'ları
+            pass
+
+    async def _finalize_market_exit(
+        self, symbol: str, sp: ScalpPosition, *, exit_reason: str
+    ) -> None:
+        """-2021 acil kapanışı sonrası kapanışı deftere doğru etiketle yaz.
+
+        **İKİNCİ BİR MARKET EMRİ GÖNDERİLMEZ.** Pozisyonu kapatan emir zaten
+        `position_manager._emergency_close` tarafından gönderildi; buradan
+        bir kapanış daha göndermek (D22'nin ilk hâli) `-2022 ReduceOnly
+        rejected` yarışı üretir ve en kötü hâlde ters yönde emir riski taşır.
+        Yapılan tek şey borsadan FLAT DOĞRULAMASI (`force_fresh`) ve
+        `_handle_closed` çağrısıdır — koruma emirlerinin iptali de oradadır,
+        yani doğrulanamayan kapanışta SL/TP'ye DOKUNULMAZ (fail-closed).
+
+        Doğrulanamazsa etiket `sp.pending_exit_reason`da durur: bir sonraki
+        safety turu `positionAmt==0` gördüğünde `_handle_closed` aynı etiketi
+        kullanır.
+        """
+        for delay in (0.0, 0.3, 0.6, 1.0, 2.0):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                pos_info = await self.client.get_position_risk(
+                    symbol, force_fresh=True
                 )
-        except Exception as e:
-            self.logger.error(
-                f"❌ {symbol}: acil kapanış sonrası defter kaydı yazılamadı ({e}); "
-                f"sonraki safety turu kapanışı yeniden tespit edecek"
-            )
+            except Exception as e:
+                self.logger.warning(
+                    f"⚠️ {symbol}: acil kapanış sonrası pozisyon doğrulanamadı "
+                    f"({e}); etiket {exit_reason} korunuyor, sonraki tur "
+                    f"kapanışı işleyecek"
+                )
+                return
+            amt = abs(float(pos_info.get("positionAmt", 0) or 0)) if pos_info else 0.0
+            if amt == 0:
+                await self._handle_closed(
+                    symbol, sp, forced_exit_reason=exit_reason
+                )
+                return
+
+        self.logger.error(
+            f"🚨 {symbol}: acil kapanış sonrası borsa hâlâ pozisyon gösteriyor; "
+            f"koruma emirleri iptal EDİLMEDİ (fail-closed). Etiket "
+            f"{exit_reason} korunuyor — sonraki safety turu kapanışı işleyecek."
+        )
 
     # `breakeven_side_ok`ın kabul ettiği azami fiyat yaşı (sn). Safety turu
     # saniyeler mertebesindedir; 30 sn, borsa okumalarında repo genelinde
@@ -1147,18 +1159,33 @@ class ExitManager:
             )
             return False
 
-        ok = await self.pm.replace_stop_loss(sp.position, target)
-        if ok:
+        result = await self._apply_stop(sp.position, target)
+        if result.ok:
             sp.position.current_stoploss = target
             self.logger.info(
                 f"🛡️ {symbol}: {reason} — SL ücret-dahil BE'ye çekildi (SL={target})",
                 extra={"trade": True},
             )
+        elif result.outcome == "emergency_closed":
+            # D22: yukarıdaki `breakeven_side_ok` kapısına RAĞMEN yarış
+            # kaybedildi. Pozisyon acil kapatıldı; "eski SL korunuyor"
+            # yazmak defteri kirletirdi.
+            await self._on_emergency_closed(
+                symbol,
+                sp,
+                result,
+                exit_reason=EXIT_REASON_BE_MARKET,
+                what=f"{reason} — BE ({target})",
+            )
+        elif result.outcome == "no_position":
+            self.logger.info(
+                f"ℹ️ {symbol}: {reason} — BE taşınmadı, borsada pozisyon kalmamış"
+            )
         else:
             self.logger.warning(
                 f"⚠️ {symbol}: {reason} — SL BE'ye taşınamadı, eski SL korunuyor"
             )
-        return ok
+        return bool(result.ok)
 
     @staticmethod
     def _active_runner_floor(sp: ScalpPosition) -> float:
@@ -1184,15 +1211,28 @@ class ExitManager:
         """
         if not new_stop or new_stop <= 0:
             return False
-        ok = await self.pm.replace_stop_loss(sp.position, new_stop)
-        if ok:
+        result = await self._apply_stop(sp.position, new_stop)
+        if result.ok:
             sp.position.current_stoploss = new_stop
             self.logger.info(f"🛡️ {symbol}: SL {new_stop} seviyesine çekildi ({reason})")
+        elif result.outcome == "emergency_closed":
+            await self._on_emergency_closed(
+                symbol,
+                sp,
+                result,
+                exit_reason=EXIT_REASON_TRAIL_MARKET,
+                what=f"{reason} — stop ({new_stop})",
+            )
+        elif result.outcome == "no_position":
+            self.logger.info(
+                f"ℹ️ {symbol}: SL {new_stop} seviyesine çekilmedi ({reason}), "
+                f"borsada pozisyon kalmamış"
+            )
         else:
             self.logger.warning(
                 f"⚠️ {symbol}: SL {new_stop} seviyesine çekilemedi ({reason}), eski SL korunuyor"
             )
-        return ok
+        return bool(result.ok)
 
     async def _handle_closed(
         self,
@@ -1208,9 +1248,26 @@ class ExitManager:
         NEDENİNİ (örn. "RISK_EVENT") zorlaması için — fiyat/PnL doğrulaması
         (`_verified_close_ledger`/`_fetch_net_income`) DEĞİŞMEDEN aynen
         çalışır, yalnız etiketlenen `exit_reason` üzerine yazılır.
+
+        D22 ETİKET SİGORTASI: verilmediyse `sp.pending_exit_reason` okunur.
+        Orada bir değer varsa pozisyon -2021 sonrası ACİL KAPATILMIŞ ama o
+        turda flat doğrulanamamıştır; kapanışı hangi yol yakalarsa yakalasın
+        deftere aynı (`TRAIL_MARKET`/`BE_MARKET`) etiket yazılmalıdır.
         """
+        if forced_exit_reason is None:
+            pending = getattr(sp, "pending_exit_reason", None)
+            if pending:
+                forced_exit_reason = str(pending)
         # SimpleNamespace/object.__new__ fixture'larında alan bulunmayabilir
         # (repo konvansiyonu: hasattr yerine getattr(..., None)).
+        if getattr(sp, "close_recorded", False):
+            # ARDIŞIK mükerrer finalize kalkanı (`_closing` yalnız EŞZAMANLI
+            # olanı tutar): bu pozisyonun kapanışı zaten deftere yazıldı.
+            # İkinci bir `record_close` exit_reason'ı ÜZERİNE YAZAR.
+            self.logger.debug(
+                f"{symbol}: kapanış zaten deftere yazılmış, mükerrer finalize atlandı"
+            )
+            return
         closing = getattr(self, "_closing", None)
         if closing is None:
             closing = set()
@@ -1229,6 +1286,10 @@ class ExitManager:
             await self._finalize_close(
                 symbol, sp, forced_exit_reason=forced_exit_reason
             )
+            try:
+                sp.close_recorded = True
+            except Exception:  # pragma: no cover - SimpleNamespace fixture'ları
+                pass
         finally:
             closing.discard(symbol)
             # KİMLİK kontrolü: `_finalize_close` saniyeler sürer (cancel_all +
@@ -1276,14 +1337,22 @@ class ExitManager:
             entry_fee_rate=float(getattr(sp.plan, "entry_fee_rate", 0.0) or 0.0),
         )
 
+        market_close_price: Optional[float] = None
         if ledger is not None:
             exit_price = ledger.exit_price
         else:
-            exit_price = None
-            try:
-                exit_price = await self.client.get_current_price(symbol)
-            except Exception:
-                pass
+            # D22: -2021 sonrası acil kapanışı YAPAN emir düz (algo DEĞİL)
+            # bir reduce-only MARKET emridir; `_verified_close_ledger`
+            # yalnız algo adaylarına (SL/TP1/TP2/TP3) baktığı için onu
+            # GÖREMEZ. Fiyatı ticker'dan TAHMİN etmek yerine o emrin gerçek
+            # dolumundan oku — income merdiveni aşağıda AYNEN çalışır.
+            market_close_price = await self._market_close_exit_price(symbol, sp)
+            exit_price = market_close_price
+            if not exit_price:
+                try:
+                    exit_price = await self.client.get_current_price(symbol)
+                except Exception:
+                    pass
             if not exit_price:
                 exit_price = sp.position.current_price or sp.position.entry_price
 
@@ -1296,7 +1365,11 @@ class ExitManager:
 
         verification_notes: List[str] = []
         if ledger is None:
-            verification_notes.append("exit_fill=unverified")
+            verification_notes.append(
+                "exit_fill=market_close_order"
+                if market_close_price
+                else "exit_fill=unverified"
+            )
 
         if income_net is not None:
             realized_pnl = income_net
@@ -1560,6 +1633,70 @@ class ExitManager:
             )
         except Exception as e:  # pragma: no cover - savunma
             self._forensics_warn(f"{type(e).__name__}: {e}")
+
+    async def _market_close_exit_price(
+        self, symbol: str, sp: ScalpPosition
+    ) -> Optional[float]:
+        """-2021 acil kapanışını yapan MARKET emrinin GERÇEK dolum VWAP'ı.
+
+        Sıra: (1) emrin `userTrades` satırları — borsa kanıtı; (2) emir
+        yanıtındaki `avgPrice`. İkisi de yoksa `None` döner ve çağıran eski
+        tahmin yoluna düşer. Satırlarda en ufak anormallik varsa TÜM sonuç
+        atılır (`_verified_close_ledger` ile aynı ilke: "kısmen doğrulanmış"
+        diye bir şey yoktur).
+        """
+        raw_id = getattr(sp, "market_close_order_id", None)
+        if raw_id:
+            trades_getter = getattr(self.client, "get_account_trades", None)
+            try:
+                numeric_id: Optional[int] = int(raw_id)
+            except (TypeError, ValueError):
+                numeric_id = None
+            if callable(trades_getter) and numeric_id and numeric_id > 0:
+                rows: Any = None
+                try:
+                    rows = await trades_getter(symbol, order_id=numeric_id, limit=500)
+                except Exception as exc:
+                    self.logger.debug(
+                        f"{symbol}: acil kapanış emri #{numeric_id} fill sorgusu "
+                        f"başarısız ({exc}); kapanış fiyatı tahmine düşüyor"
+                    )
+                vwap = self._fill_vwap(rows)
+                if vwap is not None:
+                    return vwap
+        try:
+            fallback = float(getattr(sp, "market_close_price", None) or 0.0)
+        except (TypeError, ValueError):
+            fallback = 0.0
+        return fallback if fallback > 0 else None
+
+    @staticmethod
+    def _fill_vwap(rows: Any) -> Optional[float]:
+        """userTrades satırlarının miktar-ağırlıklı ortalama fiyatı (katı)."""
+        if not isinstance(rows, list) or not rows:
+            return None
+        notional = 0.0
+        quantity = 0.0
+        for row in rows:
+            if not isinstance(row, dict):
+                return None
+            raw_qty = row.get("qty")
+            if raw_qty is None:
+                raw_qty = row.get("quantity")
+            try:
+                qty = float(raw_qty)
+                price = float(row.get("price"))
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(qty) or qty <= 0:
+                return None
+            if not math.isfinite(price) or price <= 0:
+                return None
+            notional += qty * price
+            quantity += qty
+        if quantity <= 0:
+            return None
+        return notional / quantity
 
     async def _verified_close_ledger(
         self,

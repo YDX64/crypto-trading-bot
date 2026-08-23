@@ -17,6 +17,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
+from urllib.parse import urlencode
 
 from fastapi import FastAPI, Depends, HTTPException, Request, Security, status
 from fastapi.responses import JSONResponse, HTMLResponse
@@ -471,32 +472,79 @@ async def health_check():
 # force-fresh çağrısı rate-limiter'ı doyurup tarama döngüsünü aç bırakmıştı.
 # Motor YOKKEN `/scalper/status` önbelleklenmez: o yol hiç REST yapmaz,
 # yalnız senkron anlık görüntü kurar (olay defteri her çağrıda taze olmalı).
-_API_STATUS_CACHE_TTL = 10.0
-_SCALPER_STATUS_CACHE_TTL = 5.0
-_api_status_cache: Dict[str, Any] = {"at": 0.0, "payload": None}
-_scalper_status_cache: Dict[str, Any] = {"at": 0.0, "payload": None, "engine": None}
+# TTL, panonun yoklama aralığıyla AYNIDIR (5 sn): her tik EN FAZLA bir kez
+# gerçek iş yapar ve gösterilen veri bir yoklama turundan daha eski olmaz.
+# İki uç AYNI TTL'yi kullanır — farklı TTL'ler panoda birbirini tutmayan iki
+# yaş üretiyordu.
+_STATUS_CACHE_TTL = 5.0
+_api_status_cache: Dict[str, Dict[str, Any]] = {}
+_scalper_status_cache: Dict[str, Dict[str, Any]] = {}
 
 
 def _reset_status_caches() -> None:
-    """Pano önbelleklerini boşalt (lifespan başlangıcı ve testler)."""
-    _api_status_cache.update({"at": 0.0, "payload": None})
-    _scalper_status_cache.update({"at": 0.0, "payload": None, "engine": None})
+    """Pano önbelleklerini boşalt (lifespan başlangıcı, durum değiştiren uçlar).
+
+    Durum DEĞİŞTİREN bir uç (risk-event halt/resume/flatten, TV olay defteri
+    sıfırlama) çağrıldıktan sonra panonun 5 sn boyunca ESKİ tabloyu
+    göstermesi, operatörün "komut çalıştı mı?" sorusuna yanlış cevap verir.
+    """
+    _api_status_cache.clear()
+    _scalper_status_cache.clear()
+
+
+def _status_cache_key(request: Optional[Request]) -> str:
+    """Önbellek anahtarı = SIRALANMIŞ sorgu dizesi.
+
+    Bugün bu iki uç query parametresi almıyor; anahtar yine de sorgudan
+    türetilir ki ileride bir `?include_shadow=1` eklendiğinde YANLIŞ
+    varyantın önbelleği servis edilmesin (sessiz veri sızıntısı).
+    """
+    if request is None:
+        return ""
+    try:
+        return urlencode(sorted(request.query_params.multi_items()))
+    except Exception:  # pragma: no cover - savunma
+        return ""
+
+
+def _cached_status(
+    cache: Dict[str, Dict[str, Any]], key: str, *, engine: Any = None
+) -> Optional[Any]:
+    entry = cache.get(key)
+    if not entry:
+        return None
+    if engine is not None and entry.get("engine") is not engine:
+        return None
+    if time.monotonic() - float(entry.get("at") or 0.0) >= _STATUS_CACHE_TTL:
+        return None
+    return entry.get("payload")
+
+
+def _store_status(
+    cache: Dict[str, Dict[str, Any]], key: str, payload: Any, *, engine: Any = None
+) -> Any:
+    # Anahtar başına tek kayıt; sınırsız büyümeyi engellemek için sorgu
+    # varyantı sayısı makul bir tavana bağlanır (pano tek varyant kullanır).
+    if len(cache) > 32:
+        cache.clear()
+    cache[key] = {"at": time.monotonic(), "payload": payload, "engine": engine}
+    return payload
 
 
 @app.get("/api/status")
-async def api_status():
+async def api_status(request: Request = None):
     """Sistem durumu — Binance hataları gizlenmez.
 
-    D22: yanıt SUNUCU tarafında ≥10 sn önbelleklenir ve borsa okumaları
-    `priority="background"` ile yapılır — ağırlık bütçesi dolduğunda YENİ
-    istek gitmez, bayat önbellekten servis edilir. `force_fresh` bu yoldan
-    ASLA istenmez (2026-08-18 pano-açlığı olayının kök nedeni buydu).
+    D22: yanıt SUNUCU tarafında 5 sn önbelleklenir ve borsa okumaları
+    `priority="background"` ile yapılır. `force_fresh` bu yoldan ASLA
+    istenmez (2026-08-18 pano-açlığı olayının kök nedeni buydu). Yanıttaki
+    `as_of`, gövdenin KURULDUĞU andır (isteğin geldiği an değil) — pano
+    "son güncelleme"yi buradan yazar, böylece önbellekten servis edilen bir
+    tablo taze görünmez.
     """
-    cached = _api_status_cache.get("payload")
-    if cached is not None and (
-        time.monotonic() - float(_api_status_cache.get("at") or 0.0)
-        < _API_STATUS_CACHE_TTL
-    ):
+    cache_key = _status_cache_key(request)
+    cached = _cached_status(_api_status_cache, cache_key)
+    if cached is not None:
         return cached
 
     account = {"balance": None, "btc_price": None, "open_positions": None}
@@ -541,9 +589,10 @@ async def api_status():
                 "sl_roi_target": settings.follower_sl_roi_target,
             },
             "timestamp": _utcnow_iso(),
+            # D22: gövdenin kurulduğu an (önbellekten servis edilse de sabit).
+            "as_of": _utcnow_iso(),
         }
-        _api_status_cache.update({"at": time.monotonic(), "payload": payload})
-        return payload
+        return _store_status(_api_status_cache, cache_key, payload)
 
     if orchestrator:
         client = orchestrator.binance
@@ -586,9 +635,10 @@ async def api_status():
             "trailing_stop": settings.trailing_stop_percentage,
         },
         "timestamp": _utcnow_iso(),
+        # D22: gövdenin kurulduğu an (önbellekten servis edilse de sabit).
+        "as_of": _utcnow_iso(),
     }
-    _api_status_cache.update({"at": time.monotonic(), "payload": payload})
-    return payload
+    return _store_status(_api_status_cache, cache_key, payload)
 
 
 @app.get("/positions")
@@ -1729,6 +1779,8 @@ async def tv_events_reset(request: Request):
         raise HTTPException(status_code=403, detail="Geçersiz webhook secret")
 
     result = tv_events.reset()
+    # D22: durum DEĞİŞTİ — pano 5 sn boyunca eski defteri göstermesin.
+    _reset_status_caches()
     app_logger.warning(
         f"🧹 TV olay defteri sıfırlandı ({result['cleared_symbols']} sembol) — "
         "kapı/çıkış tetiği yeni olay gelene kadar sessiz"
@@ -1858,6 +1910,12 @@ async def risk_event(request: Request):
         f"🚨 /risk-event: action={action} reason='{reason}' kaynak={source or '-'} "
         f"ttl={ttl_minutes}dk"
     )
+
+    if action != "status":
+        # D22: halt/resume/flatten durumu DEĞİŞTİRİR. Önbellek düşürülmezse
+        # pano 5 sn boyunca komut hiç çalışmamış gibi görünürdü — operatör
+        # bunu "komut yutuldu" diye okur ve ikinci kez tetikler.
+        _reset_status_caches()
 
     if action == "status":
         snap = engine.risk_event_status()
@@ -2205,6 +2263,10 @@ _EMPTY_SCALPER_STATUS = {
     "daily_loss_threshold_usdt": None,
     "daily_limit_pct": settings.scalper_daily_loss_limit_pct,
     "kill_switch_active": False,
+    # D22: gövdenin KURULDUĞU an (ISO). Önbellekten servis edilen bir yanıtta
+    # bile sabit kalır — pano "son güncelleme"yi bundan yazar ve bayat tablo
+    # taze görünmez. İstek anında tazelenir.
+    "as_of": None,
     # D22: motor yokken hiçbir giriş dönmez — borsa hazırlığı doğrulanmamıştır.
     "entries_blocked_by": "exchange_readiness",
     # D22: ağırlık telemetrisi süreç-genelidir (istek anında tazelenir).
@@ -2251,8 +2313,14 @@ _EMPTY_SCALPER_STATUS = {
 
 
 @app.get("/scalper/status")
-async def scalper_status():
-    """Scalper motorunun anlık durumu (tarama evreni, rejimler, izlenen pozisyonlar)."""
+async def scalper_status(request: Request = None):
+    """Scalper motorunun anlık durumu (tarama evreni, rejimler, izlenen pozisyonlar).
+
+    D22: motorlu yol 5 sn önbelleklenir; `as_of` gövdenin KURULDUĞU andır ve
+    pano "son güncelleme"yi ondan yazar. Motor YOKKEN önbellek kullanılmaz —
+    o yol REST yapmaz ve olay defteri her çağrıda taze olmalıdır.
+    """
+    cache_key = _status_cache_key(request)
     if not scalper_engine:
         empty = dict(_EMPTY_SCALPER_STATUS)
         # Motordan BAĞIMSIZ üç alan: motor ayakta değilken de GERÇEK değeri
@@ -2274,25 +2342,25 @@ async def scalper_status():
             empty["forensics_queue"] = dict(forensics_log.queue_snapshot())
         except Exception as e:  # teşhis alanı asla status'u düşürmemeli
             empty["rest_weight"] = {"error": f"{type(e).__name__}: {e}"}
+        empty["as_of"] = _utcnow_iso()
         return empty
 
-    # D22: motorlu yol ≥5 sn önbelleklenir (pano 5 sn'de bir yokluyor).
+    # D22: motorlu yol 5 sn önbelleklenir (pano 5 sn'de bir yokluyor).
     # `snapshot()` REST yapmaz ama tüm izlenen pozisyonlar + kapı + adli
     # kayıt sözlüklerini yeniden kurar; motor kimliği değişirse önbellek
     # düşer (restart/lifespan yeniden kurulumu).
-    if (
-        _scalper_status_cache.get("payload") is not None
-        and _scalper_status_cache.get("engine") is scalper_engine
-        and time.monotonic() - float(_scalper_status_cache.get("at") or 0.0)
-        < _SCALPER_STATUS_CACHE_TTL
-    ):
-        return _scalper_status_cache["payload"]
-
-    payload = scalper_engine.snapshot()
-    _scalper_status_cache.update(
-        {"at": time.monotonic(), "payload": payload, "engine": scalper_engine}
+    cached = _cached_status(
+        _scalper_status_cache, cache_key, engine=scalper_engine
     )
-    return payload
+    if cached is not None:
+        return cached
+
+    return _store_status(
+        _scalper_status_cache,
+        cache_key,
+        scalper_engine.snapshot(),
+        engine=scalper_engine,
+    )
 
 
 @app.get("/scalper/stats")

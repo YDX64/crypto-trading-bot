@@ -243,11 +243,6 @@ class ScalperEngine:
             # sapması, BTC fiyatı). SENKRON ve önbellekten okunur — ek REST
             # çağrısı YOKTUR; yalnız adli kayda yazılır.
             forensics_context_cb=self._forensics_close_context,
-            # D22: trailing seviyesi piyasa tarafından GEÇİLMİŞSE koşullu emri
-            # hiç gönderme; reaper/flatten ile AYNI reduce-only MARKET yolunu
-            # kullan (force_fresh doğrulaması + tek-finalizer kilidi). Yeni bir
-            # emir yolu YAZILMADI — `_close_position_market`ın ta kendisi.
-            market_close_cb=self._close_position_market,
         )
 
         # _task eski iç kullanımlar için scan task alias'ı olarak korunur.
@@ -996,7 +991,11 @@ class ScalperEngine:
 
         `None` = hiçbir şey (tarama dönüyor). Aksi halde ilk uygulanan kapı:
         `"entry_halt"` | `"kill_switch"` | `"risk_event"` |
-        `"exchange_readiness"`.
+        `"exchange_readiness"` | `"rest_weight"`.
+
+        `rest_weight` EN SONDADIR ve yalnız geri çekilme AÇIKKEN
+        (`BINANCE_WEIGHT_*_LIMIT > 0`, varsayılan KAPALI) dolabilir: diğerleri
+        kalıcı/politik kapılarken bu, o dakikaya özgü bir bütçe kısıtıdır.
 
         Neden gerekli: giriş kapalıyken `_scan_tick` lider anlık görüntüsünü
         TAZELEMEZ; `/scalper/status.market_gate` bir süre sonra
@@ -1027,7 +1026,14 @@ class ScalperEngine:
                 and getattr(self, "_recovery_ready", False)
                 and getattr(self, "_risk_ready", False)
             )
-            return None if ready else "exchange_readiness"
+            if not ready:
+                return "exchange_readiness"
+            # D22: geri çekilme AÇIKSA `_scan_tick` turu hiç başlatmaz —
+            # o zaman girişleri durduran gerçekten budur ve panoda da öyle
+            # görünmelidir (`scan_status=degraded:rest_weight` ile birlikte).
+            if self._rest_weight_backoff_level() != "off":
+                return "rest_weight"
+            return None
         except Exception:  # pragma: no cover - teşhis alanı asla patlamamalı
             return None
 
@@ -4375,6 +4381,10 @@ class ScalperEngine:
             "daily_loss_threshold_usdt": self._daily_loss_threshold_usdt,
             "daily_limit_pct": self.cfg.scalper_daily_loss_limit_pct,
             "kill_switch_active": self._kill_switch,
+            # D22: bu anlık görüntünün KURULDUĞU an. `/scalper/status` yanıtı
+            # 5 sn önbelleklendiği için pano "son güncelleme"yi istek anından
+            # değil BURADAN yazmalı — aksi halde bayat tablo taze görünür.
+            "as_of": _utcnow_iso(),
             # D22: "kapı bayat" ile "tarama durdu" karışmasın — tek alanda
             # yeni girişleri kimin durdurduğu.
             "entries_blocked_by": self.entries_blocked_by(),

@@ -127,8 +127,15 @@ class ImprovedBinanceClient:
     # Binance X-MBX-USED-WEIGHT-1M başlığından son ölçülen dakikalık ağırlık
     # (sınıf düzeyi: tüm istemci örnekleri aynı IP bütçesini paylaşır)
     _last_used_weight_1m: int = 0
-    # Süreç ömrü boyunca görülen TEPE ağırlık (teşhis: "bütçenin neresindeyiz")
+    # Son ölçümün alındığı an (epoch sn) — telemetride `last_at`.
+    _last_used_weight_at: float = 0.0
+    # DAKİKA DİLİMLİ tepe: Binance'in 1M sayacı takvim dakikasında sıfırlanır,
+    # dolayısıyla "tepe" ancak AYNI dakika içinde anlamlıdır. Süreç ömrü boyu
+    # tutulan bir tepe farklı dakikaları tek sayıya katlar ve RUNBOOK'un
+    # "max_1m > 3000 ise araştır" kuralını okunamaz kılardı.
     _peak_used_weight_1m: int = 0
+    _peak_used_weight_at: float = 0.0
+    _peak_window_start: float = 0.0
     # Ağırlık uyarı satırı bu eşikten itibaren basılır (gerçek sınır 2400).
     _WEIGHT_WARN_THRESHOLD = 1800
     # Uyarı/CRITICAL satırı dakikada en fazla BİR kez (2026-08-23: 276 satır/gün).
@@ -251,23 +258,50 @@ class ImprovedBinanceClient:
         bekleme bütçeyi boş yere harcatır, daha kısası ise sayacı yeniden
         doldurur.
         """
+        now = time.time()
         cls._last_used_weight_1m = used_weight
+        cls._last_used_weight_at = now
+
+        # Dakika dilimi değiştiyse tepe SIFIRLANIR (Binance sayacı da orada
+        # sıfırlanır); aynı dilim içindeyse yalnız büyürse güncellenir.
+        window_start = float(int(now // 60) * 60.0)
+        if window_start != cls._peak_window_start:
+            cls._peak_window_start = window_start
+            cls._peak_used_weight_1m = 0
+            cls._peak_used_weight_at = 0.0
         if used_weight > cls._peak_used_weight_1m:
             cls._peak_used_weight_1m = used_weight
+            cls._peak_used_weight_at = now
 
         soft, hard = cls._weight_limits()
-        now = time.time()
-        window_end = (int(now // 60) + 1) * 60.0
+        # Pencere DAİMA içinde bulunulan takvim dakikasının sonudur ve ASLA
+        # `max()` ile kilitlenmez: ileri bir saat sıçraması (NTP düzeltmesi,
+        # VM suspend) `max()` yüzünden saatlerce sürecek bir geri çekilme
+        # penceresi çivileyebilir ve bot bu süre boyunca hiç taramaz.
+        # `min(..., now + 60)` aynı sıçramaya karşı ikinci kemerdir.
+        window_end = min((int(now // 60) + 1) * 60.0, now + 60.0)
         if hard and used_weight >= hard:
-            cls._weight_hard_until = max(cls._weight_hard_until, window_end)
-            cls._weight_soft_until = max(cls._weight_soft_until, window_end)
+            cls._weight_hard_until = window_end
+            cls._weight_soft_until = window_end
         elif soft and used_weight >= soft:
-            cls._weight_soft_until = max(cls._weight_soft_until, window_end)
+            cls._weight_soft_until = window_end
 
     @classmethod
     def weight_backoff_level(cls) -> str:
-        """"off" | "soft" | "hard" — kritik olmayan istekler için geçerli kademe."""
+        """"off" | "soft" | "hard" — kritik olmayan istekler için geçerli kademe.
+
+        Pencere en fazla BİR dakika sürebilir. Daha uzağa işaret eden bir
+        damga yalnız saatin geriye alınmasıyla oluşabilir (ileri sıçrama
+        `_note_used_weight`te kırpılır); bu durumda pencere GEÇERSİZ sayılıp
+        temizlenir — teşhis amaçlı bir kapının botu süresiz durdurması,
+        koruyacağı 418'den daha pahalıdır.
+        """
         now = time.time()
+        horizon = now + 60.0
+        if cls._weight_hard_until > horizon or cls._weight_soft_until > horizon:
+            cls._weight_soft_until = 0.0
+            cls._weight_hard_until = 0.0
+            return "off"
         if now < cls._weight_hard_until:
             return "hard"
         if now < cls._weight_soft_until:
@@ -315,16 +349,32 @@ class ImprovedBinanceClient:
     def rest_weight_snapshot(cls) -> Dict[str, Any]:
         """`/scalper/status.rest_weight` — teşhis (secret içermez)."""
         soft, hard = cls._weight_limits()
+        level = cls.weight_backoff_level()   # geçersiz pencereyi de temizler
         now = time.time()
         until = max(cls._weight_soft_until, cls._weight_hard_until)
+
+        def _iso(stamp: float) -> Optional[str]:
+            if not stamp:
+                return None
+            return datetime.fromtimestamp(stamp, tz=timezone.utc).isoformat(
+                timespec="seconds"
+            )
+
         return {
+            # Son ölçülen `X-MBX-USED-WEIGHT-1M` ve ölçüm anı.
             "last": int(cls._last_used_weight_1m),
+            "last_at": _iso(cls._last_used_weight_at),
+            # İÇİNDE BULUNULAN takvim dakikasının tepesi (dakika başında
+            # sıfırlanır — Binance sayacı da orada sıfırlanır) ve tepe anı.
             "max_1m": int(cls._peak_used_weight_1m),
+            "peak_at": _iso(cls._peak_used_weight_at),
             "soft_backoffs": int(cls._weight_soft_backoffs),
             "hard_backoffs": int(cls._weight_hard_backoffs),
+            # 0 = o kademe KAPALI (varsayılan). Telemetri eşiklerden bağımsız.
             "soft_limit": soft,
             "hard_limit": hard,
-            "backoff": cls.weight_backoff_level(),
+            "enabled": bool(soft or hard),
+            "backoff": level,
             "backoff_seconds_left": round(max(0.0, until - now), 1),
         }
 
@@ -332,7 +382,10 @@ class ImprovedBinanceClient:
     def reset_weight_state(cls) -> None:
         """Yalnız testler için: ağırlık geri çekilme durumunu sıfırla."""
         cls._last_used_weight_1m = 0
+        cls._last_used_weight_at = 0.0
         cls._peak_used_weight_1m = 0
+        cls._peak_used_weight_at = 0.0
+        cls._peak_window_start = 0.0
         cls._weight_soft_until = 0.0
         cls._weight_hard_until = 0.0
         cls._weight_soft_backoffs = 0
@@ -1544,7 +1597,9 @@ class ImprovedBinanceClient:
             # -2011 ("Order does not exist") beklenen bir yarıştır: emir
             # aradaki milisaniyelerde dolmuş/iptal olmuştur (D22 madde 4).
             if is_benign_cancel_error(e):
-                self.logger.debug(f"{symbol}: iptal edilecek normal emir yok ({e})")
+                # D22: INFO — arıza değil, ama defter sapmasının izi olabilir
+                # (DEBUG üretimde kapalıdır ve iz tamamen kaybolurdu).
+                self.logger.info(f"ℹ️ {symbol}: iptal edilecek normal emir yok ({e})")
             else:
                 self.logger.warning(f"{symbol}: normal emirler iptal edilemedi: {e}")
             result["orders"] = {"error": str(e)}
@@ -1556,7 +1611,7 @@ class ImprovedBinanceClient:
                 cancelled += 1
         except Exception as e:
             if is_benign_cancel_error(e):
-                self.logger.debug(f"{symbol}: iptal edilecek koşullu emir yok ({e})")
+                self.logger.info(f"ℹ️ {symbol}: iptal edilecek koşullu emir yok ({e})")
             else:
                 self.logger.warning(f"{symbol}: koşullu emirler iptal edilemedi: {e}")
         result["algo_cancelled"] = cancelled

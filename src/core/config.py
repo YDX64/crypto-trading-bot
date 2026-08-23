@@ -153,15 +153,21 @@ class Settings(BaseSettings):
     binance_rate_limit_seconds: float = 0.5
     signal_queue_delay_seconds: float = 2.0
 
-    # --- REST ağırlık geri çekilmesi (D22) -----------------------------
-    # Binance USDⓈ-M IP ağırlık sınırı 2400/dk'dır ve sayaç IP GENELİNDEDİR
-    # (aynı çıkış IP'sindeki başka süreçler de tüketir). `X-MBX-USED-WEIGHT-1M`
-    # bu eşiklere ulaştığında KRİTİK OLMAYAN istekler (pano beslemeleri,
-    # periyodik hesap özeti, evren taraması, teşhis) dakika penceresi
-    # dolana kadar ağa ÇIKMAZ; emir/koruma/kapanış-doğrulama istekleri geçer.
-    # 0 = kapalı (eski davranış: yalnız uyarı logu).
-    binance_weight_soft_limit: int = 2000
-    binance_weight_hard_limit: int = 2300
+    # --- REST ağırlık geri çekilmesi (D22) — VARSAYILAN KAPALI ----------
+    # `X-MBX-USED-WEIGHT-1M` bu eşiklere ulaştığında KRİTİK OLMAYAN istekler
+    # (pano beslemeleri, periyodik hesap özeti, evren taraması, teşhis)
+    # takvim dakikası dolana kadar ağa ÇIKMAZ; emir/koruma/kapanış-doğrulama
+    # istekleri her zaman geçer.
+    #
+    # 0 = KAPALI ve bu VARSAYILANDIR (D22 daraltması). Gerekçe ÖLÇÜMDÜR:
+    # testnet'te `X-MBX-USED-WEIGHT-1M` başlığı IP GENELİ bir sayaçtır ve
+    # 2026-08-23 ölçümünde günün MEDYANI 2373 (>2000) çıktı. 2000/2300 ile
+    # açık olsaydı tarama turu kalıcı olarak durur, bot hiç işlem açmazdı.
+    # Telemetri (`/scalper/status.rest_weight`) eşiklerden BAĞIMSIZ çalışır;
+    # eşikler ancak o telemetriyle ölçüldükten sonra .env'den açılmalıdır
+    # (docs/RUNBOOK.md "REST ağırlık bütçesi").
+    binance_weight_soft_limit: int = 0
+    binance_weight_hard_limit: int = 0
 
     # Waiting Mode Configuration
     waiting_mode_enabled: bool = False

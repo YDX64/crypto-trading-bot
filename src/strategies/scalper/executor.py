@@ -95,6 +95,25 @@ class ScalpPosition:
     # = "bilinmiyor" (fail-safe).
     price_ts: Optional[float] = None
 
+    # --- D22: -2021 sonrası acil kapanışın kaydı --------------------------
+    # `position_manager._emergency_close` pozisyonu reduce-only MARKET ile
+    # kapattığında doldurulur. `pending_exit_reason` ETİKET SİGORTASIDIR:
+    # kapanış o turda doğrulanamazsa (borsa hâlâ miktar gösteriyor, REST
+    # hatası) sonraki tur hangi yoldan finalize ederse etsin deftere AYNI
+    # etiket ("TRAIL_MARKET"/"BE_MARKET") yazılır — etiketin kaybolması,
+    # D22'nin düzeltmek için var olduğu kusurdur. `market_close_order_id`
+    # kapanış fiyatının borsa kanıtından (userTrades VWAP) okunmasını
+    # sağlar; hiçbiri bir KARAR yolunda okunmaz.
+    pending_exit_reason: Optional[str] = None
+    market_close_order_id: Optional[str] = None
+    market_close_price: Optional[float] = None
+    # Kapanış deftere BİR KEZ yazılır. `_closing` kilidi EŞZAMANLI iki yolu
+    # engeller; bu bayrak ARDIŞIK olanı engeller: bir yol pozisyonu
+    # finalize ettikten sonra başka bir yol (TV olay kanalı, reaper,
+    # risk-olayı flatten) AYNI `sp` ile ikinci kez gelirse `record_close`
+    # üzerine yazılır ve exit_reason kaybolurdu.
+    close_recorded: bool = False
+
     # --- İşlem adli kaydı (D21) — YALNIZ GÖZLEM ---------------------------
     # Bu alanların HİÇBİRİ bir karar yolunda okunmaz; çıkış zaman çizgisini
     # (giriş → TP1 → BE → trailing → çıkış) kapanışta yeniden kurabilmek

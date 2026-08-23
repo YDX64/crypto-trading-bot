@@ -34,9 +34,11 @@ class ScalpTradeModel(Base):
     # Sonuç
     realized_pnl = Column(Float, default=0.0)
     roi_pct = Column(Float, default=0.0)
-    # "SL"|"TP_LADDER"|"TRAIL"|"TRAIL_MARKET"|"RISK_EVENT"|"TV_EVENT"|"MANUAL"|"UNKNOWN"
-    # TRAIL_MARKET (D22): trailing kararı koşullu emirle uygulanamadığı için
-    # reduce-only MARKET ile kapatıldı — TRAIL ailesi, AYRI sayılır.
+    # "SL"|"TP_LADDER"|"TRAIL"|"TRAIL_MARKET"|"BE_MARKET"|"RISK_EVENT"
+    # |"TV_EVENT"|"MANUAL"|"UNKNOWN"
+    # TRAIL_MARKET/BE_MARKET (D22): koruyucu stop -2021 aldı ve
+    # `position_manager._emergency_close` pozisyonu reduce-only MARKET ile
+    # kapattı — TRAIL ailesi, AYRI sayılır.
     exit_reason = Column(String, nullable=True)
 
     # Bağlam

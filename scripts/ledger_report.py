@@ -57,15 +57,19 @@ UP_THRESHOLD_PCT = 1.5
 DOWN_THRESHOLD_PCT = -1.5
 
 REGIME_ORDER = ["UP", "FLAT", "DOWN", "?"]
-# "TRAIL_MARKET" (D22): trailing kararı koşullu emirle uygulanamadığı için
-# reduce-only MARKET ile kapatılan işlem. TRAIL AİLESİNDENDİR ama AYRI
-# SAYILIR — sayısı artıyorsa iz, piyasa hızının gerisinde kalıyordur.
-EXIT_REASON_ORDER = ["SL", "TP_LADDER", "TRAIL", "TRAIL_MARKET", "MANUAL", "UNKNOWN"]
+# "TRAIL_MARKET"/"BE_MARKET" (D22): koruyucu stop borsaya konulamadı (-2021)
+# ve `position_manager._emergency_close` pozisyonu reduce-only MARKET ile
+# kapattı. TRAIL AİLESİNDENDİRLER ama AYRI SAYILIRLAR — sayıları artıyorsa
+# stop kararı piyasa hızının gerisinde kalıyordur.
+EXIT_REASON_ORDER = [
+    "SL", "TP_LADDER", "TRAIL", "TRAIL_MARKET", "BE_MARKET", "MANUAL", "UNKNOWN",
+]
 EXIT_REASON_FAMILY = {
     "SL": "SL",
     "TP_LADDER": "TP_LADDER",
     "TRAIL": "TRAIL",
     "TRAIL_MARKET": "TRAIL",
+    "BE_MARKET": "TRAIL",
     "MANUAL": "MANUAL",
     "RISK_EVENT": "MANUAL",
     "TV_EVENT": "MANUAL",
@@ -477,7 +481,8 @@ def build_exit_reason_direction_table(trades: List[ClosedTrade]) -> List[Dict[st
         stats = _group_stats(grouped[(reason, direction)])
         rows.append({
             "exit_reason": reason,
-            # D22: TRAIL_MARKET kendi satırında sayılır ama ailesi TRAIL'dir.
+            # D22: TRAIL_MARKET/BE_MARKET kendi satırlarında sayılır ama
+            # aileleri TRAIL'dir.
             "exit_family": exit_reason_family(reason),
             "direction": direction,
             **stats,

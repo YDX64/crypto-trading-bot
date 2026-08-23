@@ -36,6 +36,30 @@ class UnprotectedPositionError(Exception):
 
 
 @dataclass(frozen=True)
+class EmergencyCloseResult:
+    """Reduce-only MARKET acil kapanışın sonucu (D22).
+
+    Eski sözleşme `bool`du ve kapanışın GERÇEK dolumunu (emir kimliği, VWAP)
+    çağırana bildirmiyordu; defter bu yüzden kapanış fiyatını `ticker`dan
+    TAHMİN ediyordu. `__bool__` eski `if not closed:` yazan tüm çağıranları
+    (ve `AsyncMock(return_value=True)` test çiftlerini) değiştirmeden korur.
+    """
+
+    ok: bool
+    order_id: Optional[str] = None
+    avg_price: Optional[float] = None
+    quantity: Optional[float] = None
+    # MARKET emri GERÇEKTEN gönderildi mi? `False` = pozisyon biz bakmadan
+    # ÖNCE kapanmıştı (SL/TP tetiklenmiş olabilir). Bu ayrım defterin
+    # doğruluğu için ŞARTTIR: kapanışın nedeni biz değilsek kapanışa
+    # "TRAIL_MARKET/BE_MARKET" etiketi basmak yeni bir yalan olurdu.
+    submitted: bool = True
+
+    def __bool__(self) -> bool:  # eski `bool` sözleşmesi
+        return bool(self.ok)
+
+
+@dataclass(frozen=True)
 class StopReplaceResult:
     """SL değiştirme denemesinin YAPILANDIRILMIŞ sonucu (D22).
 
@@ -58,6 +82,11 @@ class StopReplaceResult:
     ok: bool
     outcome: str
     error_code: Optional[int] = None
+    # D22: `emergency_closed` durumunda pozisyonu kapatan reduce-only MARKET
+    # emrinin KİMLİĞİ ve dolum fiyatı. Defter kapanış fiyatını buradan alır;
+    # `ticker`dan tahmin etmek yanlış bir kanıt üretirdi.
+    close_order_id: Optional[str] = None
+    close_price: Optional[float] = None
 
     def __bool__(self) -> bool:  # eski `bool` sözleşmesi
         return bool(self.ok)
@@ -439,24 +468,32 @@ class PositionManager:
         """Korumasız pozisyonu reduceOnly piyasa emriyle güvenle kapat.
 
         Restart/reconciliation katmanları özel metoda bağlanmadan aynı güvenlik
-        akışını kullanabilsin diye sağlanan public sarmalayıcıdır.
+        akışını kullanabilsin diye sağlanan public sarmalayıcıdır. Dönüş
+        BİLEREK `bool`dur: bu yolun çağıranları kapanış dolumunu kullanmaz.
         """
-        return await self._emergency_close(symbol)
+        return bool(await self._emergency_close(symbol))
 
-    async def _emergency_close(self, symbol: str) -> bool:
-        """Pozisyonu piyasa emriyle reduceOnly olarak kapat."""
+    async def _emergency_close(self, symbol: str) -> "EmergencyCloseResult":
+        """Pozisyonu piyasa emriyle reduceOnly olarak kapat.
+
+        D22: dönüş `EmergencyCloseResult`tır — `__bool__` eski sözleşmeyi
+        aynen korur, ek olarak kapanışı GERÇEKTEN yapan emrin kimliği ve
+        dolum fiyatı taşınır. Çağıran (`exits._finalize_close`) böylece
+        defterin kapanış fiyatını tahmin etmek yerine borsanın döndürdüğü
+        dolumdan alabilir; income doğrulama merdiveni DEĞİŞMEZ.
+        """
         for attempt in range(3):
             try:
                 pos = await self.binance.get_position_risk(symbol)
                 if not pos:
-                    return True
+                    return EmergencyCloseResult(True, submitted=False)
                 amt = float(pos.get("positionAmt", 0))
                 if amt == 0:
                     self.logger.info(f"✅ {symbol}: kapatılacak pozisyon yok")
-                    return True
+                    return EmergencyCloseResult(True, submitted=False)
 
                 close_side = "SELL" if amt > 0 else "BUY"
-                await self.binance._request_with_retry(
+                response = await self.binance._request_with_retry(
                     "POST", "/fapi/v1/order",
                     params={
                         "symbol": symbol, "side": close_side, "type": "MARKET",
@@ -473,11 +510,35 @@ class PositionManager:
                     await self.binance.cancel_all_open_orders(symbol)
                 except Exception:
                     pass
-                return True
+                return self._emergency_close_result(response, abs(amt))
             except Exception as e:
                 self.logger.error(f"Acil kapatma denemesi {attempt + 1} başarısız ({symbol}): {e}")
                 await asyncio.sleep(1.5 * (attempt + 1))
-        return False
+        return EmergencyCloseResult(False)
+
+    @staticmethod
+    def _emergency_close_result(
+        response: Any, quantity: float
+    ) -> "EmergencyCloseResult":
+        """MARKET kapanış yanıtından emir kimliği + dolum fiyatını çıkar.
+
+        `avgPrice` MARKET emirlerinde yanıt anında 0 olabilir (dolum henüz
+        yayılmamıştır) — o hâlde `None` bırakılır ve defter emir kimliğinden
+        `userTrades` ile GERÇEK VWAP'ı okur. Uydurma fiyat yazılmaz.
+        """
+        order_id = None
+        avg_price = None
+        if isinstance(response, dict):
+            raw_id = response.get("orderId") or response.get("algoId")
+            if raw_id not in (None, "", 0, "0"):
+                order_id = str(raw_id)
+            try:
+                candidate = float(response.get("avgPrice") or 0.0)
+            except (TypeError, ValueError):
+                candidate = 0.0
+            if candidate > 0:
+                avg_price = candidate
+        return EmergencyCloseResult(True, order_id, avg_price, quantity)
 
     # ------------------------------------------------------------------
     # Take-profit / break-even / trailing
@@ -645,10 +706,28 @@ class PositionManager:
                     raise UnprotectedPositionError(
                         f"{symbol}: stop seviyesi geçildi ve acil kapatma başarısız oldu"
                     ) from e
+                if not getattr(closed, "submitted", True):
+                    # Pozisyon BİZ emir göndermeden önce kapanmıştı: kapanışın
+                    # nedeni biz değiliz (SL/TP tetiklenmiş olabilir). Uydurma
+                    # bir piyasa-kapanış etiketi basmak yerine "pozisyon yok"
+                    # de; defter normal kanıt merdiveniyle (userTrades/income)
+                    # DOĞRU exit_reason'ı bulsun.
+                    self.logger.info(
+                        f"ℹ️ {symbol}: -2021 geldi ama pozisyon zaten kapanmıştı; "
+                        f"acil kapanış emri GÖNDERİLMEDİ"
+                    )
+                    return StopReplaceResult(False, "no_position", e.code)
                 # D22: çağıran bunu "eski SL korunuyor" sanmamalı — pozisyon
-                # PİYASA emriyle kapatıldı ve defterde `TRAIL_MARKET` olarak
-                # sonlandırılmalı.
-                return StopReplaceResult(False, "emergency_closed", e.code)
+                # PİYASA emriyle kapatıldı ve defterde piyasa-kapanış
+                # etiketiyle (`TRAIL_MARKET`/`BE_MARKET`) sonlandırılmalı.
+                # Kapanışı yapan emrin kimliği/fiyatı çağırana taşınır.
+                return StopReplaceResult(
+                    False,
+                    "emergency_closed",
+                    e.code,
+                    close_order_id=getattr(closed, "order_id", None),
+                    close_price=getattr(closed, "avg_price", None),
+                )
             self.logger.error(
                 f"❌ {symbol}: yeni SL konulamadı (kod={e.code}: {e.msg}). "
                 f"ESKİ SL YERİNDE KALDI — pozisyon korumasız değil."
@@ -668,8 +747,10 @@ class PositionManager:
                 await self.binance.cancel_algo_order(int(old_sl_id), symbol=symbol)
             except Exception as e:
                 if is_benign_cancel_error(e):
-                    self.logger.debug(
-                        f"{symbol}: eski SL #{old_sl_id} zaten yok ({e})"
+                    # D22: INFO — arıza değil ama defter sapmasının izi
+                    # (emir aradaki milisaniyelerde dolmuş olabilir).
+                    self.logger.info(
+                        f"ℹ️ {symbol}: eski SL #{old_sl_id} zaten yok ({e})"
                     )
                 else:
                     self.logger.warning(
@@ -709,8 +790,8 @@ class PositionManager:
                     # -2011 = emir zaten yok (tetiklenmiş/iptal olmuş):
                     # beklenen yarış, arıza değil (D22 madde 4).
                     if is_benign_cancel_error(e):
-                        self.logger.debug(
-                            f"Eski stop zaten yok algoId={order.get('algoId')}: {e}"
+                        self.logger.info(
+                            f"ℹ️ Eski stop zaten yok algoId={order.get('algoId')}: {e}"
                         )
                     else:
                         self.logger.warning(

@@ -1053,7 +1053,9 @@
     kill_switch: "günlük kesici",
     entry_halt: "güvenlik kilidi",
     risk_event: "risk-olayı halt",
-    exchange_readiness: "borsa hazır değil"
+    exchange_readiness: "borsa hazır değil",
+    // D22: yalnız ağırlık geri çekilmesi AÇIKKEN görünür (vars. kapalı).
+    rest_weight: "REST ağırlık bütçesi"
   };
 
   function sysItem(key, value, cls, title){
@@ -1100,10 +1102,23 @@
     }
     bar.appendChild(sysItem("Kapı", gateText, gateCls, gateTitle));
 
-    // 2) Kline kaynağı — mainnet mi testnet mi (D17).
-    var src = s.kline_source || "?";
-    var srcCls = src === "mainnet" ? "ok" : (src === "testnet" ? "off" : "warn");
-    bar.appendChild(sysItem("Kline", src, srcCls, s.market_data_base_url || ""));
+    // 2) Kline kaynağı — mumlar HANGİ host'tan geliyor (D17).
+    //
+    // DÜZELTME (D22-R2): burada eskiden `kline_source === "mainnet"`
+    // karşılaştırılıyordu; oysa alanın GERÇEK değerleri "separate" ve
+    // "trading_host"tur — rozet doğru kurulumda bile ASLA yeşil olmuyordu.
+    // Sorulması gereken soru "mumlar testnet'ten mi geliyor" olduğu için
+    // karar host adından verilir; `kline_source` başlıkta (title) kalır.
+    var mdUrl = String(s.market_data_base_url || "");
+    var klineHost = mdUrl.replace(/^https?:\/\//, "").split("/")[0] || "?";
+    var klineTestnet = /testnet/i.test(mdUrl);
+    var srcCls = mdUrl ? (klineTestnet ? "warn" : "ok") : "off";
+    bar.appendChild(sysItem(
+      "Kline", klineHost, srcCls,
+      (klineTestnet ? "mumlar TESTNET host'undan geliyor" : "mumlar mainnet host'undan geliyor")
+      + " · kline_source=" + (s.kline_source || "?")
+      + " · emirler: " + String(s.trading_base_url || "?").replace(/^https?:\/\//, "")
+    ));
 
     // 3) Günlük zarar kesici.
     if (s.kill_switch_active){
@@ -1117,16 +1132,28 @@
       bar.appendChild(sysItem("Günlük kesici", "devre dışı", "off", ""));
     }
 
-    // 4) REST ağırlığı — 418 riski buradan görülür (limit 2400/dk).
+    // 4) REST ağırlığı — 418 riski buradan görülür (IP sınırı 2400/dk;
+    //    sayaç IP GENELİDİR, başka süreçler de tüketir). Geri çekilme
+    //    VARSAYILAN KAPALIDIR: bu rozet o hâlde SAF TELEMETRİDİR.
     var w = s.rest_weight || {};
     if (isNum(w.last)){
-      var wCls = w.backoff === "hard" ? "bad" : (w.backoff === "soft" ? "warn" : "ok");
+      var wCls = "ok";
+      if (w.backoff === "hard") wCls = "bad";
+      else if (w.backoff === "soft") wCls = "warn";
+      else if (isNum(w.max_1m) && w.max_1m >= 3000) wCls = "warn";
       var wText = w.last + "/dk";
-      if (isNum(w.max_1m) && w.max_1m > w.last) wText += " (tepe " + w.max_1m + ")";
+      // max_1m = İÇİNDE BULUNULAN takvim dakikasının tepesi (Binance sayacı
+      // orada sıfırlanır) — süreç ömrü tepesi DEĞİL.
+      if (isNum(w.max_1m) && w.max_1m > w.last) wText += " (dk tepe " + w.max_1m + ")";
       bar.appendChild(sysItem(
         "Ağırlık", wText, wCls,
-        "geri çekilme: " + (w.backoff || "off") +
-        " · soft " + (w.soft_backoffs || 0) + " / hard " + (w.hard_backoffs || 0)
+        (w.enabled
+          ? ("geri çekilme: " + (w.backoff || "off")
+             + " (soft " + (w.soft_limit || 0) + " / hard " + (w.hard_limit || 0) + ")")
+          : "geri çekilme KAPALI (yalnız ölçüm)")
+        + " · geri çekilme sayacı soft " + (w.soft_backoffs || 0)
+        + " / hard " + (w.hard_backoffs || 0)
+        + (w.peak_at ? " · dk tepesi " + w.peak_at : "")
       ));
     }
 
@@ -1472,9 +1499,10 @@
     var cls = "exit-other";
     if (reason === "SL") cls = "exit-sl";
     else if (reason === "TP_LADDER") cls = "exit-tp";
-    // D22: TRAIL_MARKET, TRAIL ailesindendir (trailing kararının piyasa
-    // emriyle uygulanmış hâli) — aynı renk, farklı etiket.
-    else if (reason === "TRAIL" || reason === "TRAIL_MARKET") cls = "exit-trail";
+    // D22: TRAIL_MARKET / BE_MARKET, TRAIL ailesindendir (stop kararının
+    // -2021 sonrası piyasa emriyle uygulanmış hâli) — aynı renk, farklı etiket.
+    else if (reason === "TRAIL" || reason === "TRAIL_MARKET" || reason === "BE_MARKET")
+      cls = "exit-trail";
     return '<span class="exit-chip ' + cls + '">' + escapeHtml(reason || "BİLİNMİYOR") + '</span>';
   }
 
@@ -1954,9 +1982,22 @@
   // ana döngü
   // ---------------------------------------------------------------
 
-  function setLastUpdate(){
-    var now = new Date();
-    qs("last-update").textContent = "son güncelleme " + now.toLocaleTimeString("tr-TR", { hour12:false });
+  // D22: "son güncelleme" GÖVDENİN KURULDUĞU andır, isteğin döndüğü an
+  // değil. `/scalper/status` ve `/api/status` sunucu tarafında 5 sn
+  // önbelleklenir; istek saatini yazmak bayat bir tabloyu her tikte taze
+  // gösterirdi. En ESKİ `as_of` yazılır — gösterilen en eski veri budur.
+  function setLastUpdate(scalperRes, statusRes){
+    var stamps = [];
+    [scalperRes, statusRes].forEach(function(res){
+      var raw = (res && res.ok && res.data) ? res.data.as_of : null;
+      if (!raw) return;
+      var t = Date.parse(raw);
+      if (!isNaN(t)) stamps.push(t);
+    });
+    var when = stamps.length ? new Date(Math.min.apply(null, stamps)) : new Date();
+    var suffix = stamps.length ? "" : " (istemci saati)";
+    qs("last-update").textContent = "son güncelleme "
+      + when.toLocaleTimeString("tr-TR", { hour12:false }) + suffix;
   }
 
   function setConnBanner(down){
@@ -2014,7 +2055,7 @@
       if (forensicsSummary) renderImpact(forensicsSummary);
       renderWaiting(waiting);
 
-      setLastUpdate();
+      setLastUpdate(scalperStatus, status);
     }).catch(function(err){
       // beklenmeyen bir hata olsa bile sayfa çökmesin
       console.error("dashboard tick hatası:", err);
