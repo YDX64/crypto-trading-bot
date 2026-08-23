@@ -33,7 +33,12 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from src.core.config import settings
 from src.core.logger import app_logger
-from src.strategies.scalper.data import KlineFetcher
+from src.strategies.scalper.data import (
+    KlineFetcher,
+    MarketDataGuard,
+    MarketDataUnavailable,
+    host_of,
+)
 from src.strategies.scalper.executor import ScalpExecutor
 from src.strategies.scalper.exits import ExitManager
 from src.strategies.scalper.indicators import atr as compute_atr
@@ -126,7 +131,16 @@ class ScalperEngine:
         # Orchestrator'dan bağımsız kendi istemci çifti.
         self.client = ImprovedBinanceClient()
         self.pm = PositionManager(self.client)
-        self.fetcher = KlineFetcher()
+        # D17: piyasa verisi (yalnız public /fapi/v1/klines) ayrı bir host'tan
+        # çekilebilir — "veri mainnet'ten, emirler testnet'te". Boş ayar =
+        # bugünkü davranış (KlineFetcher settings.binance_base_url'e düşer).
+        # DİKKAT: `self.client` (imzalı: emir/bakiye/pozisyon) ve `self.scanner`
+        # (24s ticker → evren sıralaması) BİLİNÇLİ olarak İŞLEM host'unda kalır;
+        # evrenin işlem yapılamayan sembollerle dolması kabul edilemez.
+        market_data_base_url = str(
+            getattr(settings, "scalper_market_data_base_url", "") or ""
+        ).strip()
+        self.fetcher = KlineFetcher(base_url=market_data_base_url or None)
         self.scanner = UniverseScanner(top_n=settings.scalper_top_n)
         self.tracker = ScalpTracker()
         self.executor = ScalpExecutor(self.client, self.pm, self.tracker, self.cfg)
@@ -251,6 +265,7 @@ class ScalperEngine:
 
         self.logger.info("⚡ Scalper motoru başlatılıyor...")
         self._maybe_log_shadow_mode_banner()
+        self._log_kline_source()
         self.logger.info(
             f"🎯 Evren={self.cfg.scalper_top_n} sembol, tarama={self.cfg.scalper_scan_interval_seconds}sn, "
             f"safety={self._safety_interval_seconds():g}sn, "
@@ -1146,6 +1161,16 @@ class ScalperEngine:
                 # Bu, sembol bazında atlanabilecek normal bir API hatası
                 # değildir; üst döngü global entry latch'i kapatmalıdır.
                 raise
+            except MarketDataUnavailable as e:
+                # D17: ban/ağırlık koruması HOST geneliyse kalan sembolleri
+                # denemek anlamsızdır (her biri ayrı bir traceback üretirdi:
+                # 12 sembol × tur). Tur burada kesilir, 30 sn sonra yeniden
+                # denenir. Sinyal üretilmemesi fail-closed'dır — açık
+                # pozisyonların SL/TP'si borsada yerinde durur.
+                self.logger.warning(
+                    f"⛔ Piyasa verisi kullanılamıyor ({e}); tarama turu kesildi"
+                )
+                break
             except Exception as e:
                 self.logger.error(f"❌ {symbol}: tur değerlendirmesi hata verdi ({e})", exc_info=True)
 
@@ -1357,6 +1382,54 @@ class ScalperEngine:
         if bool(getattr(self.cfg, "scalper_shadow_mode", False)):
             self.logger.warning("⚠️ GÖLGE MODU AÇIK — emir gönderilmez")
 
+    def _kline_source_snapshot(self) -> Dict[str, Any]:
+        """Kline verisinin GERÇEKTEN geldiği host + kaynak etiketi (D17).
+
+        Ayarı değil, `self.fetcher`ın kullandığı base_url'i raporlar — ayar
+        ile fetcher arasındaki olası bir sapma teşhiste görünsün. Secret
+        içermez (public host adı).
+        """
+        market_data_url = str(getattr(self.fetcher, "base_url", "") or "")
+        trading_url = str(getattr(self.client, "base_url", "") or "")
+        info: Dict[str, Any] = {
+            "market_data_base_url": market_data_url,
+            "trading_base_url": trading_url,
+            "kline_source": (
+                "separate"
+                if market_data_url and trading_url and market_data_url != trading_url
+                else "trading_host"
+            ),
+        }
+        # Ban/ağırlık durumu da görünür olmalı: aksi halde veri host'u banlıyken
+        # tarama turu "başarılı" sayıldığı için (`_scan_tick` turu keser ama
+        # hata FIRLATMAZ) sağlık YEŞİL kalır ve operatörün tek izi log satırı
+        # olurdu (düşmanca inceleme bulgusu). health_snapshot BİLİNÇLİ olarak
+        # DEĞİŞTİRİLMEDİ — ban sırasında "unhealthy" göstermek watchdog
+        # restart'ını davet eder, ki bu 2026-08-14 felaket yoludur.
+        if market_data_url:
+            try:
+                info["market_data_guard"] = MarketDataGuard.snapshot(market_data_url)
+            except Exception as e:  # teşhis alanı asla status'u düşürmemeli
+                info["market_data_guard"] = {"error": f"{type(e).__name__}: {e}"}
+        return info
+
+    def _log_kline_source(self) -> None:
+        """Başlangıçta TEK satır: kline verisi hangi host'tan geliyor.
+
+        Operatör bir restart sonrası bot.log'da "piyasa verisi nereden
+        geliyor" sorusuna tek satırda cevap bulmalı (D17 doğrulama adımı,
+        docs/RUNBOOK.md "Kline kaynağını mainnet'e alma").
+        """
+        info = self._kline_source_snapshot()
+        host = host_of(info["market_data_base_url"])
+        if info["kline_source"] == "separate":
+            self.logger.info(
+                f"📡 Kline kaynağı: {host} (AYRI — emirler: "
+                f"{host_of(info['trading_base_url'])})"
+            )
+        else:
+            self.logger.info(f"📡 Kline kaynağı: {host} (işlem host'u)")
+
     def _executor_entry_blocked(self, symbol: str) -> bool:
         """Executor'ın sembol cooldown kapısını güvenli/geriye uyumlu oku."""
         checker = getattr(self.executor, "is_entry_blocked", None)
@@ -1418,7 +1491,21 @@ class ScalperEngine:
             f"📡 TradingView sinyali alındı: {symbol} {direction.value}",
             extra={"trade": True},
         )
-        await self._evaluate_symbol(symbol, [_ExternalSignalStrategy(direction)])
+        try:
+            await self._evaluate_symbol(symbol, [_ExternalSignalStrategy(direction)])
+        except MarketDataUnavailable as e:
+            # D17: piyasa verisi host geneli kesikken (ban/ağırlık bütçesi) bu
+            # istisna FastAPI'ye sızıp /tv-signal'i HTTP 500'e düşürürdü;
+            # TradingView 2xx olmayan yanıtta alarmı TEKRAR gönderir ve her
+            # tekrar yine 500 üretir (sağlama oyu da boşa gider). Yapısal ret
+            # olarak dön: kaynak bunu normal bir "kabul edilmedi" gibi işler.
+            self.logger.warning(
+                f"🚫 TV sinyali işlenemedi: {symbol} — piyasa verisi yok ({e})"
+            )
+            return {
+                "accepted": False,
+                "reason": "piyasa verisi kullanılamıyor (ban/ağırlık bütçesi)",
+            }
 
         after = self.exits.tracked_symbols() | self.executor.pending_symbols()
         opened = symbol in after
@@ -1974,6 +2061,10 @@ class ScalperEngine:
             "enabled": self.cfg.scalper_enabled,
             "running": self.running,
             "shadow_mode": bool(getattr(self.cfg, "scalper_shadow_mode", False)),
+            # D17 teşhis: kline verisinin geldiği host + "trading_host"/"separate".
+            # Ayarı değil FETCHER'ın gerçeğini raporlar (bkz.
+            # _kline_source_snapshot); secret içermez.
+            **self._kline_source_snapshot(),
             "scan_interval": self.cfg.scalper_scan_interval_seconds,
             "safety_interval": self._safety_interval_seconds(),
             "health": self.health_snapshot(),

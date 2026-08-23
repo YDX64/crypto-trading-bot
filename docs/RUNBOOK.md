@@ -235,6 +235,55 @@ Mainnet'te (testnet DEĞİLKEN) gölge KAPALIYSA `RISK_EVENT_SECRET`, `TV_WEBHOO
 `SCALPER_SYMBOL_ALLOWLIST` boş (veya yalnız boşluk/virgül) OLAMAZ — `_validate_binance_environment`
 startup'ta reddeder (docs/MAINNET_PLAN.md §5.3); doldurmadan kapatamazsın.
 
+## Kline kaynağını mainnet'e alma (`SCALPER_MARKET_DATA_BASE_URL`, D17)
+Ne yapar: YALNIZ public `/fapi/v1/klines` çekimi verilen host'tan yapılır. Emir, bakiye,
+pozisyon, evren taraması (`ticker/24hr`), `exchangeInfo` ve income `BINANCE_BASE_URL`'de
+KALIR — API anahtarı bu host'a asla gitmez. Amaç: testnet'te işlem yaparken RSI/Bollinger/
+diverjans/rejim/ATR'yi GERÇEK piyasa mumlarından hesaplamak ve backtest harness'iyle (zaten
+mainnet) aynı veriye oturmak. Ayrıntı: `docs/DECISIONS.md` D17.
+
+⚠️ **Bu bir soak değişikliğidir**, ayar değil sinyal etkiler: D6+D16 soak'ı sürerken AÇMA
+(değişiklikler üst üste bindirilirse atıf bulanıklaşır — bkz. D11 notu). Ayrı host
+kullanırken `SCALPER_SYMBOL_ALLOWLIST` dolu olsun (işlem host'unda olup mainnet'te olmayan
+bir sembol her taramada kline hatası üretir).
+
+⚠️ `sed -i` eşleşme bulamazsa 0 ile çıkar (gölge modu bölümündeki tuzağın aynısı) — bu yüzden
+`{ grep -q ... && sed ... || echo ...; }` grubu + restart'tan ÖNCE `assert`'li geri-okuma:
+```bash
+ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date -u +%Y%m%d-%H%M%S)-klinesrc && { grep -q "^SCALPER_MARKET_DATA_BASE_URL=" .env && sed -i "s#^SCALPER_MARKET_DATA_BASE_URL=.*#SCALPER_MARKET_DATA_BASE_URL=https://fapi.binance.com#" .env || echo "SCALPER_MARKET_DATA_BASE_URL=https://fapi.binance.com" >> .env; } && ./.venv/bin/python -c "from src.core.config import settings as s; assert s.kline_source == \"separate\", \"KLINE KAYNAĞI DEĞİŞMEDİ — .env yazılmadı\"; print(\"market_data=\", s.market_data_base_url, \"| trading=\", s.binance_base_url)" && supervisorctl restart tradingbot_v2'
+```
+(Yedek damgası saat-dakika-saniye içerir — `server_deploy.sh`'nin `STAMP` deseni:
+`date +%Y%m%d` kullanılsaydı aynı gün ikinci koşu TEMİZ yedeği ezerdi ve ertesi gün
+"aynı-gün yedeği" hiç bulunmazdı.)
+**ZORUNLU doğrulama — üçü geçmeden değişiklik YAPILMIŞ SAYILMAZ:**
+1. Yukarıdaki komutun kendi `assert`'i restart'tan ÖNCE `market_data= https://fapi.binance.com |
+   trading= https://testnet.binancefuture.com` basmalı (basmazsa komut `AssertionError` ile durur,
+   restart hiç çalışmaz).
+2. Restart sonrası (~90 sn) log satırı:
+   `ssh awa 'grep "📡 Kline kaynağı" /opt/tradingbot-v2/logs/bot.log | tail -1'` (SON satır —
+   `-m1` kullanma, dosyadaki İLK/eski restart'ı gösterir) →
+   `📡 Kline kaynağı: fapi.binance.com (AYRI — emirler: testnet.binancefuture.com)`.
+3. Çalışan süreçten:
+   ```bash
+   curl -sS http://127.0.0.1:9091/scalper/status | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['kline_source']=='separate'; print(d['market_data_base_url'], d['trading_base_url'])"
+   ```
+İlk saat: `logs/bot.log`'da `Kline çekme hatası` (bilinmeyen sembol) ve `🚫 Piyasa verisi IP ban`
+satırı OLMAMALI. Ban görülürse ayarı geri al — mainnet IP banı gelecekteki mainnet ticaretini de
+vurur.
+ℹ️ Yan etki (bilinçli): public ban satırı `HTTP 418` içerdiği için `scripts/server_deploy.sh`'nin
+"son 15 dk'da ban izi" kilidi MAİNNET VERİ banında da deploy'u reddeder — testnet emirleri
+etkilenmemiş olsa bile. Yanlış-pozitif tarafta kalmak bilinçli tercihtir; acil deploy gerekiyorsa
+önce ayarı geri al, 15 dk bekle.
+
+**Geri alma (tek satır, restart dahil — YEDEK DOSYASINA BAĞLI DEĞİL):**
+```bash
+ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date -u +%Y%m%d-%H%M%S)-klinesrc-off && { grep -q "^SCALPER_MARKET_DATA_BASE_URL=" .env && sed -i "s#^SCALPER_MARKET_DATA_BASE_URL=.*#SCALPER_MARKET_DATA_BASE_URL=#" .env || true; } && ./.venv/bin/python -c "from src.core.config import settings as s; assert s.kline_source == \"trading_host\", \"KLINE KAYNAĞI HÂLÂ AYRI — .env yazılmadı\"; print(\"kline_source=\", s.kline_source)" && supervisorctl restart tradingbot_v2'
+```
+Bilinçli olarak `cp backups/env.bak-...` KULLANILMAZ: soak günlerce sürer, "bugünün"
+yedeği ertesi gün yoktur ve acil geri alma tam da o anda `cp: No such file` ile ölürdü.
+Satırı boşaltmak = varsayılan (kapalı); silmek de eşdeğerdir. Restart sonrası aynı üç
+doğrulamayı `trading_host` bekleyerek tekrarla.
+
 ## Güvenlik borçları
 1. Webhook düz HTTP + IP, secret sorgu dizesinde. Erişim logu kısmı ÇÖZÜLDÜ (D9,
    2026-08-21): `uvicorn.access`/`uvicorn.error` logger'larına `secret=...`'ü `secret=***`

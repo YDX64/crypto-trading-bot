@@ -19,6 +19,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from src.core.logger import app_logger
 from src.models.position import PositionModel, PositionStatus, PositionSide
+from src.strategies.scalper.data import MarketDataUnavailable
 from src.strategies.scalper.executor import ScalpPosition
 from src.strategies.scalper.indicators import chandelier_stop
 from src.strategies.scalper.tracker import ScalpTracker
@@ -86,6 +87,9 @@ class ExitManager:
         # SL/negatif kapanışta executor'ın sembol cooldown'unu başlatır.
         # Opsiyonel: verilmezse (eski kurulum/testler) davranış değişmez.
         self._loss_cooldown_cb = loss_cooldown_cb
+        # D17: piyasa verisi host GENELİ kesildiğinde (ban/bütçe) her tur her
+        # sembol için ayrı WARNING basılmasın — tur başına bir kez.
+        self._market_data_down_reason: Optional[str] = None
 
     def _maybe_start_loss_cooldown(
         self,
@@ -136,6 +140,10 @@ class ExitManager:
 
     async def step(self) -> None:
         """Engine her turda çağırır: her izlenen sembol için bir adım işlet."""
+        # Tur başında sıfırlanır: host geneli bir piyasa-verisi kesintisi bu
+        # tur içinde yalnız BİR kez loglanır ve kalan sembollerde trailing
+        # atlanır. TP/kapanış tespiti İMZALI yoldan geldiği için ATLANMAZ.
+        self._market_data_down_reason = None
         for symbol in list(self._positions.keys()):
             sp = self._positions.get(symbol)
             if sp is None:
@@ -371,11 +379,68 @@ class ExitManager:
             return False
         return True
 
+    def _market_data_is_separate(self) -> bool:
+        """Kline'lar İŞLEM borsasından FARKLI bir host'tan mı geliyor? (D17)
+
+        Varsayılan (ayar boş) ve tüm eski test çiftleri için False → davranış
+        bugünküyle birebir aynıdır.
+        """
+        market_url = str(
+            getattr(self.cfg, "scalper_market_data_base_url", "") or ""
+        ).strip()
+        if not market_url:
+            return False
+        trading_url = str(getattr(self.cfg, "binance_base_url", "") or "").strip()
+        return bool(trading_url) and market_url != trading_url
+
+    def _to_trading_price_space(self, sp: ScalpPosition, price: float) -> float:
+        """Chandelier'ın MUTLAK seviyesini işlem borsasının fiyat uzayına taşı.
+
+        D17 düşmanca inceleme bulgusu (HIGH): ayrı market-data host'unda
+        `chandelier_stop` mainnet mumlarından MUTLAK bir fiyat üretir, ama bu
+        değer `pm.replace_stop_loss` ile TESTNET'e emir olarak gönderilir. İki
+        defter arasındaki baz farkı `k×ATR`'yi aşarsa Binance -2021 verir ve
+        `position_manager._replace_stop_loss` bunu "piyasa stop'u geçti" sayıp
+        pozisyonu ACİL KAPATIR — yani kârlı bir koşucu, borsalar arası fiyat
+        farkı yüzünden piyasa emriyle kapanabilirdi. Ters yönde de gerçekleşen
+        risk boyutlamadan sapar ve canlı defteri (nihai hakem) kirletir.
+
+        Düzeltme, girişteki desenle AYNI (`executor._delay_adjusted_stop`):
+        girişte ölçülen fark kadar ÖTELE — mesafe (dolayısıyla birim risk)
+        birebir korunur. Tahmin edici, iki uzay arasındaki tek eş-anlı
+        gözlemimizdir: sinyal fiyatı (veri host'u) ↔ gerçek dolum (işlem
+        host'u). Aynı host'ta (varsayılan) hiç uygulanmaz — çünkü orada bu fark
+        gecikme/kayma demektir ve trailing'in bugünkü davranışı korunmalıdır.
+        """
+        if not self._market_data_is_separate():
+            return price
+        signal_price = float(getattr(sp.signal, "entry_price", 0.0) or 0.0)
+        fill_price = float(getattr(sp.position, "entry_price", 0.0) or 0.0)
+        if signal_price <= 0 or fill_price <= 0 or price <= 0:
+            return price
+        adjusted = price + (fill_price - signal_price)
+        if adjusted <= 0:
+            return price
+        return adjusted
+
     async def _update_trailing(self, symbol: str, sp: ScalpPosition) -> None:
+        if self._market_data_down_reason is not None:
+            # Bu turda host geneli kesinti zaten raporlandı; sembol sembol
+            # tekrar denemek ne veri getirir ne de log değeri katar.
+            return
         try:
             candles = await self.kline_fetch(
                 symbol, str(getattr(self.cfg, "scalper_tf_entry", "5m") or "5m"), 200
             )
+        except MarketDataUnavailable as e:
+            # Host geneli (ban/ağırlık bütçesi): turun kalanında trailing
+            # atlanır, TEK satır loglanır. SL/TP borsada yerinde durur.
+            self._market_data_down_reason = str(e)
+            self.logger.warning(
+                f"⛔ Piyasa verisi kullanılamıyor ({e}); bu safety turunda "
+                f"trailing güncellemesi atlandı ({symbol} ve kalan semboller)"
+            )
+            return
         except Exception as e:
             self.logger.warning(f"⚠️ {symbol}: trailing için mum verisi alınamadı ({e}), tur atlanıyor")
             return
@@ -409,6 +474,10 @@ class ExitManager:
             # anlamına gelir, gerçek fiyat DEĞİLDİR. Bu turda güncelleme yapılmaz.
             self.logger.debug(f"{symbol}: chandelier için yetersiz veri, trailing bu turda atlandı")
             return
+
+        # D17: mumlar ayrı bir borsadan geliyorsa seviyeyi İŞLEM borsasının
+        # fiyat uzayına taşı (aynı host'ta no-op).
+        raw_stop = self._to_trading_price_space(sp, raw_stop)
 
         floor = self._active_runner_floor(sp)
         current_sl = sp.position.current_stoploss or floor

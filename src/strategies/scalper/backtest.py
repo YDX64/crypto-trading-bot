@@ -1373,7 +1373,13 @@ async def run_backtest(
         run_metadata.clear()
         run_metadata.update(metadata)
 
-    fetcher = KlineFetcher(base_url=base_url)
+    # guard_mode="batch": harness tek tüketicidir ve safety döngüsü yoktur;
+    # ağırlık bütçesi dolduğunda koşuyu ÖLDÜRMEK yerine pencere sonuna kadar
+    # beklemek doğrudur (uzun pencereler — ör. 8 sembol × 30 gün ≈ 656 ağırlık
+    # — aksi halde ortada `MarketDataBudgetError` ile düşerdi). Canlı motor
+    # varsayılan "live" modda kalır: orada beklemek safety turunu bayatlatıp
+    # watchdog restart'ı tetikleyebilir (bkz. data.py guard modları).
+    fetcher = KlineFetcher(base_url=base_url, guard_mode="batch")
     throttled = _ThrottledFetch(fetcher.get_klines)
     cache_dir_path = Path(cache_dir) if cache_dir is not None else None
 

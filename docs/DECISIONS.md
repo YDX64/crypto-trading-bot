@@ -310,6 +310,169 @@ PF > 1.4 ama boğada toplam PnL tabanın ~%42'si (bilinçli tercih: "her rejimde
 "2026-08-23 02:57"`; değerlendirme ≥28 Ağu + ≥1 DOWN günü.
 **Geri alma:** `cp backups/env.bak-20260823-025623-riskpaketi .env && supervisorctl restart tradingbot_v2`.
 
+### D17 — Piyasa verisi ayrı host: `SCALPER_MARKET_DATA_BASE_URL` · 2026-08-23 · **ADAY, VARSAYILAN KAPALI** (canlıda uygulanmadı)
+**Ne:** Yeni ayar `SCALPER_MARKET_DATA_BASE_URL` (boş = bugünkü davranış, birebir).
+Doluyken YALNIZ public `/fapi/v1/klines` çekimi o host'tan yapılır; emir, bakiye, pozisyon,
+`ticker/24hr` (evren taraması), `exchangeInfo`, `income` ve tüm imzalı yollar
+`BINANCE_BASE_URL`'de KALIR — API anahtarı bu host'a asla gitmez. Kablolama tek satır:
+`ScalperEngine.__init__` → `KlineFetcher(base_url=settings.scalper_market_data_base_url or None)`.
+`ExitManager` aynı fetcher örneğini kullandığı için giriş ve trailing mumları AYNI kaynaktan gelir.
+**Emir fiyatları etkilenmez (kodda doğrulandı):** maker LIMIT fiyatı işlem host'unun
+`bookTicker`'ından alınır (`executor.py:1529-1534`), SL/TP gerçek dolumdan hesaplanır ve
+`_delay_adjusted_stop` (`executor.py:1280-1345`) stop'u dolum kaymasına göre öteleyerek
+giriş–stop MESAFESİNİ korur — iki borsa arasındaki küçük fiyat farkı (E8.0: medyan %0.054)
+boyutlamayı veya koruma seviyelerini kaydırmaz. Ayrı host YALNIZ gösterge girdisidir.
+
+**Neden (kök bulgu):** `engine.py:129` `KlineFetcher()`i argümansız kuruyordu →
+`data.py` `base_url or settings.binance_base_url` → canlı bot TESTNET'te olduğu için
+RSI / Bollinger / RSI-diverjansı / rejim (EMA50-200) / ATR hesaplarının TAMAMI **testnet
+mumlarından** üretiliyordu. Backtest harness'i (`backtest.py:1309`) ise mainnet
+`https://fapi.binance.com` okuyor: canlı motor ile harness AYNI mumları görmüyor
+(**P1 paritesinin veri tarafındaki açığı** — kural tarafı kapatılmıştı, veri tarafı açıktı)
+ve canlı sinyal kalitesi ölçülen backtest kalitesini temsil etmiyor.
+**Ölçülmüş kanıt (depo içi):** `docs/EXPERIMENTS.md` **E8.0** (sinyal otopsisi, commit
+`4d460db`): motorun `signal_reason`'a yazdığı giriş RSI'ı 143 C işleminde **testnet** 1m
+serisiyle uyuşuyor (medyan |Δ| **2.8**), mainnet 1m ile uyuşmuyor (medyan |Δ| **7.4**);
+`vol_ratio_5m` iki taraf arasında HİÇ taşınmıyor (Pearson r = **−0.04**, testnet ort. 206 vs
+mainnet 1.73); testnet 1m mumları neredeyse durağan (23:50-23:53 BTCUSDT testnet
+77079.20/77079.20/77079.10 vs mainnet 77108.0/77111.8/77073.8). Fiyat SEVİYESİ yakın
+(medyan sapma %0.054) ve makro özellikler yüksek korelasyonlu (RSI 15m r=0.975) — ama C
+stratejisi bir UÇ eşiğinde (RSI ≤ 25 / ≥ 75) karar verir; orada 2.8 puanlık medyan fark
+sinyali doğrudan çevirir, hacim türevli hiçbir kapı ise testnet'te ölçülemez.
+⚠️ Bu oturumda ayrıca aynı sınıf bir ölçüm RAPOR EDİLDİ (mainnet L 77100.0 / C 77126.8 vs
+testnet L 77143.8 / C 77182.6; hacim 84 vs 1494) ama bu worktree'de ağ erişimiyle YENİDEN
+ÜRETİLMEDİ — birincil kanıt E8.0'dır.
+
+**Ağırlık/ban (kod okumasıyla bulunan ikinci kusur, aynı commit'te düzeltildi):**
+`KlineFetcher` ve `UniverseScanner` bugüne kadar `rate_limiter.wait_for_binance`'i,
+`_ensure_rest_allowed` ban kesicisini, `X-MBX-USED-WEIGHT-1M` telemetrisini ve 418/429
+işlemesini HİÇ kullanmıyordu: 418 alan bir kline çağrısı 3 kez tekrar deniyor (yasağı
+uzatıyor) ve `scripts/server_deploy.sh`'nin `HTTP 418|banned` deploy kilidine GÖRÜNMÜYORDU.
+`data.py`'ye host BAŞINA `MarketDataGuard` eklendi: asyncio.Lock altında slot rezervi
+(kilitsiz check-then-act yarışı yok — `rate_limiter` 2026-08-14 düzeltmesiyle aynı desen),
+asgari istek aralığı 0.15 sn, kayan 60 sn ağırlık bütçesi 600/dk (IP sınırı 2400/dk; ölçülen
+canlı kullanım 64-114 ağırlık/dk — hesap `docs/ARCHITECTURE.md` §2; bütçe dolarsa BEKLENMEZ,
+`MarketDataBudgetError` ile tur atlanır — kilit altında beklemek safety turunun 30 sn'lik
+tazelik limitini aşıp watchdog restart'ını tetikleyebilirdi), 418/429/-1003 →
+fail-closed kesici + tekrar YOK + `HTTP 418` içeren CRITICAL log (deploy kilidi artık görür).
+**Bilinçli asimetri:** imzalı yolun AYNI host'taki banı public çekimi DURDURUR; public banı
+imzalı kesiciyi KURMAZ — `KlineFetcher` `BINANCE_BIND_IP`'ye bind edilmez (yalnız
+`ImprovedBinanceClient` edilir), yani iki yol aynı host'a farklı çıkış IP'sinden gidebilir ve
+public ban imzalı yolun banlı olduğunun KANITI değildir; emir/çıkış yönetimini kanıtsız
+durdurmak (SL değişimi, kapanış doğrulaması) para tarafında en pahalı hatadır. Ayrı host'ta
+sayaçlar/kesiciler zaten tamamen ayrıdır (Binance ağırlığı host+IP başınadır).
+Motor tarafı: `_scan_tick` host-geneli bir `MarketDataUnavailable` görürse turu KESER (tek
+WARNING; aksi halde 12 sembol × traceback'li ERROR basılırdı) — sinyal üretilmemesi
+fail-closed'dır, açık pozisyonların SL/TP'si borsada yerinde durur.
+Küresel `rate_limiter` (0.5 sn, imzalı yol) BİLİNÇLİ paylaşılmadı: 12 sembol × 3 TF × 0.5 sn
+≈ 18 sn'lik tarama turu safety/exits çağrılarını aynı kuyrukta bekletirdi (dashboard
+force-fresh açlığı olayının aynısı) ve `data.py`'nin 1. tasarım ilkesi "public veri emir
+akışını asla bloklamamalı" der.
+
+**Düşmanca inceleme düzeltmeleri (aynı gün, commit'e girmeden ÖNCE):** 2 mercekli (eşzamanlılık
++ para/işletme, en yüksek model) bir inceleme 3 HIGH + 8 MED/LOW gerçek kusur buldu; hepsi bu
+commit'e girmeden düzeltildi — bu kod hiçbir zaman kusurlu haliyle canlıya çıkmadı:
+1. **Trailing stop YABANCI fiyat uzayından emir gönderiyordu (HIGH, para riski).** `exits.
+   _update_trailing` chandelier'ı market-data mumlarından hesaplar ve MUTLAK seviyeyi
+   `pm.replace_stop_loss` ile İŞLEM borsasına yollar. Ayrı host'ta baz farkı `k×ATR`'yi aşarsa
+   Binance -2021 verir ve `position_manager._replace_stop_loss` bunu "piyasa stop'u geçti" sayıp
+   pozisyonu ACİL KAPATIR — kârlı bir koşucu borsalar arası fiyat farkı yüzünden piyasa emriyle
+   kapanabilirdi; ters yönde de gerçekleşen risk boyutlamadan sapıp canlı defteri kirletirdi.
+   Düzeltme: `_to_trading_price_space` — girişte ölçülen fark kadar ÖTELE (mesafe korunur),
+   `executor._delay_adjusted_stop` ile AYNI desen; aynı host'ta (varsayılan) NO-OP.
+2. **Ağırlık bütçesi backtest harness'ini öldürüyordu (HIGH, araştırma aracı).** Harness
+   `limit=1500` (ağırlık 10) ile sayfalar: 8 sembol × 30 gün ≈ 656 > 600 → koşu ortada
+   `MarketDataBudgetError` ile düşerdi (altın backtest testleri ağsız olduğu için görmezdi).
+   Düzeltme: guard modu — canlı "live" (hata), harness "batch" (pencere sonuna kadar bekler;
+   tek tüketici, safety döngüsü yok).
+3. **`/tv-signal` HTTP 500 (HIGH).** `external_signal` → `_evaluate_symbol` sarılmamıştı; ban
+   sırasında istisna FastAPI'ye sızıp 500 üretirdi ve TradingView alarmı TEKRAR gönderirdi
+   (her tekrar yine 500, sağlama oyu boşa). Düzeltme: yapısal ret (`accepted: false`).
+4. **Deploy ban kilidi kördü (MED).** `server_deploy.sh` `HTTP 418|banned` arıyor; İLK ban
+   sinyali tipik olarak 429/-1003'tür ve satırda "banned" yoktu; SÜREN ban boyunca tek satır
+   15 dk sonra pencereden düşüp kilidi açıyordu. Düzeltme: hem trip hem periyodik kesici satırı
+   artık `IP banned until <iso>` içerir.
+5. **Ban/bütçe durumu görünmüyordu (MED).** `_scan_tick` turu keser ama tur "başarılı" sayılır →
+   sağlık YEŞİL, `/scalper/status` sessiz. Düzeltme: `market_data_guard` alanı (host/banned/
+   blocked_until/ağırlık). `health_snapshot` BİLİNÇLİ değiştirilmedi — ban sırasında "unhealthy"
+   watchdog restart'ını davet ederdi (2026-08-14 felaket yolu).
+6. **Safety turunda log seli (MED).** Ayrı host banında imzalı yol sağlam olduğu için akış her
+   2 sn'de `_update_trailing`'e ulaşıp sembol başına WARNING basardı (180 sn'de ~240 satır).
+   Düzeltme: tur başına tek satır + turun kalanında trailing atlanır (TP/kapanış tespiti
+   imzalı yoldan devam eder).
+7. **Head-of-line blocking (MED).** Tek paylaşılan `_cache_lock`, yavaş bir host'ta (15 sn ×3)
+   BAŞKA sembollerin çekimini de bloklardı → safety turu 30 sn tazelik limitini aşabilirdi.
+   Düzeltme: anahtar başına kilit.
+8. **Kalıcı 4xx 3 kez deneniyordu (MED).** `-1121 Invalid symbol` kendiliğinden düzelmez;
+   sembol başına ~3 sn + 2 gereksiz istek. Düzeltme: `MarketDataRequestError` (tekrarsız,
+   SEMBOL bazlı — host geneli `MarketDataUnavailable` DEĞİL, tur kesilmez).
+9. **Pozitif host allowlist'i yoktu (MED).** İmzasız yolda `https://fapi.binance.com.evil.tld`
+   sessizce KABUL ediliyordu (kimlik doğrulama hatası üretmez). Düzeltme: `MARKET_DATA_ALLOWED_HOSTS`
+   TAM netloc eşleşmesi.
+10. **RUNBOOK yedek damgası ve geri alma (MED).** `date +%Y%m%d` aynı gün ikinci koşuda temiz
+    yedeği eziyordu ve ertesi gün "bugünün yedeği" hiç yoktu → acil geri alma komutu tam o anda
+    `cp: No such file` ile ölürdü. Düzeltme: `date -u +%Y%m%d-%H%M%S` + geri alma artık yedek
+    dosyasına DEĞİL, `sed` ile satırı boşaltmaya dayanıyor.
+11. **`ring_env_diff.sh` yarım kalkandı (MED).** `BINANCE_` prefiksi kapsam dışıydı; "hangi halka
+    nereye işlem yapıyor" görünmediği için MAINNET_PLAN'ın çapraz kontrolü yapılamıyordu.
+    Düzeltme: prefiks eklendi (secret'lar zaten maskeli).
+12. **"Ölçülen" iddiası (MED, dürüstlük).** 64-114 ağırlık/dk bir ÖLÇÜM değil HESAPTIR
+    (telemetri bu commit'te yeni eklendi). Metinler "HESAPLANAN" olarak düzeltildi ve terfi
+    yoluna kalibrasyon adımı eklendi.
+13. **Test/altyapı (LOW).** Küresel `asyncio.sleep` yaması yerine `data._sleep` dolaylaması;
+    `tests/conftest.py` ile guard durumu her testte sıfırlanır (sızan `asyncio.Lock` farklı
+    event loop'ta `RuntimeError` üretebilirdi); vacuous "secret" iddiası gerçek anahtar
+    kontrolüyle değiştirildi.
+
+**Bilinçli sınırlar:** (1) `UniverseScanner` (24s ticker) İŞLEM host'unda kaldı — evrenin
+işlem yapılamayan sembollerle dolması kabul edilemez; guard'a da bağlanmadı (saatte 1 istek).
+(2) Harness'a `--market-data-url` bayrağı EKLENMEDİ; zaten mainnet varsayılanıyla çalışıyor —
+parite testi iki tarafın AYNI host'a getirilebildiğini kilitler
+(`tests/test_market_data_source.py::TestHarnessParity`). (3) `BINANCE_BIND_IP` public
+istemciye uygulanmadı (ayrı bir karar; bugünkü canlı davranış değişmesin).
+
+**Kanıt:** `tests/test_market_data_source.py` — 65 test: ayar/doğrulama (https zorunlu,
+sondaki `/` ve yol reddi, boşluk = boş, mainnet'te testnet URL'i REDDEDİLİR), motor
+kablolaması (boş ayar → bugünkü yol; dolu ayar → fetcher; `client`/`scanner` işlem host'unda
+kalır; `ExitManager` aynı fetcher'ı paylaşır), harness paritesi, teşhis (status alanları +
+tek satır başlangıç logu), ağırlık/oran (her iki host için guard çağrılır, host başına
+aralık — ayrı host'lar aralığı PAYLAŞMAZ, bütçe dolunca beklemeden hata + pencere sonrası
+toparlanma + isteğin ağa hiç çıkmaması, ağırlık tablosu, başlık telemetrisi) ve ban semantiği
+(418 tekrarsız kesici, `HTTP 418` log kalıbı, ikinci istek ağa çıkmaz, imzalı ban public'i
+durdurur, public ban imzalıyı durdurmaz, ayrı host izolasyonu, 429 yumuşak ban,
+`banned until` ayrıştırma, 429/-1003'ün deploy kalıbına uyması, süren banın periyodik satırı,
+5xx'te 3 denemenin korunması, kalıcı 4xx'in TEKRARSIZ ve SEMBOL bazlı olması, `_scan_tick`'in
+turu tek WARNING ile kesmesi, TTL önbelleğinin korunması, anahtar başına kilit) + inceleme
+düzeltmeleri (trailing fiyat-uzayı ötelemesi ve aynı-host no-op'u, batch/live guard modları,
+`/tv-signal` yapısal reti, exits tur-başına tek uyarısı, host allowlist'i, guard durumunun
+status'ta görünmesi).
+`python3 -m pytest tests -q` → **741 passed, 1 skipped** (önceki taban: 676 passed, 1 skipped).
+Backtest ÇALIŞTIRILMADI ve P2 kuralı bu adaya doğrudan UYGULANAMAZ: harness'ın "testnet
+mumu" modu yoktur, yani "kapalı vs açık" farkı simüle edilemez — bu bir strateji parametresi
+değil, veri KAYNAĞI değişikliğidir. Terfi yolu: (a) tek sembolde mum sapmasını yeniden ölç,
+(b) `SCALPER_SHADOW_MODE` ile ya da mevcut D6+D16 soak'ı BİTTİKTEN sonra testnet'te ≥5 gün
+(değişiklikler üst üste bindirilmez — soak kirlenir), (c) bir tarama turu boyunca
+`X-MBX-USED-WEIGHT-1M`'i GERÇEKTEN oku (telemetri artık var) ve 600'lük bütçeyi ölçüme göre
+kalibre et, (d) insan onayı.
+
+**Geri alma:** `.env`'den `SCALPER_MARKET_DATA_BASE_URL` satırını sil (veya boşalt) + restart —
+kod geri alınmasına gerek yok, davranış bugünküyle birebir aynıya döner. Tam geri alma
+gerekirse bu commit'teki `src/core/config.py` (alan + `market_data_base_url`/`kline_source`/
+`market_data_is_testnet` property'leri + biçim validatörü + mainnet testnet-URL reddi),
+`src/strategies/scalper/data.py` (`MarketDataGuard` + `MarketDataUnavailable`/
+`MarketDataBanError`/`MarketDataBudgetError`/`MarketDataRequestError` + `klines_weight`/
+`host_of` + guard modları + anahtar başına kilit + `_fetch` kablolaması),
+`src/strategies/scalper/engine.py` (fetcher kablolaması +
+`_kline_source_snapshot`/`_log_kline_source` + `snapshot()` alanları + `_scan_tick`'teki
+`MarketDataUnavailable` dalı + `external_signal` yapısal reti),
+`src/strategies/scalper/exits.py` (`_to_trading_price_space`/`_market_data_is_separate` +
+tur-başına kesinti bayrağı), `src/strategies/scalper/backtest.py` (`guard_mode="batch"`),
+`scripts/ring_env_diff.sh` (`BINANCE_` prefiksi),
+`src/main.py` (`_EMPTY_SCALPER_STATUS`) değişikliklerini revert et. Yalnız ağırlık/ban
+guard'ını geri almak (ayarı korumak) da mümkündür — `data.py`'deki `MarketDataGuard.acquire`/
+`note_response`/`_raise_if_banned` çağrılarını `_fetch`'ten çıkarmak yeterlidir; üçü de
+bağımsızdır.
+
 ## Reddedilen kararlar (kanıtla)
 
 | Fikir | Tarih | Sonuç | Neden reddedildi |

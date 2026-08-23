@@ -19,6 +19,23 @@ TESTNET_HOSTS = (
     "demo.binance.com",           # Demo Trading web arayüzü ile aynı alan adı
     "testnet.binance.vision",     # Binance Spot testnet
 )
+# Public market-data (yalnız /fapi/v1/klines) için KABUL EDİLEN host'lar —
+# TAM eşleşme (alt-dize DEĞİL). Neden allowlist: bu yol imzasızdır, yani yanlış
+# bir host hiçbir kimlik doğrulama hatası üretmez; bot sessizce YABANCI mumlarla
+# karar verir ve o mumlardan türeyen chandelier seviyesi gerçek bir stop emrine
+# dönüşür. Bir yazım hatası (`fapi.binance.com.evil.tld`) sessizce geçmemeli.
+# Yeni bir Binance uç noktası gerekiyorsa bu demete BİLİNÇLİ olarak eklenir.
+MARKET_DATA_ALLOWED_HOSTS = (
+    "fapi.binance.com",
+    "fapi1.binance.com",
+    "fapi2.binance.com",
+    "fapi3.binance.com",
+    "fapi4.binance.com",
+    "testnet.binancefuture.com",
+    "demo-fapi.binance.com",
+    "demo.binance.com",
+    "testnet.binance.vision",
+)
 # NOT: testnet.binancefuture.com ile demo-fapi.binance.com AYNI hesabı gösterir
 # (2026-08-06'da aynı API anahtarıyla doğrulandı: iki adreste de birebir aynı
 # bakiye ve pozisyonlar). Binance testnet'i "Demo Trading" olarak yeniden
@@ -55,6 +72,21 @@ class Settings(BaseSettings):
     # `from <ana-IP> lookup 100` kuralı sayesinde bind edilen soket tüneli
     # atlar ve temiz, yalnız bize ait weight bütçesinden harcar.
     binance_bind_ip: str = ""
+    # 2026-08-23 (D17): PUBLIC piyasa verisi (yalnız /fapi/v1/klines) için AYRI
+    # host. Boş = bugünkü davranış (binance_base_url ile aynı host).
+    # NEDEN: canlı bot TESTNET'teyken RSI/Bollinger/diverjans/rejim/ATR
+    # hesapları TESTNET mumlarından üretiliyor; testnet mumları gerçek
+    # piyasadan sapar (aynı dakikada mainnet L 77100.0/C 77126.8 vs testnet
+    # L 77143.8/C 77182.6; hacim mainnet 84 vs testnet 1494 — uydurma) ve
+    # backtest harness'i (backtest.py, mainnet fapi) ile canlı motor AYNI
+    # sinyalleri görmez (parite açığı).
+    # KAPSAM: yalnız imzasız/public kline çekimi. Emir, bakiye, pozisyon,
+    # ticker, exchangeInfo, income — hepsi BINANCE_BASE_URL'de kalır.
+    # GÜVENLİK: mainnet'te işlem yapılırken (is_testnet False) bu alan boş ya
+    # da mainnet host'u olmalıdır — gerçek parayla işlem açan bir motorun
+    # testnet mumlarıyla karar vermesi _validate_binance_environment
+    # tarafından reddedilir.
+    scalper_market_data_base_url: str = ""
     # Gerçek parayla (mainnet) işlem yapmak için açık onay. Varsayılan False.
     # binance_base_url mainnet'i gösteriyorsa ve bu False ise Settings() hata verir.
     allow_mainnet: bool = False
@@ -358,6 +390,70 @@ class Settings(BaseSettings):
         base_url_lower = self.binance_base_url.lower()
         return any(host in base_url_lower for host in TESTNET_HOSTS)
 
+    @property
+    def market_data_base_url(self) -> str:
+        """Public kline çekiminin GERÇEKTEN kullandığı host (D17).
+
+        Boş `scalper_market_data_base_url` = bugünkü davranış: işlem host'u
+        ile aynı. Emir/bakiye/pozisyon yolu bu property'yi ASLA kullanmaz.
+        """
+        return (self.scalper_market_data_base_url or "").strip() or self.binance_base_url
+
+    @property
+    def kline_source(self) -> str:
+        """Teşhis etiketi: "trading_host" (tek host) | "separate" (ayrı host)."""
+        return (
+            "separate"
+            if self.market_data_base_url != self.binance_base_url
+            else "trading_host"
+        )
+
+    @property
+    def market_data_is_testnet(self) -> bool:
+        """Piyasa verisi bilinen bir testnet host'undan mı geliyor?"""
+        url_lower = self.market_data_base_url.lower()
+        return any(host in url_lower for host in TESTNET_HOSTS)
+
+    @field_validator("scalper_market_data_base_url")
+    @classmethod
+    def _validate_market_data_base_url(cls, value: str) -> str:
+        """Boş = kapalı. Doluysa biçim startup'ta fail-fast doğrulanır.
+
+        Neden burada: hatalı bir URL yalnız İLK kline çekiminde jenerik bir
+        ağ hatası olarak yüzeylenirdi (3 retry sonrası) — operatör bunu
+        geçici ağ sorunu sanar ve bot sessizce sinyalsiz kalır.
+        """
+        value = (value or "").strip()
+        if not value:
+            return ""
+        if not value.startswith("https://"):
+            raise ValueError(
+                f"SCALPER_MARKET_DATA_BASE_URL 'https://' ile başlamalı: {value!r} "
+                "(public veri olsa da düz HTTP kabul edilmez)"
+            )
+        if value.endswith("/"):
+            raise ValueError(
+                f"SCALPER_MARKET_DATA_BASE_URL sonunda '/' olmamalı: {value!r} "
+                "(endpoint yolu base_url'e doğrudan eklenir: "
+                "<base_url>/fapi/v1/klines)"
+            )
+        host = value[len("https://"):]
+        if not host or "/" in host or any(ch.isspace() for ch in value):
+            raise ValueError(
+                f"SCALPER_MARKET_DATA_BASE_URL yalnız şema+host olmalı (yol/boşluk "
+                f"içeremez): {value!r}"
+            )
+        # TAM host eşleşmesi (alt-dize DEĞİL): imzasız bir yol olduğu için
+        # yanlış host sessizce yabancı mumlarla karar verdirir.
+        if host.lower() not in MARKET_DATA_ALLOWED_HOSTS:
+            raise ValueError(
+                f"SCALPER_MARKET_DATA_BASE_URL bilinmeyen host: {host!r}. İzin "
+                f"verilenler: {', '.join(MARKET_DATA_ALLOWED_HOSTS)} "
+                "(yeni bir Binance uç noktası gerekiyorsa src/core/config.py'deki "
+                "MARKET_DATA_ALLOWED_HOSTS demetine bilinçli olarak ekleyin)."
+            )
+        return value
+
     @field_validator("binance_bind_ip")
     @classmethod
     def _validate_bind_ip(cls, value: str) -> str:
@@ -439,6 +535,9 @@ class Settings(BaseSettings):
            gösteriyorsa (allow_mainnet=True ile bilinçli olarak izin
            verilmiş olsa bile) yüksek sesle uyarı basılır — geliştirme/test
            ortamında gerçek parayla işlem açma riskine dikkat çekmek için.
+        3) (D17) Mainnet'te işlem yapılırken SCALPER_MARKET_DATA_BASE_URL bir
+           TESTNET host'unu gösteremez -> ValueError. Gerçek para sahte
+           mumlarla yönetilemez.
         """
         if not self.is_testnet:
             # binance_base_url bilinen bir testnet host'u değil -> mainnet
@@ -462,6 +561,21 @@ class Settings(BaseSettings):
                     "testnet'te kullanılabilir. Mainnet'te fail-closed giriş "
                     "kilidi devre dışı bırakılamaz — ayarı .env'den kaldırın "
                     "veya true yapın."
+                )
+
+            # D17: "piyasa verisi ayrı host" seçeneği yalnız TESTNET'te işlem
+            # yaparken (mainnet verisi + testnet emirleri) anlamlıdır. Mainnet'te
+            # işlem yapılırken market-data host'u bir TESTNET host'u olamaz —
+            # gerçek parayla açılan bir pozisyonun RSI/BB/rejim kararı sahte
+            # (testnet) mumlardan gelemez. Boş (=işlem host'u) veya mainnet
+            # host'u kabul edilir.
+            if self.market_data_is_testnet:
+                raise ValueError(
+                    "GÜVENLİK HATASI: SCALPER_MARKET_DATA_BASE_URL bir TESTNET "
+                    f"host'unu gösteriyor ({self.market_data_base_url}) ama işlemler "
+                    f"MAINNET'te açılıyor ({self.binance_base_url}). Gerçek parayla "
+                    "işlem testnet mumlarına dayandırılamaz — ayarı boşaltın "
+                    "(=işlem host'u) veya mainnet host'u verin."
                 )
 
             if not self.scalper_shadow_mode:

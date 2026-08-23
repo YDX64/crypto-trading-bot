@@ -1038,6 +1038,12 @@ _EMPTY_SCALPER_STATUS = {
     "enabled": False,
     "running": False,
     "shadow_mode": settings.scalper_shadow_mode,
+    # D17: motor kurulmamışken bile "kline verisi nereden gelecek" görünür
+    # olsun (ayardan türetilir; motor varken engine.snapshot() fetcher'ın
+    # GERÇEK base_url'ini raporlar).
+    "market_data_base_url": settings.market_data_base_url,
+    "trading_base_url": settings.binance_base_url,
+    "kline_source": settings.kline_source,
     "scan_interval": settings.scalper_scan_interval_seconds,
     "safety_interval": settings.scalper_safety_interval_seconds,
     "health": {"healthy": False, "running": False, "reason": "engine_not_created"},

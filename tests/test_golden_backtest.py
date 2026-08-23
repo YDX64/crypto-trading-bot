@@ -59,8 +59,11 @@ class _NetworkForbiddenKlineFetcher:
     sessizce ağa düşmek yerine gürültülü biçimde patlar — bu test AĞSIZ
     çalışmalı, aksi hâlde hem yavaş hem deterministik olmaz."""
 
-    def __init__(self, base_url: str) -> None:
+    def __init__(self, base_url: str, guard_mode: str = "live") -> None:
+        # guard_mode: run_backtest harness'i "batch" geçer (D17) — bu sahte
+        # sınıf ağa hiç çıkmadığı için değeri yalnız imzayı uyumlu tutar.
         self.base_url = base_url
+        self.guard_mode = guard_mode
 
     async def get_klines(self, symbol, interval, limit, end_time=None):
         raise AssertionError(

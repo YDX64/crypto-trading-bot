@@ -21,7 +21,9 @@ Yeni sinyal kaynağı (haber botu vb.) eklemek: `docs/INTEGRATIONS.md`. Otomatik
   `systemctl`'deki `live-bot.service` **trading botu DEĞİLDİR** (futbol botu).
 - **Ayarlar:** `/opt/tradingbot-v2/.env` (commit'lenmez; her değişiklikte
   `backups/env.bak-<tarih>-<etiket>` yedeği). Varsayılanlar `src/core/config.py`.
-  Kapalı duran kanallar: `RISK_EVENT_SECRET` (boş = /risk-event 503), `SCALPER_SHADOW_MODE=false`.
+  Kapalı duran kanallar: `RISK_EVENT_SECRET` (boş = /risk-event 503), `SCALPER_SHADOW_MODE=false`,
+  `SCALPER_MARKET_DATA_BASE_URL=` (boş = kline'lar da işlem host'undan; D17 adayı — doldurmadan
+  önce `docs/RUNBOOK.md` "Kline kaynağını mainnet'e alma").
 - **Veri:** `tradingbot.db` (sqlite, `scalp_trades`), `state/` (cooldown, entry-halt),
   `logs/bot.log` (uygulama), `logs/supervisor.log` (erişim logu — **secret içerir, dökme**).
 

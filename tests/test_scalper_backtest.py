@@ -602,8 +602,11 @@ class TestBacktestWarmupAndProvenance:
         interval_ms = {"5m": 300_000, "15m": 900_000, "4h": 14_400_000}
 
         class FakeKlineFetcher:
-            def __init__(self, base_url):
+            def __init__(self, base_url, guard_mode="live"):
+                # guard_mode: harness "batch" geçer (D17 — bütçe dolunca koşu
+                # ölmesin, beklesin). Sahte sınıf için yalnız imza uyumu.
                 self.base_url = base_url
+                self.guard_mode = guard_mode
 
             async def get_klines(self, symbol, interval, limit, end_time=None):
                 span = interval_ms[interval]

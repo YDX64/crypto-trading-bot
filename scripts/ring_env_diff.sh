@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Salt okunur: testnet ve mainnet halkalarının .env'i arasında SCALPER_*/TV_*/RISK_*
-# anahtarlarının hangilerinin FARKLI olduğunu gösterir. Hiçbir şeyi değiştirmez.
+# Salt okunur: testnet ve mainnet halkalarının .env'i arasında BINANCE_*/SCALPER_*/
+# TV_*/RISK_* anahtarlarının hangilerinin FARKLI olduğunu gösterir. Hiçbir şeyi değiştirmez.
+# BINANCE_ dahildir (D17): "hangi halka nereye işlem yapıyor" (BINANCE_BASE_URL) ile
+# "kline'lar nereden geliyor" (SCALPER_MARKET_DATA_BASE_URL) çapraz kontrolü ancak ikisi
+# birlikte görülünce yapılabilir — bkz. docs/MAINNET_PLAN.md §3.
 # Secret benzeri anahtarların (adında SECRET/KEY/TOKEN/PASS geçen) DEĞERİNİ asla yazdırmaz —
 # yalnız "değişti" (***) der; değer içermeyen anahtarlar olduğu gibi gösterilir.
 # Kullanım: scripts/ring_env_diff.sh [ssh-host]
@@ -27,7 +30,7 @@ mask_or_value() {
 [ -f "$v2" ] || { echo "yok: $v2" >&2; exit 1; }
 [ -f "$main" ] || { echo "yok: $main" >&2; exit 1; }
 
-keys="$(grep -hE '^(SCALPER_|TV_|RISK_)[A-Za-z0-9_]*=' "$v2" "$main" | cut -d= -f1 | sort -u)" || true
+keys="$(grep -hE '^(BINANCE_|SCALPER_|TV_|RISK_)[A-Za-z0-9_]*=' "$v2" "$main" | cut -d= -f1 | sort -u)" || true
 
 diffcount=0
 for k in $keys; do
@@ -42,7 +45,7 @@ for k in $keys; do
 done
 
 if [ "$diffcount" -eq 0 ]; then
-  echo "fark yok (SCALPER_/TV_/RISK_ anahtarları özdeş)"
+  echo "fark yok (BINANCE_/SCALPER_/TV_/RISK_ anahtarları özdeş)"
 fi
 exit 0
 REMOTE
