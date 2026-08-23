@@ -41,11 +41,18 @@ from src.trading.binance_client_improved import (
 from src.trading.position_manager import PositionManager, UnprotectedPositionError
 
 KlineFetch = Callable[[str, str, int], Awaitable[List[Candle]]]
+# Veri host'unun CANLI fiyatını veren çağrı (`KlineFetcher.get_price`).
+# Opsiyoneldir: verilmezse ayrı-host çevirisi baz ölçemez ve turu atlar
+# (fail-closed) — aynı host'ta (varsayılan) HİÇ çağrılmaz.
+PriceFetch = Callable[[str], Awaitable[float]]
 
 # --- D17: ayrı market-data host'unda fiyat uzayı çevirisi ----------------
 # Chandelier seviyesi VERİ host'unun mumlarından çıkar ama emir İŞLEM host'una
-# gider. Baz (iki defter arasındaki anlık fark) her turda YENİDEN ölçülür:
-#     baz = işlem_host_güncel_fiyat − veri_host_son_kapanış
+# gider. Baz (iki defter arasındaki anlık fark) her turda YENİDEN ölçülür ve
+# D17-R3'ten (bütünleşme incelemesi) beri LIKE-FOR-LIKE'tır:
+#     baz = işlem_host_CANLI_fiyat − veri_host_CANLI_fiyat
+# Eski biçim (`… − veri_host_son_KAPANIŞ`) iki farklı türü karıştırıyordu:
+# fark, borsa-arası bazın ÜSTÜNE mum-içi sürüklenmeyi de bindiriyordu.
 # Aşağıdaki sabitler bu çevirinin akıl sağlığı sınırlarıdır.
 #
 # İşlem host'u fiyatının azami yaşı (sn). `_step_one` her turda (≈2 sn)
@@ -97,12 +104,17 @@ class ExitManager:
         cfg: Any,
         kline_fetch: KlineFetch,
         loss_cooldown_cb: Optional[Callable[[str], None]] = None,
+        data_price_fetch: Optional[PriceFetch] = None,
     ):
         self.client = client
         self.pm = pm
         self.tracker = tracker
         self.cfg = cfg
         self.kline_fetch = kline_fetch
+        # D17-R3: veri host'unun CANLI fiyatı (borsa-arası bazın veri tarafı).
+        # Opsiyonel — verilmezse ayrı host'ta baz ölçülemez ve trailing turu
+        # atlanır (fail-closed). Aynı host'ta HİÇ çağrılmaz.
+        self.data_price_fetch = data_price_fetch
         self.logger = app_logger
         self._positions: Dict[str, ScalpPosition] = {}
         # Aynı sembol için _handle_closed'a İKİ YOLDAN (safety turu ve
@@ -124,6 +136,9 @@ class ExitManager:
         self._trailing_space_skips: int = 0    # baz ölçülemedi
         self._trailing_gate_skips: int = 0     # koruma-tarafı kapısı reddetti
         self._trailing_skip_log_at: Dict[str, float] = {}
+        # D17-R3: sembol başına veri host'u canlı fiyatı okuma hatasının
+        # oran-sınırlı loglanması (`_log_trailing_skip` ile aynı disiplin).
+        self._data_price_error_log_at: Dict[str, float] = {}
 
     def _maybe_start_loss_cooldown(
         self,
@@ -458,12 +473,26 @@ class ExitManager:
         derken kayıt TRAIL olarak etiketlenirdi). Ters yönde de gerçekleşen
         risk boyutlamadan sapar ve canlı defteri (nihai hakem) kirletir.
 
-        BAZ DİNAMİKTİR (ikinci tur inceleme, iki HIGH'ı birlikte kapatır):
-            baz = işlem_host_güncel_fiyat − veri_host_son_kapanış
-        İkisi de AYNI TURDA ölçülür: `sp.position.current_price` `_step_one`'da
-        işlem host'undan tazelenir; `data_reference` chandelier'ı hesaplayan
-        mum serisinin son KAPANMIŞ mumunun kapanışıdır. İlk sürümdeki statik
-        baz (`position.entry_price − signal.entry_price`) iki yerde kırılıyordu:
+        BAZ DİNAMİK ve LIKE-FOR-LIKE'tır (D17-R3, bütünleşme incelemesi):
+            baz = işlem_host_CANLI_fiyat − veri_host_CANLI_fiyat
+        İkisi de AYNI TURDA ve AYNI TÜRDEN ölçülür: `sp.position.current_price`
+        `_step_one`'da işlem host'unun ticker'ından tazelenir; `data_reference`
+        `_data_host_price` ile veri host'unun public `/fapi/v1/ticker/price`
+        okumasıdır.
+
+        ⚠️ `data_reference` MUM KAPANIŞI OLAMAZ. İlk dinamik sürüm
+        `candles[-1].close` (veri host'unun son KAPANMIŞ mumu) kullanıyordu;
+        bu iki büyüklük AYNI TÜRDEN DEĞİLDİR ve fark, borsa-arası bazın
+        ÜSTÜNE MUM-İÇİ SÜRÜKLENMEYİ bindirir. Sonuç sistematikti: fiyat
+        pozisyonun lehine gittikçe (LONG'ta yükseldikçe) sürüklenme pozitif
+        olur, chandelier mandalı (`new_stop > current_sl`) her turda biraz
+        daha yukarı kilitlenir ve stop fiilen CANLI FİYATI izler — chandelier
+        MESAFESİ değil. Ters yönde ise koruma-tarafı kapısı turu boşa
+        atlatır. Baz artık iki CANLI fiyatın farkıdır; mum kapanışı yalnız
+        chandelier SEVİYESİNİ üretir (`raw_stop`), bazı DEĞİL.
+
+        İlk sürümdeki statik baz (`position.entry_price − signal.entry_price`)
+        iki yerde kırılıyordu:
           1. yalnız GİRİŞ anında ölçülüp pozisyon ömrü boyunca sabit
              uygulanıyordu — iki defter arasındaki baz saatler içinde kayar;
           2. `recover()` (restart) `signal.entry_price` ile
@@ -480,9 +509,11 @@ class ExitManager:
         koruma tarafı GÜNCEL fiyata göre denetlenir (pozisyon çoktan açık,
         piyasa girişten uzaklaşmış olabilir).
 
-        Dönüş `None` = çeviri güvenilir DEĞİL (bayat/eksik işlem fiyatı, absürt
-        baz): çağıran turu atlar, borsadaki SL yerinde kalır — fail-closed.
-        Aynı host'ta (varsayılan, ayar boş) hiç uygulanmaz: `price` aynen döner.
+        Dönüş `None` = çeviri güvenilir DEĞİL (bayat/eksik işlem fiyatı, veri
+        host'u fiyatı okunamadı, absürt baz): çağıran turu atlar, borsadaki SL
+        yerinde kalır — fail-closed.
+        Aynı host'ta (varsayılan, ayar boş) hiç uygulanmaz: `price` aynen döner
+        ve `data_reference` OKUNMAZ (byte-for-byte no-op).
         """
         if not self._market_data_is_separate():
             return price
@@ -502,10 +533,60 @@ class ExitManager:
             return None
         return adjusted
 
+    async def _data_host_price(self, symbol: str) -> Optional[float]:
+        """VERİ host'unun CANLI fiyatı — borsa-arası bazın veri tarafı (D17-R3).
+
+        Yalnız ayrı market-data host'unda çağrılır; aynı host'ta (varsayılan)
+        `None` döner ve çağıran zaten hiç sormaz.
+
+        Ağırlık: `/fapi/v1/ticker/price` TEK sembolde 1'dir ve `KlineFetcher`
+        önbelleği sembol başına tur başına en fazla bir istek bırakır (TTL =
+        safety turu). Hesap: `docs/ARCHITECTURE.md` §"Kline ağırlık bütçesi".
+
+        Hata (ban/bütçe/ağ/geçersiz sembol) → `None`: çeviri yapılamaz,
+        `_update_trailing` turu atlar ve borsadaki SL yerinde kalır
+        (fail-closed, mevcut davranışın aynısı). Host GENELİ bir kesinti
+        turun kalanını da susturur (`_market_data_down_reason`).
+        """
+        fetch = getattr(self, "data_price_fetch", None)
+        if fetch is None:
+            return None
+        try:
+            price = float(await fetch(symbol) or 0.0)
+        except MarketDataUnavailable as e:
+            # Host geneli: turun kalanında trailing atlanır, TEK satır log.
+            self._market_data_down_reason = str(e)
+            self.logger.warning(
+                f"⛔ Piyasa verisi fiyatı kullanılamıyor ({e}); bu safety "
+                f"turunda trailing güncellemesi atlandı ({symbol} ve kalan "
+                f"semboller)"
+            )
+            return None
+        except Exception as e:
+            self._log_data_price_error(
+                symbol,
+                f"⚠️ {symbol}: veri host'unun canlı fiyatı okunamadı ({e}); "
+                f"baz ölçülemez, trailing güncellemesi atlandı",
+            )
+            return None
+        return price if price > 0 else None
+
+    def _log_data_price_error(self, symbol: str, message: str) -> None:
+        """Sembol başına oran-sınırlı WARNING (safety turu 2 sn'de bir döner)."""
+        log_at = getattr(self, "_data_price_error_log_at", None)
+        if log_at is None:
+            log_at = {}
+            self._data_price_error_log_at = log_at
+        now = time.monotonic()
+        if now - log_at.get(symbol, 0.0) < _TRAILING_SKIP_LOG_INTERVAL_SECONDS:
+            return
+        log_at[symbol] = now
+        self.logger.warning(message)
+
     def _trading_price_is_fresh(self, symbol: str) -> bool:
         """`sp.position.current_price` bu turda işlem host'undan tazelendi mi?
 
-        Bayat bir işlem fiyatını taze bir veri kapanışından çıkarmak SAHTE bir
+        Bayat bir işlem fiyatını taze bir veri fiyatından çıkarmak SAHTE bir
         baz üretir; en tehlikeli hâli `recover()` sonrası ilk turdur (orada
         `current_price` = giriş fiyatıdır, saatler önceki bir değer olabilir).
         """
@@ -610,16 +691,22 @@ class ExitManager:
             return
 
         # D17: mumlar ayrı bir borsadan geliyorsa seviyeyi İŞLEM borsasının
-        # fiyat uzayına taşı (aynı host'ta no-op). Baz DİNAMİKTİR: bu turda
-        # işlem host'undan okunan fiyat ile chandelier'ı besleyen serinin son
-        # KAPANMIŞ mumu arasındaki fark.
+        # fiyat uzayına taşı (aynı host'ta no-op). Baz DİNAMİK ve
+        # LIKE-FOR-LIKE'tır (D17-R3): İKİ host'un da CANLI fiyatı. Veri
+        # host'unun fiyatı ancak ayrı host'ta ve ancak bu noktada istenir —
+        # aynı host'ta ek istek YOKTUR (`data_reference` okunmaz bile).
+        if self._market_data_is_separate():
+            data_reference = await self._data_host_price(symbol)
+        else:
+            data_reference = candles[-1].close   # okunmaz; no-op yolunda ölü
         translated = self._to_trading_price_space(
-            sp, raw_stop, candles[-1].close, symbol
+            sp, raw_stop, data_reference or 0.0, symbol
         )
         if translated is None:
-            # Baz güvenilir ölçülemedi (bayat işlem fiyatı / absürt fark):
-            # YABANCI uzaydan emir göndermektense turu atla — borsadaki SL
-            # yerinde kalır (fail-closed).
+            # Baz güvenilir ölçülemedi (bayat işlem fiyatı / veri host'u
+            # fiyatı okunamadı / absürt fark): YABANCI uzaydan emir
+            # göndermektense turu atla — borsadaki SL yerinde kalır
+            # (fail-closed).
             self._trailing_space_skips = (
                 int(getattr(self, "_trailing_space_skips", 0) or 0) + 1
             )

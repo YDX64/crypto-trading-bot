@@ -39,8 +39,10 @@ from src.services.tv_events import (
     STRUCTURE_KINDS,
     tv_events,
 )
+from src.strategies.scalper.data import MarketDataGuard
 from src.strategies.scalper.engine import ScalperEngine
 from src.strategies.scalper.tracker import ScalpTracker
+from src.trading.symbol_reservations import symbol_reservations
 
 
 # ---------------------------------------------------------------------------
@@ -828,6 +830,83 @@ def _tv_body_event_source_mentions(raw: str, *, secret: str = "") -> set:
     return found & _tv_event_sources()
 
 
+# `{{ticker}} BUY` / `BINANCE:BTCUSDT.P SELL` — mevcut 49 alarmın en yalın
+# GİRİŞ biçimi. Sembol + yön sözcüğünden BAŞKA hiçbir şey taşımaz.
+_TV_SIMPLE_ENTRY_RE = re.compile(
+    r"^(?:BINANCE:)?[A-Z0-9]{2,15}USDT(?:\.P)?\s+(?:BUY|SELL|LONG|SHORT)$",
+    re.IGNORECASE,
+)
+# "entry" giriş yolunun kendisidir; bir OLAY iddiası değildir.
+_TV_NON_ENTRY_KINDS = frozenset(EVENT_KINDS) - {"entry"}
+
+
+def _tv_body_is_algopro_format(raw: str) -> bool:
+    """AlgoPro/BotV3 tek satır giriş biçiminin parmak izi.
+
+    TEK parmak izi: `resolve_tv_source` (kaynak tahmini) ve
+    `_tv_body_is_known_entry_format` (fail-loud kapısının yanlış-pozitif
+    kalkanı) AYNI fonksiyonu çağırır — iki kopya, iki davranış demektir.
+    """
+    return "| TF:" in raw or "| Price:" in raw
+
+
+def _tv_body_event_kind_mentions(raw: str, *, secret: str = "") -> set:
+    """Gövdenin HER YERİNDE geçen `kind[=:]<TANINAN OLAY KIND>` belirteçleri.
+
+    D19a-2 R1-1'in KAPATMADIĞI yüz (bütünleşme incelemesi, 2026-08-23):
+    `_tv_body_event_source_mentions` yalnız `src=<olay kaynağı>` arar. Bir
+    olay alarmının mesajında `src=` HİÇ YOKSA (ya da yanlış yazıldıysa) ve
+    belirteçler başlık koşusu DIŞINDAysa — ör. `BTCUSDT.P kind=choch bullish`
+    ya da `Bullish S-CHOCH kind=choch BTCUSDT.P` — hiçbir şey okunmaz,
+    `kind` yokluğu "entry"dir ve `bullish` sözcüğü yönü çözer: CHoCH alarmı
+    GİRİŞ OYU olur (`TV_CONFLUENCE_REQUIRED=1` ile doğrudan
+    `external_signal`). Yani D19a'nın "hiçbir olay alarmı giriş oyuna
+    dönüşmez" iddiası `src=` yokken tutmuyordu.
+
+    Bu tarama da YÖNLENDİRME YAPMAZ (G1 korunur): yalnız "bu gövde bir olay
+    alarmı olmaya çalışıyor" kanıtını üretir. EVENT_KINDS DIŞI değerler yok
+    sayılır (`kind=momentum` bir olay kanalı iddiası değildir) ve "entry"
+    zaten giriş yolunun kendisidir.
+
+    ⚠️ JSON gövdede `"kind": "choch"` biçimi bu regex'e TAKILMAZ (anahtarla
+    ayraç arasında tırnak var) — bilinçli: JSON giriş gövdeleri
+    `_tv_body_is_known_entry_format` ile zaten muaftır.
+    """
+    scan = raw.replace(secret, "") if secret else raw
+    found = {m.group(2).strip().lower() for m in _TV_BODY_KIND_RE.finditer(scan)}
+    return found & _TV_NON_ENTRY_KINDS
+
+
+def _tv_body_is_known_entry_format(raw: str, *, secret: str = "") -> bool:
+    """Gövde, mevcut 49 GİRİŞ alarmının TANINAN biçimlerinden biri mi?
+
+    Fail-loud kapısının (`reject_entry_vote_from_kind_mention`) YANLIŞ-POZİTİF
+    kalkanı: serbest metninde tesadüfen `kind=exit` geçen MEŞRU bir giriş
+    alarmı 422 almamalı (bkz. `test_free_text_without_event_source_still_enters`
+    — AlgoPro girişinin `msg:` alanında `kind=exit` geçiyor).
+
+    Tanınan üç biçim:
+      1. **JSON giriş gövdesi** — `symbol`/`side`/`action`/`direction` alanı
+         taşıyan bir nesne. Üst düzey ve `data` altındaki `kind` zaten
+         `resolve_tv_body_fields` ile okundu; buraya geldiysek okunan bir
+         `kind` YOKTUR, yani daha derindeki bir alan söz konusudur (G1
+         bilinçli kör noktası — davranışı DEĞİŞMİYOR).
+      2. **AlgoPro/BotV3 tek satır biçimi** — `| TF:` / `| Price:` parmak izi
+         (`resolve_tv_source`'un BUGÜN kullandığının aynısı).
+      3. **`{{ticker}} BUY|SELL`** — sembol + yön sözcüğünden başka hiçbir
+         şey taşımayan yalın giriş metni.
+    """
+    payload = _tv_payload(raw)
+    if payload and any(
+        payload.get(name) for name in ("side", "action", "direction", "symbol")
+    ):
+        return True
+    if _tv_body_is_algopro_format(raw):
+        return True
+    scan = raw.replace(secret, "") if secret else raw
+    return bool(_TV_SIMPLE_ENTRY_RE.match(scan.strip()))
+
+
 def resolve_tv_source(raw_src_param: Optional[str], raw_body: str):
     """`?src=` sorgu parametresini normalize et ve allowlist'e karşı doğrula.
 
@@ -846,7 +925,7 @@ def resolve_tv_source(raw_src_param: Optional[str], raw_body: str):
     """
     source = str(raw_src_param or "").strip().lower()
     if not source:
-        fallback = "algopro" if ("| TF:" in raw_body or "| Price:" in raw_body) else "tv"
+        fallback = "algopro" if _tv_body_is_algopro_format(raw_body) else "tv"
         return fallback, False
     if source not in _tv_source_allowlist():
         return "tv", True
@@ -1094,6 +1173,52 @@ def reject_entry_vote_from_event_source(
     )
 
 
+def reject_entry_vote_from_kind_mention(raw: str, *, secret: str = "") -> None:
+    """`kind=<olay kind>` taşıyan ama GİRİŞ biçimi OLMAYAN gövde → 422.
+
+    Bütünleşme incelemesi bulgusu (2026-08-23, high): D19a'nın kalkanı
+    (`reject_entry_vote_from_event_source`) yalnız `src=<olay kaynağı>`
+    adına bakar. `src=` HİÇ YOKSA ya da yanlış yazıldıysa ve belirteçler
+    başlık koşusu dışındaysa istek GİRİŞ yoluna düşüyor ve gövdedeki
+    `bullish`/`bearish` sözcüğüyle OY VERİYORDU (ölçüldü:
+    `BTCUSDT.P kind=choch bullish` → `external_signal`). Yani "hiçbir olay
+    alarmı giriş oyuna dönüşmez" değişmez kuralı `src=` yokken tutmuyordu.
+
+    Kapı ASİMETRİKTİR (yanlış-pozitif vermemek için):
+      * gövdede TANINAN bir olay `kind`i geçiyor **ve**
+      * gövde tanınan bir GİRİŞ biçimi DEĞİL
+    ise 422. Giriş biçimi tanınıyorsa serbest metindeki `kind=` YOK SAYILIR
+    (AlgoPro'nun `msg: … kind=exit` alanı bugünkü gibi işlem açtırmaya devam
+    eder — `test_free_text_without_event_source_still_enters`).
+
+    Yönlendirme DEĞİŞMEZ (G1 korunur): bu fonksiyon hiçbir isteği olay
+    yoluna SOKMAZ, yalnız sessiz bir giriş oyunu GÖRÜNÜR bir hataya çevirir.
+    """
+    kinds = sorted(_tv_body_event_kind_mentions(raw, secret=secret))
+    if not kinds:
+        return
+    if _tv_body_is_known_entry_format(raw, secret=secret):
+        return
+    try:
+        tv_events.note("rejected_entry_kind_mention")
+    except Exception:  # telemetri asla akışı bozmaz
+        pass
+    app_logger.warning(
+        f"⛔ TV webhook: gövdede kind={kinds} geçiyor ama belirteçler mesajın "
+        "BAŞINDA değil (ve gövde tanınan bir giriş biçimi değil) — 422 ile "
+        "reddedildi. Şablon: `src=… kind=… {{ticker}}` "
+        "(docs/INTEGRATIONS.md §7.2)"
+    )
+    raise HTTPException(
+        status_code=422,
+        detail=(
+            f"Olay alarmı yanlış şablon (kind={kinds}): src= ve kind= mesajın "
+            "BAŞINDA yazılmalı — `src=… kind=… {{ticker}}` "
+            "(docs/INTEGRATIONS.md §7.1 'başlık koşusu')"
+        ),
+    )
+
+
 def _tv_event_symbol(payload: dict, raw: str) -> str:
     """Olay yolunda sembol: `_tv_symbol` + KATI biçim doğrulaması (G3).
 
@@ -1250,6 +1375,11 @@ async def tradingview_webhook(request: Request):
     GİRİŞ OYU DEĞİL, bir YAPI/ÇIKIŞ OLAYIDIR — sağlamaya (TvConfluence)
     HİÇ girmez, `src/services/tv_events.py`'ye yazılır. `kind` yoksa
     davranış bugünküyle birebir aynıdır (mevcut 49 alarm).
+
+    `?dry_run=1` (yalnız sorgu parametresi) İKİ YOLDA DA yan etkisizdir:
+    olay yolunda deftere yazılmaz, giriş yolunda sağlamaya oy verilmez ve
+    `external_signal`/takipçi köprüsü çağrılmaz — yanıt
+    `{"dry_run": true, "would": {...}}`.
     """
     configured = (settings.tv_webhook_secret or "").strip()
     if not configured:
@@ -1277,6 +1407,7 @@ async def tradingview_webhook(request: Request):
     body_fields = resolve_tv_body_fields(raw, secret=configured)
     kind = resolve_tv_kind(body_fields.get("kind"))
     raw_src_param = request.query_params.get("src")
+    dry_run = _tv_truthy(request.query_params.get("dry_run"))
     if kind != "entry":
         return await _handle_tv_event(
             raw=raw,
@@ -1286,7 +1417,7 @@ async def tradingview_webhook(request: Request):
             body_via=body_fields.get("via"),
             raw_src_param=raw_src_param,
             url_secret=url_secret,
-            dry_run=_tv_truthy(request.query_params.get("dry_run")),
+            dry_run=dry_run,
         )
 
     # Kaynak etiketi: GÖVDEDEKİ `src` (allowlist'teyse) `?src=`'i geçersiz
@@ -1305,6 +1436,9 @@ async def tradingview_webhook(request: Request):
         raw_src_param,
         _tv_body_event_source_mentions(raw, secret=configured),
     )
+    # `src=` YOK ama `kind=<olay kind>` VAR: aynı değişmez kuralın ikinci
+    # yüzü (bütünleşme incelemesi). Giriş biçimi tanınıyorsa YOK SAYILIR.
+    reject_entry_vote_from_kind_mention(raw, secret=configured)
 
     # Takipçi köprüsü (D20): AlgoPro kaynaklı GİRİŞ-YOLU gövdeleri takipçi
     # halkasına iletilir. Secret yukarıda zaten doğrulandı (403'te buraya hiç
@@ -1316,9 +1450,30 @@ async def tradingview_webhook(request: Request):
     try:
         symbol, direction = resolve_tv_signal(raw, configured, url_secret=url_secret)
     except HTTPException as exc:
-        if exc.status_code == 422:
+        # `dry_run` HİÇBİR yan etki üretmez — takipçi halkası da bir yan
+        # etkidir (orada POZİSYON açılabilir), bu yüzden köprü atlanır.
+        if exc.status_code == 422 and not dry_run:
             _maybe_forward_to_follower(request, raw)
         raise
+
+    # `?dry_run=1` GİRİŞ yolunda da yan etkisizdir (bütünleşme incelemesi):
+    # daha önce sessizce YOK SAYILIYORDU, yani RUNBOOK'un "doğrulama"
+    # komutu sağlamaya OY yazıp `external_signal` üzerinden GERÇEK EMİR
+    # açabilirdi. Motor hazır olmasa bile yanıt verilir (503 dönmez):
+    # doğrulamanın değeri motordan bağımsızdır — olay yoluyla AYNI ilke.
+    if dry_run:
+        app_logger.info(
+            f"🧪 TV girişi (DRY-RUN, oy YAZILMADI): {symbol} "
+            f"{direction.value} ← {source}"
+        )
+        return {
+            "dry_run": True,
+            "would": {
+                "symbol": symbol,
+                "direction": direction.value,
+                "source": source,
+            },
+        }
 
     _maybe_forward_to_follower(request, raw)
 
@@ -1878,6 +2033,14 @@ async def get_waiting_history(db: AsyncSession = Depends(get_db)):
 # Scalper motoru
 # ---------------------------------------------------------------------------
 
+# ⚠️ SÖZLEŞME (bütünleşme incelemesi, 2026-08-23): bu sözlüğün ANAHTAR
+# KÜMESİ `ScalperEngine.snapshot()` ile BİREBİR aynı olmalıdır
+# (`tests/test_market_data_source.py::TestStatusPayloadShape`). Dashboard
+# "alan yok"u "değer yok" ile karıştırmamalı: motor kurulmadan önce
+# `market_data_guard`/`risk_event`/`tv_events`/`entry_rejects` alanlarının
+# HİÇ olmaması, panelde sessiz bir "bu kanal yok" anlamına geliyordu.
+# Dinamik olanlar (`market_data_guard`, `tv_events`, `symbol_reservations`)
+# istek anında `/scalper/status` içinde TAZELENİR.
 _EMPTY_SCALPER_STATUS = {
     "enabled": False,
     "running": False,
@@ -1888,6 +2051,8 @@ _EMPTY_SCALPER_STATUS = {
     "market_data_base_url": settings.market_data_base_url,
     "trading_base_url": settings.binance_base_url,
     "kline_source": settings.kline_source,
+    # Ban/ağırlık durumu — istek anında tazelenir (aşağıya bak).
+    "market_data_guard": {},
     "scan_interval": settings.scalper_scan_interval_seconds,
     "safety_interval": settings.scalper_safety_interval_seconds,
     "health": {"healthy": False, "running": False, "reason": "engine_not_created"},
@@ -1934,6 +2099,18 @@ _EMPTY_SCALPER_STATUS = {
     "entry_halted": False,
     "entry_halt_reason": None,
     "entry_halted_at": None,
+    # Risk-olayı halt'ı (D10) dosyadan okunur ve motordan BAĞIMSIZDIR; motor
+    # yokken bile alan görünmeli (fail-closed bir kapıdır, yokluğu "kapalı"
+    # ile karıştırılmamalı). Değer motor kurulmadan okunamaz: "bilinmiyor".
+    "risk_event": {
+        "active": None,
+        "reason": None,
+        "source": None,
+        "until_ts": None,
+        "open_positions": 0,
+    },
+    # Olay defteri de motordan bağımsızdır — istek anında tazelenir.
+    "tv_events": {},
     "signals_today": 0,
     "last_scan_at": None,
     # D17: piyasa verisi kesintisiyle KESİLEN tarama turu "başarılı" sayılmaz;
@@ -1946,12 +2123,15 @@ _EMPTY_SCALPER_STATUS = {
     "tracked": [],
     "pending_entries": [],
     "cooldowns": [],
+    "entry_rejects": {},
+    "stop_mode": str(getattr(settings, "scalper_stop_mode", "structural")),
     "sizing": {},
     "sizing_equity_usdt": None,
     "virtual_capital_enabled": False,
     "virtual_capital_base_usdt": 0.0,
     "virtual_capital_current_usdt": None,
     "virtual_capital_start_trade_id": 0,
+    "symbol_reservations": {},
 }
 
 
@@ -1960,9 +2140,17 @@ async def scalper_status():
     """Scalper motorunun anlık durumu (tarama evreni, rejimler, izlenen pozisyonlar)."""
     if not scalper_engine:
         empty = dict(_EMPTY_SCALPER_STATUS)
-        # Olay defteri motordan BAĞIMSIZ doldurulur (bkz. _handle_tv_event) —
-        # motor ayakta değilken de görünmeli.
+        # Motordan BAĞIMSIZ üç alan: motor ayakta değilken de GERÇEK değeri
+        # görünmeli. Anahtar kümesi `_EMPTY_SCALPER_STATUS`'ta zaten var —
+        # burada yalnız TAZELENİR (bkz. sözlüğün üstündeki sözleşme notu).
         empty["tv_events"] = tv_events.snapshot()
+        empty["symbol_reservations"] = symbol_reservations.snapshot()
+        try:
+            empty["market_data_guard"] = MarketDataGuard.snapshot(
+                settings.market_data_base_url
+            )
+        except Exception as e:  # teşhis alanı asla status'u düşürmemeli
+            empty["market_data_guard"] = {"error": f"{type(e).__name__}: {e}"}
         return empty
     return scalper_engine.snapshot()
 

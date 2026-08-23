@@ -2132,6 +2132,252 @@ class TestMidMessageTokensFailLoud:
         assert main_module._tv_body_event_source_mentions(raw, secret=weird) == set()
 
 
+class TestKindMentionWithoutSourceFailsLoud:
+    """Bütünleşme incelemesi (2026-08-23, high) — R1-1'in KAPATMADIĞI yüz.
+
+    `_tv_body_event_source_mentions` yalnız `src=<olay kaynağı>` arar. Bir
+    olay alarmının mesajında `src=` HİÇ YOKSA (ya da yanlış yazıldıysa) ve
+    belirteçler başlık koşusu DIŞINDAysa hiçbir şey okunmaz → `kind`
+    yokluğu "entry"dir → gövdedeki `bullish`/`bearish` yönü çözer → alarm
+    GİRİŞ OYU olur. `TV_CONFLUENCE_REQUIRED=1` iken bu DOĞRUDAN
+    `external_signal`dır (pozisyon açar).
+
+    Düzeltmesiz ölçüm (aynı gövdeler, `reject_entry_vote_from_kind_mention`
+    devre dışı): 5/5 yerleşimde `external_signal` çağrıldı.
+    """
+
+    # `src=` YOK, `kind=<olay kind>` VAR — beş yerleşim.
+    MISPLACED = [
+        "BTCUSDT.P kind=choch bullish",                  # sembol önce
+        "Bullish S-CHOCH kind=choch BTCUSDT.P",          # düz yazı önce
+        "BTCUSDT bullish note kind=exit",                # sonda
+        "LuxAlgo alert\nBTCUSDT.P kind=trend bullish",   # ikinci satırın ortasında
+        "BTCUSDT bearish / kind:choch",                  # `:` ayracı, ortada
+    ]
+
+    @pytest.mark.parametrize("raw", MISPLACED)
+    async def test_kind_without_src_never_becomes_an_entry_vote(
+        self, webhook_ready, tv_ledger, raw
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await main_module.tradingview_webhook(
+                _FakeRequest(raw.encode(), {"secret": SECRET})
+            )
+        assert exc.value.status_code == 422
+        assert "BAŞINDA" in str(exc.value.detail)
+        webhook_ready.external_signal.assert_not_awaited()
+        assert tv_ledger.symbols() == []
+
+    @pytest.mark.parametrize("raw", MISPLACED)
+    async def test_confluence_is_never_consulted(
+        self, webhook_ready, tv_ledger, monkeypatch, raw
+    ):
+        """`TV_CONFLUENCE_REQUIRED=2` yolunda da sağlamaya OY YAZILMAZ."""
+        votes: list = []
+        monkeypatch.setattr(main_module.settings, "tv_confluence_required", 2)
+        monkeypatch.setattr(
+            main_module,
+            "_tv_confluence",
+            lambda: SimpleNamespace(
+                vote=lambda *a, **kw: votes.append(a)
+                or {"triggered": False, "sources": []}
+            ),
+        )
+        with pytest.raises(HTTPException) as exc:
+            await main_module.tradingview_webhook(
+                _FakeRequest(raw.encode(), {"secret": SECRET})
+            )
+        assert exc.value.status_code == 422
+        assert votes == []
+        webhook_ready.external_signal.assert_not_awaited()
+
+    async def test_rejection_is_counted(self, webhook_ready, tv_ledger):
+        with pytest.raises(HTTPException):
+            await main_module.tradingview_webhook(
+                _FakeRequest(self.MISPLACED[0].encode(), {"secret": SECRET})
+            )
+        assert tv_ledger.snapshot()["counters"]["rejected_entry_kind_mention"] == 1
+
+    async def test_tokens_at_the_head_still_route_to_the_event_path(
+        self, webhook_ready, tv_ledger
+    ):
+        """`src=` olmadan da BAŞTA duran `kind=` OLAY yoluna gider (422 değil)."""
+        result = await main_module.tradingview_webhook(
+            _FakeRequest(b"kind=choch BTCUSDT.P bullish", {"secret": SECRET})
+        )
+        assert result["routed"] == "event" and result["kind"] == "choch"
+        webhook_ready.external_signal.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            # AlgoPro/BotV3 tek satır biçimi — serbest metninde `kind=` geçse
+            # bile GİRİŞ olarak kalır (bugünkü davranış).
+            "BUY on ADAUSDT | TF: 5 | msg: take profit at kind=exit",
+            "🟢 BUY  | BINANCE:BTCUSDT | TF: 1 | Price: 76556.52 | note kind=tp1",
+        ],
+    )
+    async def test_known_entry_formats_ignore_free_text_kind(
+        self, webhook_ready, tv_ledger, raw
+    ):
+        result = await main_module.tradingview_webhook(
+            _FakeRequest(raw.encode(), {"secret": SECRET, "src": "algopro"})
+        )
+        assert result["accepted"] is True
+        webhook_ready.external_signal.assert_awaited_once()
+
+    async def test_json_entry_body_with_deep_kind_is_not_rejected(
+        self, webhook_ready, tv_ledger
+    ):
+        """JSON giriş gövdesi (side/symbol) — derindeki `kind` bugünkü gibi
+        okunmaz VE 422 üretmez (G1'in bilinçli kör noktası korunur)."""
+        raw = json.dumps(
+            {
+                "secret": SECRET,
+                "symbol": "BTCUSDT",
+                "side": "buy",
+                "meta": {"kind": "exit"},
+            }
+        )
+        result = await main_module.tradingview_webhook(_FakeRequest(raw.encode(), {}))
+        assert result["accepted"] is True
+
+    @pytest.mark.parametrize("raw", ["BTCUSDT BUY", "BINANCE:ETHUSDT.P sell"])
+    def test_simple_ticker_side_body_is_a_known_entry_format(self, raw):
+        assert main_module._tv_body_is_known_entry_format(raw) is True
+
+    def test_kind_mention_scan_ignores_unknown_kinds(self):
+        scan = main_module._tv_body_event_kind_mentions
+        assert scan("BTCUSDT kind=momentum bullish") == set()
+        assert scan("BTCUSDT kind=entry bullish") == set()
+        assert scan("BTCUSDT kind=choch bullish") == {"choch"}
+
+    def test_kind_mention_scan_strips_secret(self):
+        weird = "aaa-kind=choch-bbb"
+        raw = f"secret={weird} BTCUSDT buy"
+        assert main_module._tv_body_event_kind_mentions(raw, secret=weird) == set()
+
+    def test_algopro_fingerprint_is_shared_with_source_resolution(self):
+        """TEK parmak izi: kaynak tahmini ve fail-loud kapısı aynı fonksiyon."""
+        body = "BUY on ADAUSDT | TF: 5 | Price: 1.23"
+        assert main_module._tv_body_is_algopro_format(body) is True
+        assert main_module.resolve_tv_source(None, body) == ("algopro", False)
+
+
+class TestDryRunHasNoSideEffects:
+    """Bütünleşme incelemesi (2026-08-23, medium) — `?dry_run=1` GİRİŞ yolu.
+
+    `dry_run` yalnız OLAY dalına geçiriliyordu; giriş yolunda SESSİZCE yok
+    sayılıyordu. Yani `docs/RUNBOOK.md`'nin "doğrulama" komutu, mesajın
+    `kind=` belirteci düşmüşse (ki doğrulamanın sebebi tam da budur)
+    sağlamaya GERÇEK bir oy yazıyor ve `external_signal` üzerinden
+    GERÇEK EMİR açabiliyordu.
+    """
+
+    ENTRY_BODY = b"BTCUSDT BUY"
+
+    @pytest.fixture(autouse=True)
+    def _no_follower_bridge(self, monkeypatch):
+        self.forwarded: list = []
+        monkeypatch.setattr(
+            main_module,
+            "maybe_forward_algopro_event",
+            lambda raw, source: self.forwarded.append(source),
+        )
+
+    async def test_entry_dry_run_does_not_open_anything(
+        self, webhook_ready, tv_ledger
+    ):
+        result = await main_module.tradingview_webhook(
+            _FakeRequest(self.ENTRY_BODY, {"secret": SECRET, "dry_run": "1"})
+        )
+        assert result == {
+            "dry_run": True,
+            "would": {"symbol": "BTCUSDT", "direction": "LONG", "source": "tv"},
+        }
+        webhook_ready.external_signal.assert_not_awaited()
+        assert self.forwarded == []          # takipçi halkası da bir yan etkidir
+
+    async def test_entry_dry_run_does_not_vote(
+        self, webhook_ready, tv_ledger, monkeypatch
+    ):
+        votes: list = []
+        monkeypatch.setattr(main_module.settings, "tv_confluence_required", 2)
+        monkeypatch.setattr(
+            main_module,
+            "_tv_confluence",
+            lambda: SimpleNamespace(
+                vote=lambda *a, **kw: votes.append(a)
+                or {"triggered": False, "sources": []}
+            ),
+        )
+        result = await main_module.tradingview_webhook(
+            _FakeRequest(self.ENTRY_BODY, {"secret": SECRET, "dry_run": "true"})
+        )
+        assert result["dry_run"] is True
+        assert votes == []
+        webhook_ready.external_signal.assert_not_awaited()
+
+    async def test_entry_dry_run_works_without_an_engine(
+        self, webhook_ready, tv_ledger, monkeypatch
+    ):
+        """Doğrulamanın değeri motordan bağımsızdır (olay yoluyla aynı ilke)."""
+        monkeypatch.setattr(main_module, "scalper_engine", None)
+        result = await main_module.tradingview_webhook(
+            _FakeRequest(self.ENTRY_BODY, {"secret": SECRET, "dry_run": "yes"})
+        )
+        assert result["would"]["symbol"] == "BTCUSDT"
+
+    async def test_entry_dry_run_reports_the_resolved_source(
+        self, webhook_ready, tv_ledger
+    ):
+        result = await main_module.tradingview_webhook(
+            _FakeRequest(
+                b"BUY on ADAUSDT | TF: 5 | Price: 1.23",
+                {"secret": SECRET, "dry_run": "1"},
+            )
+        )
+        assert result["would"] == {
+            "symbol": "ADAUSDT",
+            "direction": "LONG",
+            "source": "algopro",
+        }
+        assert self.forwarded == []
+
+    async def test_dry_run_422_does_not_forward_to_the_follower(
+        self, webhook_ready, tv_ledger
+    ):
+        """AlgoPro `🎯 TP1 HIT` gövdesi yön taşımaz → 422; köprü ATLANMALI."""
+        raw = b"\xf0\x9f\x8e\xaf TP1 HIT | BINANCE:BTCUSDT | TF: 1 | Price: 76583.92"
+        with pytest.raises(HTTPException) as exc:
+            await main_module.tradingview_webhook(
+                _FakeRequest(raw, {"secret": SECRET, "src": "algopro", "dry_run": "1"})
+            )
+        assert exc.value.status_code == 422
+        assert self.forwarded == []
+
+    async def test_without_dry_run_the_same_body_still_enters(
+        self, webhook_ready, tv_ledger
+    ):
+        """Negatif kontrol: bayrak yokken bugünkü davranış birebir sürer."""
+        result = await main_module.tradingview_webhook(
+            _FakeRequest(self.ENTRY_BODY, {"secret": SECRET})
+        )
+        assert result["accepted"] is True
+        webhook_ready.external_signal.assert_awaited_once()
+
+    async def test_422_without_dry_run_still_forwards(
+        self, webhook_ready, tv_ledger
+    ):
+        """D20 köprüsü bayraksız istekte AYNEN çalışmaya devam eder."""
+        raw = b"\xf0\x9f\x8e\xaf TP1 HIT | BINANCE:BTCUSDT | TF: 1 | Price: 76583.92"
+        with pytest.raises(HTTPException):
+            await main_module.tradingview_webhook(
+                _FakeRequest(raw, {"secret": SECRET, "src": "algopro"})
+            )
+        assert self.forwarded == ["algopro"]
+
+
 class TestColonSeparatorIsProseSafe:
     """R1-2 — `:` düz yazı noktalamasıdır; TANINMAYAN değeri 422 ÜRETMEZ."""
 
@@ -2493,9 +2739,12 @@ class TestRoutingInvariants:
             try:
                 await main_module.tradingview_webhook(_FakeRequest(body.encode(), query))
             except HTTPException as exc:
-                assert "Olay kaynağı" not in str(exc.detail), (
-                    f"yanlış-pozitif 422: {body!r} {query!r}"
-                )
+                # İKİ kalkanın da yanlış-pozitifi yasak: olay-kaynağı adı
+                # (D19a A) ve `kind=` belirteci (bütünleşme incelemesi).
+                for guard in ("Olay kaynağı", "Olay alarmı yanlış şablon"):
+                    assert guard not in str(exc.detail), (
+                        f"yanlış-pozitif 422 ({guard}): {body!r} {query!r}"
+                    )
         assert checked == 400
 
     async def test_no_event_alarm_ever_reaches_the_entry_path(
@@ -2551,4 +2800,55 @@ class TestRoutingInvariants:
                 routed += 1
         assert routed and rejected                       # iki dal da gezildi
         assert votes == []                               # SAĞLAMAYA HİÇ girmedi
+        webhook_ready.external_signal.assert_not_awaited()
+
+    # `src=` DÜŞMÜŞ (ya da yanlış yazılmış) olay alarmları — bütünleşme
+    # incelemesi. D19a'nın kalkanı yalnız `src=<olay kaynağı>`na bakıyordu;
+    # `src` hiç yoksa kalkan boştu ve gövdedeki yön sözcüğü OY veriyordu.
+    _KIND_PLACEMENTS = (
+        "{sym} kind={kind} {dir}",                     # sembol önce (ortada)
+        "Bullish S-CHOCH kind={kind} {sym} {dir}",     # düz yazı önce
+        "{sym} {dir} note kind={kind}",                # sonda
+        "LuxAlgo alert\n{sym} kind={kind} {dir}",      # ikinci satırın ortasında
+        "kind={kind} {sym} {dir}",                     # BAŞTA (olay yoluna gider)
+    )
+
+    async def test_event_alarm_without_src_never_reaches_the_entry_path(
+        self, webhook_ready, tv_ledger, monkeypatch
+    ):
+        votes: list = []
+        monkeypatch.setattr(main_module.settings, "tv_confluence_required", 2)
+        monkeypatch.setattr(
+            main_module,
+            "_tv_confluence",
+            lambda: SimpleNamespace(
+                vote=lambda *a, **kw: votes.append(a)
+                or {"triggered": False, "sources": []}
+            ),
+        )
+        rng = random.Random(23)
+        routed = rejected = 0
+        for _ in range(400):
+            template = rng.choice(self._KIND_PLACEMENTS)
+            body = template.format(
+                sym=rng.choice(self._SYMS),
+                kind=rng.choice(["exit", "choch", "trend", "tp1"]),
+                dir=rng.choice(["bullish", "bearish", "buy", "sell"]),
+            )
+            # `?src=` YOK ve gövdede `src=` YOK: kalkanın eski dayanağı boş.
+            query = {"secret": SECRET}
+            if rng.random() < 0.5:
+                query["src"] = rng.choice(["luxosc", "luxso", "algopro"])
+            try:
+                result = await main_module.tradingview_webhook(
+                    _FakeRequest(body.encode(), query)
+                )
+            except HTTPException as exc:
+                assert exc.status_code == 422, body
+                rejected += 1
+            else:
+                assert result["routed"] == "event", body
+                routed += 1
+        assert routed and rejected
+        assert votes == []
         webhook_ready.external_signal.assert_not_awaited()

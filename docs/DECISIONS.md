@@ -1290,17 +1290,31 @@ tek satır değişmeden geçiyor.
 
 ⚠️ **Operatör notu (alarm kurulumu):** yönlendirme belirteçleri (`src=`, `kind=`)
 alarm mesajının **BAŞINDA** olmalıdır (`docs/INTEGRATIONS.md` §7.2 şablonları buna
-uyar). Ortada kalırlarsa istek ya yine olay yoluna gider ya **422** alır — ama
-**hiçbir koşulda giriş oyuna dönüşmez**. 422 alan alarm TV'de "webhook failed"
-görünür; çözüm mesajı düzeltmektir, alarmı silmek değil.
+uyar). Ortada kalırlarsa istek ya yine olay yoluna gider ya **422** alır. 422 alan
+alarm TV'de "webhook failed" görünür; çözüm mesajı düzeltmektir, alarmı silmek
+değil.
+> ⚠️ **Bu maddedeki "hiçbir koşulda giriş oyuna dönüşmez" ifadesi 2026-08-23
+> bütünleşme incelemesinde DARALTILDI:** kalkan `src=<olay kaynağı>` adına
+> bağlıydı; `src=` hiç yoksa (ya da yanlış yazıldıysa) ve belirteçler başlık
+> koşusu dışındaysa istek GİRİŞ oyu oluyordu (ölçüldü: 5/5 yerleşimde
+> `external_signal`). Aynı commit'te ikinci bir kalkan eklendi
+> (`reject_entry_vote_from_kind_mention`): gövdenin herhangi bir yerinde
+> `kind[=:]<exit|choch|trend|tp1>` varsa ve gövde tanınan bir GİRİŞ biçimi
+> değilse 422. Güncel ve tam kural: `docs/INTEGRATIONS.md` §7.1 (JSON'da derin
+> iç içe `kind` hâlâ okunmaz ve 422 üretmez — bilinçli kapsam sınırı).
 
 **Kanıt:** `python3 -m pytest tests -q` → **877 passed, 1 skipped**
 (D19 tabanı: 744 passed, 1 skipped → +133 test; `tests/test_tv_events.py` 68 → 201).
 `tests/test_tv_signal_bridge.py` TEK SATIR değişmeden geçiyor (49 alarmın regresyonu).
 Ayrıca `TestRoutingInvariants` iki DEĞİŞMEZ kuralı tohumlanmış rastgele gövdelerle
 tarar: (1) hiçbir GİRİŞ alarmı olay-kaynağı koruması yüzünden yanlışlıkla 422 almaz,
-(2) hiçbir OLAY alarmı — belirteç nereye yazılırsa yazılsın — `external_signal`'a ya
-da `TvConfluence.vote()`'a ULAŞMAZ.
+(2) **gövdesinde `src=<olay kaynağı>` taşıyan** hiçbir OLAY alarmı — belirteç nereye
+yazılırsa yazılsın — `external_signal`'a ya da `TvConfluence.vote()`'a ULAŞMAZ.
+> ⚠️ (2) 2026-08-23 bütünleşme incelemesinde DARALTILDI: özellik testi her gövdeye
+> bir `src=<olay kaynağı>` koyuyordu, yani iddia yalnız o koşul altında
+> ölçülmüştü. `src=` YOKKEN kural TUTMUYORDU — düzeltmesi ve yeni özellik testi
+> (`test_event_alarm_without_src_never_reaches_the_entry_path`, 5 yerleşim ×
+> 400 tohumlanmış gövde) aynı incelemenin commit'indedir.
 
 **Geri alma:** D19 ile aynı — `.env`'den `SCALPER_TV_EVENTS_*` kaldır (varsayılan
 `shadow`), tamamen kapatmak için `SCALPER_TV_EVENTS_MODE=off`. Kod düzeyinde geri
@@ -1308,6 +1322,57 @@ almak gerekirse bu commit'teki `src/main.py`, `src/core/config.py`,
 `src/services/tv_events.py`, `src/strategies/scalper/engine.py`,
 `src/strategies/scalper/exits.py` değişikliklerini revert et; D19'un kendisi
 bağımsız olarak ayakta kalır (ama A/B/C bulguları geri gelir — **önerilmez**).
+
+### D17-R3 / D19a-R3 — bütünleşme incelemesi: dalların KESİŞİMİNDEKİ dört kusur · 2026-08-23
+**Ne:** D15/D17/D18/D19/D20 dalları ayrı ayrı incelenmişti; bu tur dalların BİRLİKTE
+oluşturduğu yüzeyi (aynı endpoint'in iki yolu, aynı host'un iki fiyat türü, aynı
+payload'ın iki şekli) denetledi. Dördü de DOĞRULANDI ve bu commit'te düzeltildi;
+her birinin düzeltmesiz KIRMIZI olan bir regresyon testi vardır.
+
+| # | Bulgu (mekanizma) | Düzeltme | Regresyon testi |
+|---|---|---|---|
+| **1** [high] | D19a'nın "hiçbir olay alarmı giriş oyuna dönüşmez" kalkanı `src=<olay kaynağı>` ADINA bağlıydı. Olay alarmının mesajında `src=` HİÇ YOKSA (ya da yanlış yazıldıysa) ve belirteçler başlık koşusu DIŞINDAysa (`BTCUSDT.P kind=choch bullish`, `Bullish S-CHOCH kind=choch BTCUSDT.P`) hiçbir şey okunmaz → `kind` yokluğu "entry" → gövdedeki `bullish` yönü çözer → istek GİRİŞ OYU olur. `TV_CONFLUENCE_REQUIRED=1` ile bu DOĞRUDAN `external_signal`dır. **Ölçüldü: 5/5 yerleşimde pozisyon açıldı.** D19a'nın özellik testi kusuru göremiyordu çünkü ürettiği HER gövdeye bir `src=<olay kaynağı>` koyuyordu. | İkinci kalkan `reject_entry_vote_from_kind_mention`: gövdenin herhangi bir yerinde `kind[=:]<exit\|choch\|trend\|tp1>` varsa **ve** gövde tanınan bir GİRİŞ biçimi DEĞİLSE → 422 "olay alarmı yanlış şablon". Tanınan giriş biçimleri: JSON giriş gövdesi (`symbol`/`side`), AlgoPro/BotV3 `\| TF:`/`\| Price:` parmak izi (kaynak tahminiyle AYNI fonksiyon), `{{ticker}} BUY\|SELL`. EVENT_KINDS dışı değerler yok sayılır. Yönlendirme DEĞİŞMEZ (G1 korunur). Yeni sayaç `rejected_entry_kind_mention`. | `TestKindMentionWithoutSourceFailsLoud` (5 yerleşim × 422 + sağlamaya oy yok + sayaç; başta duran `kind=` hâlâ OLAY yoluna gider; AlgoPro serbest metnindeki `kind=exit` hâlâ AÇAR), `TestRoutingInvariants::test_event_alarm_without_src_never_reaches_the_entry_path` (5 yerleşim × 400 tohumlanmış gövde) |
+| **2** [medium] | `exits._to_trading_price_space` bazı `işlem_host_CANLI − veri_host_son_KAPANIŞ` olarak ölçüyordu. İki büyüklük AYNI TÜRDEN DEĞİLDİR: fark, borsa-arası bazın ÜSTÜNE MUM-İÇİ sürüklenmeyi bindirir. Etki sistematiktir — fiyat lehe gittikçe sürüklenme büyür, chandelier mandalı (`new_stop > current_sl`) her turda biraz daha sıkışır ve stop fiilen CANLI FİYATI izler, chandelier MESAFESİNİ değil (ters yönde koruma-tarafı kapısı turu boşa atlatır). | Baz LIKE-FOR-LIKE: `işlem_host_CANLI − veri_host_CANLI`. Veri tarafı yeni `KlineFetcher.get_price` (public `/fapi/v1/ticker/price`, tek sembol → ağırlık 1, `MarketDataGuard`'dan geçer, TTL = safety turu = 2 sn, TEKRAR YOK). Fiyat okunamazsa çeviri `None` → tur atlanır (mevcut fail-safe); host geneli kesintide turun kalanı susar. Aynı host'ta byte-for-byte no-op (fiyat HİÇ istenmez). | `TestLikeForLikeBasis` (mum-içi sürüklenme stopu SIKIŞTIRMAZ, baz iki canlı fiyatın farkıdır, okunamayan fiyat turu atlar, ban tur genelini susturur, fetcher yoksa fail-closed, log oran sınırı, engine kablolaması), `TestDataHostPriceFetch` (ağırlık 1 + guard, TTL, ban ağa çıkmaz, eksik `price` alanı 0 DEĞİL hata, tekrar yok), `test_same_host_stop_is_byte_for_byte_unchanged` (+ `data_price_calls == []`) |
+| **3** [medium] | `?dry_run=1` yalnız OLAY dalına geçiriliyordu; GİRİŞ yolunda SESSİZCE yok sayılıyordu. Yani RUNBOOK'un doğrulama komutu — ki çağrılma SEBEBİ tam da "`kind=` düştü mü" sorusudur — sağlamaya GERÇEK oy yazıp `external_signal` üzerinden GERÇEK EMİR açabiliyordu; ayrıca takipçi köprüsünü tetikliyordu. | Giriş yolunda `dry_run` → oy YOK, `external_signal` YOK, takipçi köprüsü YOK (422 dalında da), motor gerekmez; yanıt `{"dry_run": true, "would": {symbol, direction, source}}`. RUNBOOK doğrulama örnekleri her iki yol için de `dry_run` ile yazıldı. | `TestDryRunHasNoSideEffects` (7 test: yanıt şekli, oy yok, motor gerekmez, kaynak raporu, 422'de köprü yok; negatif kontroller: bayraksız istek AÇAR ve köprü ÇALIŞIR) |
+| **4** [low] | `/scalper/status` İKİ farklı şekil döndürüyordu: `_EMPTY_SCALPER_STATUS` (motor yokken) `market_data_guard`, `risk_event`, `tv_events`, `entry_rejects`, `stop_mode`, `symbol_reservations` anahtarlarını HİÇ taşımıyordu. Panelde "alan yok" sessizce "kanal yok" diye okunur — özellikle `market_data_guard` (ban durumu) için tehlikeli. | Eksik anahtarlar sözlüğe eklendi; dinamik olanlar (`market_data_guard`, `tv_events`, `symbol_reservations`) istek anında tazelenir. Sözleşme sözlüğün üstüne yazıldı. | `TestStatusPayloadShape` (iki payload'ın ANAHTAR KÜMESİ eşit; endpoint dinamik alanları gerçek değerle doldurur) |
+
+**Kapak dışı, aynı commit (yalnız belge/kayıt):** `env.example`'a `SCALPER_STRUCTURE_*`
+(D18, yorumlu — kanıt REDDETTİ, açmak yeni kanıt ister) ve `TV_EVENTS_STATE_PATH`;
+`docs/RUNBOOK.md` "Deploy ve geri alma" ÜÇ halka tablosu + `ring_env_diff` kapsamı
+(ve kapsam DIŞI anahtarlar); `docs/ARCHITECTURE.md` ağırlık bütçesi tablosuna baz
+referansı satırı; `docs/INTEGRATIONS.md` §7.1 mutlak ifadesinin daraltılması + §7.2'ye
+"`src=` ASLA düşürülmez" uyarısı; D19a "Kanıt"(2) ve operatör notuna çekince;
+`docs/EXPERIMENTS.md` E6d/E6e satırları tablo başlığına bağlandı (biçim).
+
+**Kanıt:** `python3 -m pytest tests -q` → **1500 passed, 1 skipped** (taban 4c227b3:
+1457 passed, 1 skipped → +43 test). `tests/test_tv_signal_bridge.py` **TEK SATIR
+değişmeden** geçiyor (49 giriş alarmının regresyonu). Düzeltmesiz kırmızı ölçümleri:
+bulgu 1 → 12 test FAILED (5/5 yerleşimde `external_signal` çağrıldı), bulgu 2 → 6 test
+FAILED, bulgu 3 → 5 test FAILED.
+
+**Ağırlık hesabı (bulgu 2'nin bedeli, YALNIZ ayrı host'ta):** safety turu 2 sn →
+30 tur/dk; TTL = tur süresi → sembol başına tur başına en fazla 1 istek × ağırlık 1 =
+**30 ağırlık/dk / açık pozisyon**. `SCALPER_MAX_POSITIONS=3` → **90 ağırlık/dk**;
+toplam 140 + 90 = **230 ağırlık/dk** (IP bütçesi 2400'ün ~%9.6'sı, kendi 600'lük
+tavanımızın ~%38'i). Kuramsal tavan (8 sembolde de açık pozisyon) 8 × 30 = 240, trailing
+mumlarıyla birlikte 480 ağırlık/dk — bugün `scalper_max_positions=3` yüzünden
+ULAŞILAMAZ. Ayrıntı: `docs/ARCHITECTURE.md` §"Kline ağırlık bütçesi".
+
+**DOĞRULANAMADI (kod okumasıyla kapatılmadı):** hiçbir ölçüm canlıda yapılmadı —
+`SCALPER_MARKET_DATA_BASE_URL` canlıda BOŞ olduğu için bulgu 2'nin düzeltmesi
+testnet'te henüz hiç çalışmadı; ticker ağırlığı HESAPtır, `X-MBX-USED-WEIGHT-1M`
+ölçümü yapılmadı. Bulgu 1'in kapsam sınırı bilinçlidir: JSON gövdede `"kind": "choch"`
+biçimi (anahtarla ayraç arasında tırnak) hiçbir taramaya takılmaz, yani `data`'dan
+DAHA DERİN bir JSON `kind` bugün de okunmaz ve 422 üretmez — bu D19a G1'in bilerek
+bıraktığı kör noktadır ve DEĞİŞTİRİLMEDİ.
+
+**Geri alma:** bulgu 1 → `src/main.py`'de `reject_entry_vote_from_kind_mention`
+çağrısını kaldır (D19a davranışına döner, kusur geri gelir). Bulgu 2 →
+`exits._update_trailing`'de `data_reference`'ı `candles[-1].close`'a döndür ve
+`engine`'de `data_price_fetch=` bağlamasını kaldır (ayar boşken zaten no-op'tur, yani
+canlı testnet davranışı HER İKİ durumda da aynıdır). Bulgu 3 → giriş yolundaki
+`if dry_run:` bloğunu kaldır. Bulgu 4 → `_EMPTY_SCALPER_STATUS`'tan eklenen anahtarları
+çıkar. Hiçbiri `.env` değişikliği gerektirmez.
 
 
 ## Reddedilen kararlar (kanıtla)
