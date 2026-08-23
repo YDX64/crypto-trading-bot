@@ -393,6 +393,20 @@ class TestFlip:
         assert "FOLLOWER_FLIP kapalı" in result["reason"]
         engine.exits._handle_closed.assert_not_called()
 
+    async def test_kill_switch_still_allows_flip_close_but_no_reentry(self, tmp_path):
+        """Kapı kapalıysa sonuç FLAT kalmaktır: ters sinyal kapatır, açmaz."""
+        existing = _fake_position(direction=Direction.SHORT)
+        engine = _make_engine(tmp_path, positions={"BTCUSDT": existing})
+        engine._kill_switch = True
+        engine.client.get_position_risk = AsyncMock(
+            side_effect=[{"positionAmt": -0.12}, {"positionAmt": 0.0}]
+        )
+        result = await engine.handle_event(parse_follower_event(BUY_ENTRY))
+        assert result["accepted"] is False
+        assert "kill switch" in result["reason"]
+        engine.exits._handle_closed.assert_awaited_once()  # kapanış YAPILDI
+        engine.executor.open_position.assert_not_called()  # yeni giriş YOK
+
     async def test_flip_close_failure_blocks_new_entry(self, tmp_path):
         existing = _fake_position(direction=Direction.SHORT)
         engine = _make_engine(tmp_path, positions={"BTCUSDT": existing})

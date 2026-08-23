@@ -602,6 +602,10 @@ class FollowerEngine:
                     }
                 flipped = True
 
+            # Kapılar KAPANIŞTAN SONRA kontrol edilir — bilinçli: kill switch /
+            # risk-olayı halt'ı / giriş kilidi "YENİ GİRİŞ YOK" demektir, "açık
+            # pozisyonu tut" demez. AlgoPro'nun ters sinyali bir ÇIKIŞ
+            # kararıdır; kapı kapalıysa sonuç FLAT kalmaktır (en güvenli hâl).
             blocked = self._entry_block_reason()
             if blocked is not None or not self._entries_ready():
                 self._count_reject("gate")
