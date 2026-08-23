@@ -213,3 +213,30 @@ Kaynak: `python3 scripts/autoresearch.py` — otomatik uretildi, elle duzenlemey
 | E5c | BOGA | 52 | 86.5 | +1578.66 | 1.50 | 1510.41 | - |
 | E5c | KARAR | - | - | +0.00 | - | - | REDDEDILDI (asiri filtreleme (islem<60: ['BOGA'])) |
 | E5c | hipotez | Kaldirac tavani 12 tek basina: E4i (10) ile E4j (15) arasi — boga islem sayisi >=60 kalir mi? | | | | | |
+
+## 2026-08-23 — Autoresearch (scripts/autoresearch.py)
+Kaynak: `python3 scripts/autoresearch.py` — otomatik uretildi, elle duzenlemeyin.
+| Varyant | Pencere | Islem | WR% | PnL | PF | maxDD | Karar |
+|---|---|---|---|---|---|---|---|
+| E6a | AYI | 190 | 83.7 | +136.30 | 1.01 | 5051.74 | - |
+| E6a | YATAY | 128 | 84.4 | -63.93 | 0.99 | 3324.57 | - |
+| E6a | BOGA | 80 | 90.0 | +1944.25 | 1.52 | 1029.05 | - |
+| E6a | KARAR | - | - | -4861.70 | - | - | REDDEDILDI (AYI PF 1.01<1.1 ve AYI/YATAY birlikte iyilesmedi; BOGA PnL kaybi >%20) |
+| E6a | hipotez | Rejim TF'sini 15m->5m'e hizlandirmak donus gunlerinde DOWN'a saatler degil dakikalar icinde gecer; ters-gun LONG'lari keser (bedel: bogada dip alimlari). | | | | | |
+| E6b | AYI | 213 | 85.4 | +292.19 | 1.04 | 1841.30 | - |
+| E6b | YATAY | 145 | 86.9 | +1196.14 | 1.29 | 1614.42 | - |
+| E6b | BOGA | 90 | 93.3 | +1950.83 | 2.43 | 367.29 | - |
+| E6b | KARAR | - | - | -3439.16 | - | - | REDDEDILDI (AYI PF 1.04<1.1 ve AYI/YATAY birlikte iyilesmedi; BOGA PnL kaybi >%20) |
+| E6b | hipotez | Marj tavani %10->%5: boyutlama dogrusal oldugundan PF/WR AYNI kalmali, PnL ve maxDD yarilanmali (kanit: risk katmani sinyali degistirmez). | | | | | |
+| E6c | AYI | 226 | 88.9 | +707.56 | 1.12 | 1302.23 | - |
+| E6c | YATAY | 159 | 89.9 | +1301.76 | 1.38 | 1076.79 | - |
+| E6c | BOGA | 101 | 96.0 | +2298.81 | 3.71 | 257.13 | - |
+| E6c | KARAR | - | - | -2570.20 | - | - | REDDEDILDI (BOGA PnL kaybi >%20) |
+| E6c | hipotez | A paketi birlesik: marj %5 + TP1 %8 (D12). Beklenti: D12'nin PF/DD iyilesmesi + yarim olcek. | | | | | |
+
+**E6 okuması (elle, 2026-08-23):** E6b/E6c'nin "REDDEDİLDİ" hükmü P2'nin "BOĞA PnL kaybı ≤ %20"
+maddesinin **ölçek** artefaktıdır — marj tavanı %5 boyutlamayı doğrusal yarılar: E6b'de PF
+tabanla birebir aynı (AYI 1.04 / YATAY 1.29 / BOĞA 2.43), maxDD yarı (1841/1614/367 vs
+3683/3229/735) → negatif kontrol GEÇTİ (risk katmanı sinyali değiştirmez). E6c = E4f (TP1 %8)
+yarım ölçekte: PF 1.12/1.38/3.71, DD 1302/1077/257. E6a (`TF_REGIME=5m`) gerçek RED: AYI 1.01,
+YATAY 0.99, BOĞA +1944 (−%50). Karar/kapsam: `docs/superpowers/specs/2026-08-22-reversal-day-loss-design.md`.

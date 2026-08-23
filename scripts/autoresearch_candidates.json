@@ -107,5 +107,42 @@
       "SCALPER_TP1_ROI": "8",
       "SCALPER_CHANDELIER_ATR_MULT": "3.0"
     }
+  },
+  {
+    "id": "E6a",
+    "hypothesis": "Rejim TF'sini 15m->5m'e hizlandirmak donus gunlerinde DOWN'a saatler degil dakikalar icinde gecer; ters-gun LONG'lari keser (bedel: bogada dip alimlari).",
+    "overrides": {
+      "SCALPER_TF_REGIME": "5m"
+    }
+  },
+  {
+    "id": "E6b",
+    "hypothesis": "Marj tavani %10->%5: boyutlama dogrusal oldugundan PF/WR AYNI kalmali, PnL ve maxDD yarilanmali (kanit: risk katmani sinyali degistirmez).",
+    "overrides": {
+      "SCALPER_MAX_MARGIN_PCT": "5"
+    }
+  },
+  {
+    "id": "E6c",
+    "hypothesis": "A paketi birlesik: marj %5 + TP1 %8 (D12). Beklenti: D12'nin PF/DD iyilesmesi + yarim olcek.",
+    "overrides": {
+      "SCALPER_MAX_MARGIN_PCT": "5",
+      "SCALPER_TP1_ROI": "8"
+    }
+  },
+  {
+    "id": "E6d",
+    "hypothesis": "Sabit ROI stop %50->%40: kayip/islem kucultur; E3a (%30) SL sayisini 2x yapmisti, %40 ara nokta.",
+    "overrides": {
+      "SCALPER_FIXED_STOP_ROI_PCT": "40"
+    }
+  },
+  {
+    "id": "E6e",
+    "hypothesis": "Stop %40 + TP1 %8 birlikte: odeme orani (kazanc/kayip) 0.22'den ~0.25'e, BE daha erken.",
+    "overrides": {
+      "SCALPER_FIXED_STOP_ROI_PCT": "40",
+      "SCALPER_TP1_ROI": "8"
+    }
   }
 ]
