@@ -1,6 +1,11 @@
 # Dönüş-günü kayıp paketi — tasarım (2026-08-22, kullanıcı onaylı)
 
 ## Sorun (kanıt: canlı defter 12–22 Ağu, `scripts/ledger_report.py`)
+> **DÜZELTME (E8 sinyal otopsisi, 2026-08-23):** aşağıdaki "ödeme asimetrisi" satırı 22 Ağu'nun 4 tam-stop
+> kaybından genellenmişti. Defter genelinde SL'lerin çoğu TP1 sonrası BE stop'u (medyan −%6.4 ROI; 54 SL'den
+> yalnız 6'sı tam −%50) → ölçülen başabaş WR **%50–58**, gerçek WR %68–71. Kenar sanıldığından geniş;
+> sorun ödeme şekli değil, **giriş zamanlaması** (düşen-bıçak LONG / rahatlama-rallisi SHORT). A paketi bu
+> yüzden de gereksizdi (geri alındı).
 - Ödeme asimetrisi: TRAIL ort. **+%10.9 ROI**, SL ort. **−%48 ROI** → başabaş WR ≈ **%81.5**.
   Defter WR %70.7; yalnız UP rejim (%88.6) başabaşın üstünde. FLAT −41 (67 işlem),
   DOWN −128 (15 işlem).

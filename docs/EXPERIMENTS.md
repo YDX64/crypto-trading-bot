@@ -250,3 +250,275 @@ YATAY 0.99, BOĞA +1944 (−%50). Karar/kapsam: `docs/superpowers/specs/2026-08-
 | E6e | BOGA | 109 | 92.7 | +3280.18 | 1.99 | 653.34 | - |
 | E6e | KARAR | - | - | +3213.20 | - | - | ADAY (AYI PF=1.40) |
 | E6e | hipotez | Stop %40 + TP1 %8 birlikte: odeme orani (kazanc/kayip) 0.22'den ~0.25'e, BE daha erken. | | | | | |
+
+## 2026-08-23 — Sinyal otopsisi (E8): hangi girişler yanlıştı, giriş anında nasıl bilinebilirdi?
+
+Salt-okunur analiz (kod DEĞİŞTİRİLMEDİ). Soru kullanıcı kararıyla daraltıldı: boyut/TP1/stop
+ayarı YOK; yalnız **giriş sinyali kalitesi**. Yöntem: canlı defterin 202 kapanmış işlemini
+giriş zaman damgasından ÖNCE kapanmış mumlardan türetilen 40+ özellikle zenginleştirmek,
+kaybeden/kazanan ayrımını ölçmek, tek-eşikli kapıları hem defterde hem harness'ta simüle etmek.
+
+**Veri ve yollar** (hepsi yeniden üretilebilir):
+- Defter: `awa:/opt/tradingbot-v2/tradingbot.db` → `scalp_trades` (203 satır, 202 CLOSED,
+  2026-08-07 09:20 → 2026-08-22 23:52 UTC). Kopya: scratchpad `signal_autopsy/ledger_raw.json`.
+- TV kaynak eşlemesi: `awa:/opt/tradingbot-v2/logs/bot.log` + `bot.log.{1..7}.gz`,
+  `✅ Sağlama tamam: SEM YÖN — kaynaklar [...]` satırları (bot.log yerel saat = **UTC+2**;
+  doğrulama: sağlama→dolum gecikmesi medyan 75 sn, p90 246 sn — saat kayması olsaydı ±7200 sn olurdu).
+  Kopya: `signal_autopsy/tv_votes.log` (4451 satır). 58 TV işleminin **49'u** eşleşti, 9'u "bilinmiyor".
+- Piyasa verisi: Binance public `/fapi/v1/klines`, İKİ ayrı çekim —
+  `klines/` (mainnet, 2026-06-25→08-23, 1m/5m/15m/1h/1d), `klines_testnet/` (testnet, aynı pencere),
+  `klines_bear/` (mainnet, 2025-12-15→2026-02-15, harness AYI penceresi için).
+- Script'ler: `signal_autopsy/{fetch_klines,enrich,analyze,run_analysis,rules,enrich_harness}.py`;
+  çıktılar `trades_enriched[_testnet].csv/json`, `analysis_report[_testnet].txt`,
+  `rules_{mainnet,testnet}.txt`, `harness_rules.txt`, `harness_daygate.txt`.
+  Scratchpad kökü: `/private/tmp/claude-501/-Users-max-Downloads-Downloads-TRADINGBOT/7dda3fb5-.../scratchpad/signal_autopsy/`.
+- Gösterge matematiği repo'nun kendi saf modüllerinden (`indicators.rsi_series/bollinger/atr/ema`,
+  `regime.detect_regime`) — motorla birebir; pencere boyları da motorunkiyle aynı
+  (rejim 250×15m, bağlam 100×5m, giriş 150×1m — `engine.py:1167-1172`).
+
+### E8.0 — Veri kaynağı bulgusu: canlı motor TESTNET, harness MAINNET mumu okuyor
+`ScalperEngine` `KlineFetcher()`'ı parametresiz kurar → `settings.binance_base_url`
+(`data.py:60-61`, `engine.py:129`) = **testnet** (`.env`: `BINANCE_BASE_URL=https://testnet.binancefuture.com`).
+Harness ise mainnet'e sabitlenmiştir (`backtest.py:1309` `base_url="https://fapi.binance.com"`).
+Testnet 1m mumları neredeyse durağan: 2026-08-22 23:50-23:53 BTCUSDT kapanışları
+testnet `77079.20 / 77079.20 / 77079.10` (hacim 3.6 / 1.5) — mainnet `77108.0 / 77111.8 / 77073.8`
+(hacim 39.0 / 21.0). Sonuçlar:
+- Motorun `signal_reason`'a yazdığı giriş RSI'ı (143 C işlemi) **testnet** 1m serisiyle uyuşuyor
+  (medyan |Δ| **2.8**, %52'si ≤3), mainnet 1m ile uyuşmuyor (medyan |Δ| **7.4**, %18'i ≤3).
+  Gecikme taraması (0–30 dk) en iyi uyumu 0–1 dk'da veriyor → zamanlama doğru, fark veri kaynağı.
+- **Hacim tabanlı hiçbir özellik iki taraf arasında taşınmaz**: `vol_ratio_5m` korelasyon
+  r = **−0.04**, testnet ortalaması 206 (mainnet 1.73). Hacim kapısı önerilmemeli.
+- Makro/orta-vade özellikler taşınır (mainnet↔testnet Pearson r): BTC gün-açılışı sapması
+  **0.998**, BTC 3g koşu **1.000**, RSI(15m) **0.975**, RSI(5m) **0.953**, ATR persentili **0.955**,
+  EMA50 mesafesi (ATR birimi) **0.883**. Bu yüzden aşağıdaki kurallar bu ailelerden seçildi.
+- Fiyat SEVİYESİ testnet≈mainnet: defterdeki dolum fiyatı ile mainnet 5m kapanışı arasında
+  medyan sapma %0.054 (n=199; >%1 sapan yalnız 4 satır: 3× BEATUSDT + XRP #199).
+
+**Parite kontrolü (rejim kapısı D5).** Motorun kuralı "DOWN'da LONG / UP'ta SHORT yasak".
+Testnet-pariteli yeniden hesapta 25/202 satır kuralı ihlal ediyor görünüyor; hepsi açıklanıyor:
+**20'si** kapının canlıya alınmasından (2026-08-16, `engine.py` yorumu) ÖNCE; kalan 5'ten
+2'si (#91 LTC, #92 SOL, 08-18) TV muafiyetinin kaldırıldığı gün açılmış TV SHORT'ları;
+son 3'ü (#52, #55, #73) kıl payı — EMA50/EMA200 farkı sırasıyla %−0.026 / %−0.096 / %0.000,
+kapanış/EMA50 farkı %−0.40 / %−0.04 / %+0.14. 5 dk'lık rejim önbelleği
+(`engine.py:103 _REGIME_CACHE_TTL=300`) bu üçünü tek başına açıklar.
+**2026-08-18'den sonra tek bir ihlal yok** — D5 paritesi doğrulandı.
+
+### E8.1 — Popülasyon (opened_at'e göre; 202 CLOSED)
+| Kesit | n | SL | SL% | WR% | PnL | PF |
+|---|---|---|---|---|---|---|
+| Tümü | 202 | 54 | 26.7 | 67.8 | +849.1 | 2.11 |
+| `pnl_source=binance_income_net` (güvenilir) | 179 | 51 | 28.5 | 70.4 | +596.2 | 1.93 |
+| C | 144 | 44 | 30.6 | 63.2 | +516.4 | 1.86 |
+| TV | 58 | 10 | 17.2 | 79.3 | +332.7 | 3.03 |
+| LONG | 144 | 27 | 18.8 | 77.1 | +761.4 | 2.44 |
+| SHORT | 58 | 27 | 46.6 | 44.8 | +87.7 | 1.37 |
+| C-LONG | 101 | 22 | 21.8 | 73.3 | +373.5 | 1.87 |
+| C-SHORT | 43 | 22 | 51.2 | 39.5 | +142.9 | 1.84 |
+| TV-LONG | 43 | 5 | 11.6 | 86.0 | +387.9 | 4.92 |
+| **TV-SHORT** | **15** | **5** | **33.3** | **60.0** | **−55.2** | **0.15** |
+
+BTC gün tipi (post-hoc, UP>+1.5% / DOWN<−1.5%): UP 97 işlem +705.0 (PF 4.57, SL %16.5) ·
+FLAT 88 +257.9 (1.86, %37.5) · DOWN 17 −113.8 (0.58, %29.4).
+Ters-gün kovaları: **DOWN günü LONG** n=15, 4 SL, −110.4 (PF 0.58) · **UP günü SHORT** n=13,
+**10 SL**, −85.6 (PF 0.22).
+
+**Ödeme asimetrisi — spec'teki rakam üretilemedi (düzeltme).** `roi_pct` alanı
+`realized_pnl / margin_usdt × 100`'dür (`tracker.py:132`). Defterde SL çıkışlarının ROI'ı
+yalnız 6 satırda tam −%50'dir; kalanlar TP1 sonrası BE'ye çekilmiş stoplardır
+(dağılım −54.8 … −0.1, medyan **−6.4**). Ölçüm:
+| Kesit | kazanan n / ort | kaybeden n / ort | başabaş WR | gerçek WR |
+|---|---|---|---|---|
+| Tüm defter (USDT) | 137 / +11.77 | 64 / −11.94 | **%50.3** | %67.8 |
+| Güvenilir alt küme (USDT) | 126 / +9.82 | 53 / −12.10 | **%55.2** | %70.4 |
+| 12 Ağu sonrası (USDT) | 133 / +9.30 | 54 / −12.92 | **%58.2** | %71.1 |
+| Tüm defter (ROI%) | +9.93% | −12.13% | **%55.0** | %67.8 |
+`docs/superpowers/specs/2026-08-22-reversal-day-loss-design.md`'deki "SL ort −%48 ROI →
+başabaş WR %81.5" bu veriden **yeniden üretilemedi**; en olası kaynak, ortalama USDT kaybının
+dönem-ortalaması bir marja bölünmesi (marj 17→22 Ağu arası 36→162 büyüdü, D16). CLAUDE.md'deki
+"başabaş ≈ %85" ise **simülatör** rakamıdır (SL −514 / TRAIL +88 birim, "rejim referansları"
+tablosu) — canlı defterle karıştırılmamalı. Kenar sanılandan geniştir; bu, ayar değil sinyal
+odaklı çözümü zayıflatmaz, yalnız aciliyet çerçevesini düzeltir.
+
+### E8.2 — Özellik kümesi (hepsi giriş anından ÖNCE kapanmış mumlardan)
+Sembol: `sym_chg_1h/4h/24h`, `sym_run_3d`, `sym_day_open_dev`, `atr_pct_5m`, `atr_pctile_30d`
+(30 günlük 5m ATR% persentili), `dist_ema50_15m_atr/_pct`, `rsi_1m/5m/15m`, `bb_pctb_1m/5m/15m`,
+`vol_ratio_5m`, `sym_regime_15m`. Motor-pariteli: `eng_rsi_entry`, `eng_bb_pctb_entry`,
+`eng_atr_pct_entry`, `eng_regime_sym/btc` (motorun çektiği pencere boylarıyla).
+Lider: `btc_chg_1h/3h/24h`, `btc_run_3d`, `btc_day_open_dev`, `btc_regime_15m`.
+Yön-işaretli (`align_* > 0` = işlem yönü hareketle AYNI yönde): `align_btc_day/1h/3h/24h/run_3d`,
+`align_sym_day/1h/run_3d`, `align_dist_ema50_atr`, `abs_dist_ema50_atr`,
+`rsi_extremity_1m/5m/15m/eng` ( = (50−RSI)×yön ), `bb_overshoot_1m/5m/eng`.
+Zaman: `hour_utc`, `dow`. Kümelenme: `cluster_60m_same_dir(_sym)`.
+TV: `tv_sources`, `tv_confluence_lag_s`, `tv_vote_span_s`.
+**Post-hoc (kapı özelliği DEĞİL, yalnız tanı):** `mae_pct`, `mfe_pct`, `btc_day_type_posthoc`.
+
+### E8.3 — Kaybeden (exit_reason=SL, n=54) vs kalanlar — en ayırt edici 5 özellik
+AUC = P(SL değeri > SL-olmayan değeri); 0.5 = bilgi yok. p = permütasyon (2000 tur).
+Sayılar testnet mumlarıyla (motorun gördüğü); mainnet karşılıklarıyla fark ≤0.02 AUC
+(mainnet tablosu `signal_autopsy/analysis_report.txt`, testnet `analysis_report_testnet.txt`).
+| Özellik | SL ort (med) | SL-olmayan ort (med) | AUC | p |
+|---|---|---|---|---|
+| `align_btc_run_3d` (BTC 3g koşusu, yön işaretli) | 2.28 (0.62) | 7.50 (5.56) | 0.292 | <0.001 |
+| `btc_chg_24h` | 0.86 (0.22) | 3.77 (1.33) | 0.299 | <0.001 |
+| `sym_run_3d` | −1.11 (−0.46) | 10.49 (5.06) | 0.312 | <0.001 |
+| `atr_pctile_30d` | 41.1 (25.1) | 62.8 (79.2) | 0.322 | <0.001 |
+| `rsi_extremity_15m` ( = (50−RSI₁₅ₘ)×yön ) | 2.79 (1.14) | −4.58 (−5.05) | 0.644 | <0.001 |
+Yalnız **LONG** (n=144, 27 SL): `rsi_5m` 41.2 vs 49.1 (AUC 0.333, p 0.006) · `rsi_15m` 48.0 vs
+57.1 (0.342, p 0.012) · `dist_ema50_15m_atr` −0.47 vs **+1.69** (0.325, p 0.004) ·
+`btc_chg_24h` 1.70 vs 4.72 (0.302, p 0.001) · `sym_chg_4h` −3.18 vs 0.73 (0.332, p 0.009).
+Yalnız **SHORT** (n=58, 27 SL): giriş anında ölçülen HİÇBİR özellik anlamlı ayırmıyor
+(`atr_pctile_30d` p 0.44, `align_btc_day` p 0.29, `align_dist_ema50_atr` p 0.39; tek "anlamlı"
+olan `mae_pct` post-hoc). SHORT tarafında kayıp **öngörülemiyor**; aşağıdaki SHORT kuralı
+ayrım değil, **ödeme asimetrisi** üzerinden çalışıyor (kazançlar ≈0, kayıplar tam stop).
+
+**C-LONG için bağlam-TF RSI'ı tek başına monoton** (ledger, testnet mumu):
+| RSI(14, 5m=bağlam TF) | n | SL | SL% | PnL |
+|---|---|---|---|---|
+| <30 | 15 | 6 | 40.0 | −51.1 |
+| 30–35 | 11 | 4 | 36.4 | −90.3 |
+| 35–40 | 12 | 3 | 25.0 | +24.0 |
+| 40–45 | 24 | 5 | 20.8 | +58.5 |
+| 45–50 | 18 | 1 | 5.6 | +142.6 |
+| ≥50 | 21 | 3 | 14.3 | +289.8 |
+Eşik 40'ta: engellenen 38 C-LONG (13 SL, −117.5), kalan 63 işlem +490.9 / PF 4.42.
+Monotonluk eşik-uydurmasına karşı en güçlü kanıttır.
+
+### E8.4 — İki kayıp arketipi (en büyük 12 kayıp incelendi)
+(değerler mainnet / testnet mumu — ikisi de veriliyor, sonuç aynı)
+- **(A) Düşen bıçak** — işlem yönü ÜST zaman dilimine karşı: LONG'da RSI(5m/15m)<50 ve fiyat
+  15m EMA50'nin altında. Örnek #199 XRP C-LONG 22 Ağu 14:40 (−84.0): rsi5 25.5/33.6,
+  rsi15 41.7/42.2, EMA50 mesafesi −1.67/−1.25 ATR, BTC gün-açılışına göre −1.68%.
+- **(B) Tepe kovalama** — işlem yönünde AŞIRI uzama: #187 ETH TV-LONG 22 Ağu 01:07 (−89.3):
+  EMA50'nin **+3.56/+2.01 ATR** üstünde, ATR persentili 96.8/90.1, BTC 3 günde +20.9%.
+  #152 XRP C-LONG 20 Ağu (−70.0): +3.35/+4.45 ATR, rsi15 71.1/73.4, ATR persentili 100.
+  **(B) kapatılamıyor:** aynı yönde uzama filtreleri defterde net NEGATİF
+  (`align_dist_ema50_atr > 2.0` engelle → tüm defterde **−559.3**, TV-LONG'da −302.1).
+  Uzama trend sürüşünün ta kendisi; (B) kayıpları trendden kazanmanın bedeli.
+
+### E8.5 — Tek-eşikli kapı simülasyonu (DEFTER üstünde)
+Ölçüt: Δ = kapı uygulansaydı toplam PnL değişimi; ayrıca güvenilir alt küme, tarih ortasından
+bölünmüş iki yarı, BTC gün tipi kırılımı ve bootstrap %90 aralık (2000 tur). İki veri kaynağında
+da ölçüldü; "Δ güvenilir", "yarı-1/yarı-2", "ci90" ve "PF" sütunları **mainnet** koşusundan
+(testnet koşusunun karşılıkları `signal_autopsy/rules_testnet.txt`'te, işaret ve mertebe aynı).
+`align_btc_day` ailesi iki kaynakta birebir aynıdır (r=0.998).
+| Kural (kapsam) | blok / SL | Δ mainnet | Δ testnet | Δ güvenilir | yarı-1 / yarı-2 | ci90 | PF |
+|---|---|---|---|---|---|---|---|
+| `RSI(5m) < 40` → C-LONG yok | 35–38 / 12–13 | +179.7 | +117.5 | +112.4 | +89.0 / +90.7 | [+4.7, +393.8] | 2.11→3.15 |
+| `RSI(15m) < 50` → C-LONG yok | 41–42 / 13–14 | +176.3 | +172.3 | +103.5 | +70.8 / +105.4 | [−14.8, +422.6] | 2.11→3.32 |
+| `fiyat < EMA50(15m) − 1.0·ATR` → C-LONG yok | 27–30 / 10 | +124.0 | +122.5 | +76.8 | +49.4 / +74.5 | [−12.9, +298.6] | 2.11→2.72 |
+| `ATR persentili < 40` → SHORT yok | 36–39 / 19–20 | +110.3 | +109.8 | +90.3 | +59.0 / +51.3 | [−1.2, +235.0] | 2.11→2.63 |
+| `BTC gün açılışına göre ≥1.3% ters` → giriş yok | 11 / 2 | −27.8 | −27.8 | **+99.2** | −129.6 / +101.8 | [−314.4, +242.6] | 2.11→2.38 |
+Reddedilenler (defterde net negatif): `align_btc_run_3d > 15` (tüm defter **−152.7**;
+LONG'da eşik 12 → **−382.9**, 50 kazanan engelliyor) · `cluster_60m_same_dir > 1` (**−509.2**;
+kümelenme trendin kendisi) · aynı yönde uzama filtreleri (yukarıda) · `vol_ratio_5m`
+(testnet'te ölçülemez, E8.0) · gün/saat kalıpları (Cts SL %51.4, Pzt %60.0 — 16 günde
+2-3 örnek; **rejim artefaktı, kural yapılmamalı**).
+
+### E8.6 — HARNESS ölçümü (3 pencere, mevcut env; P2 kuralı)
+Taban koşular (sunucu env kopyası `scripts/.scalper_env_snapshot.txt`, C-only, 8 majör,
+`--cache-dir data/klines_cache`; log `signal_autopsy/bt_{AYI,YATAY,BOGA}.log`, ham JSON
+`bt_{AYI,YATAY,BOGA}.json`; kaynak `logs/backtest_20260823_{015145,015330,015400}.json`
+— `logs/` gitignore'da, commit'lenmez):
+AYI 213 işlem +584.4 / PF 1.04 (D12'nin "yeni taban 1.04/DD 3683"i ile birebir) ·
+YATAY 145 +2392.3 / 1.29 · BOĞA 90 +3901.7 / 2.43.
+
+**Yöntem sınırı (önemli):** kapı **post-hoc** uygulandı — harness JSON'undaki her işlem giriş
+zamanıyla yeniden zenginleştirilip filtrelendi. Engellenen bir işlem harness'ta
+kapasite/sembol-içi tekillik kısıtını serbest BIRAKMAZ, yani yerine başka bir sinyal geçmez.
+Bu yüzden sayılar gerçek motor-içi kapının **alt sınırı**dır; kapı kodlandığında (D15) tekrar
+ölçülmelidir. Script: `signal_autopsy/enrich_harness.py`.
+
+**Lider gün-açılışı kapısı (D15 `SCALPER_MARKET_GATE_DAY_PCT`) — eşik taraması**
+(blok/SL → ΔPnL; sonuç PnL / PF):
+| Eşik | Kapsam | AYI | YATAY | BOĞA | P2 |
+|---|---|---|---|---|---|
+| 0.5% | iki yönlü | 84/15 → **+2421.9** (3006.2 / **1.40**) | 39/3 → −2002.4 (389.9 / 1.06) | 17/0 → −1294.8 (2606.8 / 1.96) | ❌ BOĞA −%33 |
+| 1.0% | iki yönlü | 69/12 → +1751.8 (2336.2 / 1.26) | 16/2 → −487.3 (1905.0 / 1.26) | 3/0 → −241.3 (3660.3 / 2.34) | ✅ (BOĞA −%6.2) |
+| **1.3%** | **iki yönlü** | 66/12 → **+2010.4** (2594.8 / **1.29**) | 9/1 → −186.6 (2205.7 / 1.28) | 1/0 → −104.0 (3797.6 / 2.39) | **✅ (AYI PF 1.29, BOĞA −%2.7)** |
+| **1.0%** | **yalnız SHORT** | 45/9 → +1675.7 (2260.1 / **1.22**) | 11/2 → **+138.1** (2530.4 / **1.35**) | 3/0 → −241.3 (3660.3 / 2.34) | **✅ (3 pencerede 2'si pozitif)** |
+| 1.3% | yalnız SHORT | 42/9 → +1934.3 (2518.7 / 1.24) | 7/1 → −16.6 (2375.7 / 1.30) | 1/0 → −104.0 (3797.6 / 2.39) | ✅ |
+| 1.3% | yalnız LONG | 24/3 → +76.1 (660.5 / 1.05) | 2/0 → −170.0 | 0 | ❌ (AYI PF 1.05) |
+| 2.0% | iki yönlü | 38/8 → +1695.3 (2279.7 / 1.21) | 2/0 → −230.1 | 0 | ✅ |
+Okuma: kazancın tamamına yakını **SHORT bacağından** geliyor (AYI'da BTC gün-açılışının
+%1+ ÜSTÜNDEyken açılan 45 SHORT −1675.7 etmiş). LONG bacağının harness kanıtı zayıf
+(AYI +76), ama canlı defterin 22 Ağu kaybı tam oradan geldi (8 işlem, +102.1) —
+iki kanıt çelişmiyor, farklı rejimlerde farklı bacak çalışıyor.
+
+**Diğer kuralların 3-pencere hükmü (aynı post-hoc yöntem, `signal_autopsy/harness_rules.txt`):**
+| Kural | AYI | YATAY | BOĞA | P2 |
+|---|---|---|---|---|
+| `RSI(5m)<40` → LONG yok | +98.5 (PF 1.06) | −1244.1 | −771.6 (−%20) | ❌ AYI PF<1.1 |
+| `RSI(15m)<50` → LONG yok | −454.8 | −2802.4 | −1166.6 | ❌ |
+| `RSI(15m)<50` → iki yönlü | +227.1 (1.12) | −2488.7 | −1719.9 (−%44) | ❌ BOĞA |
+| `fiyat < EMA50(15m)−1·ATR` → iki yönlü | +786.3 (1.14) | −3555.1 | −1394.8 (−%36) | ❌ BOĞA |
+| `ATR persentili<40` → SHORT yok | −1037.5 | −565.3 | +323.5 | ❌ AYI |
+| `align_btc_run_3d>15` → giriş yok | +2453.3 (1.25) | 0 tetik | 0 tetik | ⚠ tek pencere |
+**Yani: defterde en güçlü olan bağlam-TF kuralları harness'ta P2'yi GEÇMİYOR.** Defter
+16 günlük ve LONG-ağırlıklı (144/202) bir boğa örneklemi; harness'ın AYI/YATAY pencereleri
+SHORT-ağırlıklı. Bağlam-TF kuralı "üst TF'ye karşı işlem açma" demek olduğundan, C'nin
+kârının ters-trend dip alımından geldiği pencerelerde (YATAY: `RSI(15m)<50` 54 LONG'un
+50'si kazanan) doğrudan kârı kesiyor. **Hüküm: kanıt yetersiz — uygulanmaz.**
+
+### E8.7 — TV SHORT kaynak kalitesi (15 işlem, PF 0.15)
+Kaynak eşlemesi `bot.log` "Sağlama tamam" satırlarından. Sunucudaki log tutma penceresi
+**2026-08-16 00:05**'te başlıyor (`bot.log.7.gz`), TV işlemleri ise 08-12'de başlamış: bu yüzden
+9 TV işleminin kaynağı "bilinmiyor" — 7'si (08-12…08-15) log tutma penceresinin dışında,
+2'si (#60 08-16 LONG, #89 08-18 SHORT) pencere içinde olduğu hâlde ±10 dk'da eşleşen
+"Sağlama tamam" satırı bulunamadı (nedeni **kodda/logda doğrulanamadı**).
+| Kaynak çifti | Yön | n | SL | PnL | PF | WR% |
+|---|---|---|---|---|---|---|
+| luxosc+luxso | SHORT | 5 | 3 | **−50.9** | **0.00** | 40.0 |
+| bilinmiyor | SHORT | 7 | 1 | −3.5 | 0.67 | 71.4 |
+| algopro+luxosc | SHORT | 2 | 1 | −1.0 | 0.72 | 50.0 |
+| algopro+luxso | SHORT | 1 | 0 | +0.2 | ∞ | 100.0 |
+| bilinmiyor | LONG | 2 | 1 | +11.1 | 57.96 | 50.0 |
+| algopro+luxso | LONG | 14 | 2 | +62.4 | 1.69 | 85.7 |
+| algopro+luxosc | LONG | 12 | 1 | +141.5 | 19.54 | 91.7 |
+| luxosc+luxso | LONG | 15 | 1 | +172.9 | 133.93 | 86.7 |
+Mekanizma: 15 TV SHORT'un 9 kazananından **8'i +1 USDT'nin altında** (TP1 dolup BE'ye
+çekilen TRAIL: +0.1 … +0.7; tek istisna #29 +5.6). Brüt kâr toplamı 10.2, brüt kayıp 65.2 →
+PF 0.156. Kaybın **%88'i 3 satırdan** geliyor (#92 −30.6, #75 −18.4, #30 −8.6) ve üçü de
+DÜŞÜK oynaklık rejiminde (ATR persentili 19.9 / 33.7 / 45.6). Yani "PF 0.15" bir
+ayırt-edicilik değil **ödeme asimetrisi** problemidir: TV SHORT'un yukarı tarafı yok,
+aşağı tarafı tam stop. Kaynak bazında hüküm vermek için örneklem yetersiz (kaynak başına
+1–5 işlem); `luxosc+luxso` SHORT'un brüt kârı **tam sıfır** olması yine de en zayıf halka işareti.
+TV sağlama süresi (ilk oy→tamam) medyan 148 sn ve sonucu AYIRMIYOR (SL ort 152 sn,
+SL-olmayan 150 sn) → sağlama penceresi (420 sn) bir kalite kaldıracı değil.
+TV LONG'da hiçbir kaynak çifti negatif değil.
+
+### E8.8 — Kod gerektiren kapılar (bir sonraki ajana kesin tarif)
+Mevcut `SCALPER_*` anahtarlarıyla ölçülemeyenler ve neden:
+1. **Lider gün-açılışı kapısı** — D15 `SCALPER_MARKET_GATE` / `_DAY_PCT`. Ölçüm yukarıda:
+   **iki yönlü, eşik %1.3** (spec'teki varsayılan %1.0 da P2'yi geçiyor ama YATAY'da −%20).
+   Alt-kapı önerisi: **SHORT bacağı %1.0, LONG bacağı %1.3** (kanıt ayrık — E8.6).
+2. **Lider N-günlük koşu alt-kapısı** (`_RUN_PCT/_RUN_DAYS`) — **varsayılan 0 (KAPALI) kalsın.**
+   Canlı defterde net **−152.7** (LONG eşik 12'de −382.9; 50 kazanan engelliyor), harness'ta
+   yalnız AYI'da tetikleniyor (+2453, 13 işlem), YATAY/BOĞA'da hiç tetiklenmiyor. Tek pencerede
+   parlayan aday = P2'ye göre red. Spec'teki "lider koştuysa o yöne girme" hipotezinin
+   İŞARETİ defterde TERS: kazananların `align_btc_run_3d` ortalaması 7.50, kaybedenlerin 2.28.
+3. **Bağlam-TF trend uyumu** (`passes_context_trend`, öneri): C LONG için
+   `RSI(14, scalper_tf_context) >= X`, SHORT için `<= 100−X`; X=0 kapalı. Veri hazır —
+   `ctx.candles_15m` (bağlam rolü, 100 mum) zaten çekiliyor, YENİ REST çağrısı YOK.
+   Defter kanıtı güçlü ve monoton (E8.3), **harness kanıtı P2'yi geçmiyor (E8.6) → şu an
+   uygulanmamalı**; ancak D15 kapısı canlıya girip soak bittikten sonra tekrar ölçülmeye değer.
+   Mevcut `SCALPER_C_REQUIRE_FLOW_CONFIRM` AYNI niyeti taşıyor ("düşen bıçakta dip alma")
+   ama MFI'yi **giriş TF'sinde** (canlıda 1m) okuyor (`setups.py:144-162`) ve E2b'de
+   YATAY'da düşmüştü — farklı bir kaldıraç, karıştırılmamalı.
+   `SCALPER_USE_EQUILIBRIUM_FILTER` ise TERS kutupludur (LONG'u yalnız *discount*ta geçirir,
+   `setups.py:194-217`) — bu bulgunun tam tersini yapar, açılmamalı.
+4. **Uzama kapısı** (`fiyat − EMA50(tf_regime)` / ATR) — kodlanabilir (`ctx.candles_4h`
+   zaten 250 mum) ama **iki taraflı da red**: ters yön eşiği harness'ta BOĞA'yı −%36 bozuyor,
+   aynı yön eşiği defterde −559. Önerilmiyor.
+5. **ATR persentili** (`atr_pctile_30d`) — 30 günlük 5m geçmişi gerekir (sembol başına
+   ~8640 mum = 6 ek REST çağrısı, günlük önbelleklenebilir). Defterde SHORT için +110 ama
+   harness'ta AYI −1037 → **önerilmiyor**; ayrıca SHORT tarafında ayırt-edicilik yok (p 0.44).
+6. **Hacim tabanlı kapı** — testnet'te ÖLÇÜLEMEZ (E8.0, r=−0.04). Mainnet'e geçmeden
+   denenmemeli; harness'ta iyi görünse bile canlıda (testnet) anlamsız çalışır.
+
+**Örneklem uyarısı.** Defter 202 işlem / 16 gün, 54 SL. Yön×strateji kırılımında hücre başına
+15–101 işlem kalıyor; TV-SHORT 15, DOWN-günü LONG 15, UP-günü SHORT 13. Bu boyutta
+çok-parametreli kural aramak aşırı uydurmadır; yukarıdaki taramada bilinçli olarak yalnız
+TEK eşikli, ön-kayıtlı (spec'ten veya mekanizmadan türeyen) kurallar denendi ve her biri
+4 ayrı kesitte (tümü / güvenilir / yarı-1 / yarı-2) + gün tipi kırılımında + bootstrap
+aralığıyla raporlandı. Yine de tek bir kuralın bile defter kanıtı **tek başına** terfi
+gerekçesi değildir (P2: 3 rejim penceresi + testnet soak).
