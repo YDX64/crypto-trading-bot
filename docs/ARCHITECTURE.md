@@ -109,6 +109,10 @@ satır 56-63). `?src=` yoksa kaynak, AlgoPro'nun varsayılan mesaj biçiminden
 | `scalper_tv_symbol_allowlist` | `""` | TV dış sinyaline sembol filtresi (OSC kanıtı olan sembollerle sınırlamak için) |
 | `scalper_regime_filter` | `True` | Rejim kapısını (§4) aç/kapat |
 | `scalper_tv_regime_filter` | `True` | Rejim kapısının TV sinyaline de uygulanıp uygulanmayacağı |
+| `scalper_market_gate` | `False` | Lider piyasa kapısı (§4.1) — ters-gün kapısı, varsayılan KAPALI |
+| `scalper_market_gate_symbol` | `BTCUSDT` | Kapının baktığı lider sembol |
+| `scalper_market_gate_day_pct` | `1.0` | Gün-içi alt-kapısı eşiği (%; 0 = kapalı) |
+| `scalper_market_gate_run_pct` / `_run_days` | `15.0` / `3` | Uzama alt-kapısı eşiği ve gün sayısı (0 = kapalı) |
 | `scalper_tf_entry/context/regime` | `5m/15m/4h` | Giriş/bağlam/rejim zaman dilimleri |
 | `scalper_c_rsi_long_max/short_min` | `25.0/75.0` | C'nin RSI uç eşiği |
 | `scalper_c_require_divergence` | `True` | C'de RSI diverjans şartı |
@@ -154,6 +158,43 @@ tutulabilir ama varsayılan `True`'dur (`engine.py:822-825`).
 daraltması yapar: `scalper_c_allowed_regimes` CSV'sinde olmayan rejimlerde
 sinyal üretmez (`setups.py:462-463`); varsayılan `"UP,DOWN,RANGE"` = eski
 davranışla birebir (yalnız UNKNOWN engelli).
+
+### 4.1 Lider piyasa kapısı ("ters-gün kapısı", D15 — varsayılan KAPALI)
+
+Rejim kapısının **hemen yanında**, aynı tek giriş noktasında
+(`engine._market_gate_reason`, `_evaluate_symbol` içinde — yani C taraması
+VE TV `external_signal` aynı anda). Rejim kapısından farkı: rejim kapısı
+sembolün **kendi** EMA50/200 trendine bakar; bu kapı yalnız **lider**
+sembole (`scalper_market_gate_symbol`, varsayılan BTCUSDT) bakar ve kararı
+tüm evrene uygular. Saf kural `src/strategies/scalper/market_gate.py`
+(`evaluate_market_gate`, IO yok) — canlı motor ve backtest harness'ı
+(`backtest.simulate_symbol` + `LeaderSeries`) **aynı fonksiyon nesnesini**
+çağırır (parite: `tests/test_market_gate.py::TestEngineHarnessParity`).
+
+İki bağımsız alt-kapı (her biri kendi yüzdesi `0` yapılarak kapatılır):
+
+- **gün-içi** (`scalper_market_gate_day_pct`): lider son kapanışı gün
+  açılışının ≥%X **altındaysa** yeni LONG, ≥%X **üstündeyse** yeni SHORT
+  açılmaz.
+- **uzama** (`scalper_market_gate_run_pct` / `_run_days`): lider son N
+  **tamamlanmış** günde ≥+%Y koştuysa LONG, ≤−%Y düştüyse SHORT açılmaz
+  (koşu = `kapanış[-1]/kapanış[-1-N] − 1`, yani N+1 kapanış gerekir).
+
+"Gün açılışı" iki tarafta da **son tamamlanmış günlük kapanış**tır
+(`day_open_from_daily_closes`): `KlineFetcher._drop_unclosed` oluşmakta olan
+günlük mumu her zaman attığı için gerçek "bugünün open'ı" canlıda elde
+edilemez; 7/24 açık bir piyasada iki büyüklük tik mertebesinde aynıdır ve
+ortak vekil parite boşluğu bırakmaz.
+
+REST ağırlığı: lider **başına** ~60 sn TTL önbellek (`_MARKET_GATE_CACHE_TTL`),
+sembol başına değil — tarama turu başına en çok 2 istek (`1d` limit N+2 ve
+giriş TF limit 3; ikisi de ağırlık 1). Kapı kapalıyken tek istek bile gitmez.
+Lider verisi alınamazsa kapı **uygulanmaz** (fail-open) ve WARNING loglanır —
+lider verisinin gelmemesi bir risk olayı değildir. `/scalper/status`
+`market_gate` alt-sözlüğü (enabled/leader/day_drift_pct/run_pct/last_reason/
+rejects) teşhis için dışa verilir; harness'ta engellenen sinyaller
+`missed_counter["market_gate_day"/"market_gate_run"]` altında raporlanır.
+Ölçüm ve P2 hükmü: `docs/EXPERIMENTS.md` "2026-08-23 — Lider piyasa kapısı (E7)".
 
 ## 5. Çıkış mimarisi
 
@@ -351,6 +392,7 @@ pencere tarihleri ve karar kuralı `docs/DECISIONS.md` P2'de.
 |---|---|
 | **C** | Strateji varyantı "Saf Uç Avcısı": rejim filtresiz, RSI ucu + Bollinger taşması + diverjans → ters yönde giriş, `risk_multiplier=0.5` (`setups.py:431-565`) |
 | **Rejim kapısı** | `DOWN`'da LONG, `UP`'ta SHORT sinyalini engelleyen kural (`engine.py:815-834`) |
+| **Lider piyasa kapısı** | Liderin (BTCUSDT) gün-içi sapmasına ve çok-günlük koşusuna bakıp o yöne yeni giriş kapatan kural (§4.1, `market_gate.py`; varsayılan KAPALI) |
 | **Sağlama / confluence** | Birden çok farklı TV göstergesinin aynı yönde oy vermesi şartı (`tv_confluence.py`) |
 | **Reaper** | Yaş limitini aşan, BE korumasız pozisyonları reduce-only MARKET ile kapatan görev (`engine.py:602`) |
 | **Chandelier** | ATR tabanlı, yalnız lehte kayan trailing stop (`indicators.py:280`) |

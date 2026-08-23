@@ -213,3 +213,97 @@ Kaynak: `python3 scripts/autoresearch.py` — otomatik uretildi, elle duzenlemey
 | E5c | BOGA | 52 | 86.5 | +1578.66 | 1.50 | 1510.41 | - |
 | E5c | KARAR | - | - | +0.00 | - | - | REDDEDILDI (asiri filtreleme (islem<60: ['BOGA'])) |
 | E5c | hipotez | Kaldirac tavani 12 tek basina: E4i (10) ile E4j (15) arasi — boga islem sayisi >=60 kalir mi? | | | | | |
+
+## 2026-08-23 — Lider piyasa kapısı (E7, spec §C / D15)
+
+Kod: `src/strategies/scalper/market_gate.py` (saf kural, motor + harness ORTAK), commit `ece8bd8`.
+Env tabanı: `scripts/.scalper_env_snapshot.txt` (sunucu env kopyası; TP1 10, fixed_roi 50,
+max_margin 10, TF 1m/5m/15m, entry maker, dyn lev 3-20, max_positions 5, divergence açık).
+D16 paketi bu ölçümlerin ORTASINDA uygulanıp GERİ ALINDI; tablodaki tüm koşular geri
+alınmış (orijinal) tabanla YENİDEN koşuldu — her log dosyasının başında o koşuda fiilen
+kullanılan tam env yazılıdır (`# taban env:` bloğu).
+Komut:
+```bash
+env $(cat scripts/.scalper_env_snapshot.txt | xargs) SCALPER_MARKET_GATE=true \
+  SCALPER_MARKET_GATE_DAY_PCT=<X> SCALPER_MARKET_GATE_RUN_PCT=<Y> SCALPER_MARKET_GATE_RUN_DAYS=3 \
+  python3 -m src.strategies.scalper.backtest --strategies C \
+  --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,BNBUSDT,ADAUSDT,LTCUSDT \
+  --start <YYYY-MM-DD> --end <YYYY-MM-DD> --cache-dir data/klines_cache
+```
+Loglar: `logs/market_gate/<varyant>_<pencere>.log` (24 dosya, sıralı koşuldu).
+
+### Varyantlar
+| Varyant | Ayar | Pencere | İşlem | WR% | PnL | PF | maxDD | ΔPnL | day tetik | run tetik |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **V0** | kapı KAPALI (taban) | AYI | 213 | 85.4 | +584 | 1.04 | 3683 | — | 0 | 0 |
+| V0 | | YATAY | 145 | 86.9 | +2392 | 1.29 | 3229 | — | 0 | 0 |
+| V0 | | BOĞA | 90 | 93.3 | +3902 | 2.43 | 735 | — | 0 | 0 |
+| **V1** | gün-içi %1.0 | AYI | 149 | 87.2 | **+2999** | **1.33** | 2956 | +2415 | 196 | 0 |
+| V1 | | YATAY | 135 | 87.4 | +2593 | 1.36 | 2882 | +201 | 62 | 0 |
+| V1 | | BOĞA | 88 | 93.2 | +3725 | 2.37 | 735 | −177 (−%4.5) | 15 | 0 |
+| **V1a** | gün-içi %0.7 | AYI | 138 | 88.4 | +3897 | 1.52 | 2442 | +3312 | 219 | 0 |
+| V1a | | YATAY | 124 | 85.5 | +873 | 1.11 | 3517 | **−1520 (−%63.5)** | 81 | 0 |
+| V1a | | BOĞA | 83 | 92.8 | +3384 | 2.24 | 813 | −518 (−%13.3) | 18 | 0 |
+| **V1b** | gün-içi %1.5 | AYI | 158 | 86.1 | +1832 | 1.17 | 3348 | +1247 | 162 | 0 |
+| V1b | | YATAY | 138 | 87.7 | +2962 | 1.41 | 2840 | +570 | 30 | 0 |
+| V1b | | BOĞA | 90 | 93.3 | +3902 | 2.43 | 735 | 0 (tetik yok) | 0 | 0 |
+| **V2** | uzama %15 / 3g | AYI | 196 | 87.2 | +2909 | 1.24 | 3083 | +2324 | 0 | 60 |
+| V2 | | YATAY | 145 | 86.9 | +2392 | 1.29 | 3229 | 0 (tetik yok) | 0 | 0 |
+| V2 | | BOĞA | 90 | 93.3 | +3902 | 2.43 | 735 | 0 (tetik yok) | 0 | 0 |
+| **V2a** | uzama %10 / 3g | AYI | 192 | 87.0 | +2563 | 1.21 | 3083 | +1979 | 0 | 70 |
+| V2a | | YATAY | 145 | 86.9 | +2392 | 1.29 | 3229 | 0 | 0 | 0 |
+| V2a | | BOĞA | 76 | 93.4 | +2941 | 2.14 | 735 | **−960 (−%24.6)** | 0 | 40 |
+| **V2b** | uzama %20 / 3g | AYI | 196 | 87.2 | +2909 | 1.24 | 3083 | +2324 | 0 | 60 |
+| V2b | | YATAY/BOĞA | = V0 | | | | | 0 | 0 | 0 |
+| **V3** | ikisi (%1.0 + %15/3g) | AYI/YATAY/BOĞA | **V1 ile BİREBİR AYNI** | | | | | | 196/62/15 | 0/0/0 |
+
+V0, `docs/DECISIONS.md`'deki mevcut tabanı **birebir** üretti (AYI 1.04/DD 3683 · YATAY 1.29/3229 ·
+BOĞA 2.43/735) → kapı kapalıyken harness çıktısı değişmemiştir (parite negatif kontrolü).
+**V3 ≡ V1:** uzama alt-kapısının engelleyeceği her sinyal gün-içi alt-kapısı tarafından zaten
+engelleniyor (V3'te `market_gate_run` sayacı üç pencerede de **0**) — iki alt-kapı toplamsal DEĞİL.
+
+### P2 hükmü (AYI PF ≥ 1.1 **veya** AYI+YATAY PnL birlikte ↑, **VE** BOĞA PnL kaybı ≤ %20)
+| Varyant | AYI PF | AYI+YATAY birlikte ↑ | BOĞA kaybı | Hüküm |
+|---|---|---|---|---|
+| V1 (gün-içi %1.0) | 1.33 ✓ | ✓ (+2415 / +201) | −%4.5 ✓ | **GEÇTİ** (her iki kol) |
+| V1a (%0.7) | 1.52 ✓ | ✗ (YATAY −%63.5) | −%13.3 ✓ | GEÇTİ ama YATAY'ı yıkıyor → red |
+| V1b (%1.5) | 1.17 ✓ | ✓ (+1247 / +570) | %0 ✓ | GEÇTİ (daha muhafazakâr) |
+| V2 (%15/3g) | 1.24 ✓ | ✗ (YATAY değişmedi) | %0 ✓ | GEÇTİ ama kanıt tek olaya dayanıyor |
+| V2a (%10/3g) | 1.21 ✓ | ✗ | **−%24.6 ✗** | **KALDI** |
+| V2b (%20/3g) | 1.24 ✓ | ✗ | %0 ✓ | V2 ile birebir aynı |
+| V3 (ikisi) | 1.33 ✓ | ✓ | −%4.5 ✓ | GEÇTİ (= V1) |
+
+### Hangi kaybı kesiyor? (yön/çıkış kırılımı — kapının asıl iddiası)
+**AYI penceresi, V0 → V1 (gün-içi %1.0):**
+- SL sayısı **29 → 17** (−%41), SL toplam zararı **−14907 → −8738** (+6169 kurtarıldı).
+- LONG: 79 işlem / **−956** → 61 işlem / **−121** (düşen-bıçak LONG'ları kesiliyor).
+- SHORT: 134 / +1541 → 88 / **+3120** (rahatlama-rallisi SHORT'ları da kesiliyor — kapı simetrik).
+- Rejim kırılımı: RANGE günleri **−1029 → +425** (asıl düzelme burada; DOWN 1758 → 2686).
+
+**AYI penceresi, V0 → V2 (uzama %15/3g):** SL 29 → 23, SHORT +1541 → **+3598**, LONG −956 → −689.
+
+**Lider (BTCUSDT) tetik istatistiği** (pencere içi günler, `1d` serisinden türetildi):
+| Pencere | gün-içi %1 LONG-blok günü | gün-içi %1 SHORT-blok günü | uzama %15/3g LONG-blok | uzama %15/3g SHORT-blok |
+|---|---|---|---|---|
+| AYI | 11 | 5 | 0 | **1** (2026-02-06, koşu −%20.1) |
+| YATAY | 4 | 7 | 0 | 0 |
+| BOĞA | 1 | 3 | 0 | 0 |
+(Gün sayıları gün-SONU ölçümüdür; kapı dakika bazında değerlendirildiği için aynı gün içinde
+iki yön de tetiklenebilir — bu yüzden tetik sayısı gün sayısından çok daha büyüktür.)
+
+### Kanıtın gücü — dürüst değerlendirme
+- **Gün-içi alt-kapısı (V1): kanıt orta-güçlü.** Üç pencerede de tetikleniyor (196/62/15),
+  AYI'da 16 farklı güne yayılıyor, ve etkisi mekanizmayla tutarlı (SL sayısı düşüyor, hem
+  düşen-bıçak LONG hem rahatlama-rallisi SHORT kesiliyor). Yine de kanıt **tek lider**
+  (BTCUSDT) ve **tek 21 günlük ayı penceresi** üzerinden; AYI'daki +2415'in büyük kısmı
+  02-05/02-06 çöküş-toparlanma çiftinden geliyor.
+- **Uzama alt-kapısı (V2): kanıt ZAYIF.** 60 tetiğin tamamı AYI penceresinde ve **TEK bir
+  lider olayından** (2026-02-06, 3 günlük −%20.1 koşu) geliyor; %15 ile %20 eşikleri
+  **birebir aynı** sonucu veriyor (arada hiç olay yok), YATAY ve BOĞA'da hiç tetiklenmiyor.
+  n=1 olay = istatistik değil, anekdot. Ayrıca %10'a gevşetmek BOĞA'yı −%24.6 ile P2'den
+  düşürüyor (08-20'de BTC'nin +%10.2'lik 3 günlük koşusu LONG'ları vetoluyor) — yani eşik
+  duyarlılığı yüksek ve yanlış tarafa ayarlanırsa doğrudan zarar veriyor.
+- **V3 ≡ V1** olduğu için uzama alt-kapısını gün-içi ile BİRLİKTE açmanın ölçülebilir hiçbir
+  faydası yok; tek başına açmanın da (V2) faydası tek olaya dayanıyor.
+- Simülatörün mutlak sayıları rejime duyarlıdır (P3); yukarıdaki hüküm **göreli** farklara
+  dayanır ve canlı defter nihai hakemdir.

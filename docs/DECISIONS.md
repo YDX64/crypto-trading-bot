@@ -281,6 +281,73 @@ tekilleştirme bloğu + `shadow_active_count`, engine.py'deki kapasite dalı, co
 `.strip()`/allowlist filtresi ve RUNBOOK.md "Gölge modu" bölümünü bu commit'ten önceki
 haline döndür — üçü de bağımsız, birbirine muhtaç değil.
 
+### D15 — Lider piyasa kapısı ("ters-gün kapısı") · 2026-08-23 · ADAY, UYGULANMADI (varsayılan KAPALI)
+**Ne:** `SCALPER_MARKET_GATE` (varsayılan `false`) ile iki BAĞIMSIZ alt-kapı
+(`src/strategies/scalper/market_gate.py`, saf fonksiyon, IO yok):
+1. **gün-içi** (`SCALPER_MARKET_GATE_DAY_PCT`, varsayılan 1.0): lider sembolün
+   (`SCALPER_MARKET_GATE_SYMBOL`, varsayılan BTCUSDT) son kapanışı gün açılışının ≥%X
+   ALTINDAYSA yeni LONG, ≥%X ÜSTÜNDEYSE yeni SHORT açılmaz.
+2. **uzama** (`SCALPER_MARKET_GATE_RUN_PCT`=15 / `_RUN_DAYS`=3): lider son N TAMAMLANMIŞ günde
+   ≥+%Y koştuysa LONG, ≤−%Y düştüyse SHORT açılmaz (koşu = `kapanış[-1]/kapanış[-1-N] − 1`).
+Her alt-kapı kendi yüzdesi 0 yapılarak ayrı ayrı kapatılır. Rejim kapısından (D5) FARKLIDIR:
+D5 sembolün KENDİ EMA50/200 trendine bakar, bu kapı yalnız LİDERE bakıp kararı tüm evrene uygular.
+
+**Nerede:** `engine._market_gate_reason`, rejim kapısının HEMEN yanında, `_evaluate_symbol`
+içinde — yani C taraması VE TV `external_signal` AYNI tek giriş noktasından geçer (D5'teki gibi
+ayrı bir TV muafiyet bayrağı YOKTUR; TV zaten aynı fonksiyondan geçiyor). Harness tarafı
+`backtest.simulate_symbol` + `LeaderSeries` — İKİ TARAF AYNI FONKSİYON NESNESİNİ çağırır (P1).
+
+**Girdi türetme paritesi (bilinçli tasarım kararı):** "gün açılışı" iki tarafta da SON
+TAMAMLANMIŞ GÜNLÜK KAPANIŞ'tır (`day_open_from_daily_closes`). Gerekçe: `KlineFetcher.
+_drop_unclosed` oluşmakta olan mumu HER ZAMAN atar (repaint koruması), bu yüzden canlı motor
+oluşmakta olan GÜNLÜK mumu hiç göremez — gerçek "bugünün open'ı" canlıda TÜRETİLEMEZ.
+Harness'ta türetilebilirdi ama o zaman iki taraf farklı bir büyüklük hesaplar ve parite bozulurdu.
+7/24 açık bir piyasada günlük open ile önceki close arasındaki fark tik mertebesindedir (eşik %1).
+
+**REST ağırlığı:** lider BAŞINA ~60 sn TTL önbellek (sembol başına DEĞİL) — tarama turu başına
+en çok 2 istek (`1d` limit N+2 ve giriş TF limit 3; ikisi de ağırlık 1). Kapı kapalıyken TEK
+istek bile gitmez (`test_gate_off_makes_no_request_at_all`). Lider verisi alınamazsa kapı
+UYGULANMAZ (fail-open) + WARNING — lider verisi eksikliği bir risk olayı değildir (spec §C).
+
+**Kanıt (E7, `docs/EXPERIMENTS.md` "2026-08-23 — Lider piyasa kapısı"):** 8 varyant × 3 pencere,
+loglar `logs/market_gate/<varyant>_<pencere>.log`. V0 (kapı kapalı) mevcut tabanı BİREBİR üretti
+(AYI 1.04/DD 3683 · YATAY 1.29/3229 · BOĞA 2.43/735).
+- **V1 (gün-içi %1.0)** — AYI 1.04→**1.33** (+584→+2999, DD 3683→2956) · YATAY 1.29→**1.36**
+  (+2392→+2593) · BOĞA 2.43→2.37 (+3902→+3725, −%4.5). P2'nin HER İKİ kolunu da geçer.
+  Mekanizma doğrulandı: AYI'da SL 29→17, SL zararı −14907→−8738; LONG −956→−121 (düşen-bıçak),
+  SHORT +1541→+3120 (rahatlama-rallisi) — kapı simetrik çalışıyor; RANGE günleri −1029→+425.
+- **V2 (uzama %15/3g)** — AYI 1.04→1.24 (+2909), YATAY/BOĞA hiç tetiklenmiyor. P2'yi geçer AMA
+  60 tetiğin TAMAMI TEK bir lider olayından (2026-02-06, 3 günlük −%20.1). %15 ve %20 eşikleri
+  BİREBİR aynı sonucu veriyor (arada olay yok) → n=1, kanıt ZAYIF.
+- **V3 (ikisi) ≡ V1 birebir** (V3'te `market_gate_run` üç pencerede de 0) → alt-kapılar toplamsal
+  değil; uzamayı gün-içiyle birlikte açmanın ölçülebilir faydası YOK.
+- **V2a (uzama %10/3g) P2'den KALDI**: BOĞA −%24.6 (08-20'de BTC'nin +%10.2 3-günlük koşusu
+  LONG'ları vetoluyor, LONG 60→46) — uzama eşiği gevşetilmemeli.
+- **V1a (%0.7) reddedildi**: AYI en iyi (1.52) ama YATAY +2392→+873 (−%63.5) — tek pencerede parlıyor.
+- **V1b (%1.5)** muhafazakâr alternatif: AYI 1.17, YATAY +570, BOĞA hiç tetiklenmiyor (%0 kayıp).
+
+**Neden UYGULANMADI:** (1) CLAUDE.md kural 1 zinciri backtest → testnet ≥5 gün → onay ister ve
+D6'nın soak'u sürüyor — üst üste binen değişiklik atfı kirletir. (2) Kanıt tek lider (BTCUSDT) ve
+tek 21 günlük ayı penceresinden geliyor; AYI kazancının büyük kısmı 02-05/02-06 çöküş-toparlanma
+çiftinden. (3) Uzama alt-kapısı için kanıt açıkça yetersiz (n=1 olay). Açılacaksa önce YALNIZ
+gün-içi alt-kapısı (`SCALPER_MARKET_GATE=true`, `DAY_PCT=1.0`, `RUN_PCT=0`) ve tercihen önce
+gölge modunda (D14) gözlemlenmeli.
+
+**Kanıt (kod):** `tests/test_market_gate.py` — 67 test (saf fonksiyon: her alt-kapı/yön/eşik
+sınırı/eksik-geçersiz veri; motor: önbellek, fail-open+WARNING, ret sayaçları, `/scalper/status`
+`market_gate` alanı, GERÇEK `_evaluate_symbol` üzerinden C ve TV yolunun ikisi de; harness:
+look-ahead yasağı, `missed_counter` anahtarları; PARİTE: iki modülün aynı fonksiyon nesnesini
+aynı argümanlarla çağırdığı; Settings env parse). `python3 -m pytest tests -q` → 743 passed,
+1 skipped (önceki: 676). `tests/test_golden_backtest.py` DEĞİŞMEDEN geçer.
+
+**Geri alma:** `.env`'den `SCALPER_MARKET_GATE`'i kaldır/`false` yap — varsayılan zaten `false`,
+davranış değişmez, kod geri alınmasına gerek yok. Tam geri alma gerekirse commit `ece8bd8`
+(`market_gate.py`, `engine.py` kapı bloğu + `_market_gate_*` metodları + snapshot alanı,
+`backtest.py` `LeaderSeries`/`gather_leader_series`/`_fetch_series_cached`/`simulate_symbol`
+`leader` parametresi, `kline_cache.py` "1d" girdisi, `config.py` 5 alan, `main.py`
+`_EMPTY_SCALPER_STATUS`) revert edilir.
+
+
 ## Reddedilen kararlar (kanıtla)
 
 | Fikir | Tarih | Sonuç | Neden reddedildi |
