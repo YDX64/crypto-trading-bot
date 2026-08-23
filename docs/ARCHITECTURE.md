@@ -155,6 +155,42 @@ daraltması yapar: `scalper_c_allowed_regimes` CSV'sinde olmayan rejimlerde
 sinyal üretmez (`setups.py:462-463`); varsayılan `"UP,DOWN,RANGE"` = eski
 davranışla birebir (yalnız UNKNOWN engelli).
 
+### 4.1 Piyasa yapısı kapısı (BOS/CHoCH) — `structure.py`, varsayılan KAPALI
+
+`src/strategies/scalper/structure.py` (2026-08-23, E9/D18 adayı) saf bir yapı
+durum makinesidir: fraktal pivot (`SCALPER_STRUCTURE_PIVOT`, varsayılan 5, her
+iki taraf) → son onaylanmış swing seviyesi → **kapanışla** (varsayılan;
+`SCALPER_STRUCTURE_USE_CLOSE=false` ile fitil) kırılım. Kırılım mevcut yapı
+yönüyle aynıysa **BOS** (devam), tersineyse **CHoCH** (karakter değişimi) ve
+yapı yönü döner. Yön henüz NONE iken ilk kırılım BOS'tur. Her seviye YALNIZ
+BİR KEZ olay üretir; yeni pivot onaylanınca seviye güncellenir.
+
+- **Neden:** rejim kapısı (§4, EMA50/200) dönüşleri saatler geç görür; yapı
+  kırılımı aynı soruyu mumun kapanışında yanıtlar (`docs/EXPERIMENTS.md` E9).
+- **Veri:** `StrategyContext`'te ZATEN çekilmiş seriler
+  (`SCALPER_STRUCTURE_TF` = rol adı `entry|context|regime` ya da doğrudan
+  zaman dilimi metni). **Yeni REST çağrısı yoktur.**
+- **Giriş kapısı** (`SCALPER_STRUCTURE_GATE`, `_BLOCK_COUNTER`): yapı BEAR
+  iken LONG, BULL iken SHORT açılmaz. Motorda rejim kapısının HEMEN ARDINDA,
+  `_evaluate_symbol` içinde — yani C ve TV sinyalleri AYNI kapıdan geçer.
+  Harness (`backtest.simulate_symbol`) AYNI saf fonksiyon çiftini
+  (`structure_state_for` → `structure_gate_blocks`) AYNI pencerelerle çağırır
+  (P1 paritesi; `tests/test_structure.py`).
+- **Çıkış tetikleyicisi** (`SCALPER_STRUCTURE_EXIT=off|be|close`, varsayılan
+  `off`): açık pozisyonun TERSİNE ve GİRİŞTEN SONRA bir CHoCH gelirse stop
+  BE'ye çekilir (`be`) ya da pozisyon reduce-only MARKET ile kapatılır
+  (`close`, `exit_reason="STRUCT_CHOCH"`). Canlı tarafta
+  `engine._apply_structure_exits` safety turunda çalışır: mum isteği
+  (sembol, aralık, limit) tarama turununkiyle BİREBİR aynıdır (KlineFetcher
+  TTL önbelleğine düşer), tur başına EN FAZLA BİR aksiyon uygulanır (2026-08-14
+  watchdog dersi), kapanış `_close_position_market` ile borsada DOĞRULANIR
+  (fail-closed) ve `be` aksiyonu stopu piyasanın yanlış tarafına koyacaksa
+  (borsada -2021) uygulanmaz. Harness'ta aynı kural `manage_position` içinde.
+- **Gözlem:** kapı kapalıyken de her tarama turunda hesaplanır ve
+  `/scalper/status` → `structure` (sembol → `direction/last_event/age_bars`)
+  alanında yayınlanır; hesap hatası taramayı DÜŞÜRMEZ (fail-open, tek sefer
+  loglanır) — bir sinyal filtresi, güvenlik kilidi değildir.
+
 ## 5. Çıkış mimarisi
 
 Tümü `src/strategies/scalper/exits.py`'de, `ExitManager.step()` her `symbol`
