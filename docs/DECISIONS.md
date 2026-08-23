@@ -1635,6 +1635,197 @@ D21 ile ÇELİŞİRSE **D21-R3 bağlayıcıdır**. Beş bulgu, hepsi regresyon t
    görünüyordu); pano "okunamadı" ile "kayıt yok"u AYRI mesajla gösterir ve
    hatayı önbelleğe almaz; `ledger_report.build_report` tek gövdeye indi.
 
+### D22 — `-2021` sonrası acil kapanışın DÜRÜST kaydı + REST ağırlık telemetrisi + durum netliği · 2026-08-23 · **AKTİF (daraltılmış)**
+**Kanıt kaynağı:** 2026-08-23 canlı testnet logu (kod okumasıyla doğrulandı).
+**Kapsam uyarısı:** bu kararın İLK hâli daha genişti; 12 ajanlık düşmanca
+inceleme onu 4 yüksek bulguyla REDDETTİ ve karar aşağıdaki GÜVENLİ ALT KÜMEYE
+daraltıldı. Reddedilen tasarım aşağıda "Reddedilenler"e işlendi — tekrar
+önerilmemesi için gerekçesiyle birlikte.
+
+**Tek cümlelik özet:** bot artık kendi fiyat okumasına dayanarak piyasa emri
+GÖNDERMİYOR; yalnızca borsanın ZATEN yaptırdığı acil kapanışı deftere DOĞRU
+yazıyor, REST ağırlığını ÖLÇÜYOR (davranış değiştirmeden) ve panoyu yanlış
+teşhise sürükleyen alanları düzeltiyor.
+
+---
+
+#### 1) `-2021` sonrası acil kapanış → `TRAIL_MARKET` / `BE_MARKET`
+
+**Kusur (bugün 3 olay: DOGE, BNB, ETH).** `exits._update_trailing` chandelier
+seviyesini gönderiyor, Binance `-2021 Order would immediately trigger`
+dönüyor, `position_manager._replace_stop_loss` bunu bilinçli bir çıkış kararı
+sayıp `_emergency_close` ile pozisyonu reduce-only MARKET ile KAPATIYOR —
+**bu davranış D22'den ÖNCE de vardı ve korunmuştur.** Kusur KAYITTAYDI:
+fonksiyon `False` döndüğü için `_update_trailing` "trailing SL güncellenemedi,
+**eski SL korunuyor**" logluyordu — pozisyon YOKKEN. Bir sonraki safety turu
+kapanışı tespit edip deftere `exit_reason=TRAIL` yazıyordu. Sonuç: defter "iz
+tetiklendi" derken bot piyasa emriyle çıkmıştı; canlı defter NİHAİ HAKEM
+olduğu için (CLAUDE.md) bu, kanıt tabanını kirletir.
+
+**Düzeltme — YALNIZ kayıt katmanı:**
+- **(a) Yapılandırılmış sonuç.** `position_manager._replace_stop_loss` artık
+  `StopReplaceResult` döner (`replaced` | `emergency_closed` | `no_position` |
+  `failed`; `__bool__` eski sözleşmeyi korur, tüm çağıranlar değişmeden
+  çalışır). `emergency_closed` gelirse exits **"ACİL KAPANIŞ GERÇEKLEŞTİ"**
+  loglar. **"Eski SL korunuyor" YALNIZ `failed` durumunda yazılır** — yani
+  pozisyon gerçekten açık ve eski koruma yerindeyken.
+- **(b) Dürüst etiket, TÜM stop yollarında.** `_update_trailing` ve TP2 runner
+  tabanı → `TRAIL_MARKET`; TP1 break-even, `force_breakeven` (TV olayı) ve
+  takipçi TP1 → `BE_MARKET`; `force_stop_to` (yapı çıkışı) → `TRAIL_MARKET`.
+  İkisi de TRAIL AİLESİNDENDİR (`forensics.exit_reason_family`) ama
+  `scripts/ledger_report.py`'de AYRI SATIRDA sayılır ve panoda aynı TRAIL
+  rengini kullanır. Sayılarının artması ANLAMLIDIR: stop kararı piyasa hızının
+  gerisinde kalıyordur.
+- **(c) ÇİFT EMİR YOK.** Kapanışı yapan emir zaten `_emergency_close`
+  tarafından gönderilmiştir. `_finalize_market_exit` **ikinci bir MARKET
+  emri GÖNDERMEZ**; yaptığı tek şey `get_position_risk(force_fresh=True)` ile
+  FLAT DOĞRULAMASI ve `_handle_closed` çağrısıdır. Doğrulanamazsa koruma
+  emirlerine DOKUNULMAZ (fail-closed) — ikinci bir kapanış emri `-2022
+  ReduceOnly rejected` yarışı üretirdi.
+- **(d) Etiket sigortası.** Etiket, finalize edilmeden ÖNCE
+  `sp.pending_exit_reason`a çivilenir. O tur doğrulama başarısız olsa bile
+  (`-2022`, REST hatası, borsa hâlâ miktar gösteriyor) kapanışı sonraki turda
+  hangi yol yakalarsa yakalasın `_handle_closed` AYNI etiketi kullanır.
+  Etiketin kaybolması, D22'nin düzeltmek için var olduğu kusurdur.
+- **(e) Kapanış fiyatı GERÇEK dolumdan.** `_emergency_close` artık
+  `EmergencyCloseResult` döner (emir kimliği + `avgPrice`; `__bool__` eski
+  sözleşmeyi korur). `_verified_close_ledger` yalnız ALGO adaylarına
+  (SL/TP1/TP2/TP3) baktığı için düz MARKET kapanışını GÖREMEZ; artık defter
+  fiyatı `userTrades` VWAP'ından (yoksa `avgPrice`ten) okur ve notu
+  `exit_fill=market_close_order` olur. Satırlarda en ufak anormallik varsa TÜM
+  sonuç atılır ve eski tahmin yoluna düşülür. **Income doğrulama merdiveni
+  DEĞİŞMEDİ** (income → trades → tahmini brüt).
+
+**AYNI HOST'ta koruma-tarafı kapısı YOKTUR** (bkz. "Reddedilenler"): stop
+borsaya gönderilir, hükmü BORSA verir. Ayrı market-data host'unda (D17) kapı
+AYNEN durur — orada yanlış taraf borsalar-arası BAZ hatası olabilir, tur
+atlanır ve borsadaki SL yerinde kalır.
+
+**Nerede:** `src/strategies/scalper/exits.py` (`_apply_stop`,
+`_on_emergency_closed`, `_note_market_close`, `_finalize_market_exit`,
+`_market_close_exit_price`, `_fill_vwap`, `_handle_closed`),
+`src/strategies/follower/exits.py` (`_check_tp1_breakeven`),
+`src/trading/position_manager.py` (`StopReplaceResult`,
+`EmergencyCloseResult`, `_replace_stop_loss_result`, `_emergency_close`),
+`src/strategies/scalper/executor.py` (`ScalpPosition` alanları),
+`scripts/ledger_report.py`, `src/strategies/scalper/forensics.py`.
+**Test:** `tests/test_trailing_market_exit.py` (40 test).
+**Geri alma:** commit'i revert et. Kısmi geri alma gereksizdir — emir yolu
+değişmedi, yalnız kayıt katmanı eklendi.
+
+---
+
+#### 2) REST ağırlık TELEMETRİSİ (geri çekilme **varsayılan KAPALI**)
+
+**Kusur.** `X-MBX-USED-WEIGHT-1M` ≥ 1800 için YALNIZ bir WARNING vardı; bugün
+276 uyarı satırı, tepe **4059/dk** (sınır 2400). Sayaç **IP GENELİDİR** — aynı
+çıkış IP'sindeki başka süreçler de tüketir. 418 = koruma turunun körleşmesi;
+repodaki en pahalı arıza sınıfı (2026-08-12, 2026-08-15).
+
+**Düzeltme — ÖLÇÜM açık, DAVRANIŞ kapalı.** İstemci katmanında kademeli geri
+çekilme mekanizması vardır (`_weight_gate`, `priority` parametresi) ama
+`BINANCE_WEIGHT_SOFT_LIMIT=0` / `BINANCE_WEIGHT_HARD_LIMIT=0` ile **VARSAYILAN
+OLARAK KAPALIDIR**.
+
+> **Neden kapalı — ölçüm.** Testnet'te `X-MBX-USED-WEIGHT-1M` başlığı IP
+> GENELİ bir sayaçtır ve 2026-08-23 ölçümünde günün **MEDYANI 2373**'tü
+> (>2000). İlk tasarımın 2000/2300 eşikleriyle açık olsaydı `_scan_tick`
+> KALICI olarak durur ve bot hiç işlem açmazdı. Eşik, önce telemetriyle
+> ölçülmeli, sonra o dağılımın belirgin ÜSTÜNE konmalıdır
+> (`docs/RUNBOOK.md` "REST ağırlık bütçesi").
+
+Açıldığında sözleşme şudur:
+- **≥ soft:** KRİTİK OLMAYAN istekler takvim dakikasının sonuna kadar ağa
+  ÇIKMAZ (Binance 1M sayacı orada sıfırlanır). Önbelleği olan okumalar BAYAT
+  servis edilir (`_get_account`, `get_current_price`).
+- **≥ hard:** aynısı + dakikada BİR CRITICAL satır.
+- **KRİTİK istekler HER ZAMAN geçer:** emir, SL/TP, positionRisk koruma turu,
+  kapanış doğrulaması, günlük risk income'ı. Varsayılan `priority="critical"`
+  — bir çağrı yolu unutulursa güvenli tarafta kalır.
+- Görünürlük: `entries_blocked_by="rest_weight"` ve
+  `scan_status="degraded:rest_weight"`.
+
+**Pencere `max()` ile KİLİTLENMEZ** (düşmanca inceleme bulgusu): ileri bir
+saat sıçraması (NTP düzeltmesi, VM suspend) `max()` yüzünden saatlerce
+sürecek bir geri çekilme çivileyebilirdi. Pencere daima içinde bulunulan
+takvim dakikasının sonudur (`min(..., now+60)` ikinci kemer) ve okuma
+tarafında bir dakikadan uzağa işaret eden damga GEÇERSİZ sayılıp temizlenir.
+
+**Telemetri (eşiklerden BAĞIMSIZ):** `/scalper/status.rest_weight` =
+`{last, last_at, max_1m, peak_at, soft_backoffs, hard_backoffs, soft_limit,
+hard_limit, enabled, backoff, backoff_seconds_left}`. **`max_1m` DAKİKA
+DİLİMLİDİR** — içinde bulunulan takvim dakikasının tepesidir ve dakika
+başında sıfırlanır. Süreç ömrü boyu tutulan bir tepe farklı dakikaları tek
+sayıya katlar ve RUNBOOK'un "`max_1m` > 3000 ise araştır" kuralını okunamaz
+kılardı. Ağırlık uyarı satırı dakikada en fazla birdir (276 satır/gün, gerçek
+arızayı gömüyordu).
+
+**Nerede:** `src/trading/binance_client_improved.py`, `src/core/config.py`,
+`env.example`, `src/main.py`, `src/strategies/scalper/engine.py`.
+**Test:** `tests/test_rest_weight_backoff.py` (53 test).
+**Geri alma:** zaten kapalıdır; açmak `.env`'de eşik vermekle olur ve `.env`
+yedeği + bu dosyaya bir satır ister.
+
+---
+
+#### 3) Pano önbelleği ve `as_of` damgası
+
+`/api/status` ve `/scalper/status` sunucu tarafında **5 sn** önbelleklenir
+(pano da 5 sn'de bir yokluyor: her tik EN FAZLA bir kez gerçek iş yapar) ve
+pano yolundan `force_fresh` İSTENMEZ — 2026-08-18'de panonun force-fresh
+çağrısı rate-limiter'ı doyurup tarama döngüsünü aç bırakmıştı. Motor YOKKEN
+`/scalper/status` önbelleklenmez (o yol REST yapmaz ve olay defteri taze
+olmalıdır).
+
+Önbelleğin üç kuralı vardır:
+1. **`as_of`** (ISO) gövdenin KURULDUĞU andır, isteğin geldiği an değil; pano
+   "son güncelleme"yi ondan yazar. Aksi halde önbellekten servis edilen bayat
+   bir tablo her tikte TAZE görünürdü.
+2. **Durum DEĞİŞTİREN uçlar önbelleği düşürür:** `/risk-event`
+   (halt/resume/flatten), `/tv-events/reset`. Aksi halde operatör komuttan
+   sonra 5 sn boyunca "komut yutuldu" diye okurdu.
+3. **Sorgu dizesi anahtarın parçasıdır** (`?include_shadow=1` gibi bir
+   varyant ileride eklenirse yanlış gövde servis edilmesin).
+
+#### 4) Durum netliği: `entries_blocked_by` + `market_gate.stale_reason`
+
+**Kusur.** Kill switch/entry-halt açıkken `_scan_tick` lider anlık görüntüsünü
+TAZELEMEZ; `/scalper/status.market_gate` bir süre sonra `stale=true,
+gate_effective=false` gösterir. Bu, "lider piyasa kapısı bozuldu" gibi okunur —
+gerçek neden ise "tarama zaten durmuş"tur.
+
+**Düzeltme.**
+- `/scalper/status.entries_blocked_by` = `null` | `"entry_halt"` |
+  `"kill_switch"` | `"risk_event"` | `"exchange_readiness"` | `"rest_weight"`
+  (bu öncelik sırasıyla; sonuncusu yalnız geri çekilme AÇIKKEN dolabilir).
+- `market_gate.stale_reason` = `"entries_blocked"` (tarama durdu) vs
+  `"leader_stale"` (veri gelmiyor).
+- `/scalper/status.forensics_queue` (yazıcı kuyruğu + post-mortem durumu) da
+  yayımlanır; `_EMPTY_SCALPER_STATUS` ile şekil paritesi test edilir.
+- Pano üst şeridinde tek satır **"Sistem durumu"**: Kapı, Kline kaynağı,
+  Günlük kesici, Ağırlık, TV olayları, Post-mortem kuyruğu. **YENİ İSTEK
+  AÇMAZ** — verisi zaten çekilen `/scalper/status` gövdesinden okunur.
+  **"Kline" rozeti düzeltildi:** eskiden `kline_source === "mainnet"`
+  karşılaştırılıyordu, oysa alanın gerçek değerleri `"separate"` /
+  `"trading_host"`tur — rozet DOĞRU kurulumda bile asla yeşil olmuyordu.
+  Karar artık gerçek host adından verilir (testnet → sarı, mainnet → yeşil).
+
+#### 5) Küçük: beklenen durumlar ERROR/WARNING olarak loglanmaz
+`-2011 Order does not exist` (zaten dolmuş/iptal edilmiş emrin iptali) beklenen
+bir yarıştır → **INFO** (`is_benign_cancel_error`; `cancel_all_open_orders`,
+`position_manager._cancel_stale_stops`, eski SL iptali). **DEBUG DEĞİL:**
+üretimde DEBUG kapalıdır ve bu satır defter sapmasının (emir aradaki
+milisaniyelerde dolmuş) tek izidir. Maker kısmi dolum uyarıları WARNING → INFO
+(akış onları zaten doğru ele alıyor: kalan iptal, dolan miktar derhal korunur).
+
+**Kapsam sınırı (bağlayıcı):** hiçbir `SCALPER_*` strateji parametresi
+değişmedi; giriş kuralları, boyutlama, TP/stop seviyeleri ve backtest harness'ı
+BİREBİR aynıdır (CLAUDE.md yasak #1 ve #2 kapsamı dışında). **Emir yolu da
+değişmedi** — hiçbir yeni emir gönderilmez, mevcut bir emir de bastırılmaz.
+Değişen: (i) kapanışın deftere yazılan ETİKETİ ve FİYAT KAYNAĞI, (ii) log
+seviyeleri, (iii) durum alanları ve pano önbelleği, (iv) varsayılan KAPALI bir
+ağırlık telemetrisi/geri çekilmesi.
+
 ## Reddedilen kararlar (kanıtla)
 
 | Fikir | Tarih | Sonuç | Neden reddedildi |
@@ -1662,6 +1853,39 @@ D21 ile ÇELİŞİRSE **D21-R3 bağlayıcıdır**. Beş bulgu, hepsi regresyon t
 | Yapı (CHoCH/BOS) giriş kapısı — 5m pivot 5 (E9/S1) | 08-23 | AYI 0.85/−1057, YATAY 0.93/−356, BOĞA −%67 | C ters-trend; yapıya ters işlem yasağı kâr kaynağını yasaklıyor |
 | Yapı giriş kapısı — 15m pivot 5/8 (E9/S2, S2p8) | 08-23 | En iyi hâl AYI PF 1.00, YATAY −%91, BOĞA −%61 | pivot büyüdükçe tabana yakınsıyor = "en iyisi hiçbir şey yapmamak" |
 | Yapı CHoCH çıkışı — BE / market kapanış (E9/S3, S4) | 08-23 | WR %85 → %48 / %34; AYI −1589 / −2442 | SL 29→1 düşüyor ama TRAIL kazananları 182→29 çöküyor (ödeme asimetrisi) |
+| **D22 ilk hâli — aynı host'ta ÖN-KAPANIŞ** (koruma-tarafı kapısı + `_trailing_market_exit`) | 08-23 | 12-ajan düşmanca incelemesi: 4 YÜKSEK bulgu | aşağıda |
+| **D22 ilk hâli — ağırlık geri çekilmesi varsayılan AÇIK** (2000/2300) | 08-23 | testnet `X-MBX-USED-WEIGHT-1M` günlük MEDYANI 2373 | eşik medyanın ALTINDA: tarama KALICI durur, bot hiç işlem açmazdı; varsayılan 0/0'a alındı, eşik önce ölçülür |
+
+### D22'nin reddedilen ön-kapanış tasarımı (08-23, kayıt için)
+
+**Öneri neydi.** `_update_trailing`, chandelier seviyesini borsaya göndermeden
+ÖNCE botun kendi canlı fiyat okumasıyla karşılaştıracak; seviye "yanlış
+taraftaysa" koşullu emri HİÇ göndermeyip pozisyonu kendiliğinden reduce-only
+MARKET ile kapatacaktı (`_trailing_market_exit` → `engine._close_position_market`).
+
+**Neden reddedildi (12 ajanlık düşmanca inceleme, 4 yüksek bulgu):**
+1. **Yetki genişlemesi.** Bugüne kadar "pozisyonu piyasa emriyle kapat"
+   kararını yalnız BORSA (`-2021`), reaper (yaş limiti) ya da operatör
+   (`/risk-event flatten`) verebiliyordu. Öneri, bu geri alınamaz kararı
+   rutin bir safety turuna ve botun KENDİ fiyat okumasına bağlıyordu.
+2. **Bayat/yanlış fiyat riski.** Kapı `sp.position.current_price` üzerine
+   kuruluydu. Öneri buna 30 sn'lik bir tazelik kontrolü ekliyordu ama tazelik
+   DOĞRULUK değildir: tek bir hatalı ticker okuması kârlı bir koşucuyu
+   piyasadan çıkarabilirdi. Kapı kaldırılınca bu risk de ortadan kalktı.
+3. **Çift emir / `-2022` yarışı.** `-2021` yarışı gerçekleştiğinde
+   `position_manager` zaten MARKET emri göndermişken `_finalize_market_exit`
+   ikinci bir MARKET daha gönderiyordu; pozisyon snapshot'ı bir an geride
+   kalırsa `-2022 ReduceOnly rejected` ve etiket kaybı.
+4. **Kazanç yok.** Öneri, `-2021` sonrası kapanışı ENGELLEMİYORDU (o zaten
+   oluyordu); yalnız aynı kapanışı BİR TUR ÖNCE ve daha zayıf bir kanıtla
+   yapıyordu. Kayıt kusuru ise ön-kapanış OLMADAN da tamamen düzeltilebilirdi
+   — nitekim öyle yapıldı.
+
+**Kalan davranış:** stop borsaya gönderilir, hükmü borsa verir, mevcut
+`_emergency_close` çalışır ve kapanış `TRAIL_MARKET`/`BE_MARKET` etiketiyle
+deftere yazılır. Ayrı market-data host'unda (D17) kapı AYNEN durur — orada
+"yanlış taraf" bir baz ÖLÇÜM hatası olabilir ve doğru cevap turu atlamaktır.
+
 
 ## Metodoloji kararları
 

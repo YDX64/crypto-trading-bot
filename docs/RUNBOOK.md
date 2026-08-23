@@ -13,6 +13,12 @@
 | ⚠️ Tuzak | `systemctl` altındaki `live-bot.service` **futbol botudur**; `info-bot.service` Telegram info botu. Trading botu systemd'de değil. |
 
 ## Günlük kontrol (2 dk)
+En hızlı yol panonun üst şeridi: **Sistem durumu** (D22) — Kapı, Kline kaynağı, Günlük kesici,
+REST ağırlığı, TV olayları, Post-mortem kuyruğu tek satırda. Şerit MEVCUT `/scalper/status`
+çağrısından beslenir, yeni istek açmaz. Terminalden aynı bilgi:
+```bash
+curl -s localhost:9091/scalper/status | python3 -c 'import json,sys; d=json.load(sys.stdin); print({k:d.get(k) for k in ("entries_blocked_by","kill_switch_active","kline_source","scan_status")}, d.get("rest_weight"), d.get("market_gate",{}).get("stale_reason"))'
+```
 ```bash
 ssh awa 'supervisorctl status tradingbot_v2; tail -3 /opt/tradingbot-v2/logs/bot.log | cut -c1-160'
 ssh awa 'cd /opt/tradingbot-v2 && ./.venv/bin/python - <<PY
@@ -383,11 +389,85 @@ görünür (motor yok — bu bir arıza DEĞİL). Takipçinin durumu `/follower/
 - İki halkanın `.env` farkını (secret DEĞERLERİ maskeli) görmek için:
   `MAIN_ENV=/opt/tradingbot-ap/.env scripts/ring_env_diff.sh awa`
 
+## REST ağırlık bütçesi (D22) — ölçüm AÇIK, geri çekilme **VARSAYILAN KAPALI**
+Binance USDⓈ-M IP ağırlık sınırı **2400/dk** ve sayaç **IP GENELİDİR** (aynı çıkış IP'sindeki
+başka süreçler de tüketir). Bot bu bütçeyi ÖLÇER ve raporlar; **davranışını varsayılan olarak
+DEĞİŞTİRMEZ** (`BINANCE_WEIGHT_SOFT_LIMIT=0`, `BINANCE_WEIGHT_HARD_LIMIT=0`).
+
+> **Neden kapalı.** Testnet'te bu başlığın 2026-08-23 günlük **MEDYANI 2373** ölçüldü. İlk
+> tasarımın 2000/2300 eşikleriyle açık olsaydı tarama turu KALICI dururdu ve bot hiç işlem
+> açmazdı. **Eşik ölçmeden açılmaz.**
+
+**Nereye bakılır (telemetri eşiklerden bağımsızdır):**
+```bash
+curl -s localhost:9091/scalper/status | python3 -c 'import json,sys; print(json.load(sys.stdin)["rest_weight"])'
+# {"last":…, "last_at":…, "max_1m":…, "peak_at":…, "soft_backoffs":…, "hard_backoffs":…,
+#  "soft_limit":0.0, "hard_limit":0.0, "enabled":false, "backoff":"off", …}
+```
+Panoda üst şeritte **Sistem durumu → Ağırlık** (son/dk + "dk tepe"; sarı = soft, kırmızı = hard).
+
+**`max_1m` DAKİKA DİLİMLİDİR.** İçinde bulunulan takvim dakikasının tepesidir ve dakika başında
+sıfırlanır — Binance'in 1M sayacı da orada sıfırlanır. Süreç ömrü boyu tutulan bir tepe farklı
+dakikaları tek sayıya katlar ve aşağıdaki kuralı okunamaz kılar.
+
+**Ne zaman normal, ne zaman arıza:**
+- Tekil yüksek okumalar (testnet başlığı edge-bazlı ve tutarsızdır) → gürültü.
+- **Aynı dakika diliminde** `max_1m` > 3000 tekrar tekrar görülüyor → gerçek risk. Sırayla bak:
+  1. Ağırlık uyarısındaki endpoint dökümü (`… | son uyarıdan beri istekler:
+     /fapi/v2/positionRisk×N, …`) — kim yiyor?
+  2. Aynı IP'de başka bir bot/süreç var mı (`BINANCE_BIND_IP` ayrı IP'ye bind eder).
+  3. Panonun açık kalması maliyetli DEĞİL (`/api/status` ve `/scalper/status` 5 sn
+     sunucu-tarafı önbellek; pano yolundan `force_fresh` istenmez).
+
+**Geri çekilmeyi AÇMAK (ölçümle):**
+1. Birkaç gün `rest_weight.max_1m` dağılımını topla (yukarıdaki `curl`, dakikada bir).
+2. `soft` eşiğini gözlenen **medyanın belirgin ÜSTÜNE**, `hard`ı 2400 sınırının hemen altına koy.
+   Medyanın altındaki bir eşik = kalıcı durma.
+3. `.env` → `BINANCE_WEIGHT_SOFT_LIMIT=<soft>`, `BINANCE_WEIGHT_HARD_LIMIT=<hard>`;
+   `.env` yedeği (`backups/env.bak-<tarih>-weight`) + `docs/DECISIONS.md` satırı ZORUNLU.
+4. Açıkken sözleşme:
+
+| Ağırlık | Kritik OLMAYAN istekler | Kritik istekler | Log |
+|---|---|---|---|
+| < soft | normal | normal | — |
+| ≥ soft | takvim dakikası dolana kadar GÖNDERİLMEZ; önbellek varsa BAYAT servis | geçer | ağırlık uyarısı ≤1/dk |
+| ≥ hard | tamamen durur | geçer | + CRITICAL ≤1/dk |
+
+- **Kritik** = emir, SL/TP, positionRisk koruma turu, kapanış doğrulaması, günlük risk income'ı.
+- **Kritik olmayan** = `/api/status` pano beslemesi, tarama turu (`_scan_tick` hiç başlamaz),
+  adli kayıt post-mortem turu.
+- Açıkken görünürlük: `entries_blocked_by="rest_weight"`, `scan_status="degraded:rest_weight"`.
+
 ## Arızalar
 **Binance 418 / ban:** `logs/bot.log`'da `HTTP 418|banned|devre kesici`. Ban aktifken restart
 **YASAK** (ban süresini uzatır). Kök nedenler ve çözümler: rate limiter kilidi (mevcut), dashboard
-force-fresh açlığı (düzeltildi), ağırlık başlığı testnet'te tutarsız (ortalama ~2.7k görünür,
-gerçek 429 yoksa gürültü). Bekle; ban bitince önce `wait_for_binance` loglarını izle.
+force-fresh açlığı (düzeltildi), ağırlık geri çekilmesi (D22, yukarıdaki bölüm), ağırlık başlığı
+testnet'te tutarsız (ortalama ~2.7k görünür, gerçek 429 yoksa gürültü). Bekle; ban bitince önce
+`wait_for_binance` loglarını izle.
+
+**`exit_reason=TRAIL_MARKET` / `BE_MARKET` gördüm (D22):** arıza DEĞİL. Koruyucu stop
+(trailing / runner tabanı / break-even) borsaya gönderildi, Binance `-2021 Order would
+immediately trigger` dedi (seviye piyasa tarafından çoktan geçilmiş) ve
+`position_manager._emergency_close` pozisyonu reduce-only MARKET ile kapattı — bu davranış
+D22'den ÖNCE de vardı; D22 yalnız kapanışın deftere DOĞRU etiketle ve GERÇEK dolum fiyatıyla
+yazılmasını sağlar. Bot kendiliğinden piyasa emri göndermez. TRAIL ailesindendir, AYRI sayılır.
+**Sayıları artıyorsa** stop kararı piyasa hızının gerisinde kalıyordur — parametre değişikliği
+CLAUDE.md yasak #1'e tabidir (3 rejim backtesti). Telemetri:
+`/scalper/status.trailing_skips` = `{price_space_skips, protective_gate_skips, market_exits}`.
+
+Logda görülecek satır: `🔻 <SEMBOL>: … piyasa tarafından geçilmiş (-2021); ACİL KAPANIŞ
+GERÇEKLEŞTİ …`. **"eski SL korunuyor" satırı YALNIZ pozisyon gerçekten açıkken yazılır** —
+ikisini bir arada görüyorsan bu bir regresyondur.
+
+Kapanış o turda borsada doğrulanamazsa (`koruma emirleri iptal EDİLMEDİ` satırı) koruma
+emirlerine DOKUNULMAZ ve etiket saklanır; bir sonraki safety turu kapanışı aynı etiketle
+deftere yazar. Elle müdahale gerekmez, ama satır tekrar ediyorsa pozisyonu borsada kontrol et.
+
+**"Kapı bayat / gate_effective=false" ama kapı sağlam (D22):** önce
+`/scalper/status.market_gate.stale_reason` bak. `"entries_blocked"` = tarama zaten durmuş
+(nedeni `/scalper/status.entries_blocked_by`: `entry_halt` | `kill_switch` | `risk_event` |
+`exchange_readiness` | `rest_weight`) — kapıyı kurcalama, önce girişleri kim durdurduysa onu çöz.
+`"leader_stale"` = lider verisi gerçekten gelmiyor (bkz. lider piyasa kapısı bölümü).
 
 **Entry-halt (`state/scalper_entry_halt.json`):** güvenlik kilidi, fail-closed. Açmak = nedeni
 anla → dosyayı `.cleared-<tarih>` diye yeniden adlandır → restart. Recover sonrası kapanış

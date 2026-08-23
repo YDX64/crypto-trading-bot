@@ -34,7 +34,12 @@ class ScalpTradeModel(Base):
     # Sonuç
     realized_pnl = Column(Float, default=0.0)
     roi_pct = Column(Float, default=0.0)
-    exit_reason = Column(String, nullable=True)               # "SL"|"TP_LADDER"|"TRAIL"|"MANUAL"|"UNKNOWN"
+    # "SL"|"TP_LADDER"|"TRAIL"|"TRAIL_MARKET"|"BE_MARKET"|"RISK_EVENT"
+    # |"TV_EVENT"|"MANUAL"|"UNKNOWN"
+    # TRAIL_MARKET/BE_MARKET (D22): koruyucu stop -2021 aldı ve
+    # `position_manager._emergency_close` pozisyonu reduce-only MARKET ile
+    # kapattı — TRAIL ailesi, AYRI sayılır.
+    exit_reason = Column(String, nullable=True)
 
     # Bağlam
     signal_reason = Column(String, nullable=False)

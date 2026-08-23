@@ -24,7 +24,7 @@ from typing import Any, Callable, Dict, List, Optional
 from src.strategies.follower.executor import FOLLOWER_STRATEGY, FollowerPosition
 from src.strategies.follower.plan import split_three_quantities
 from src.strategies.follower.types import parse_ledger_levels
-from src.strategies.scalper.exits import ExitManager
+from src.strategies.scalper.exits import EXIT_REASON_BE_MARKET, ExitManager
 from src.strategies.scalper.executor import ScalpPosition
 from src.strategies.scalper.tracker import ScalpTracker
 from src.strategies.scalper.types import (
@@ -36,7 +36,11 @@ from src.strategies.scalper.types import (
 )
 from src.models.position import PositionModel, PositionSide, PositionStatus
 from src.trading.binance_client_improved import BinanceAPIError, ImprovedBinanceClient
-from src.trading.position_manager import PositionManager, UnprotectedPositionError
+from src.trading.position_manager import (
+    PositionManager,
+    StopReplaceResult,
+    UnprotectedPositionError,
+)
 
 
 # Fiyat okuması ile emrin borsaya varması arasındaki boşluk payı (%).
@@ -194,12 +198,33 @@ class FollowerExitManager(ExitManager):
         ):
             self._log_be_unreachable(symbol, sp, target)
             return
-        ok = already_tighter or await self.pm.replace_stop_loss(sp.position, target)
-        if not ok:
-            self.logger.warning(
-                f"⚠️ {symbol}: SL break-even'e taşınamadı, eski SL korunuyor. "
-                f"Sonraki turda tekrar denenecek."
-            )
+        # D22: yapılandırılmış sonuç — `-2021 → _emergency_close` ile
+        # "emir reddedildi, eski SL yerinde" AYNI `False` değildir. Yukarıdaki
+        # `_be_target_placeable` kapısı bu yolu ender kılar ama YARIŞI
+        # tamamen kapatamaz; kaybedildiğinde defter DOĞRU etiketlenmelidir.
+        result = (
+            StopReplaceResult(True, "already_tighter")
+            if already_tighter
+            else await self._apply_stop(sp.position, target)
+        )
+        if not result.ok:
+            if result.outcome == "emergency_closed":
+                await self._on_emergency_closed(
+                    symbol,
+                    sp,
+                    result,
+                    exit_reason=EXIT_REASON_BE_MARKET,
+                    what=f"BE seviyesi ({target})",
+                )
+            elif result.outcome == "no_position":
+                self.logger.info(
+                    f"ℹ️ {symbol}: BE taşınmadı — borsada pozisyon kalmamış"
+                )
+            else:
+                self.logger.warning(
+                    f"⚠️ {symbol}: SL break-even'e taşınamadı, eski SL korunuyor. "
+                    f"Sonraki turda tekrar denenecek."
+                )
             return
         sp.tp1_done = True
         if not already_tighter:

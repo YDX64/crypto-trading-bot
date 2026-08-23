@@ -95,6 +95,25 @@ class ScalpPosition:
     # = "bilinmiyor" (fail-safe).
     price_ts: Optional[float] = None
 
+    # --- D22: -2021 sonrası acil kapanışın kaydı --------------------------
+    # `position_manager._emergency_close` pozisyonu reduce-only MARKET ile
+    # kapattığında doldurulur. `pending_exit_reason` ETİKET SİGORTASIDIR:
+    # kapanış o turda doğrulanamazsa (borsa hâlâ miktar gösteriyor, REST
+    # hatası) sonraki tur hangi yoldan finalize ederse etsin deftere AYNI
+    # etiket ("TRAIL_MARKET"/"BE_MARKET") yazılır — etiketin kaybolması,
+    # D22'nin düzeltmek için var olduğu kusurdur. `market_close_order_id`
+    # kapanış fiyatının borsa kanıtından (userTrades VWAP) okunmasını
+    # sağlar; hiçbiri bir KARAR yolunda okunmaz.
+    pending_exit_reason: Optional[str] = None
+    market_close_order_id: Optional[str] = None
+    market_close_price: Optional[float] = None
+    # Kapanış deftere BİR KEZ yazılır. `_closing` kilidi EŞZAMANLI iki yolu
+    # engeller; bu bayrak ARDIŞIK olanı engeller: bir yol pozisyonu
+    # finalize ettikten sonra başka bir yol (TV olay kanalı, reaper,
+    # risk-olayı flatten) AYNI `sp` ile ikinci kez gelirse `record_close`
+    # üzerine yazılır ve exit_reason kaybolurdu.
+    close_recorded: bool = False
+
     # --- İşlem adli kaydı (D21) — YALNIZ GÖZLEM ---------------------------
     # Bu alanların HİÇBİRİ bir karar yolunda okunmaz; çıkış zaman çizgisini
     # (giriş → TP1 → BE → trailing → çıkış) kapanışta yeniden kurabilmek
@@ -2053,8 +2072,11 @@ class ScalpExecutor:
             # Kalan miktarı bekletmek, dolan miktarı süresiz SL'siz bırakır.
             # Görülür görülmez iptal et; terminal iptal yanıtındaki
             # executedQty _on_pending_filled ile derhal korumaya alınır.
-            self.logger.warning(
-                f"⚠️ {symbol}: maker giriş kısmen doldu; kalan miktar hemen iptal ediliyor"
+            # D22: kısmi dolum maker girişte BEKLENEN bir durumdur ve akış
+            # onu zaten doğru ele alıyor (kalan iptal + dolan miktar derhal
+            # korunuyor). WARNING seviyesi gerçek arızaları gömüyordu.
+            self.logger.info(
+                f"ℹ️ {symbol}: maker giriş kısmen doldu; kalan miktar hemen iptal ediliyor"
             )
             return await self._cancel_pending(
                 symbol, pending, observed_order=order, reason="partial_fill"
@@ -2081,8 +2103,8 @@ class ScalpExecutor:
 
         if status in ("CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED"):
             if self._executed_qty(order) > 0:
-                self.logger.warning(
-                    f"⚠️ {symbol}: maker giriş {status} ama kısmi dolum var; "
+                self.logger.info(
+                    f"ℹ️ {symbol}: maker giriş {status} ama kısmi dolum var; "
                     f"gerçekleşen miktar korunuyor"
                 )
                 return await self._on_pending_filled(symbol, pending, order)

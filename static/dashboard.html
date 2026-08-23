@@ -92,6 +92,51 @@
     margin-top:14px;
   }
 
+  /* ---------- sistem durumu şeridi (D22) ----------
+     TEK satır: kapı / kline kaynağı / günlük kesici / REST ağırlığı /
+     TV olayları / post-mortem kuyruğu. Verisi MEVCUT /scalper/status
+     çağrısından gelir — panonun yeni istek açması bu repoda yaşanmış bir
+     arızadır (2026-08-18 rate-limiter açlığı). */
+  .sysbar{
+    display:flex;
+    flex-wrap:wrap;
+    align-items:center;
+    gap:6px 10px;
+    background:var(--panel);
+    border:1px solid var(--border);
+    border-radius:var(--radius);
+    padding:9px 14px;
+    margin-top:10px;
+    font-size:12px;
+  }
+  .sysbar-title{
+    font-size:11px;
+    font-weight:700;
+    letter-spacing:0.08em;
+    text-transform:uppercase;
+    color:var(--text-faint);
+    margin-right:2px;
+  }
+  .sysbar-item{
+    display:inline-flex;
+    align-items:baseline;
+    gap:5px;
+    padding:3px 9px;
+    border-radius:999px;
+    border:1px solid var(--border);
+    background:var(--panel-2);
+    white-space:nowrap;
+  }
+  .sysbar-item .k{color:var(--text-dim);}
+  .sysbar-item .v{font-family:var(--mono); font-weight:600; color:var(--text);}
+  .sysbar-item.ok{border-color:var(--profit-border); background:var(--profit-bg);}
+  .sysbar-item.ok .v{color:var(--profit);}
+  .sysbar-item.warn{border-color:var(--gold-border); background:var(--gold-bg);}
+  .sysbar-item.warn .v{color:var(--gold);}
+  .sysbar-item.bad{border-color:var(--loss-border); background:var(--loss-bg);}
+  .sysbar-item.bad .v{color:var(--loss);}
+  .sysbar-item.off .v{color:var(--text-faint);}
+
   .brand{
     display:flex;
     align-items:center;
@@ -681,6 +726,12 @@
     </div>
   </div>
 
+  <!-- 1b. SİSTEM DURUMU ŞERİDİ (D22) -->
+  <div class="sysbar" id="sysbar">
+    <span class="sysbar-title">Sistem durumu</span>
+    <span class="placeholder small">yükleniyor…</span>
+  </div>
+
   <!-- 2. STRATEJİ SKOR TABLOSU -->
   <div class="section">
     <div class="section-head">
@@ -986,6 +1037,151 @@
       dailyEl.textContent = "—";
       dailyEl.title = "";
       dailyEl.className = "stat-value lg mono dim";
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // 1b. sistem durumu şeridi (D22)
+  //
+  // TEK satırda operatörün "şu an ne oluyor" sorusunun cevabı. YENİ İSTEK
+  // AÇMAZ: verisi zaten çekilen /scalper/status gövdesinden okunur (panonun
+  // ek yoklaması 2026-08-18'de rate-limiter'ı doyurup tarama döngüsünü aç
+  // bırakmıştı).
+  // ---------------------------------------------------------------
+
+  var BLOCK_LABELS = {
+    kill_switch: "günlük kesici",
+    entry_halt: "güvenlik kilidi",
+    risk_event: "risk-olayı halt",
+    exchange_readiness: "borsa hazır değil",
+    // D22: yalnız ağırlık geri çekilmesi AÇIKKEN görünür (vars. kapalı).
+    rest_weight: "REST ağırlık bütçesi"
+  };
+
+  function sysItem(key, value, cls, title){
+    var item = el("span", "sysbar-item" + (cls ? " " + cls : ""));
+    item.appendChild(el("span", "k", escapeHtml(key)));
+    item.appendChild(el("span", "v", escapeHtml(value)));
+    if (title) item.title = title;
+    return item;
+  }
+
+  function renderSysbar(scalperRes){
+    var bar = qs("sysbar");
+    if (!bar) return;
+    bar.innerHTML = "";
+    bar.appendChild(el("span", "sysbar-title", "Sistem durumu"));
+
+    var s = (scalperRes && scalperRes.ok && scalperRes.data) ? scalperRes.data : null;
+    if (!s){
+      bar.appendChild(el("span", "placeholder small", "henüz bağlı değil / veri yok"));
+      return;
+    }
+
+    // 1) Lider piyasa kapısı — "açık" ≠ "koruyor" (gate_effective).
+    var gate = s.market_gate || {};
+    var gateText, gateCls, gateTitle = "";
+    if (!gate.enabled){
+      gateText = "kapalı"; gateCls = "off";
+    } else if (gate.gate_effective){
+      gateText = "etkin"; gateCls = "ok";
+      if (isNum(gate.day_drift_pct)) gateTitle = "lider gün sapması " + fmtNum(gate.day_drift_pct, 2) + "%";
+    } else if (gate.stale){
+      // D22: bayatlığın NEDENİ ayırt edilir — tarama duruyor mu, veri mi gelmiyor.
+      var blocked = s.entries_blocked_by;
+      if (gate.stale_reason === "entries_blocked"){
+        gateText = "bayat (tarama durdu)";
+        gateTitle = "yeni girişleri durduran: " + (BLOCK_LABELS[blocked] || blocked || "?");
+      } else {
+        gateText = "bayat (lider verisi yok)";
+        gateTitle = gate.last_error ? String(gate.last_error) : "";
+      }
+      gateCls = "warn";
+    } else {
+      gateText = "etkin değil"; gateCls = "warn";
+    }
+    bar.appendChild(sysItem("Kapı", gateText, gateCls, gateTitle));
+
+    // 2) Kline kaynağı — mumlar HANGİ host'tan geliyor (D17).
+    //
+    // DÜZELTME (D22-R2): burada eskiden `kline_source === "mainnet"`
+    // karşılaştırılıyordu; oysa alanın GERÇEK değerleri "separate" ve
+    // "trading_host"tur — rozet doğru kurulumda bile ASLA yeşil olmuyordu.
+    // Sorulması gereken soru "mumlar testnet'ten mi geliyor" olduğu için
+    // karar host adından verilir; `kline_source` başlıkta (title) kalır.
+    var mdUrl = String(s.market_data_base_url || "");
+    var klineHost = mdUrl.replace(/^https?:\/\//, "").split("/")[0] || "?";
+    var klineTestnet = /testnet/i.test(mdUrl);
+    var srcCls = mdUrl ? (klineTestnet ? "warn" : "ok") : "off";
+    bar.appendChild(sysItem(
+      "Kline", klineHost, srcCls,
+      (klineTestnet ? "mumlar TESTNET host'undan geliyor" : "mumlar mainnet host'undan geliyor")
+      + " · kline_source=" + (s.kline_source || "?")
+      + " · emirler: " + String(s.trading_base_url || "?").replace(/^https?:\/\//, "")
+    ));
+
+    // 3) Günlük zarar kesici.
+    if (s.kill_switch_active){
+      bar.appendChild(sysItem(
+        "Günlük kesici", "AKTİF · 00:00 UTC'de sıfırlanır", "bad",
+        "günlük net K/Z limiti aşıldı; yeni giriş yok"
+      ));
+    } else if (isNum(s.daily_limit_pct) && s.daily_limit_pct > 0){
+      bar.appendChild(sysItem("Günlük kesici", "kapalı (limit %" + fmtNum(s.daily_limit_pct, 1) + ")", "ok", ""));
+    } else {
+      bar.appendChild(sysItem("Günlük kesici", "devre dışı", "off", ""));
+    }
+
+    // 4) REST ağırlığı — 418 riski buradan görülür (IP sınırı 2400/dk;
+    //    sayaç IP GENELİDİR, başka süreçler de tüketir). Geri çekilme
+    //    VARSAYILAN KAPALIDIR: bu rozet o hâlde SAF TELEMETRİDİR.
+    var w = s.rest_weight || {};
+    if (isNum(w.last)){
+      var wCls = "ok";
+      if (w.backoff === "hard") wCls = "bad";
+      else if (w.backoff === "soft") wCls = "warn";
+      else if (isNum(w.max_1m) && w.max_1m >= 3000) wCls = "warn";
+      var wText = w.last + "/dk";
+      // max_1m = İÇİNDE BULUNULAN takvim dakikasının tepesi (Binance sayacı
+      // orada sıfırlanır) — süreç ömrü tepesi DEĞİL.
+      if (isNum(w.max_1m) && w.max_1m > w.last) wText += " (dk tepe " + w.max_1m + ")";
+      bar.appendChild(sysItem(
+        "Ağırlık", wText, wCls,
+        (w.enabled
+          ? ("geri çekilme: " + (w.backoff || "off")
+             + " (soft " + (w.soft_limit || 0) + " / hard " + (w.hard_limit || 0) + ")")
+          : "geri çekilme KAPALI (yalnız ölçüm)")
+        + " · geri çekilme sayacı soft " + (w.soft_backoffs || 0)
+        + " / hard " + (w.hard_backoffs || 0)
+        + (w.peak_at ? " · dk tepesi " + w.peak_at : "")
+      ));
+    }
+
+    // 5) TV olay kanalı — mod + bugünkü olay sayısı.
+    var tv = s.tv_events || {};
+    var counters = tv.counters || {};
+    var tvCount = isNum(counters.ingested) ? counters.ingested : null;
+    var tvMode = tv.mode || "off";
+    bar.appendChild(sysItem(
+      "TV olayları",
+      tvMode + (tvCount === null ? "" : ": " + tvCount + " olay"),
+      tvMode === "active" ? "ok" : (tvMode === "shadow" ? "warn" : "off"),
+      // Sayaç SÜREÇ ömrüyle sınırlıdır, "bugün" DEĞİL — başlangıç anı burada.
+      (tv.counters_since ? "sayaç başlangıcı: " + tv.counters_since + " · " : "") +
+      "gölge modda motor davranışı DEĞİŞMEZ (D19)"
+    ));
+
+    // 6) Post-mortem / adli kayıt kuyruğu.
+    var fq = s.forensics_queue || {};
+    if (isNum(fq.pending) || isNum(fq.dropped)){
+      var pend = isNum(fq.pending) ? fq.pending : 0;
+      var dropped = isNum(fq.dropped) ? fq.dropped : 0;
+      var fqCls = dropped > 0 ? "bad" : (pend > 50 ? "warn" : "ok");
+      bar.appendChild(sysItem(
+        "Post-mortem", pend + " bekliyor" + (dropped ? " · " + dropped + " düştü" : ""),
+        fqCls,
+        fq.postmortem_blocked ? ("ertelendi: " + fq.postmortem_blocked) : ""
+      ));
     }
   }
 
@@ -1303,7 +1499,10 @@
     var cls = "exit-other";
     if (reason === "SL") cls = "exit-sl";
     else if (reason === "TP_LADDER") cls = "exit-tp";
-    else if (reason === "TRAIL") cls = "exit-trail";
+    // D22: TRAIL_MARKET / BE_MARKET, TRAIL ailesindendir (stop kararının
+    // -2021 sonrası piyasa emriyle uygulanmış hâli) — aynı renk, farklı etiket.
+    else if (reason === "TRAIL" || reason === "TRAIL_MARKET" || reason === "BE_MARKET")
+      cls = "exit-trail";
     return '<span class="exit-chip ' + cls + '">' + escapeHtml(reason || "BİLİNMİYOR") + '</span>';
   }
 
@@ -1783,9 +1982,22 @@
   // ana döngü
   // ---------------------------------------------------------------
 
-  function setLastUpdate(){
-    var now = new Date();
-    qs("last-update").textContent = "son güncelleme " + now.toLocaleTimeString("tr-TR", { hour12:false });
+  // D22: "son güncelleme" GÖVDENİN KURULDUĞU andır, isteğin döndüğü an
+  // değil. `/scalper/status` ve `/api/status` sunucu tarafında 5 sn
+  // önbelleklenir; istek saatini yazmak bayat bir tabloyu her tikte taze
+  // gösterirdi. En ESKİ `as_of` yazılır — gösterilen en eski veri budur.
+  function setLastUpdate(scalperRes, statusRes){
+    var stamps = [];
+    [scalperRes, statusRes].forEach(function(res){
+      var raw = (res && res.ok && res.data) ? res.data.as_of : null;
+      if (!raw) return;
+      var t = Date.parse(raw);
+      if (!isNaN(t)) stamps.push(t);
+    });
+    var when = stamps.length ? new Date(Math.min.apply(null, stamps)) : new Date();
+    var suffix = stamps.length ? "" : " (istemci saati)";
+    qs("last-update").textContent = "son güncelleme "
+      + when.toLocaleTimeString("tr-TR", { hour12:false }) + suffix;
   }
 
   function setConnBanner(down){
@@ -1835,6 +2047,7 @@
       setConnBanner(networkDown);
 
       renderTopbar(health, status, positions, scalperStatus);
+      renderSysbar(scalperStatus);
       renderStrategyCards(scalperStats);
       renderPositions(positions, scalperStatus);
       renderRegimeMap(scalperStatus);
@@ -1842,7 +2055,7 @@
       if (forensicsSummary) renderImpact(forensicsSummary);
       renderWaiting(waiting);
 
-      setLastUpdate();
+      setLastUpdate(scalperStatus, status);
     }).catch(function(err){
       // beklenmeyen bir hata olsa bile sayfa çökmesin
       console.error("dashboard tick hatası:", err);

@@ -63,6 +63,26 @@ NON_RETRYABLE_CODES = frozenset({
 })
 
 
+class RestWeightBackoff(Exception):
+    """Kritik OLMAYAN bir istek dakikalık ağırlık bütçesi yüzünden gönderilmedi.
+
+    `BinanceAPIError` DEĞİLDİR: ağa hiç çıkılmadı, borsanın bir cevabı yok ve
+    `-1003`/418 ban semantiğiyle karıştırılmamalıdır (kesici kurulmaz).
+    Çağıranlar bunu "bu tur veri yok" olarak ele alır; koruma/emir yolu bu
+    istisnayı ASLA görmez (onlar `priority="critical"`tir).
+    """
+
+    def __init__(self, endpoint: str, used_weight: int, limit: float, level: str):
+        self.endpoint = endpoint
+        self.used_weight = used_weight
+        self.limit = limit
+        self.level = level
+        super().__init__(
+            f"REST ağırlık geri çekilmesi ({level}): {endpoint} gönderilmedi "
+            f"(son ölçülen ağırlık {used_weight} ≥ {limit:g}/dk)"
+        )
+
+
 class BinanceAPIError(Exception):
     """Binance hata kodunu ve mesajını koruyan istisna.
 
@@ -85,6 +105,20 @@ class BinanceAPIError(Exception):
         return self.status_code >= 500 or self.status_code == 429
 
 
+def is_benign_cancel_error(exc: BaseException) -> bool:
+    """İptal edilmek istenen emir ZATEN yok mu? (-2011 / "does not exist")
+
+    Bu bir arıza DEĞİL, beklenen bir yarıştır: emir aradaki milisaniyelerde
+    dolmuş ya da borsa tarafından iptal edilmiştir. Çağıranlar bunu ERROR
+    değil DEBUG/INFO olarak loglar (2026-08-23 log kirliliği).
+    """
+    if isinstance(exc, BinanceAPIError):
+        if exc.code in (-2011, ERR_NO_NEED_MARGIN):
+            return True
+        return "does not exist" in (exc.msg or "").lower()
+    return False
+
+
 class ImprovedBinanceClient:
     """Geliştirilmiş Binance Futures API istemcisi"""
 
@@ -93,6 +127,27 @@ class ImprovedBinanceClient:
     # Binance X-MBX-USED-WEIGHT-1M başlığından son ölçülen dakikalık ağırlık
     # (sınıf düzeyi: tüm istemci örnekleri aynı IP bütçesini paylaşır)
     _last_used_weight_1m: int = 0
+    # Son ölçümün alındığı an (epoch sn) — telemetride `last_at`.
+    _last_used_weight_at: float = 0.0
+    # DAKİKA DİLİMLİ tepe: Binance'in 1M sayacı takvim dakikasında sıfırlanır,
+    # dolayısıyla "tepe" ancak AYNI dakika içinde anlamlıdır. Süreç ömrü boyu
+    # tutulan bir tepe farklı dakikaları tek sayıya katlar ve RUNBOOK'un
+    # "max_1m > 3000 ise araştır" kuralını okunamaz kılardı.
+    _peak_used_weight_1m: int = 0
+    _peak_used_weight_at: float = 0.0
+    _peak_window_start: float = 0.0
+    # Ağırlık uyarı satırı bu eşikten itibaren basılır (gerçek sınır 2400).
+    _WEIGHT_WARN_THRESHOLD = 1800
+    # Uyarı/CRITICAL satırı dakikada en fazla BİR kez (2026-08-23: 276 satır/gün).
+    _WEIGHT_LOG_INTERVAL = 60.0
+    _weight_warn_at: float = 0.0
+    _weight_hard_log_at: float = 0.0
+    # Geri çekilme pencereleri (epoch sn) — Binance 1M sayacı takvim
+    # dakikasında sıfırlanır, bu yüzden pencere dakikanın SONUNA kadardır.
+    _weight_soft_until: float = 0.0
+    _weight_hard_until: float = 0.0
+    _weight_soft_backoffs: int = 0
+    _weight_hard_backoffs: int = 0
     # /commissionRate IP weight=20; işlem başına çağrılmamalıdır.
     _COMMISSION_CACHE_TTL = 3600.0
     _CLIENT_ALGO_ID_RE = re.compile(r"^[.A-Za-z0-9_:/-]{1,36}$")
@@ -175,6 +230,168 @@ class ImprovedBinanceClient:
         else:
             cls._pos_snapshot_ts = 0.0
         cls._account_cache_ts = 0.0
+
+    # ------------------------------------------------------------------
+    # REST ağırlık geri çekilmesi (D22)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _weight_limits(cls) -> Tuple[float, float]:
+        """(soft, hard) eşikleri — 0/negatif = o kademe KAPALI."""
+        def _read(name: str, default: float) -> float:
+            try:
+                value = float(getattr(settings, name, default) or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+            return value if value > 0 else 0.0
+
+        return _read("binance_weight_soft_limit", 2000.0), _read(
+            "binance_weight_hard_limit", 2300.0
+        )
+
+    @classmethod
+    def _note_used_weight(cls, used_weight: int) -> None:
+        """`X-MBX-USED-WEIGHT-1M` ölçümünü işle ve geri çekilme penceresini kur.
+
+        Pencere, ölçümün alındığı TAKVİM DAKİKASININ sonuna kadar sürer:
+        Binance'in 1M sayacı orada sıfırlanır, dolayısıyla daha uzun bir
+        bekleme bütçeyi boş yere harcatır, daha kısası ise sayacı yeniden
+        doldurur.
+        """
+        now = time.time()
+        cls._last_used_weight_1m = used_weight
+        cls._last_used_weight_at = now
+
+        # Dakika dilimi değiştiyse tepe SIFIRLANIR (Binance sayacı da orada
+        # sıfırlanır); aynı dilim içindeyse yalnız büyürse güncellenir.
+        window_start = float(int(now // 60) * 60.0)
+        if window_start != cls._peak_window_start:
+            cls._peak_window_start = window_start
+            cls._peak_used_weight_1m = 0
+            cls._peak_used_weight_at = 0.0
+        if used_weight > cls._peak_used_weight_1m:
+            cls._peak_used_weight_1m = used_weight
+            cls._peak_used_weight_at = now
+
+        soft, hard = cls._weight_limits()
+        # Pencere DAİMA içinde bulunulan takvim dakikasının sonudur ve ASLA
+        # `max()` ile kilitlenmez: ileri bir saat sıçraması (NTP düzeltmesi,
+        # VM suspend) `max()` yüzünden saatlerce sürecek bir geri çekilme
+        # penceresi çivileyebilir ve bot bu süre boyunca hiç taramaz.
+        # `min(..., now + 60)` aynı sıçramaya karşı ikinci kemerdir.
+        window_end = min((int(now // 60) + 1) * 60.0, now + 60.0)
+        if hard and used_weight >= hard:
+            cls._weight_hard_until = window_end
+            cls._weight_soft_until = window_end
+        elif soft and used_weight >= soft:
+            cls._weight_soft_until = window_end
+
+    @classmethod
+    def weight_backoff_level(cls) -> str:
+        """"off" | "soft" | "hard" — kritik olmayan istekler için geçerli kademe.
+
+        Pencere en fazla BİR dakika sürebilir. Daha uzağa işaret eden bir
+        damga yalnız saatin geriye alınmasıyla oluşabilir (ileri sıçrama
+        `_note_used_weight`te kırpılır); bu durumda pencere GEÇERSİZ sayılıp
+        temizlenir — teşhis amaçlı bir kapının botu süresiz durdurması,
+        koruyacağı 418'den daha pahalıdır.
+        """
+        now = time.time()
+        horizon = now + 60.0
+        if cls._weight_hard_until > horizon or cls._weight_soft_until > horizon:
+            cls._weight_soft_until = 0.0
+            cls._weight_hard_until = 0.0
+            return "off"
+        if now < cls._weight_hard_until:
+            return "hard"
+        if now < cls._weight_soft_until:
+            return "soft"
+        return "off"
+
+    @classmethod
+    def weight_backoff_active(cls) -> bool:
+        """Kritik olmayan istekler şu an ertelenmeli mi?"""
+        return cls.weight_backoff_level() != "off"
+
+    def _weight_gate(self, endpoint: str, priority: str) -> None:
+        """Kritik OLMAYAN isteği ağırlık bütçesi doluyken ağa bırakma.
+
+        `priority="critical"` (varsayılan) hiçbir zaman engellenmez: emir,
+        SL/TP, positionRisk koruma turu ve kapanış doğrulaması bir dakikalık
+        bütçe uğruna ertelenmez — korumasız/ölçülmemiş pozisyon, 418'den
+        pahalıdır.
+        """
+        if priority == "critical":
+            return
+        cls = type(self)
+        level = cls.weight_backoff_level()
+        if level == "off":
+            return
+        soft, hard = cls._weight_limits()
+        now = time.time()
+        if level == "hard":
+            cls._weight_hard_backoffs += 1
+            if now - cls._weight_hard_log_at >= cls._WEIGHT_LOG_INTERVAL:
+                cls._weight_hard_log_at = now
+                self.logger.critical(
+                    f"🛑 REST ağırlık SERT sınırı: son ölçüm "
+                    f"{cls._last_used_weight_1m}/dk (≥{hard:g}); kritik OLMAYAN "
+                    f"tüm istekler dakika sonuna kadar durduruldu "
+                    f"(toplam soft={cls._weight_soft_backoffs}, "
+                    f"hard={cls._weight_hard_backoffs})"
+                )
+            raise RestWeightBackoff(endpoint, cls._last_used_weight_1m, hard, "hard")
+
+        cls._weight_soft_backoffs += 1
+        raise RestWeightBackoff(endpoint, cls._last_used_weight_1m, soft, "soft")
+
+    @classmethod
+    def rest_weight_snapshot(cls) -> Dict[str, Any]:
+        """`/scalper/status.rest_weight` — teşhis (secret içermez)."""
+        soft, hard = cls._weight_limits()
+        level = cls.weight_backoff_level()   # geçersiz pencereyi de temizler
+        now = time.time()
+        until = max(cls._weight_soft_until, cls._weight_hard_until)
+
+        def _iso(stamp: float) -> Optional[str]:
+            if not stamp:
+                return None
+            return datetime.fromtimestamp(stamp, tz=timezone.utc).isoformat(
+                timespec="seconds"
+            )
+
+        return {
+            # Son ölçülen `X-MBX-USED-WEIGHT-1M` ve ölçüm anı.
+            "last": int(cls._last_used_weight_1m),
+            "last_at": _iso(cls._last_used_weight_at),
+            # İÇİNDE BULUNULAN takvim dakikasının tepesi (dakika başında
+            # sıfırlanır — Binance sayacı da orada sıfırlanır) ve tepe anı.
+            "max_1m": int(cls._peak_used_weight_1m),
+            "peak_at": _iso(cls._peak_used_weight_at),
+            "soft_backoffs": int(cls._weight_soft_backoffs),
+            "hard_backoffs": int(cls._weight_hard_backoffs),
+            # 0 = o kademe KAPALI (varsayılan). Telemetri eşiklerden bağımsız.
+            "soft_limit": soft,
+            "hard_limit": hard,
+            "enabled": bool(soft or hard),
+            "backoff": level,
+            "backoff_seconds_left": round(max(0.0, until - now), 1),
+        }
+
+    @classmethod
+    def reset_weight_state(cls) -> None:
+        """Yalnız testler için: ağırlık geri çekilme durumunu sıfırla."""
+        cls._last_used_weight_1m = 0
+        cls._last_used_weight_at = 0.0
+        cls._peak_used_weight_1m = 0
+        cls._peak_used_weight_at = 0.0
+        cls._peak_window_start = 0.0
+        cls._weight_soft_until = 0.0
+        cls._weight_hard_until = 0.0
+        cls._weight_soft_backoffs = 0
+        cls._weight_hard_backoffs = 0
+        cls._weight_warn_at = 0.0
+        cls._weight_hard_log_at = 0.0
 
     def _ensure_rest_allowed(self, endpoint: str) -> None:
         """Küresel ban devre kesicisi: -1003/418 sonrası ban bitene kadar
@@ -333,6 +550,7 @@ class ImprovedBinanceClient:
         params: Optional[Dict[str, Any]] = None,
         signed: bool = False,
         invalidate_symbol: Optional[str] = None,
+        priority: str = "critical",
     ) -> Any:
         """API isteği yap — her deneme parametreleri sıfırdan kurar.
 
@@ -342,6 +560,12 @@ class ImprovedBinanceClient:
         invalidate_symbol: API'ye GÖNDERİLMEZ — yalnız önbellek invalidasyonu
         için. Sembolsüz yazma endpoint'leri (örn. algoId'li DELETE) etkilenen
         sembolü bununla bildirir ki invalidasyon global yerine hedefli olsun.
+
+        priority (D22): "critical" (varsayılan) = emir/koruma/kapanış
+        doğrulaması — ağırlık bütçesi dolsa bile gönderilir. "background" =
+        pano beslemesi, periyodik hesap özeti, evren taraması, teşhis —
+        `X-MBX-USED-WEIGHT-1M` yumuşak sınırı aştıysa dakika penceresi
+        dolana kadar `RestWeightBackoff` ile geri çevrilir.
         """
         base_params = dict(params or {})
         cache_symbol = base_params.get("symbol") or invalidate_symbol
@@ -349,6 +573,7 @@ class ImprovedBinanceClient:
         last_error: Optional[Exception] = None
 
         self._ensure_rest_allowed(endpoint)
+        self._weight_gate(endpoint, priority)
 
         # Yazma denemesi başlarken VE başarıyla bitince okuma önbellekleri
         # düşer: belirsiz sonuçlu (timeout) bir POST bile bayat okuma bırakmaz.
@@ -399,20 +624,33 @@ class ImprovedBinanceClient:
                     except (TypeError, ValueError):
                         uw = None
                     if uw is not None:
-                        type(self)._last_used_weight_1m = uw
+                        cls_ = type(self)
+                        # D22: ölçüm yalnız kaydedilmez, geri çekilme
+                        # penceresini de kurar (kritik olmayan istekler).
+                        cls_._note_used_weight(uw)
                         # Testnet'te başlık edge-bazlı ve tutarsız (aynı dakika
                         # içinde 1912→375 gözlendi); mutlak değer değil trend
                         # sinyali. Eşik gerçek 2400 sınırına yakın tutulur ki
                         # log gürültüsü olmasın ama gerçek riske yaklaşım görünsün.
-                        if uw >= 1800:
-                            counts = type(self)._endpoint_counts
+                        # Satır DAKİKADA EN FAZLA BİR: 2026-08-23'te aynı uyarı
+                        # 276 kez basıldı ve gerçek arızayı gömdü.
+                        now_log = time.time()
+                        if (
+                            uw >= cls_._WEIGHT_WARN_THRESHOLD
+                            and now_log - cls_._weight_warn_at
+                            >= cls_._WEIGHT_LOG_INTERVAL
+                        ):
+                            cls_._weight_warn_at = now_log
+                            counts = cls_._endpoint_counts
                             top = sorted(
                                 counts.items(), key=lambda kv: kv[1], reverse=True
                             )[:6]
                             detail = ", ".join(f"{ep}×{n}" for ep, n in top)
-                            type(self)._endpoint_counts = {}
+                            cls_._endpoint_counts = {}
                             self.logger.warning(
                                 f"⚖️ Binance 1dk kullanılan ağırlık: {uw} ({endpoint}) "
+                                f"| tepe {cls_._peak_used_weight_1m} "
+                                f"| geri çekilme={cls_.weight_backoff_level()} "
                                 f"| son uyarıdan beri istekler: {detail}"
                             )
 
@@ -708,24 +946,37 @@ class ImprovedBinanceClient:
             self.logger.error(f"❌ Bağlantı testi başarısız: {e}")
             return False
 
-    async def _get_account(self, *, force_fresh: bool = False) -> Dict[str, Any]:
+    async def _get_account(
+        self, *, force_fresh: bool = False, priority: str = "critical"
+    ) -> Dict[str, Any]:
         """/fapi/v2/account yanıtı — süreç-geneli önbellek (TTL 15 sn).
 
         Bakiye/cüzdan okumaları ve dashboard polling'i tek weight-5 çağrıyı
         paylaşır. Yazma istekleri önbelleği düşürür; kurtarma akışları
         force_fresh=True ile her zaman taze okur.
+
+        D22: `priority="background"` (pano/teşhis) çağrıları ağırlık geri
+        çekilmesi sırasında SÜRESİ GEÇMİŞ önbellekten servis edilir — bayat
+        bir bakiye göstermek, bütçeyi 418'e taşımaktan iyidir. Önbellek hiç
+        yoksa `RestWeightBackoff` yüzeye çıkar ve çağıran "bilinmiyor" der.
         """
         cls = type(self)
         if (not force_fresh and cls._account_cache is not None
                 and time.monotonic() - cls._account_cache_ts < cls._ACCOUNT_CACHE_TTL):
+            return cls._account_cache
+        if (priority != "critical" and cls._account_cache is not None
+                and cls.weight_backoff_active()):
             return cls._account_cache
         async with self._read_lock("_account_cache_lock"):
             if (not force_fresh and cls._account_cache is not None
                     and time.monotonic() - cls._account_cache_ts < cls._ACCOUNT_CACHE_TTL):
                 return cls._account_cache
             gen = cls._write_generation
+            # `priority` YALNIZ kritik olmayan çağrılarda geçilir: varsayılan
+            # yolun imzası (ve onu taklit eden test çiftleri) değişmesin.
+            extra = {} if priority == "critical" else {"priority": priority}
             response = await self._request_with_retry(
-                "GET", "/fapi/v2/account", signed=True
+                "GET", "/fapi/v2/account", signed=True, **extra
             )
             # Fetch sırasında yazma olduysa yanıt emir-öncesi olabilir:
             # çağırana döner ama "taze" diye damgalanmaz.
@@ -734,7 +985,9 @@ class ImprovedBinanceClient:
                 cls._account_cache_ts = time.monotonic()
             return response
 
-    async def get_account_balance(self) -> Optional[float]:
+    async def get_account_balance(
+        self, *, priority: str = "critical"
+    ) -> Optional[float]:
         """Kullanılabilir USDT bakiyesi.
 
         DİKKAT: Hata durumunda None döner (0.0 DEĞİL). Çağıran taraf bunu
@@ -742,7 +995,8 @@ class ImprovedBinanceClient:
         0.0 dönüyordu ve bu, config'deki sahte bakiyeye düşülmesine yol açıyordu.
         """
         try:
-            response = await self._get_account()
+            extra = {} if priority == "critical" else {"priority": priority}
+            response = await self._get_account(**extra)
             for asset in response.get("assets", []):
                 if asset["asset"] == "USDT":
                     balance = float(asset["availableBalance"])
@@ -1340,7 +1594,14 @@ class ImprovedBinanceClient:
                 "DELETE", "/fapi/v1/allOpenOrders", params={"symbol": symbol}, signed=True
             )
         except Exception as e:
-            self.logger.warning(f"{symbol}: normal emirler iptal edilemedi: {e}")
+            # -2011 ("Order does not exist") beklenen bir yarıştır: emir
+            # aradaki milisaniyelerde dolmuş/iptal olmuştur (D22 madde 4).
+            if is_benign_cancel_error(e):
+                # D22: INFO — arıza değil, ama defter sapmasının izi olabilir
+                # (DEBUG üretimde kapalıdır ve iz tamamen kaybolurdu).
+                self.logger.info(f"ℹ️ {symbol}: iptal edilecek normal emir yok ({e})")
+            else:
+                self.logger.warning(f"{symbol}: normal emirler iptal edilemedi: {e}")
             result["orders"] = {"error": str(e)}
 
         cancelled = 0
@@ -1349,7 +1610,10 @@ class ImprovedBinanceClient:
                 await self.cancel_algo_order(int(algo["algoId"]), symbol=symbol)
                 cancelled += 1
         except Exception as e:
-            self.logger.warning(f"{symbol}: koşullu emirler iptal edilemedi: {e}")
+            if is_benign_cancel_error(e):
+                self.logger.info(f"ℹ️ {symbol}: iptal edilecek koşullu emir yok ({e})")
+            else:
+                self.logger.warning(f"{symbol}: koşullu emirler iptal edilemedi: {e}")
         result["algo_cancelled"] = cancelled
         return result
 
@@ -1422,7 +1686,7 @@ class ImprovedBinanceClient:
             return snapshot.get(sym)
 
     async def get_all_positions(
-        self, *, force_fresh: bool = True
+        self, *, force_fresh: bool = True, priority: str = "critical"
     ) -> List[Dict[str, Any]]:
         """Borsadaki TÜM açık pozisyonlar — restart sonrası kurtarma için.
 
@@ -1434,7 +1698,8 @@ class ImprovedBinanceClient:
         restart'ının kök nedeni) — 15 sn'lik account önbelleği panel için
         fazlasıyla taze.
         """
-        account = await self._get_account(force_fresh=force_fresh)
+        extra = {} if priority == "critical" else {"priority": priority}
+        account = await self._get_account(force_fresh=force_fresh, **extra)
         return [
             p for p in account.get("positions", [])
             if float(p.get("positionAmt", 0)) != 0
@@ -1525,15 +1790,23 @@ class ImprovedBinanceClient:
             )
         return response
 
-    async def get_current_price(self, symbol: str) -> Optional[float]:
+    async def get_current_price(
+        self, symbol: str, *, priority: str = "critical"
+    ) -> Optional[float]:
         cls = type(self)
         sym = str(symbol).strip().upper()
         cached = cls._price_cache.get(sym)
         if cached is not None and time.monotonic() - cached[0] < cls._PRICE_CACHE_TTL:
             return cached[1]
+        # D22: pano beslemesi ağırlık geri çekilmesinde SÜRESİ GEÇMİŞ fiyatı
+        # gösterir (ek istek yok). Koruma yolu (critical) buraya düşmez.
+        if (priority != "critical" and cached is not None
+                and cls.weight_backoff_active()):
+            return cached[1]
+        extra = {} if priority == "critical" else {"priority": priority}
         try:
             response = await self._request_with_retry(
-                "GET", "/fapi/v1/ticker/price", params={"symbol": sym}
+                "GET", "/fapi/v1/ticker/price", params={"symbol": sym}, **extra
             )
             price = float(response["price"])
             cls._price_cache[sym] = (time.monotonic(), price)
@@ -1545,6 +1818,10 @@ class ImprovedBinanceClient:
                     k: v for k, v in cls._price_cache.items() if v[0] >= cutoff
                 }
             return price
+        except RestWeightBackoff as e:
+            # D22: bilinçli erteleme, arıza değil — ERROR loglanmaz.
+            self.logger.debug(str(e))
+            return None
         except Exception as e:
             self.logger.error(f"Fiyat sorgusu hatası: {e}")
             return None
