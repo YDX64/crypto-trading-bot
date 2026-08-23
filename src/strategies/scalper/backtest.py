@@ -62,8 +62,9 @@ from src.strategies.scalper import kline_cache
 from src.strategies.scalper.data import KlineFetcher
 from src.strategies.scalper.indicators import atr, chandelier_stop
 from src.strategies.scalper.market_gate import (
-    day_open_from_daily_closes,
+    MARKET_GATE_INTRADAY_TF,
     evaluate_market_gate,
+    resolve_day_open,
 )
 from src.strategies.scalper.regime import detect_regime
 from src.strategies.scalper.scanner import UniverseScanner
@@ -315,9 +316,10 @@ class LeaderSeries:
     veren salt-okunur seri. AĞ YOK — yalnız çekilmiş mumlar üzerinde çalışır.
 
     Canlı motorla parite: `inputs_at(cutoff)` canlının o an gördüğü ÜÇ
-    büyüklüğü birebir üretir — (gün açılışı vekili, giriş TF son kapanışı,
+    büyüklüğü birebir üretir — (gün açılışı, giriş TF son kapanışı,
     tamamlanmış günlük kapanışlar). Türetme kuralı iki tarafta da
-    `market_gate.day_open_from_daily_closes`'tur.
+    `market_gate.resolve_day_open`'dur: önce GERÇEK açılış (bugünün 00:00
+    UTC 15m mumunun open'ı), o yoksa son tamamlanmış günlük kapanış vekili.
     """
 
     symbol: str
@@ -325,6 +327,11 @@ class LeaderSeries:
     entry_closes: List[float]
     daily_close_times: List[int]
     daily_closes: List[float]
+    # Gün açılışı serisi (15m). Eski çağrıcılar/testler vermezse yedek
+    # (önceki günlük kapanış) yoluna düşülür — davranış geriye uyumlu.
+    intraday_open_times: List[int] = field(default_factory=list)
+    intraday_opens: List[float] = field(default_factory=list)
+    intraday_close_times: List[int] = field(default_factory=list)
 
     def inputs_at(
         self, cutoff_ms: int
@@ -333,16 +340,24 @@ class LeaderSeries:
         veriden; yetersizse None (kapı uygulanmaz, canlıdaki fail-open ile
         aynı ilke).
 
-        Look-ahead YASAK: her iki seri de `close_time <= cutoff_ms` ile
-        kesilir — canlı motorun `KlineFetcher._drop_unclosed`'ı ile aynı
-        anlam (yalnız kapanmış mum görülür).
+        Look-ahead YASAK: tüm seriler `close_time <= cutoff_ms` ile kesilir —
+        canlı motorun `KlineFetcher._drop_unclosed`'ı ile aynı anlam (yalnız
+        kapanmış mum görülür). Gün açılışı mumu da bu kurala tabidir: günün
+        ilk 15 dakikasında henüz kapanmadığı için vekile düşülür, canlıda
+        olduğu gibi.
         """
         j = bisect.bisect_right(self.entry_close_times, cutoff_ms) - 1
         if j < 0:
             return None
         k = bisect.bisect_right(self.daily_close_times, cutoff_ms)
         closes = self.daily_closes[:k]
-        day_open = day_open_from_daily_closes(closes)
+        day_open, _source = resolve_day_open(
+            self.intraday_open_times,
+            self.intraday_opens,
+            self.intraday_close_times,
+            closes,
+            cutoff_ms,
+        )
         if day_open is None:
             return None
         return day_open, self.entry_closes[j], closes
@@ -375,12 +390,26 @@ async def gather_leader_series(
         fetch, symbol, "1d", daily_needed,
         end_time=end_time, cache_dir=cache_dir, refresh=refresh,
     )
+    # Gün açılışı serisi: 00:00 UTC mumunun `open`'ı = `1d` mumunun `open`'ı
+    # (ölçüldü: 76 gün sınırı, 0 uyuşmazlık). `needed` formülü
+    # gather_symbol_data'nın 15m anahtarıyla aynı tutulur ki evrende zaten
+    # bulunan bir liderin 15m serisi ikinci kez çekilmesin.
+    intraday_needed = (
+        days * _CANDLES_PER_DAY[MARKET_GATE_INTRADAY_TF] + _CTX_15M_WINDOW
+    )
+    intraday_candles = await _fetch_series_cached(
+        fetch, symbol, MARKET_GATE_INTRADAY_TF, intraday_needed,
+        end_time=end_time, cache_dir=cache_dir, refresh=refresh,
+    )
     return LeaderSeries(
         symbol=symbol,
         entry_close_times=[c.close_time for c in entry_candles],
         entry_closes=[c.close for c in entry_candles],
         daily_close_times=[c.close_time for c in daily_candles],
         daily_closes=[c.close for c in daily_candles],
+        intraday_open_times=[c.open_time for c in intraday_candles],
+        intraday_opens=[c.open for c in intraday_candles],
+        intraday_close_times=[c.close_time for c in intraday_candles],
     )
 
 
@@ -1549,6 +1578,8 @@ async def run_backtest(
                 "run_days": leader_run_days,
                 "daily_candles": len(leader_series.daily_closes),
                 "entry_candles": len(leader_series.entry_closes),
+                "intraday_tf": MARKET_GATE_INTRADAY_TF,
+                "intraday_candles": len(leader_series.intraday_opens),
             }
 
         for symbol in symbols:

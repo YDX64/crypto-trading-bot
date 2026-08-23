@@ -182,15 +182,20 @@ tüm evrene uygular. Saf kural `src/strategies/scalper/market_gate.py`
   **Kullanılmamalı:** iki bağımsız ölçüm (E7 harness + E8 canlı defter) bu alt-kapıyı
   desteklemiyor; `RUN_PCT>0` ile açılırsa motor başlangıçta WARNING basar (D15).
 
-"Gün açılışı" iki tarafta da **son tamamlanmış günlük kapanış**tır
-(`day_open_from_daily_closes`): `KlineFetcher._drop_unclosed` oluşmakta olan
-günlük mumu her zaman attığı için gerçek "bugünün open'ı" canlıda elde
-edilemez; 7/24 açık bir piyasada iki büyüklük tik mertebesinde aynıdır ve
-ortak vekil parite boşluğu bırakmaz.
+"Gün açılışı" iki tarafta da `market_gate.resolve_day_open` ile bulunur:
+önce **gerçek açılış** — o günün 00:00 UTC `15m` mumunun `open`'ı, ki `1d`
+mumunun `open`'ına birebir eşittir (ikisi de aralığın ilk işlem fiyatı;
+ölçüldü: BTCUSDT mainnet+testnet, 76 gün sınırı, 0 uyuşmazlık). Bu yol
+`_drop_unclosed`'a hiç dokunmaz (o 15m mumu çoktan kapanmıştır), yani
+oluşmakta olan GÜNLÜK mumu görmeye gerek kalmaz. Günün ilk 15 dakikasında
+(mum henüz kapanmamış — look-ahead yasak) **iki taraf da** son tamamlanmış
+günlük kapanış vekiline düşer; hangisinin kullanıldığı `/scalper/status`
+`market_gate.day_open_source` alanındadır.
 
 REST ağırlığı: lider **başına** ~60 sn TTL önbellek (`_MARKET_GATE_CACHE_TTL`),
-sembol başına değil — tarama turu başına en çok 2 istek (`1d` limit N+2 ve
-giriş TF limit 3; ikisi de ağırlık 1). Kapı kapalıyken tek istek bile gitmez.
+sembol başına değil — tarama turu başına en çok **3 istek**: `1d` (limit N+2),
+giriş TF (limit 3) ve `15m` (limit 100); üçü de limit ≤ 100 olduğu için
+ağırlık 1, toplam 3 ağırlık/dakika. Kapı kapalıyken tek istek bile gitmez.
 Lider verisi alınamazsa kapı **uygulanmaz** (fail-open) ve WARNING loglanır —
 lider verisinin gelmemesi bir risk olayı değildir. `/scalper/status`
 `market_gate` alt-sözlüğü (enabled/leader/day_drift_pct/run_pct/last_reason/

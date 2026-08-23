@@ -38,9 +38,11 @@ from src.strategies.scalper.executor import ScalpExecutor
 from src.strategies.scalper.exits import ExitManager
 from src.strategies.scalper.indicators import atr as compute_atr
 from src.strategies.scalper.market_gate import (
-    day_open_from_daily_closes,
+    MARKET_GATE_INTRADAY_LIMIT,
+    MARKET_GATE_INTRADAY_TF,
     evaluate_market_gate,
     market_gate_metrics,
+    resolve_day_open,
 )
 from src.strategies.scalper.regime import detect_regime
 from src.strategies.scalper.scanner import UniverseScanner
@@ -132,10 +134,11 @@ class ScalperEngine:
     _RISK_EVENT_HALT_CACHE_TTL = 1.0
     # Lider piyasa kapısı (D15): sembol BAŞINA değil, LİDER başına tek
     # anlık görüntü. 60 sn TTL — REST ağırlık diyeti (docs/RUNBOOK.md
-    # "418/ban" + docs/ARCHITECTURE.md ağırlık bölümü): tarama turu başına
-    # 20 sembol × 2 istek yerine dakikada 2 istek (1d limit≤100 → ağırlık 1,
-    # giriş TF limit≤100 → ağırlık 1). Tarama aralığı 60 sn olduğu için
-    # pratikte tur başına en çok bir tazeleme yapılır.
+    # "418/ban" + docs/ARCHITECTURE.md ağırlık bölümü): 20 sembol × 3 istek
+    # yerine dakikada 3 istek — 1d (limit N+2), giriş TF (limit 3) ve 15m
+    # (limit 100, gerçek gün açılışı için); ÜÇÜ DE limit ≤ 100 olduğundan
+    # ağırlık 1, toplam 3 ağırlık/dakika (bütçe 2400/dk). Tarama aralığı
+    # 60 sn olduğu için pratikte tur başına en çok bir tazeleme yapılır.
     _MARKET_GATE_CACHE_TTL = 60.0
 
     def __init__(self) -> None:
@@ -1885,6 +1888,13 @@ class ScalperEngine:
         try:
             daily = await self.fetcher.get_klines(leader, "1d", run_days + 2)
             entry = await self.fetcher.get_klines(leader, tf_entry, 3)
+            # Gerçek gün açılışı için 00:00 UTC 15m mumu (bkz.
+            # market_gate.day_open_from_intraday): 100 mum = 25 saat ve
+            # limit <= 100 olduğu için ağırlık 1. `_drop_unclosed`'a HİÇ
+            # dokunmadan `1d` mumunun open'ıyla BİREBİR aynı değeri verir.
+            intraday = await self.fetcher.get_klines(
+                leader, MARKET_GATE_INTRADAY_TF, MARKET_GATE_INTRADAY_LIMIT
+            )
         except Exception as e:
             self.logger.warning(
                 f"⚠️ Piyasa kapısı: lider {leader} verisi alınamadı, kapı bu "
@@ -1893,12 +1903,22 @@ class ScalperEngine:
             return None
 
         daily_closes = [float(c.close) for c in daily]
-        day_open = day_open_from_daily_closes(daily_closes)
         last_close = float(entry[-1].close) if entry else None
+        # Karar anı: son KAPANAN giriş mumunun kapanışı (duvar saati DEĞİL) —
+        # harness'ta da kesim zamanı mum kapanışıdır, parite böyle korunur.
+        cutoff_ms = int(entry[-1].close_time) if entry else int(time.time() * 1000)
+        day_open, day_open_source = resolve_day_open(
+            [int(c.open_time) for c in intraday],
+            [float(c.open) for c in intraday],
+            [int(c.close_time) for c in intraday],
+            daily_closes,
+            cutoff_ms,
+        )
         if day_open is None or last_close is None:
             self.logger.warning(
                 f"⚠️ Piyasa kapısı: lider {leader} serisi yetersiz "
-                f"(1d={len(daily_closes)}, {tf_entry}={len(entry)}), kapı bu "
+                f"(1d={len(daily_closes)}, {tf_entry}={len(entry)}, "
+                f"{MARKET_GATE_INTRADAY_TF}={len(intraday)}), kapı bu "
                 f"turda UYGULANMADI"
             )
             return None
@@ -1906,6 +1926,7 @@ class ScalperEngine:
         snapshot: Dict[str, Any] = {
             "leader": leader,
             "day_open": day_open,
+            "day_open_source": day_open_source,
             "last_close": last_close,
             "daily_closes": daily_closes,
             **market_gate_metrics(day_open, last_close, daily_closes, self.cfg),
@@ -1929,6 +1950,7 @@ class ScalperEngine:
             "enabled": bool(getattr(self.cfg, "scalper_market_gate", False)),
             "leader": leader,
             "day_drift_pct": snapshot.get("day_drift_pct"),
+            "day_open_source": snapshot.get("day_open_source"),
             "run_pct": snapshot.get("run_pct"),
             "last_reason": getattr(self, "_market_gate_last_reason", None),
             "rejects": dict(getattr(self, "_market_gate_rejects", {})),

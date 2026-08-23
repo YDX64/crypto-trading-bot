@@ -305,8 +305,9 @@ Harness'ta türetilebilirdi ama o zaman iki taraf farklı bir büyüklük hesapl
 7/24 açık bir piyasada günlük open ile önceki close arasındaki fark tik mertebesindedir (eşik %1).
 
 **REST ağırlığı:** lider BAŞINA ~60 sn TTL önbellek (sembol başına DEĞİL) — tarama turu başına
-en çok 2 istek (`1d` limit N+2 ve giriş TF limit 3; ikisi de ağırlık 1). Kapı kapalıyken TEK
-istek bile gitmez (`test_gate_off_makes_no_request_at_all`). Lider verisi alınamazsa kapı
+en çok **3 istek**: `1d` (limit N+2), giriş TF (limit 3) ve `15m` (limit 100, gerçek gün
+açılışı için — aşağıya bakın); ÜÇÜ DE limit ≤ 100 olduğu için ağırlık 1, toplam 3 ağırlık/dakika
+(bütçe 2400/dk). Kapı kapalıyken TEK istek bile gitmez (`test_gate_off_makes_no_request_at_all`). Lider verisi alınamazsa kapı
 UYGULANMAZ (fail-open) + WARNING — lider verisi eksikliği bir risk olayı değildir (spec §C).
 
 **Kanıt (E7, `docs/EXPERIMENTS.md` "2026-08-23 — Lider piyasa kapısı"):** 8 varyant × 3 pencere,
@@ -337,8 +338,14 @@ BIRAKMIYOR, bu yüzden sayıları motor-içi kapının ALT SINIRI (E8 bunu kendi
 YATAY %1.0'da işaret bile farklı (E7 +201 / E8 −487) — fark tam olarak kapasite yeniden
 tahsisinden geliyor. İki ölçüm ÇELİŞMİYOR; E8 muhafazakâr taraftan bakıyor ve eşik önerisi (%1.3)
 motor-içi kapıyla doğrulandı → benimsendi. Bacak-ayrık eşik (SHORT %1.0 / LONG %1.3) E8'in
-önerisiydi ama UYGULANMADI: ayrı bir tasarım kararıdır (kendi spec'i + onayı gerekir) ve E7 verisi
-"LONG bacağı işe yaramıyor" iddiasını desteklemiyor (LONG bacağı tabana göre −956→+180 iyileşiyor).
+önerisiydi; UYGULANMADI (ayrı tasarım kararı, kendi spec'i + onayı gerekir) ama artık İKİ ölçüm
+tarafından da destekleniyor — **ilk itirazım YANLIŞTI ve geri alındı**: "LONG bacağı da iyileşiyor
+(−956→+180)" demiştim; E8'in önerdiği atıf testini iki JSON raporu üzerinde koşunca bu
+iyileşmenin **~%93'ünün kapasite etkisi** olduğu çıktı (kapının engellediği 24 LONG toplam −76.1
+= başabaş; +1060'ı boşalan slota giren 9 YENİ işlemden). SHORT bacağında tam tersi: engellenen 42
+işlem −1934.3 (gerçek kaybedenler), atıf ~%92 kapının kendisi. Karşı argüman kayda geçsin: canlı
+defterin 22 Ağu kaybı tam olarak LONG bacağından geldi (8 işlem, +102.1 kurtarırdı) — bacakları
+ayrı kapatılabilir tutan bugünkü tasarım bu yüzden doğru.
 
 **Neden UYGULANMADI:** (1) CLAUDE.md kural 1 zinciri backtest → testnet ≥5 gün → onay ister ve
 D6'nın soak'u sürüyor — üst üste binen değişiklik atfı kirletir. (2) Kanıt tek lider (BTCUSDT) ve
@@ -356,18 +363,36 @@ yani lider koşusuyla AYNI yönde açılan işlemler KAZANIYOR, kapının varsay
 Varsayılan `SCALPER_MARKET_GATE_RUN_PCT=15` spec §C'de onaylandığı için **sessizce
 değiştirilmedi**; bunun yerine motor açılışta AÇIKÇA uyarıyor
 (`ScalperEngine._maybe_log_market_gate_banner` — kapı açık + `RUN_PCT>0` ise ikinci bir WARNING).
-Varsayılanı 0'a çekmek kullanıcı kararıdır.
+Varsayılanı 0'a çekmek kullanıcı kararıdır — **AÇIK KARAR MADDESİ**.
+E8'in ek gerekçesi (bende olmayan bir ölçüm): harness'ın "üç pencerede inert" hükmü BUGÜNKÜ
+piyasaya taşınmıyor. O pencerelerde BTC 3 günde %15 koşmadığı için kapı hiç tetiklenmiyordu;
+botun ŞU AN soak ettiği dönemde koşuyor — 7–22 Ağu canlı defterinde `RUN_PCT=15` 202 işlemin
+35'inde tetikleniyor ve **net −152.7** ediyor. Yani `SCALPER_MARKET_GATE=true` çıplak
+varsayılanlarla açılırsa uzama alt-kapısı inert DEĞİL, aktif ve negatiftir. Ayrıca `DAY_PCT`
+varsayılanı 1.0 iken tüm kanıt 1.3 diyor: çıplak varsayılanlar hiçbir ölçümün önermediği
+(1.0 + 15) çiftini verir. Bu yüzden `docs/RUNBOOK.md` "Lider piyasa kapısı" bölümündeki açma
+komutu üç değişkeni de AÇIKÇA yazar ve restart'tan önce `assert` ile doğrular — log'daki WARNING
+bir KONTROL DEĞİLDİR (D14 review bulgusu #4 emsali: sessizce başarısız olan `sed`).
 
-**Bilinen sapma — "gün açılışı" vekili ve testnet.** Fark ÖLÇÜLDÜ (BTCUSDT, 70 gün): mainnet'te
-(harness veri kaynağı) gerçek `1d` open ile önceki close arasındaki fark ort. %0.000082 / maks
-%0.0006 — eşiğin binde 6'sı, yani E7 sonuçları E8'in "gerçek open" tanımıyla da geçerli.
-TESTNET'te (canlı motorun kaynağı, `data.py` → `settings.binance_base_url`) fark ~200× büyük:
-ort. %0.013 / maks %0.152 = eşiğin %15'i. Yani testnet soak'unda kapı, harness'ın ölçtüğünden
-MARJİNAL günlerde farklı karar verebilir. Gerçek open'a geçmenin ucuz ve parite-korur bir yolu
-bulunamadı: `1h` mumu da 00:00-01:00 UTC arasında kapanmamış olduğu için düşer (saat başında
-referans değiştiren, harness'ın taklit edemeyeceği canlı-only süreksizlik) ve `_drop_unclosed`'ı
-gevşetmek tüm motorun paylaştığı repaint korumasını zayıflatır. Mainnet'te — gerçek paranın
-çalışacağı yer — sapma ihmal edilebilir olduğu için vekil bilinçle korundu.
+**"Gün açılışı" türetmesi — E8'in yolu uygulandı, önceki sapma KAPATILDI.** İlk sürüm gün
+açılışı olarak son tamamlanmış günlük KAPANIŞ'ı vekil kullanıyordu (gerekçe: `_drop_unclosed`
+oluşmakta olan günlük mumu attığı için gerçek open canlıda görünmüyor). Vekilin hatası ölçüldü:
+mainnet ort. %0.000082 / maks %0.0006 (ihmal edilebilir) ama TESTNET'te — canlı motorun kaynağı
+(`data.py` → `settings.binance_base_url`) — ort. %0.013 / maks %0.152 = eşiğin %15'i, kuyruklu
+dağılımla (medyan %0.000167, p95 %0.106). Bu bir süre "bilinen sapma" olarak kaydedildi.
+E8 bedelsiz çözümü buldu: **`1d` mumunun `open`'ı, o günün 00:00 UTC `15m` mumunun `open`'ına
+BİREBİR eşittir** (ikisi de aralığın ilk işlem fiyatı). Bağımsız doğrulandı — BTCUSDT, mainnet +
+testnet, **76 gün sınırı, 0 uyuşmazlık, maks fark %0.00000000**. Uygulandı
+(`market_gate.resolve_day_open` + `day_open_from_intraday`): motor lider için `15m` limit 100
+çeker (25 saat, ağırlık 1), harness aynı seriyi `gather_symbol_data` ile AYNI önbellek
+anahtarından okur (ek ağ isteği YOK). `_drop_unclosed`'a HİÇ dokunulmadı — o 15m mumu çoktan
+kapanmıştır, repaint riski yok. Günün ilk 15 dakikasında (mum henüz kapanmamış, look-ahead yasak)
+İKİ TARAF DA eski vekile düşer; hangisinin kullanıldığı `/scalper/status` →
+`market_gate.day_open_source` alanında görünür.
+**Regresyon:** V1 ve V1c üç pencerede yeniden koşuldu, sonuçlar önceki koşularla BİT DÜZEYİNDE
+AYNI (V1c AYI 158/+3812.25/PF 1.43/DD 2956.08 · YATAY 137/+2791.37/1.38/2840.06 · BOĞA
+89/+3797.60/2.39/734.59) — E7 tablosu her iki tanım altında geçerli, testnet belirsizliği kalktı.
+Eski loglar `logs/market_gate_prevclose/`.
 
 **Kanıt (kod):** `tests/test_market_gate.py` — 67 test (saf fonksiyon: her alt-kapı/yön/eşik
 sınırı/eksik-geçersiz veri; motor: önbellek, fail-open+WARNING, ret sayaçları, `/scalper/status`

@@ -235,6 +235,56 @@ Mainnet'te (testnet DEĞİLKEN) gölge KAPALIYSA `RISK_EVENT_SECRET`, `TV_WEBHOO
 `SCALPER_SYMBOL_ALLOWLIST` boş (veya yalnız boşluk/virgül) OLAMAZ — `_validate_binance_environment`
 startup'ta reddeder (docs/MAINNET_PLAN.md §5.3); doldurmadan kapatamazsın.
 
+## Lider piyasa kapısı (`SCALPER_MARKET_GATE`, D15) — ADAY, HENÜZ ONAYLANMADI
+Liderin (varsayılan BTCUSDT) gün-içi sapmasına bakıp o yöne yeni giriş kapatan kapı
+(ayrıntı: `docs/ARCHITECTURE.md` §4.1, ölçüm: `docs/EXPERIMENTS.md` E7). **Varsayılan
+kapalı ve canlıya UYGULANMADI** — bu bölüm, kullanıcı onayı geldiğinde doğru değerlerle
+açılabilmesi içindir; onaysız açma.
+
+⚠️ **Çıplak varsayılanlarla AÇMA.** `SCALPER_MARKET_GATE=true`'yu tek başına yazarsan
+`config.py` varsayılanları devreye girer: `DAY_PCT=1.0` (ölçülen en iyi **1.3**) ve
+`RUN_PCT=15` (**iki bağımsız ölçüm bunu desteklemiyor**, aşağı). Yani hiçbir ölçümün
+önermediği bir çift alırsın. Aşağıdaki komut üç değişkeni de AÇIKÇA yazar.
+
+⚠️ **Uzama alt-kapısı (`RUN_PCT`) KAPALI kalmalı** — E7 (harness): yalnız ayı penceresinde
+ve tek lider olayında tetikleniyor, gün-içi kapısının üstüne katkısı YOK. E8 (canlı defter,
+7–22 Ağu): `RUN_PCT=15` 202 işlemin 35'inde tetikleniyor ve net **−152.7** ediyor (12 DOWN-günü
+işlemini engelleyip +137.9 kurtarıyor, 23 UP-günü KAZANANINI engelleyip −290.6 kaybettiriyor).
+Harness'ın "üç pencerede inert" hükmü BUGÜNKÜ piyasaya taşınmıyor: o pencerelerde BTC 3 günde
+%15 koşmuyordu, şimdi koşuyor. Motor açılışta ayrıca WARNING basar ama **log bir KONTROL
+değildir** (D14 review bulgusu #4 emsali) — değeri komutta açıkça `0` yaz.
+
+**Açmak (yalnız kullanıcı onayıyla):**
+```bash
+ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date +%Y%m%d)-marketgate && for kv in "SCALPER_MARKET_GATE=true" "SCALPER_MARKET_GATE_SYMBOL=BTCUSDT" "SCALPER_MARKET_GATE_DAY_PCT=1.3" "SCALPER_MARKET_GATE_RUN_PCT=0"; do k="${kv%%=*}"; { grep -q "^$k=" .env && sed -i "s|^$k=.*|$kv|" .env || echo "$kv" >> .env; }; done && ./.venv/bin/python -c "from src.core.config import settings as s; assert s.scalper_market_gate, \"KAPI AÇILMADI\"; assert s.scalper_market_gate_day_pct == 1.3, f\"DAY_PCT={s.scalper_market_gate_day_pct}\"; assert s.scalper_market_gate_run_pct == 0, f\"RUN_PCT={s.scalper_market_gate_run_pct} — uzama alt-kapısı KAPALI olmalı\"; print(\"gate=\", s.scalper_market_gate, \"day=\", s.scalper_market_gate_day_pct, \"run=\", s.scalper_market_gate_run_pct)" && supervisorctl restart tradingbot_v2'
+```
+`sed -i` eşleşme bulamazsa 0 ile çıkar — bu yüzden her anahtar `{ grep -q && sed || echo; }`
+grubuyla yazılır ve restart'tan ÖNCE `assert`'li config geri-okuması yapılır (D14 review
+bulgusu #4 ile aynı disiplin).
+
+**ZORUNLU doğrulama — soak bu ikisi geçmeden BAŞLAMIŞ SAYILMAZ:**
+1. Komutun kendi `assert`'leri restart'tan ÖNCE `gate= True day= 1.3 run= 0.0` basmalı
+   (basmazsa `AssertionError` ile durur ve restart hiç çalışmaz).
+2. Restart sonrası (~90 sn): `curl -sS http://127.0.0.1:9091/scalper/status | python3 -c
+   "import sys,json; g=json.load(sys.stdin)['market_gate']; assert g['enabled'] is True; print(g)"`
+
+**Ne görürsün:**
+- Restart loglarında `🧭 PİYASA KAPISI AÇIK — lider BTCUSDT, gün-içi %1.3, uzama %0.0/3g`.
+  `RUN_PCT>0` bırakıldıysa ayrıca sert bir WARNING — görürsen komutu yanlış çalıştırmışsın.
+- Engellenen her sinyalde `⛔ <SEMBOL>: piyasa kapısı — gün-içi sapma (BTCUSDT gün −1.42%,
+  koşu +2.10%) nedeniyle LONG girişi engellendi (SCALPER_MARKET_GATE)`.
+- `GET /scalper/status` → `market_gate: {enabled, leader, day_drift_pct, day_open_source,
+  run_pct, last_reason, rejects}`. `rejects` süreç ömrü boyunca `market_gate_day` /
+  `market_gate_run` sayaçlarıdır — soak sonunda tetik sayısını buradan oku.
+- `day_open_source` normalde `intraday_open` (gerçek 00:00 UTC açılışı). Günün ilk 15
+  dakikasında `prev_daily_close`'a düşer — beklenen davranış, hata değil.
+
+**Kapatmak:**
+```bash
+ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date +%Y%m%d)-marketgate-off && { grep -q "^SCALPER_MARKET_GATE=" .env && sed -i "s/^SCALPER_MARKET_GATE=.*/SCALPER_MARKET_GATE=false/" .env || echo "SCALPER_MARKET_GATE=false" >> .env; } && ./.venv/bin/python -c "from src.core.config import settings as s; assert not s.scalper_market_gate, \"KAPI HÂLÂ AÇIK\"; print(\"gate=\", s.scalper_market_gate)" && supervisorctl restart tradingbot_v2'
+```
+Varsayılan zaten kapalı (satırı silmek de eşdeğerdir); kod geri alınmasına gerek yok.
+
 ## Güvenlik borçları
 1. Webhook düz HTTP + IP, secret sorgu dizesinde. Erişim logu kısmı ÇÖZÜLDÜ (D9,
    2026-08-21): `uvicorn.access`/`uvicorn.error` logger'larına `secret=...`'ü `secret=***`

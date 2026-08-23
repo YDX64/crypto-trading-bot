@@ -307,6 +307,11 @@ iki yön de tetiklenebilir — bu yüzden tetik sayısı gün sayısından çok 
   n=1 olay = istatistik değil, anekdot. Ayrıca %10'a gevşetmek BOĞA'yı −%24.6 ile P2'den
   düşürüyor (08-20'de BTC'nin +%10.2'lik 3 günlük koşusu LONG'ları vetoluyor) — yani eşik
   duyarlılığı yüksek ve yanlış tarafa ayarlanırsa doğrudan zarar veriyor.
+  **Ek (E8): harness'ın "üç pencerede inert" hükmü BUGÜNKÜ piyasaya taşınmıyor.** O pencerelerde
+  BTC 3 günde %15 koşmadığı için kapı hiç tetiklenmiyordu; botun ŞU AN soak ettiği dönemde
+  koşuyor — 7–22 Ağu canlı defterinde `RUN_PCT=15` **202 işlemin 35'inde tetikleniyor ve net
+  −152.7 ediyor** (12 DOWN-günü işlemini engelleyip +137.9 kurtarıyor, 23 UP-günü KAZANANINI
+  engelleyip −290.6 kaybettiriyor). "Harness'ta zararsız" ≠ "canlıda zararsız".
 - **V3 ≡ V1** olduğu için uzama alt-kapısını gün-içi ile BİRLİKTE açmanın ölçülebilir hiçbir
   faydası yok; tek başına açmanın da (V2) faydası tek olaya dayanıyor.
 - Simülatörün mutlak sayıları rejime duyarlıdır (P3); yukarıdaki hüküm **göreli** farklara
@@ -329,11 +334,25 @@ kapının ALT SINIRI" diye işaretledi — iki ölçüm çelişmiyor, E8 muhafaz
 V1'i (%1.0) domine ediyor — AYI +2999→**+3812** (PF 1.33→1.43), YATAY +2593→**+2791**
 (1.36→1.38), BOĞA kaybı −%4.5→**−%2.7**; maxDD hiçbir pencerede kötüleşmiyor.
 V1c AYI yön kırılımı: LONG 64/**+180** (PF 1.04), SHORT 94/**+3632** (1.84), SL 17 (V0: 29).
-E8'in "kazancın tamamına yakını SHORT bacağından" gözlemi burada da görünüyor; ancak E7'de LONG
-bacağı da tabana göre iyileşiyor (V0 79/−956 → V1c 64/+180), yani E7 LONG bacağını E8'den daha
-değerli buluyor — yine kapasite etkisi. **Bacak-ayrık eşik (SHORT %1.0 / LONG %1.3) uygulanmadı:**
-ayrı bir tasarım kararı, kendi spec'i ve onayı gerekir; E7 verisi LONG bacağının işe yaramadığı
-iddiasını DESTEKLEMİYOR.
+**Bacak atfı — ilk yorumum YANLIŞTI, E8 haklıydı.** "E7'de LONG bacağı da iyileşiyor (79/−956 →
+64/+180), demek ki LONG kapısı da değerli" demiştim. E8 bunun kapasite etkisinden ayrılmadığını
+söyledi ve ayrıştırmayı önerdi; iki JSON raporunu (symbol, entry_time, direction) üzerinden
+eşleştirerek koştum (yeni backtest YOK):
+
+| AYI, V0 → V1c | Δ PnL | (i) engellenen | (ii) yeni giren | Atıf |
+|---|---|---|---|---|
+| **LONG** | +1136.1 | 24 işlem, PnL **−76.1** (≈başabaş) | 9 işlem, **+1060.0** | **~%7 kapı, ~%93 kapasite** |
+| **SHORT** | +2091.8 | 42 işlem, PnL **−1934.3** (gerçek kaybedenler) | 2 işlem, +157.5 | **~%92 kapı, ~%8 kapasite** |
+
+(Ortak 55 LONG / 92 SHORT işlemin PnL'i iki koşuda birebir aynı — atıf temiz.)
+Yani kapının KENDİSİ neredeyse tamamen SHORT bacağından kazandırıyor; LONG bacağının engellediği
+24 işlem toplamda −76.1, yani gürültü. LONG'daki +1136'nın %93'ü boşalan kapasiteye giren 9 YENİ
+işlemden geliyor — kapıya değil, kapasite yeniden tahsisine ait bir kazanç.
+**Bacak-ayrık eşik artık İKİ ölçümle de destekleniyor** ama yine de UYGULANMADI: ayrı bir tasarım
+kararıdır (kendi spec'i + kullanıcı onayı gerekir). Karşı argüman kayda geçsin: canlı defterin
+22 Ağu kaybı tam olarak LONG bacağından geldi (8 işlem, +102.1 kurtarırdı), yani harness'ta nötr
+görünen LONG bacağı canlıda hâlâ işe yarayabilir — bacakları ayrı kapatılabilir tutan bugünkü
+tasarım bu yüzden doğru.
 
 **Uzama alt-kapısı — ikinci bağımsız RED.** E8 canlı defterde net **negatif** ölçtü (−152.7;
 LONG eşiği %12'de −382.9, 50 kazanan engelleniyor) ve spec'in hipotezinin İŞARETİNİ ters buldu
@@ -343,7 +362,7 @@ demiştik. İki bağımsız kanıt aynı yöne işaret ediyor → **`SCALPER_MAR
 Varsayılan spec'te 15 onaylandığı için sessizce değiştirilmedi; bunun yerine motor açılışta
 uyarıyor (`ScalperEngine._maybe_log_market_gate_banner`).
 
-### "Gün açılışı" tanımı — ölçülmüş eşdeğerlik ve testnet uyarısı
+### "Gün açılışı" tanımı — ÇÖZÜLDÜ (E8'in 15m yolu), önceki sapma kapatıldı
 E8 ölçümünü gerçek `1d` mumu **open**'ı ile yaptı; bu uygulama son tamamlanmış günlük
 **close**'u vekil kullanıyor (gerekçe: `KlineFetcher._drop_unclosed` oluşmakta olan günlük mumu
 her zaman atar → canlıda "bugünün open'ı" ELDE EDİLEMEZ; bkz. D15). İki tanım arasındaki fark
@@ -354,11 +373,33 @@ her zaman atar → canlıda "bugünün open'ı" ELDE EDİLEMEZ; bkz. D15). İki 
 | **Mainnet** (harness) | %0.000082 | %0.000597 | %0.06 |
 | **Testnet** (canlı motor) | %0.013 | %0.152 | **%15.2** |
 
-Mainnet'te iki tanım pratikte AYNI (fark eşiğin binde 6'sı) → E7 tablosu E8'in tanımıyla da
-geçerlidir. Testnet'te fark ~200× büyük: en kötü günde eşiğin %15'i kadar. **Bilinen sapma:**
-testnet soak'unda kapı, harness'ın ölçtüğünden marjinal günlerde farklı karar verebilir. Gerçek
-open'a geçmek için ucuz ve parite-korur bir yol bulunamadı (`1h` mumu da 00:00-01:00 UTC arası
-kapanmamış olduğu için düşer → saat başında referans değiştiren, harness'ın taklit edemeyeceği
-canlı-only bir süreksizlik doğardı; `_drop_unclosed`'ı gevşetmek ise tüm motorun paylaştığı
-repaint korumasını zayıflatır). Mainnet'te — gerçek paranın çalışacağı yer — sapma ihmal
-edilebilir olduğu için mevcut vekil bilinçle korundu.
+Mainnet'te iki tanım pratikte AYNI (fark eşiğin binde 6'sı); testnet'te fark ~200× büyüktü
+(en kötü günde eşiğin %15'i, dağılım kuyruklu: medyan %0.000167, p95 %0.106) ve bu bir süre
+"bilinen sapma" olarak kaydedildi.
+
+**E8 bu sapmayı kapatan yolu buldu ve uygulandı:** `1d` mumunun `open`'ı, o günün **00:00 UTC
+15m mumunun `open`'ına BİREBİR eşittir** (ikisi de aralığın ilk işlem fiyatıdır). Bağımsız
+doğruladım — BTCUSDT, mainnet (3 pencere önbelleği) + testnet, **76 gün sınırı, 0 uyuşmazlık,
+maks fark %0.00000000**. Böylece gerçek gün açılışı `_drop_unclosed`'a HİÇ dokunmadan (o 15m
+mumu çoktan kapanmıştır) okunabiliyor:
+- Motor: lider için `15m` limit 100 (= 25 saat, ağırlık 1). Kapı açıkken lider başına toplam
+  **3 istek / 60 sn** (`1d` + giriş TF + `15m`, üçü de ağırlık 1) — sembol başına DEĞİL.
+- Harness: `gather_leader_series` aynı 15m serisini `gather_symbol_data` ile AYNI önbellek
+  anahtarıyla çeker → lider evrende zaten varsa **ek ağ isteği YOK** (loglarda
+  `💾 BTCUSDT 15m: önbellekten yüklendi`).
+- Ortak kural `market_gate.resolve_day_open`; günün ilk 15 dakikasında (mum henüz kapanmamış,
+  look-ahead yasak) **iki taraf da** eski vekile düşer — `day_open_source` alanı hangisinin
+  kullanıldığını `/scalper/status`'te gösterir.
+- Neden liderin 15m'si AYRI çekiliyor (motorun zaten çektiği 15m serisi kullanılamaz mı?):
+  motorun `_evaluate_symbol` içinde çektiği seri DEĞERLENDİRİLEN SEMBOLE aittir, lidere değil;
+  ayrıca o serinin zaman dilimi `scalper_tf_regime`/`tf_context` ile konfigüre edilebilir
+  (sunucuda 15m ama garanti değil) ve kapı anlık görüntüsü lider başına önbelleklenir, hangi
+  sembolün tetiklediğinden bağımsızdır. Sembol==lider durumunda yeniden kullanmak yalnız 8
+  sembolün 1'inde işe yarar, konfigürasyona bağımlı ve kırılgan olurdu.
+
+**Regresyon kontrolü:** V1 ve V1c üç pencerede de yeniden koşuldu; sonuçlar önceki (vekil)
+koşularla **bit düzeyinde AYNI** (V1c AYI 158 işlem / WR 88.0 / +3812.25 / PF 1.43 / DD 2956.08,
+179 tetik · YATAY 137 / 87.6 / +2791.37 / 1.38 / 2840.06, 32 tetik · BOĞA 89 / 93.3 / +3797.60 /
+2.39 / 734.59, 3 tetik). Mainnet verisinde değişim inert — E7 tablosu her iki tanım altında da
+geçerli — ama testnet soak'undaki belirsizlik artık YOK.
+Eski (vekil) koşu logları `logs/market_gate_prevclose/` altında saklandı.

@@ -39,11 +39,17 @@ from src.strategies.scalper import market_gate as market_gate_module
 from src.strategies.scalper.backtest import LeaderSeries, simulate_symbol
 from src.strategies.scalper.engine import ScalperEngine
 from src.strategies.scalper.market_gate import (
+    DAY_OPEN_SOURCE_INTRADAY,
+    DAY_OPEN_SOURCE_PREV_CLOSE,
+    MARKET_GATE_INTRADAY_TF,
     REASON_DAY,
     REASON_RUN,
     day_open_from_daily_closes,
+    day_open_from_intraday,
     evaluate_market_gate,
     market_gate_metrics,
+    resolve_day_open,
+    utc_day_start_ms,
 )
 from src.strategies.scalper.types import (
     Candle,
@@ -346,16 +352,34 @@ class _LeaderFetcher:
         return opened
 
 
-# BTC senaryosu: 4 gün +%20 koşu (100 → 120), sonra 5. gün içinde 120 → 118
-# (−%1.67 gün-içi sapma). Her iki alt-kapı da LONG'u engeller.
+# BTC senaryosu: 4 gün +%20 koşu (100 → 120), sonra 5. gün içinde 118'e iniş.
+# Her iki alt-kapı da LONG'u engeller.
 _LEADER_DAILY_CLOSES = [100.0, 105.0, 112.0, 120.0]
 _LEADER_TODAY_INDEX = len(_LEADER_DAILY_CLOSES)          # 5. gün (indeks 4)
 _LEADER_TODAY_START = _LEADER_TODAY_INDEX * _DAY_MS
 # Bugünün (henüz kapanmamış) günlük mumu da seride: gerçek Binance yanıtı
 # gibi — fetcher onu atmalı, harness ise close_time filtresiyle görmemeli.
 _LEADER_DAILY = _daily_candles(_LEADER_DAILY_CLOSES + [118.0])
-_LEADER_ENTRY = _minute_candles([118.6, 118.4, 118.2, 118.0], _LEADER_TODAY_START)
-# Karar anı = liderin 4. dakika mumunun kapanışı (close = 118.0).
+
+# GERÇEK gün açılışı 121.0; ÖNCEKİ günlük kapanış (vekil) 120.0. İkisi
+# BİLEREK farklı seçildi ki testler hangi türetme yolunun kullanıldığını
+# AYIRT EDEBİLSİN (aynı olsalardı yol değişse bile sayılar tutardı).
+_LEADER_TRUE_DAY_OPEN = 121.0
+_M15_MS = 15 * 60 * 1000
+_LEADER_INTRADAY = [
+    Candle(
+        open_time=_LEADER_TODAY_START + n * _M15_MS,
+        open=(_LEADER_TRUE_DAY_OPEN if n == 0 else 119.0),
+        high=121.5, low=117.5, close=118.5, volume=1.0,
+        close_time=_LEADER_TODAY_START + (n + 1) * _M15_MS - 1,
+    )
+    for n in range(96)
+]
+
+# Karar anı günün ORTASINDA (12:00 UTC): 00:00 UTC 15m mumu çoktan kapandı,
+# yani gerçek açılış yolu kullanılabilir olmalı.
+_ENTRY_START = _LEADER_TODAY_START + 12 * 60 * 60 * 1000
+_LEADER_ENTRY = _minute_candles([118.6, 118.4, 118.2, 118.0], _ENTRY_START)
 _DECISION_MS = _LEADER_ENTRY[-1].close_time
 
 
@@ -366,6 +390,9 @@ def _leader_series() -> LeaderSeries:
         entry_closes=[c.close for c in _LEADER_ENTRY],
         daily_close_times=[c.close_time for c in _LEADER_DAILY],
         daily_closes=[c.close for c in _LEADER_DAILY],
+        intraday_open_times=[c.open_time for c in _LEADER_INTRADAY],
+        intraday_opens=[c.open for c in _LEADER_INTRADAY],
+        intraday_close_times=[c.close_time for c in _LEADER_INTRADAY],
     )
 
 
@@ -405,7 +432,8 @@ def _bare_engine(cfg: Any, fetcher: Any) -> ScalperEngine:
 class TestEngineMarketGate:
     def _fetcher(self, now_ms: int = _DECISION_MS) -> _LeaderFetcher:
         return _LeaderFetcher(
-            {("BTCUSDT", "1d"): _LEADER_DAILY, ("BTCUSDT", "1m"): _LEADER_ENTRY},
+            {("BTCUSDT", "1d"): _LEADER_DAILY, ("BTCUSDT", "1m"): _LEADER_ENTRY,
+             ("BTCUSDT", "15m"): _LEADER_INTRADAY},
             now_ms,
         )
 
@@ -426,9 +454,12 @@ class TestEngineMarketGate:
         engine = _bare_engine(_engine_cfg(), fetcher)
         for _ in range(5):
             await engine._market_gate_reason(Direction.LONG)
-        # 5 değerlendirme → yalnız 2 istek (1d + 1m), TTL içinde tazelenmez.
-        assert len(fetcher.calls) == 2
-        assert {c[1] for c in fetcher.calls} == {"1d", "1m"}
+        # 5 değerlendirme → yalnız 3 istek (1d + giriş TF + 15m), TTL içinde
+        # tazelenmez. Üçü de limit<=100 olduğu için toplam ağırlık 3/dakika.
+        assert len(fetcher.calls) == 3
+        assert {c[1] for c in fetcher.calls} == {"1d", "1m", "15m"}
+        intraday_call = [c for c in fetcher.calls if c[1] == MARKET_GATE_INTRADAY_TF][0]
+        assert intraday_call[2] <= 100  # Binance ağırlık 1 sınırı
 
     async def test_daily_limit_is_run_days_plus_two(self):
         """N günlük koşu N+1 TAMAMLANMIŞ kapanış ister; oluşmakta olan günlük
@@ -441,7 +472,10 @@ class TestEngineMarketGate:
         snapshot = engine._market_gate_cache["BTCUSDT"][0]
         # Bugünün kapanmamış mumu ATILDI → 4 tamamlanmış kapanış.
         assert snapshot["daily_closes"] == _LEADER_DAILY_CLOSES
-        assert snapshot["day_open"] == 120.0        # dünkü kapanış
+        # Gün açılışı GERÇEK 00:00 UTC 15m open'ından (121.0) gelir — önceki
+        # günlük kapanış vekilinden (120.0) DEĞİL.
+        assert snapshot["day_open"] == _LEADER_TRUE_DAY_OPEN
+        assert snapshot["day_open_source"] == DAY_OPEN_SOURCE_INTRADAY
         assert snapshot["last_close"] == 118.0      # son kapanan 1m mum
 
     async def test_fetch_failure_is_fail_open_with_warning(self):
@@ -463,7 +497,9 @@ class TestEngineMarketGate:
 
     async def test_short_leader_series_is_fail_open_with_warning(self):
         fetcher = _LeaderFetcher(
-            {("BTCUSDT", "1d"): [], ("BTCUSDT", "1m"): _LEADER_ENTRY}, _DECISION_MS
+            {("BTCUSDT", "1d"): [], ("BTCUSDT", "1m"): _LEADER_ENTRY,
+             ("BTCUSDT", "15m"): []},
+            _DECISION_MS,
         )
         engine = _bare_engine(_engine_cfg(), fetcher)
         warnings: List[str] = []
@@ -480,7 +516,8 @@ class TestEngineMarketGate:
         # Kapı kapalıyken bile durum sözlüğü ŞEKLİ sabittir.
         empty = engine._market_gate_status()
         assert set(empty) == {
-            "enabled", "leader", "day_drift_pct", "run_pct", "last_reason", "rejects",
+            "enabled", "leader", "day_drift_pct", "day_open_source", "run_pct",
+            "last_reason", "rejects",
         }
         assert empty["enabled"] is True
         assert empty["leader"] == "BTCUSDT"
@@ -494,7 +531,9 @@ class TestEngineMarketGate:
         status = engine._market_gate_status()
         assert status["rejects"] == {REASON_DAY: 1, REASON_RUN: 1}
         assert status["last_reason"] is None               # son değerlendirme serbest
-        assert status["day_drift_pct"] == pytest.approx(-1.6666666, abs=1e-4)
+        # 118 / 121 − 1 = −%2.479 (gerçek açılışa göre; vekil olsaydı −%1.667)
+        assert status["day_drift_pct"] == pytest.approx(-2.4793388, abs=1e-4)
+        assert status["day_open_source"] == DAY_OPEN_SOURCE_INTRADAY
         assert status["run_pct"] == pytest.approx(20.0)
 
     async def test_leader_symbol_is_normalised_and_defaults(self):
@@ -579,7 +618,7 @@ class _EvalFetcher(_LeaderFetcher):
     async def get_klines(self, symbol, interval, limit=200, end_time=None):
         if (symbol, interval) not in self.series:
             # İşlem sembolü — sinyal üretimi için yeterli, kapı için önemsiz.
-            return _minute_candles([100.0] * 5, _LEADER_TODAY_START)
+            return _minute_candles([100.0] * 5, _ENTRY_START)
         return await super().get_klines(symbol, interval, limit, end_time)
 
 
@@ -588,7 +627,8 @@ class TestMarketGateInEvaluateSymbol:
         symbol_reservations.clear()
         try:
             fetcher = _EvalFetcher(
-                {("BTCUSDT", "1d"): _LEADER_DAILY, ("BTCUSDT", "1m"): _LEADER_ENTRY},
+                {("BTCUSDT", "1d"): _LEADER_DAILY, ("BTCUSDT", "1m"): _LEADER_ENTRY,
+             ("BTCUSDT", "15m"): _LEADER_INTRADAY},
                 _DECISION_MS,
             )
             engine = _bare_engine(_EvalCfg(), fetcher)
@@ -627,7 +667,8 @@ class TestMarketGateInEvaluateSymbol:
 class TestLeaderSeries:
     def test_inputs_at_decision_time(self):
         day_open, last_close, closes = _leader_series().inputs_at(_DECISION_MS)
-        assert day_open == 120.0
+        # GERÇEK açılış (00:00 UTC 15m open), vekil (120.0) DEĞİL.
+        assert day_open == _LEADER_TRUE_DAY_OPEN
         assert last_close == 118.0
         assert closes == _LEADER_DAILY_CLOSES
 
@@ -692,7 +733,7 @@ class _SimCfg:
 
 def _traded_symbol_candles() -> List[Candle]:
     """İşlem sembolünün mumları — kapanış ZAMANLARI lider ile hizalı."""
-    return _minute_candles([100.0] * len(_LEADER_ENTRY), _LEADER_TODAY_START)
+    return _minute_candles([100.0] * len(_LEADER_ENTRY), _ENTRY_START)
 
 
 class TestHarnessMarketGate:
@@ -748,10 +789,8 @@ class TestEngineHarnessParity:
         birinde yapılan bir değişiklik diğerini de kapsar (CLAUDE.md #2)."""
         assert engine_module.evaluate_market_gate is market_gate_module.evaluate_market_gate
         assert backtest_module.evaluate_market_gate is market_gate_module.evaluate_market_gate
-        assert (
-            engine_module.day_open_from_daily_closes
-            is backtest_module.day_open_from_daily_closes
-        )
+        assert engine_module.resolve_day_open is market_gate_module.resolve_day_open
+        assert backtest_module.resolve_day_open is market_gate_module.resolve_day_open
 
     @staticmethod
     def _spy(monkeypatch, module) -> List[tuple]:
@@ -784,7 +823,8 @@ class TestEngineHarnessParity:
 
         # --- canlı motor -------------------------------------------------
         fetcher = _LeaderFetcher(
-            {("BTCUSDT", "1d"): _LEADER_DAILY, ("BTCUSDT", "1m"): _LEADER_ENTRY},
+            {("BTCUSDT", "1d"): _LEADER_DAILY, ("BTCUSDT", "1m"): _LEADER_ENTRY,
+             ("BTCUSDT", "15m"): _LEADER_INTRADAY},
             _DECISION_MS,
         )
         engine = _bare_engine(_engine_cfg(scalper_market_gate_run_pct=0.0), fetcher)
@@ -804,6 +844,9 @@ class TestEngineHarnessParity:
             entry_closes=[_LEADER_ENTRY[-1].close],
             daily_close_times=[c.close_time for c in _LEADER_DAILY],
             daily_closes=[c.close for c in _LEADER_DAILY],
+            intraday_open_times=[c.open_time for c in _LEADER_INTRADAY],
+            intraday_opens=[c.open for c in _LEADER_INTRADAY],
+            intraday_close_times=[c.close_time for c in _LEADER_INTRADAY],
         )
 
         class _OnlyAtDecision:
@@ -931,3 +974,144 @@ class TestMarketGateStartupBanner:
         engine, warnings = self._engine(SimpleNamespace())
         engine._maybe_log_market_gate_banner()
         assert warnings == []
+
+
+# ==========================================================================
+# Ek 3) Gün açılışı türetmesi — GERÇEK 00:00 UTC açılışı ve yedeği
+# ==========================================================================
+
+class TestUtcDayStart:
+    def test_floors_to_utc_midnight(self):
+        assert utc_day_start_ms(4 * _DAY_MS) == 4 * _DAY_MS
+        assert utc_day_start_ms(4 * _DAY_MS + 1) == 4 * _DAY_MS
+        assert utc_day_start_ms(5 * _DAY_MS - 1) == 4 * _DAY_MS
+
+
+class TestDayOpenFromIntraday:
+    """E8'in bulgusu (bağımsız doğrulandı: BTCUSDT mainnet+testnet, 76 gün
+    sınırı, 0 uyuşmazlık, maks fark %0.00000000): `1d` mumunun open'ı, o günün
+    00:00 UTC 15m mumunun open'ına BİREBİR eşittir. Böylece canlı motor
+    `_drop_unclosed`'a hiç dokunmadan gerçek gün açılışını okuyabiliyor."""
+
+    @staticmethod
+    def _series():
+        return (
+            [c.open_time for c in _LEADER_INTRADAY],
+            [c.open for c in _LEADER_INTRADAY],
+            [c.close_time for c in _LEADER_INTRADAY],
+        )
+
+    def test_returns_open_of_midnight_candle(self):
+        ot, op, ct = self._series()
+        assert day_open_from_intraday(ot, op, ct, _DECISION_MS) == _LEADER_TRUE_DAY_OPEN
+
+    def test_none_before_midnight_candle_closes(self):
+        """Günün ilk 15 dakikasında o mum HENÜZ KAPANMAMIŞTIR → None
+        (look-ahead yasak; canlıda `_drop_unclosed` ile aynı sonuç)."""
+        ot, op, ct = self._series()
+        just_after_midnight = _LEADER_TODAY_START + 60_000  # 00:01 UTC
+        assert day_open_from_intraday(ot, op, ct, just_after_midnight) is None
+
+    def test_available_exactly_when_midnight_candle_closes(self):
+        ot, op, ct = self._series()
+        close_ms = _LEADER_INTRADAY[0].close_time
+        assert day_open_from_intraday(ot, op, ct, close_ms) == _LEADER_TRUE_DAY_OPEN
+        assert day_open_from_intraday(ot, op, ct, close_ms - 1) is None
+
+    def test_none_when_day_has_no_midnight_candle(self):
+        ot, op, ct = self._series()
+        assert day_open_from_intraday(ot, op, ct, _DECISION_MS + _DAY_MS) is None
+
+    @pytest.mark.parametrize("bad", [0.0, -1.0, float("nan")])
+    def test_invalid_open_falls_through(self, bad):
+        ot, op, ct = self._series()
+        op = list(op)
+        op[0] = bad
+        assert day_open_from_intraday(ot, op, ct, _DECISION_MS) is None
+
+    def test_empty_series_returns_none(self):
+        assert day_open_from_intraday([], [], [], _DECISION_MS) is None
+
+
+class TestResolveDayOpen:
+    @staticmethod
+    def _series():
+        return (
+            [c.open_time for c in _LEADER_INTRADAY],
+            [c.open for c in _LEADER_INTRADAY],
+            [c.close_time for c in _LEADER_INTRADAY],
+        )
+
+    def test_prefers_true_open(self):
+        ot, op, ct = self._series()
+        value, source = resolve_day_open(ot, op, ct, _LEADER_DAILY_CLOSES, _DECISION_MS)
+        assert value == _LEADER_TRUE_DAY_OPEN
+        assert source == DAY_OPEN_SOURCE_INTRADAY
+
+    def test_falls_back_within_first_15_minutes(self):
+        ot, op, ct = self._series()
+        value, source = resolve_day_open(
+            ot, op, ct, _LEADER_DAILY_CLOSES, _LEADER_TODAY_START + 60_000
+        )
+        assert value == _LEADER_DAILY_CLOSES[-1]      # 120.0 = önceki kapanış
+        assert source == DAY_OPEN_SOURCE_PREV_CLOSE
+
+    def test_falls_back_when_intraday_series_missing(self):
+        """Eski çağrıcılar / 15m çekimi boş dönerse davranış GERİYE UYUMLU."""
+        value, source = resolve_day_open(
+            None, None, None, _LEADER_DAILY_CLOSES, _DECISION_MS
+        )
+        assert value == _LEADER_DAILY_CLOSES[-1]
+        assert source == DAY_OPEN_SOURCE_PREV_CLOSE
+
+    def test_returns_none_when_both_paths_empty(self):
+        value, source = resolve_day_open([], [], [], [], _DECISION_MS)
+        assert value is None
+        assert source == DAY_OPEN_SOURCE_PREV_CLOSE
+
+
+class TestDayOpenSourceParity:
+    """Motor ve harness AYNI kesim anında AYNI gün-açılışını ve AYNI kaynağı
+    üretmeli — gerçek açılış yolunda da, yedek yolunda da."""
+
+    async def test_engine_and_harness_agree_on_true_open(self):
+        fetcher = _LeaderFetcher(
+            {("BTCUSDT", "1d"): _LEADER_DAILY, ("BTCUSDT", "1m"): _LEADER_ENTRY,
+             ("BTCUSDT", "15m"): _LEADER_INTRADAY},
+            _DECISION_MS,
+        )
+        engine = _bare_engine(_engine_cfg(), fetcher)
+        snapshot = await engine._leader_market_snapshot()
+        harness = _leader_series().inputs_at(_DECISION_MS)
+
+        assert snapshot["day_open"] == harness[0] == _LEADER_TRUE_DAY_OPEN
+        assert snapshot["last_close"] == harness[1]
+        assert snapshot["daily_closes"] == harness[2]
+        assert snapshot["day_open_source"] == DAY_OPEN_SOURCE_INTRADAY
+
+    async def test_engine_and_harness_agree_on_fallback(self):
+        """Günün ilk 15 dakikası: İKİ TARAF DA vekile düşer (aynı değer)."""
+        early = _LEADER_TODAY_START + 60_000
+        early_entry = _minute_candles([118.0], _LEADER_TODAY_START)
+        fetcher = _LeaderFetcher(
+            {("BTCUSDT", "1d"): _LEADER_DAILY, ("BTCUSDT", "1m"): early_entry,
+             ("BTCUSDT", "15m"): _LEADER_INTRADAY},
+            early,
+        )
+        engine = _bare_engine(_engine_cfg(), fetcher)
+        snapshot = await engine._leader_market_snapshot()
+
+        harness_series = LeaderSeries(
+            symbol="BTCUSDT",
+            entry_close_times=[c.close_time for c in early_entry],
+            entry_closes=[c.close for c in early_entry],
+            daily_close_times=[c.close_time for c in _LEADER_DAILY],
+            daily_closes=[c.close for c in _LEADER_DAILY],
+            intraday_open_times=[c.open_time for c in _LEADER_INTRADAY],
+            intraday_opens=[c.open for c in _LEADER_INTRADAY],
+            intraday_close_times=[c.close_time for c in _LEADER_INTRADAY],
+        )
+        harness = harness_series.inputs_at(early_entry[-1].close_time)
+
+        assert snapshot["day_open"] == harness[0] == _LEADER_DAILY_CLOSES[-1]
+        assert snapshot["day_open_source"] == DAY_OPEN_SOURCE_PREV_CLOSE

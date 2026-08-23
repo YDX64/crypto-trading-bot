@@ -23,11 +23,10 @@ bakar ve tüm evrene aynı kararı uygular.
 **Parite (CLAUDE.md kural 2):** bu modülü hem canlı motor
 (`engine._market_gate_reason`) hem backtest harness'ı
 (`backtest.simulate_symbol`) çağırır. Girdi türetme de ortak: "gün açılışı"
-her iki tarafta da `day_open_from_daily_closes` ile SON TAMAMLANMIŞ GÜNLÜK
-KAPANIŞ'tan türetilir (bkz. o fonksiyonun docstring'i — canlıda oluşmakta
-olan günlük mum `KlineFetcher._drop_unclosed` tarafından zaten atıldığı
-için "bugünün open'ı" canlıda ELDE EDİLEMEZ; 7/24 açık bir piyasada
-önceki kapanış ile açılış aynı tik mertebesindedir).
+her iki tarafta da `resolve_day_open` ile bulunur — önce GERÇEK açılış
+(bugünün 00:00 UTC 15m mumunun `open`'ı; `1d` mumunun `open`'ına birebir
+eşittir, bkz. `day_open_from_intraday`), o elde edilemezse (günün ilk 15
+dakikası) son tamamlanmış günlük kapanış vekili.
 
 Veri eksikse kapı UYGULANMAZ (fail-open): lider verisinin gelmemesi bir
 risk OLAYI değildir; giriş hattı mevcut davranışını korur ve çağıran katman
@@ -36,12 +35,26 @@ WARNING loglar (spec §C: "fail-closed DEĞİL").
 
 from __future__ import annotations
 
+import bisect
 import math
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 # missed_counter / log anahtarları — harness ve motor AYNI dizeleri kullanır.
 REASON_DAY = "market_gate_day"
 REASON_RUN = "market_gate_run"
+
+UTC_DAY_MS = 86_400_000
+
+# Gün açılışını türetmek için kullanılan gün-içi zaman dilimi. cfg'deki
+# giriş/bağlam/rejim dilimlerinden BAĞIMSIZ olarak sabittir: kural, mumun
+# 00:00 UTC'de BAŞLAMASIDIR ve 15m bunu her konfigürasyonda sağlar.
+# 96 mum = 24 saat; canlıda limit 100 (ağırlık 1) tüm günü kapsar.
+MARKET_GATE_INTRADAY_TF = "15m"
+MARKET_GATE_INTRADAY_LIMIT = 100
+
+# Gün açılışı kaynağı (teşhis/log) — hangi yoldan türetildiği.
+DAY_OPEN_SOURCE_INTRADAY = "intraday_open"      # tam isabetli (00:00 UTC mumu)
+DAY_OPEN_SOURCE_PREV_CLOSE = "prev_daily_close"  # yedek (00:00-00:15 penceresi)
 
 
 def _as_float(value: Any) -> Optional[float]:
@@ -98,6 +111,75 @@ def day_open_from_daily_closes(daily_closes: Optional[Sequence[float]]) -> Optio
     if last is None or last <= 0.0:
         return None
     return last
+
+
+def utc_day_start_ms(timestamp_ms: int) -> int:
+    """`timestamp_ms`'in ait olduğu UTC gününün 00:00:00'ı (epoch ms).
+
+    Binance günlük mumları UTC gün sınırına hizalıdır, bu yüzden basit
+    tamsayı bölmesi doğru sonucu verir (yerel saat/DST YOK).
+    """
+    return (int(timestamp_ms) // UTC_DAY_MS) * UTC_DAY_MS
+
+
+def day_open_from_intraday(
+    open_times: Sequence[int],
+    opens: Sequence[float],
+    close_times: Sequence[int],
+    cutoff_ms: int,
+) -> Optional[float]:
+    """Bugünün 00:00 UTC 15m mumunun `open`'ı — GERÇEK gün açılışı.
+
+    Neden bu işe yarıyor: bir mumun `open`'ı aralığın İLK işlem fiyatıdır;
+    `1d` mumu [00:00, 24:00) ile `15m` mumu [00:00, 00:15) AYNI ilk işlemi
+    paylaşır. Ölçüldü (BTCUSDT, mainnet + testnet, 76 gün sınırı):
+    **76 birebir eşleşme, 0 uyuşmazlık, maks fark %0.00000000.**
+
+    Böylece canlı motor, `_drop_unclosed`'a HİÇ dokunmadan (o 15m mumu
+    çoktan kapanmıştır) gerçek gün açılışını okuyabilir — oluşmakta olan
+    GÜNLÜK mumu görmesi gerekmez.
+
+    Look-ahead YOK: yalnız `close_time <= cutoff_ms` olan mum kabul edilir.
+    Mum henüz kapanmamışsa (00:00-00:15 UTC penceresi) None döner ve çağıran
+    taraf `day_open_from_daily_closes` yedeğine düşer.
+    """
+    if not open_times:
+        return None
+    day_start = utc_day_start_ms(cutoff_ms)
+    idx = bisect.bisect_left(open_times, day_start)
+    if idx >= len(open_times) or open_times[idx] != day_start:
+        return None
+    if idx >= len(close_times) or close_times[idx] > cutoff_ms:
+        return None  # mum henüz kapanmadı → yedeğe düş
+    value = _as_float(opens[idx]) if idx < len(opens) else None
+    if value is None or value <= 0.0:
+        return None
+    return value
+
+
+def resolve_day_open(
+    intraday_open_times: Optional[Sequence[int]],
+    intraday_opens: Optional[Sequence[float]],
+    intraday_close_times: Optional[Sequence[int]],
+    daily_closes: Optional[Sequence[float]],
+    cutoff_ms: int,
+) -> Tuple[Optional[float], str]:
+    """(gün_açılışı, kaynak) — motor ve harness'ın ORTAK türetme kuralı.
+
+    Önce gerçek 00:00 UTC açılışı denenir; elde edilemezse (günün ilk 15
+    dakikası, ya da seri eksik) son tamamlanmış günlük kapanış vekiline
+    düşülür. Yedeğin hatası ÖLÇÜLDÜ: mainnet %0.0001 mertebesi, testnet
+    medyan %0.0002 / p95 %0.106 / maks %0.152 — %1.3'lük eşik yanında
+    yalnız birkaç spesifik günde ve yalnız 15 dakikalık pencerede anlamlı.
+    """
+    if intraday_open_times is not None and intraday_opens is not None \
+            and intraday_close_times is not None:
+        value = day_open_from_intraday(
+            intraday_open_times, intraday_opens, intraday_close_times, cutoff_ms
+        )
+        if value is not None:
+            return value, DAY_OPEN_SOURCE_INTRADAY
+    return day_open_from_daily_closes(daily_closes), DAY_OPEN_SOURCE_PREV_CLOSE
 
 
 def evaluate_market_gate(
