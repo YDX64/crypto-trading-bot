@@ -201,6 +201,10 @@ takipçi `/follower/event` (secret `X-Follower-Secret` başlığında) → `Foll
 - Kalibrasyon: `tail state/follower_levels.jsonl` — AlgoPro seviyeleri ile k×ATR
   kuralının sapması (`sl_distance_deviation_pct`).
 
+⚠️ **Dashboard uyarısı:** `static/dashboard.html` scalper halkası için yazılmıştır;
+takipçi portunda (`ssh -L 9093:127.0.0.1:9093 awa`) açılırsa `/scalper/*` uçları BOŞ
+görünür (motor yok — bu bir arıza DEĞİL). Takipçinin durumu `/follower/status`tadır.
+
 **Arıza/durdurma:**
 - Girişleri durdur / her şeyi kapat: `POST http://127.0.0.1:9093/risk-event`
   (D10 ile AYNI sözleşme, `RISK_EVENT_SECRET` takipçinin kendi `.env`'inden).
