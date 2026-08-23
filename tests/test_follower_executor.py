@@ -103,6 +103,7 @@ class _FakePm:
     def __init__(self, sl_ok=True):
         self.sl_ok = sl_ok
         self.calls: list = []
+        self.sl_kwargs: dict = {}
 
     async def resolve_fill(self, symbol, entry_order):
         self.calls.append("resolve_fill")
@@ -110,6 +111,7 @@ class _FakePm:
 
     async def place_stop_loss_or_close(self, **kwargs):
         self.calls.append("place_stop_loss_or_close")
+        self.sl_kwargs = dict(kwargs)
         if not self.sl_ok:
             return None
         return {"algoId": 500, "effectiveStopPrice": kwargs["stop_price"]}
@@ -202,6 +204,35 @@ class TestHappyPath:
             equity_usdt=1000.0,
         )
         assert "set_leverage:100" in client.calls
+
+    async def test_reanchor_budget_bounded_by_liquidation_guard(self):
+        """-2021 sonrası yeniden çapalama bütçesi 100x'te %5 OLAMAZ.
+
+        `FOLLOWER_MAX_SL_PCT` (%5) tek başına kullanılırsa 100x'te stop marjın
+        5 katı uzağa taşınabilirdi (likidasyonun ötesi). Bütçe likidasyon
+        kapısıyla tutarlı kırpılır: LIQ_GUARD / kaldıraç = 50/100 = %0.5.
+        """
+        executor, client, pm, tracker = _make_executor()
+        await executor.open_position(
+            event=parse_follower_event(SELL_ENTRY),
+            levels=_levels(),
+            equity_usdt=1000.0,
+        )
+        assert pm.sl_kwargs["max_distance_pct"] == pytest.approx(0.5)
+        assert pm.sl_kwargs["reference_price"] == pytest.approx(77126.08)
+
+    async def test_reanchor_budget_uses_band_when_leverage_low(self):
+        """Düşük kaldıraçta bağlayıcı sınır FOLLOWER_MAX_SL_PCT'tir."""
+        cfg = _cfg(follower_lev_max=5, follower_max_sl_pct=3.0)
+        executor, client, pm, tracker = _make_executor(cfg)
+        levels = _levels(cfg)
+        await executor.open_position(
+            event=parse_follower_event(SELL_ENTRY),
+            levels=levels,
+            equity_usdt=1000.0,
+        )
+        # 50/5 = %10 > %3 → bant kazanır.
+        assert pm.sl_kwargs["max_distance_pct"] == pytest.approx(3.0)
 
     async def test_exit_plan_holds_three_targets(self):
         executor, client, pm, tracker = _make_executor()

@@ -140,7 +140,7 @@ def _fake_position(symbol="BTCUSDT", direction=Direction.SHORT, qty=0.12):
     )
 
 
-def _make_engine(tmp_path, cfg=None, *, positions=None, position_amt=0.12):
+def _make_engine(tmp_path, cfg=None, *, positions=None, position_amt=0.0):
     engine = object.__new__(FollowerEngine)
     # Kapanış doğrulama merdiveni testte GERÇEK uyku yapmasın.
     engine._CLOSE_VERIFY_DELAYS = (0.0, 0.0)
@@ -292,6 +292,27 @@ class TestGates:
         assert "bant dışı" in result["reason"]
 
 
+class TestExchangeTruthGate:
+    """Borsa gerçeği son kapıdır: izlenmeyen ama AÇIK pozisyon üstüne girilmez."""
+
+    async def test_untracked_live_position_blocks_entry(self, tmp_path):
+        engine = _make_engine(tmp_path, position_amt=-0.05)
+        result = await engine.handle_event(parse_follower_event(SELL_ENTRY))
+        assert result["accepted"] is False
+        assert "izlenmeyen açık pozisyon" in result["reason"]
+        engine.executor.open_position.assert_not_called()
+
+    async def test_position_read_failure_is_fail_closed(self, tmp_path):
+        engine = _make_engine(tmp_path)
+        engine.client.get_position_risk = AsyncMock(
+            side_effect=RuntimeError("ağ hatası")
+        )
+        result = await engine.handle_event(parse_follower_event(SELL_ENTRY))
+        assert result["accepted"] is False
+        assert "doğrulanamadı" in result["reason"]
+        engine.executor.open_position.assert_not_called()
+
+
 class TestEntryFlow:
     async def test_entry_opens_and_tracks(self, tmp_path):
         engine = _make_engine(tmp_path)
@@ -341,8 +362,14 @@ class TestFlip:
     async def test_reverse_signal_closes_and_reopens(self, tmp_path):
         existing = _fake_position(direction=Direction.SHORT)
         engine = _make_engine(tmp_path, positions={"BTCUSDT": existing})
+        # 1) flip kapanışı için canlı miktar, 2) kapanış doğrulaması,
+        # 3) yeni girişten önceki "izlenmeyen pozisyon" kapısı.
         engine.client.get_position_risk = AsyncMock(
-            side_effect=[{"positionAmt": -0.12}, {"positionAmt": 0.0}]
+            side_effect=[
+                {"positionAmt": -0.12},
+                {"positionAmt": 0.0},
+                {"positionAmt": 0.0},
+            ]
         )
         engine.executor.open_position = AsyncMock(
             return_value=_fake_position(direction=Direction.LONG)

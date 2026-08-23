@@ -286,15 +286,27 @@ class FollowerExecutor:
         levels = plan.levels
 
         # --- SL: kurulamazsa pm pozisyonu ZATEN acil kapattı ---
+        # `max_distance_pct` = -2021 ("emir anında tetiklenir") sonrası yeniden
+        # çapalama RİSK BÜTÇESİDİR; aşılırsa pm pozisyonu kapatır. Burada
+        # FOLLOWER_MAX_SL_PCT (vars. %5) TEK BAŞINA KULLANILAMAZ: 100x'te %5
+        # fiyat mesafesi marjın 5 katıdır — likidasyonun çok ötesi. Bütçe bu
+        # yüzden likidasyon kapısıyla (lev × sl_pct ≤ LIQ_GUARD) TUTARLI
+        # kırpılır: azami mesafe = LIQ_GUARD / kaldıraç (100x'te %0.5).
+        liq_guard_pct = float(
+            getattr(self.cfg, "follower_lev_liq_guard_pct", 50.0) or 50.0
+        )
+        band_pct = float(getattr(self.cfg, "follower_max_sl_pct", 0.0) or 0.0)
+        budget_candidates = [
+            value
+            for value in (band_pct, liq_guard_pct / max(1, plan.leverage))
+            if value > 0
+        ]
         sl_order = await self.pm.place_stop_loss_or_close(
             symbol=symbol,
             sl_side=sl_side,
             stop_price=levels.stop,
             reference_price=entry_price,
-            max_distance_pct=float(
-                getattr(self.cfg, "follower_max_sl_pct", 0.0) or 0.0
-            )
-            or None,
+            max_distance_pct=min(budget_candidates) if budget_candidates else None,
         )
         if sl_order is None:
             self.logger.error(

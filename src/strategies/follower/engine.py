@@ -625,6 +625,34 @@ class FollowerEngine:
                     "reason": f"kapasite dolu ({len(tracked)}/{max_positions})",
                 }
 
+            # Borsa gerçeği son kapıdır: izlenmeyen ama AÇIK bir pozisyon
+            # (ör. record_open DB hatası, elle açılmış pozisyon) üstüne ikinci
+            # bir giriş yapmak pozisyonu İKİYE KATLAR. Scalper'ın
+            # `_evaluate_symbol`'daki `live_symbols` kapısının eşleniği;
+            # okuma başarısızsa fail-closed.
+            try:
+                live_info = await self.client.get_position_risk(
+                    symbol, force_fresh=True
+                )
+                live_amt = (
+                    abs(float(live_info.get("positionAmt", 0) or 0))
+                    if live_info
+                    else 0.0
+                )
+            except Exception as exc:
+                self._count_reject("position_check")
+                return {
+                    "accepted": False,
+                    "reason": f"borsa pozisyonu doğrulanamadı ({exc})",
+                }
+            if live_amt != 0:
+                self._count_reject("live_position")
+                return {
+                    "accepted": False,
+                    "reason": f"borsada izlenmeyen açık pozisyon var ({live_amt}) — "
+                    f"giriş yapılmadı",
+                }
+
             entry_price = event.price
             if entry_price is None or entry_price <= 0:
                 try:
