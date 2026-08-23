@@ -210,6 +210,8 @@ takipçi `/follower/event` (secret `X-Follower-Secret` başlığında) → `Foll
 - Takipçi giriş kilidi: `state/follower_entry_halt.json` (fail-closed, `scalper_entry_halt`
   ile KARIŞTIRMA). Açmak = nedeni anla → dosyayı `.cleared-<tarih>` yap → restart.
 - Deploy ön koşulu: bu dosya varken `scripts/deploy.sh awa --ring follower` REDDEDİLİR.
+- İki halkanın `.env` farkını (secret DEĞERLERİ maskeli) görmek için:
+  `MAIN_ENV=/opt/tradingbot-ap/.env scripts/ring_env_diff.sh awa`
 
 ## Arızalar
 **Binance 418 / ban:** `logs/bot.log`'da `HTTP 418|banned|devre kesici`. Ban aktifken restart

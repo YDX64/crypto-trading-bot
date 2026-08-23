@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Salt okunur: testnet ve mainnet halkalarının .env'i arasında SCALPER_*/TV_*/RISK_*
+# Salt okunur: iki halkanın .env'i arasında SCALPER_*/TV_*/RISK_*/FOLLOWER_*/BOT_MODE
 # anahtarlarının hangilerinin FARKLI olduğunu gösterir. Hiçbir şeyi değiştirmez.
 # Secret benzeri anahtarların (adında SECRET/KEY/TOKEN/PASS geçen) DEĞERİNİ asla yazdırmaz —
 # yalnız "değişti" (***) der; değer içermeyen anahtarlar olduğu gibi gösterilir.
 # Kullanım: scripts/ring_env_diff.sh [ssh-host]
 #   scripts/ring_env_diff.sh awa
 #   V2_ENV=/opt/tradingbot-v2/.env MAIN_ENV=/opt/tradingbot-main/.env scripts/ring_env_diff.sh awa
+#   MAIN_ENV=/opt/tradingbot-ap/.env scripts/ring_env_diff.sh awa   # AlgoPro takipçi halkası (D20)
 set -euo pipefail
 
 HOST="${1:-awa}"
@@ -27,7 +28,7 @@ mask_or_value() {
 [ -f "$v2" ] || { echo "yok: $v2" >&2; exit 1; }
 [ -f "$main" ] || { echo "yok: $main" >&2; exit 1; }
 
-keys="$(grep -hE '^(SCALPER_|TV_|RISK_)[A-Za-z0-9_]*=' "$v2" "$main" | cut -d= -f1 | sort -u)" || true
+keys="$(grep -hE '^(SCALPER_|TV_|RISK_|FOLLOWER_|BOT_MODE)[A-Za-z0-9_]*=' "$v2" "$main" | cut -d= -f1 | sort -u)" || true
 
 diffcount=0
 for k in $keys; do
@@ -42,7 +43,7 @@ for k in $keys; do
 done
 
 if [ "$diffcount" -eq 0 ]; then
-  echo "fark yok (SCALPER_/TV_/RISK_ anahtarları özdeş)"
+  echo "fark yok (SCALPER_/TV_/RISK_/FOLLOWER_/BOT_MODE anahtarları özdeş)"
 fi
 exit 0
 REMOTE
