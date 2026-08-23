@@ -95,42 +95,101 @@ sinyal fiyatından değil GERÇEK dolumdan hesaplanır ve `_delay_adjusted_stop`
 MESAFESİNİ korur. **Chandelier trailing** tek istisnaydı: mumlardan MUTLAK bir
 seviye üretip doğrudan emre çeviriyordu — ayrı host'ta bu, yabancı bir defterin
 fiyatını borsaya stop olarak göndermek demekti (baz farkı `k×ATR`'yi aşarsa
-Binance -2021 → `position_manager` pozisyonu ACİL KAPATIR). `exits.
-_to_trading_price_space` bu seviyeyi girişte ölçülen fark kadar öteler (aynı
-host'ta no-op) — mesafe korunur. Böylece ayrı host YALNIZ gösterge girdisidir
-(RSI/BB/diverjans/rejim/ATR); iki borsa arasındaki küçük fiyat farkı (E8.0:
-medyan %0.054) boyutlamayı ya da koruma seviyelerini kaydırmaz.
+Binance -2021 → `position_manager` pozisyonu ACİL KAPATIR).
 
-**Kesinti davranışı:** host geneli bir hata (`MarketDataUnavailable`) tarama
-turunu tek WARNING ile keser (`_scan_tick`), safety turunda trailing'i tur
-başına tek satırla atlar (`exits.step`) ve `/tv-signal`'i 500 yerine yapısal
-ret'e çevirir (`external_signal`). TEK SEMBOLE ait kalıcı 4xx (ör. `-1121
-Invalid symbol`) ise `MarketDataRequestError`'dır: tekrar denenmez ve turu
-kesmez, yalnız o sembol atlanır. Harness (`backtest.py`) guard'ı `batch`
-modunda kullanır — bütçe dolarsa koşu ölmez, pencere sonuna kadar bekler.
+İki katmanlı kalkan (`exits._update_trailing`, yalnız ayrı host'ta; aynı host'ta
+ikisi de NO-OP → canlı davranış birebir korunur):
+
+1. **Dinamik baz çevirisi** (`_to_trading_price_space`). Her çıkış turunda
+   `baz = işlem_host_güncel_fiyat − veri_host_son_kapanış`; chandelier seviyesi
+   `+ baz` ile işlem uzayına taşınır, MESAFE (birim risk) korunur. İki referans
+   da AYNI turda okunur: `sp.position.current_price` `_step_one`'da işlem
+   host'undan tazelenir, `candles[-1].close` chandelier'ı besleyen serinin son
+   KAPANMIŞ mumudur. Baz ölçülemezse (işlem fiyatı bayat/eksik, |baz| > %2)
+   çeviri `None` döner ve **tur atlanır** — yabancı uzaydan emir gönderilmez.
+   *Neden dinamik:* ilk sürüm bazı yalnız GİRİŞ anında ölçüyordu
+   (`position.entry_price − signal.entry_price`) ve pozisyon ömrü boyunca sabit
+   uyguluyordu; ayrıca `recover()` iki fiyatı da `trade.entry_price`'tan
+   kurduğu için restart sonrası baz 0 çıkıp düzeltme sessizce no-op oluyordu
+   (DB'de sinyal-anı fiyatı kolonu yok). Dinamik baz her turda yeniden
+   ölçüldüğü için restart'ta ek alan/migrasyon gerektirmez.
+2. **Koruma-tarafı kapısı** (`_is_protective_side`). Çeviriden ve BE tabanından
+   (`floor`, işlem uzayındadır) sonra: LONG stop güncel fiyatın `%0.05` altında,
+   SHORT stop üstünde olmalıdır. Değilse emir **hiç gönderilmez** (eski SL
+   yerinde kalır, oran-sınırlı WARNING + `trailing_skips` sayacı). Gönderilseydi
+   Binance -2021 verir ve `position_manager._replace_stop_loss` bunu bir çıkış
+   kararı sayıp pozisyonu PİYASA emriyle kapatırdı.
+
+`_delay_adjusted_stop` ile **desen** aynıdır (mutlak seviyeyi ötele, mesafeyi
+koru) ama referansları farklıdır ve olmalıdır: oradaki öteleme TEK SEFERLİK bir
+gecikme telafisidir (sinyal anı → gerçek dolum, aynı host) ve koruma tarafını
+GİRİŞ fiyatına göre denetler; buradaki SÜREKLİ bir borsa-arası baz çevirisidir
+ve koruma tarafını GÜNCEL fiyata göre denetler.
+
+Böylece ayrı host YALNIZ gösterge girdisidir (RSI/BB/diverjans/rejim/ATR); iki
+borsa arasındaki küçük fiyat farkı (E8.0: medyan %0.054) boyutlamayı ya da
+koruma seviyelerini kaydırmaz.
+
+**Kesinti davranışı — hata KAPSAMI belirleyicidir:**
+
+| Yanıt | Tip | Kapsam | Tekrar | Kesici |
+|---|---|---|---|---|
+| 418 / `-1003` / "banned until" | `MarketDataBanError` | host | yok | **hard ban** 180 sn (deploy kilidi kapanır) |
+| 429 (tek başına) | `MarketDataBanError` | host | yok | soft: `Retry-After` → ağırlık başlığı → 30 sn (deploy kilidi kapanmaz) |
+| 401 / 403 / 451 / diğer 4xx | `MarketDataHostError` | host | yok | soft: `Retry-After` → 60 sn |
+| 400 / 404 (`-1121 Invalid symbol`) | `MarketDataRequestError` | **sembol** | yok | yok |
+| 5xx / ağ | (3 deneme) → `MarketDataHostError` | host | 3× | yok |
+
+Host geneli tipler `MarketDataUnavailable` alt sınıfıdır: tarama turunu tek
+WARNING ile keser (`_scan_tick` → `scan_status=degraded:market_data`), safety
+turunda trailing'i tur başına tek satırla atlar (`exits.step`) ve
+`/tv-signal`'i 500 yerine yapısal ret'e çevirir (`external_signal`). SEMBOL
+kapsamlı tip turu KESMEZ (yalnız o sembol atlanır) ama `/tv-signal`'de yine
+yapısal ret üretir. Harness (`backtest.py`) guard'ı `batch` modunda kullanır —
+bütçe dolarsa koşu ölmez, en eski ağırlık girdisi pencereden düşene kadar
+bekler (canlıdan daha gevşek bütçe/aralık; ban koruması aynen sürer).
+
+**Kesilen tur "başarılı" DEĞİLDİR:** `_scan_success_count` artmaz,
+`last_scan_at` tazelenmez, önceki hata serisi silinmez; `/scalper/status` →
+`scan_status` = `"degraded:market_data"` + `scan_degraded_count`/`_reason`/
+`_at`. Freshness alanları (`_scan_last_success_monotonic`) BİLİNÇLİ tazelenir:
+ban sırasında "unhealthy" göstermek watchdog restart'ını davet eder, ki bu
+2026-08-14 felaket yoludur.
 
 Teşhis: `GET /scalper/status` →
 `market_data_base_url` / `trading_base_url` / `kline_source`
-("trading_host"|"separate"); başlangıçta tek satır `📡 Kline kaynağı: <host>`.
+("trading_host"|"separate"), `market_data_guard` (host/banned/**hard_ban**/
+blocked_until/ağırlık), `scan_status`, `trailing_skips`; başlangıçta tek satır
+`📡 Kline kaynağı: <host>`.
 
 **Ağırlık hesabı** (Binance USDⓈ-M `/fapi/v1/klines` ağırlığı limit'e göre:
-<100→1, 100-499→2, 500-1000→5, >1000→10; IP bütçesi 2400/dk):
+<100→1, 100-499→2, 500-1000→5, >1000→10; IP bütçesi 2400/dk). Tablo **CANLI
+profile** göredir: `SCALPER_TF_ENTRY=1m`, `TF_CONTEXT=5m`, `TF_REGIME=15m`,
+tarama turu 30 sn, safety turu 2 sn. TTL'ler `data._TTL_BY_INTERVAL`
+(1m→5 sn, 5m→20 sn, 15m→60 sn, 4h→300 sn); TTL mum periyodunun ~%7-8'idir —
+`1m` girdisi D17 sonrası eklendi, yoksa varsayılan 60 sn'ye düşüp giriş dilimi
+TAM BİR MUM bayat kalıyordu.
 
 | Kaynak | İstek | TTL | İstek/dk | Ağırlık/dk |
 |---|---|---|---|---|
-| scan, giriş TF | `5m` limit 150 | 20 sn (< 30 sn tarama turu) | 2 × sembol | 4 × sembol |
+| scan, giriş TF | `1m` limit 150 | 5 sn (< 30 sn tur) | 2 × sembol | 4 × sembol |
+| scan, bağlam TF | `5m` limit 100 | 20 sn (< 30 sn tur) | 2 × sembol | 4 × sembol |
 | scan, rejim TF | `15m` limit 250 | 60 sn | 1 × sembol | 2 × sembol |
-| scan, bağlam TF | `15m` limit 100 | 60 sn | 1 × sembol | 2 × sembol |
-| exits trailing | `5m` limit 200 | 20 sn | 3 × açık poz. | 6 × açık poz. |
+| exits trailing | `1m` limit 200 | 5 sn (safety 2 sn → TTL bağlar) | 10 × açık poz. | 20 × açık poz. |
 
-8 sembollük allowlist + 3 açık pozisyon → **32 + 9 = 41 istek/dk ≈ 82 ağırlık/dk**;
-`SCALPER_TOP_N=12` ile 57 istek/dk ≈ **114 ağırlık/dk** (IP bütçesinin ~%5'i).
-⚠️ Bu bir HESAPTIR (TTL/tur aritmetiği), ölçüm değil: `X-MBX-USED-WEIGHT-1M`
-telemetrisi D17'de eklendi, gerçek okuma canlıda henüz yapılmadı (D17 terfi
-adımı (c)). Harness AYRI bir profildir: `limit=1500` sayfaları ağırlık 10 eder
-(8 sembol × 21 gün ≈ 472, × 30 gün ≈ 656) — bu yüzden `batch` modunda bekler.
+8 sembollük allowlist + 3 açık pozisyon → **40 + 30 = 70 istek/dk ≈ 140
+ağırlık/dk**; `SCALPER_TOP_N=12` ile 90 istek/dk ≈ **180 ağırlık/dk** (IP
+bütçesinin ~%7.5'i). Varsayılan (yavaş) profil 5m/15m/4h ise bunun yaklaşık
+yarısıdır. ⚠️ Bu bir HESAPTIR (TTL/tur aritmetiği), ölçüm değil:
+`X-MBX-USED-WEIGHT-1M` telemetrisi D17'de eklendi, gerçek okuma canlıda henüz
+yapılmadı (D17 terfi adımı (c)). Harness AYRI bir profildir: `limit=1500`
+sayfaları ağırlık 10 eder (8 sembol × 21 gün ≈ 472, × 30 gün ≈ 656) — bu yüzden
+`batch` modunda hem bekler hem de daha gevşek bir bütçe (1200/dk) ve aralık
+(0.05 sn) kullanır.
 `MarketDataGuard` bu yola host BAŞINA bir tavan koyar: asgari istek aralığı
-0.15 sn + kayan 60 sn'de 600 ağırlık bütçesi (ölçülenin ~7 katı — normal
+0.15 sn + KAYAN 60 sn'de 600 ağırlık bütçesi (deque; sabit sınırlı "tumbling"
+pencere değil — orada sınır anında sayaç sıfırlandığı için 60 sn'lik herhangi
+bir kayan aralığa bütçenin iki katı sığabiliyordu) (hesaplananın ~4 katı — normal
 işletmede bağlamaz; bağlarsa istek ATILMAZ ve BEKLENMEZ — `MarketDataBudgetError`
 yükselir, çağıran turu atlar. Bilinçli: kilit altında 60 sn beklemek safety
 turunun 30 sn'lik tazelik limitini aşıp watchdog restart'ı tetikleyebilirdi
@@ -167,7 +226,7 @@ satır 56-63). `?src=` yoksa kaynak, AlgoPro'nun varsayılan mesaj biçiminden
 | `src/core/rate_limiter.py` | Küresel Binance/OpenAI hız sınırlayıcı | `RateLimiter.wait_for_binance:49` (asyncio.Lock ile atomik slot rezervi) |
 | `src/strategies/scalper/engine.py` | Orkestrasyon: scan/safety/exchange döngüleri, kapılar, kill switch, risk-olayı kanalı | `ScalperEngine:100`, `_scan_tick:699`, `_evaluate_symbol:769`, rejim kapısı `815-834`, `_reap_aged_positions:602`, `_update_kill_switch:1343`, `external_signal:968`, `health_snapshot:1241`, `_risk_event_halt_snapshot`/`risk_event_halt`/`risk_event_resume`/`risk_event_flatten`/`risk_event_status` (risk-olayı bölümü, `_persist_entry_halt` sonrası) |
 | `src/strategies/scalper/setups.py` | Saf strateji mantığı (A/B/C/D/E), stop politikası, ortak kapılar | `StrategyC:431` (`evaluate:459`), `apply_stop_policy:87`, `passes_equilibrium:194`, `get_enabled:931` |
-| `src/strategies/scalper/data.py` | Public kline çekimi, TTL önbelleği, host başına oran/ağırlık/ban koruması (D17) | `KlineFetcher`, `MarketDataGuard`, `MarketDataBanError`, `klines_weight`, `host_of` |
+| `src/strategies/scalper/data.py` | Public kline çekimi, TTL önbelleği, host başına oran/kayan-ağırlık/ban koruması, hata kapsamı sınıflandırması (D17) | `KlineFetcher`, `MarketDataGuard`, `MarketDataBanError`, `MarketDataHostError`, `MarketDataRequestError`, `klines_weight`, `host_of`, `retry_after_seconds` |
 | `src/strategies/scalper/regime.py` | 4h/tf_regime rejim tespiti (EMA50/200) | `detect_regime:19` |
 | `src/strategies/scalper/executor.py` | Giriş boyutlama, risk kapıları, maker/taker giriş, SL/TP algo emirleri, cooldown | `try_open:678`, `_finalize_position:1263`, `_open_maker_entry_locked:1430`, `_set_cooldown:548`, `start_loss_cooldown:586` |
 | `src/strategies/scalper/exits.py` | TP1/TP2 doğrulama, BE, chandelier trailing, kapanış doğrulama | `ExitManager.step:133`, `_check_tp1:185`, `_check_tp2:232`, `_update_trailing:359`, `_handle_closed:428`, `_verified_close_ledger:525`, `recover:1095` |

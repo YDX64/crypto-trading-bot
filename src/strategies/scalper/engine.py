@@ -36,6 +36,7 @@ from src.core.logger import app_logger
 from src.strategies.scalper.data import (
     KlineFetcher,
     MarketDataGuard,
+    MarketDataRequestError,
     MarketDataUnavailable,
     host_of,
 )
@@ -118,6 +119,10 @@ class ScalperEngine:
     _VIRTUAL_EQUITY_CACHE_TTL = 30.0
     _EXCHANGE_PROBE_INTERVAL = 30.0
     _RESERVATION_OWNER = "scalper"
+    # Piyasa verisi kesintisi uyarısının azami sıklığı (sn). Tarama turu 30
+    # sn'de bir döner; uzun bir banda (180 sn+) her tur satır basmak logu
+    # doldurur ve gerçek olayları gizler.
+    _SCAN_DEGRADED_LOG_INTERVAL = 60.0
     # Risk-olayı halt dosyası _evaluate_symbol'ün sembol döngüsünde her
     # sinyal denemesinde okunabilir — kısa TTL disk I/O'yu boğmadan ~1sn
     # içinde halt/resume'u yansıtır (POST /risk-event canlı etkisi için
@@ -236,6 +241,17 @@ class ScalperEngine:
         self._scan_last_error_at: Optional[str] = None
         self._scan_consecutive_errors: int = 0
         self._scan_success_count: int = 0
+        # D17 (düşmanca inceleme): piyasa verisi kesintisiyle YARIDA KESİLEN
+        # bir tur "başarılı" DEĞİLDİR. Hata da değildir (fail-closed davranış,
+        # `_scan_tick` bilinçli olarak `break` eder) — bu yüzden ayrı sayaç +
+        # ayrı durum etiketiyle görünür kılınır. `_scan_last_success_monotonic`
+        # BİLİNÇLİ tazelenmeye devam eder: freshness'ı düşürmek watchdog
+        # restart'ını davet eder, ki bu 2026-08-14 felaket yoludur (ban
+        # ortasında restart → toplu UNKNOWN kapanış).
+        self._scan_degraded_reason: Optional[str] = None
+        self._scan_degraded_at: Optional[str] = None
+        self._scan_degraded_count: int = 0
+        self._scan_degraded_log_at: float = 0.0
 
         self._safety_last_started_at: Optional[str] = None
         self._safety_last_success_at: Optional[str] = None
@@ -838,6 +854,9 @@ class ScalperEngine:
         while self.running:
             started = time.monotonic()
             self._scan_last_started_at = _utcnow_iso()
+            # Tur başında temizlenir: yalnız BU turda oluşan bir kesinti
+            # turu "degraded" yapar (bkz. _mark_scan_degraded).
+            self._scan_degraded_reason = None
             try:
                 await self._scan_tick()
             except asyncio.CancelledError:
@@ -855,11 +874,22 @@ class ScalperEngine:
                 self.logger.error(f"❌ Scalper döngü hatası: {e}", exc_info=True)
             else:
                 succeeded_at = _utcnow_iso()
+                # Freshness (watchdog) her hâlükârda tazelenir: piyasa verisi
+                # kesintisinde "unhealthy" göstermek watchdog restart'ını davet
+                # eder, ki bu 2026-08-14 felaket yoludur (ban ortasında restart
+                # → toplu UNKNOWN kapanış). D17'nin bilinçli kararı.
                 self._scan_last_success_at = succeeded_at
                 self._scan_last_success_monotonic = time.monotonic()
-                self._scan_consecutive_errors = 0
-                self._scan_success_count += 1
-                self._last_scan_at = succeeded_at
+                if getattr(self, "_scan_degraded_reason", None):
+                    # Tur YARIDA kesildi (piyasa verisi host geneli kesinti):
+                    # başarı sayacı ARTMAZ, `last_scan_at` tazelenmez ve önceki
+                    # hata serisi silinmez — "tamamlanmış tur" ile "kesilmiş
+                    # tur" sayaç düzeyinde ayrışmalı (düşmanca inceleme).
+                    pass
+                else:
+                    self._scan_consecutive_errors = 0
+                    self._scan_success_count += 1
+                    self._last_scan_at = succeeded_at
             finally:
                 self._scan_last_duration_seconds = time.monotonic() - started
 
@@ -1167,12 +1197,72 @@ class ScalperEngine:
                 # 12 sembol × tur). Tur burada kesilir, 30 sn sonra yeniden
                 # denenir. Sinyal üretilmemesi fail-closed'dır — açık
                 # pozisyonların SL/TP'si borsada yerinde durur.
-                self.logger.warning(
-                    f"⛔ Piyasa verisi kullanılamıyor ({e}); tarama turu kesildi"
-                )
+                # Tur "başarılı" SAYILMAZ: `_mark_scan_degraded` ayrı sayacı
+                # artırır ve `/scalper/status.scan_status` alanını
+                # "degraded:market_data" yapar (aksi halde sağlık YEŞİL kalır
+                # ve operatörün tek izi bu log satırı olurdu).
+                self._mark_scan_degraded(f"market_data: {e}")
                 break
             except Exception as e:
                 self.logger.error(f"❌ {symbol}: tur değerlendirmesi hata verdi ({e})", exc_info=True)
+
+    def _mark_scan_degraded(self, reason: str, kind: str = "market_data") -> None:
+        """Tarama turunu "yarıda kesildi" olarak işaretle (hata DEĞİL).
+
+        D17'de kesilen tur `_loop`'un `else` dalına düşüyordu: `success_count`
+        artıyor, `consecutive_errors` sıfırlanıyor, `last_scan_at` tazeleniyor
+        ve sağlık YEŞİL kalıyordu — operatörün tek izi tek bir log satırıydı
+        (düşmanca inceleme bulgusu). Artık:
+          * ayrı sayaç (`_scan_degraded_count`) ve neden/zaman alanları,
+          * `/scalper/status.scan_status` = "degraded:<kind>",
+          * ORAN-SINIRLI (60 sn) tek WARNING — safety/scan turları saniyeler
+            içinde döndüğü için uzun bir banda log seli oluşurdu.
+        Freshness alanları BİLİNÇLİ olarak bozulmaz (watchdog restart'ı ban
+        ortasında felaket yoludur).
+        """
+        self._scan_degraded_reason = reason
+        self._scan_degraded_kind = kind
+        self._scan_degraded_at = _utcnow_iso()
+        self._scan_degraded_count = (
+            int(getattr(self, "_scan_degraded_count", 0) or 0) + 1
+        )
+        now = time.monotonic()
+        last = float(getattr(self, "_scan_degraded_log_at", 0.0) or 0.0)
+        if last <= 0.0 or (now - last) >= self._SCAN_DEGRADED_LOG_INTERVAL:
+            self._scan_degraded_log_at = now
+            self.logger.warning(
+                f"⛔ Piyasa verisi kullanılamıyor ({reason}); tarama turu "
+                f"kesildi — tur DEGRADE sayıldı "
+                f"(scan_status=degraded:{kind}, toplam "
+                f"{self._scan_degraded_count})"
+            )
+
+    def _exits_trailing_skip_snapshot(self) -> Dict[str, int]:
+        """ExitManager'ın atlanan trailing sayaçlarını geriye uyumlu oku."""
+        snapshotter = getattr(self.exits, "trailing_skip_snapshot", None)
+        if not callable(snapshotter):
+            return {}
+        try:
+            return dict(snapshotter())
+        except Exception as e:  # teşhis alanı asla status'u düşürmemeli
+            return {"error": f"{type(e).__name__}: {e}"}
+
+    def _scan_status(self) -> str:
+        """"ok" | "degraded:<kind>" — son turun sonucu (teşhis alanı)."""
+        if getattr(self, "_scan_degraded_reason", None):
+            return f"degraded:{getattr(self, '_scan_degraded_kind', 'market_data')}"
+        return "ok"
+
+    def _scan_degraded_snapshot(self) -> Dict[str, Any]:
+        """Kesinti telemetrisi (secret içermez; eski test çiftlerinde boş)."""
+        return {
+            "scan_status": self._scan_status(),
+            "scan_degraded_reason": getattr(self, "_scan_degraded_reason", None),
+            "scan_degraded_at": getattr(self, "_scan_degraded_at", None),
+            "scan_degraded_count": int(
+                getattr(self, "_scan_degraded_count", 0) or 0
+            ),
+        }
 
     async def _evaluate_symbol(self, symbol: str, enabled_strategies: list) -> None:
         owner = symbol_reservations.owner(symbol)
@@ -1506,6 +1596,21 @@ class ScalperEngine:
                 "accepted": False,
                 "reason": "piyasa verisi kullanılamıyor (ban/ağırlık bütçesi)",
             }
+        except MarketDataRequestError as e:
+            # İkinci tur düşmanca inceleme: SEMBOL kapsamlı kalıcı hata
+            # (`-1121 Invalid symbol`) `MarketDataUnavailable` DEĞİLDİR, yani
+            # yukarıdaki dal onu yakalamıyordu → /tv-signal HTTP 500. Ayrı
+            # market-data host'unda bu senaryo GERÇEKÇİDİR: işlem host'unda
+            # olup veri host'unda olmayan bir sembol için TradingView alarmı
+            # gelir ve her tekrar yine 500 üretirdi.
+            self.logger.warning(
+                f"🚫 TV sinyali işlenemedi: {symbol} — piyasa verisi kaynağı "
+                f"bu sembolü tanımıyor ({e})"
+            )
+            return {
+                "accepted": False,
+                "reason": "sembol piyasa verisi kaynağında bulunamadı",
+            }
 
         after = self.exits.tracked_symbols() | self.executor.pending_symbols()
         opened = symbol in after
@@ -1755,6 +1860,10 @@ class ScalperEngine:
             success_count=self._scan_success_count,
             freshness_limit_seconds=scan_freshness_limit,
         )
+        # D17: "yarıda kesilmiş tur" sağlıkta GÖRÜNÜR olmalı, ama `healthy`
+        # bayrağını DÜŞÜRMEZ — ban sırasında unhealthy göstermek watchdog
+        # restart'ını davet eder (2026-08-14 felaket yolu).
+        scan.update(self._scan_degraded_snapshot())
         safety = self._loop_health(
             task=self._safety_task,
             last_started_at=self._safety_last_started_at,
@@ -2084,6 +2193,13 @@ class ScalperEngine:
             "risk_event": self.risk_event_status(),
             "signals_today": self._signals_today,
             "last_scan_at": self._last_scan_at,
+            # D17: kesilen tarama turu artık "başarılı" sayılmıyor; durum
+            # burada görünür ("ok" | "degraded:market_data").
+            **self._scan_degraded_snapshot(),
+            # D17: ayrı market-data host'unda fiyat-uzayı çevirisi ya da
+            # koruma-tarafı kapısı yüzünden GÖNDERİLMEYEN trailing emirleri.
+            # Sürekli artıyorsa iki defter arasındaki baz bozulmuştur.
+            "trailing_skips": self._exits_trailing_skip_snapshot(),
             "tracked": tracked,
             "pending_entries": self.executor.pending_snapshot(),
             "cooldowns": cooldowns,

@@ -21,8 +21,12 @@ v2="$1"; main="$2"
 
 mask_or_value() {
   # $1 = anahtar adı, $2 = değer
+  # BINANCE_BIND_IP maskelidir (düşmanca inceleme bulgusu): sunucunun Binance'e
+  # çıktığı IP adresidir — ban/ağırlık muhasebesi IP başınadır, yani bu değer
+  # operasyonel olarak hassastır ve bir diff çıktısı (ekran görüntüsü, ticket,
+  # sohbet) yoluyla dışarı sızmamalıdır. "Değişti mi?" sorusuna *** yeter.
   case "$1" in
-    *SECRET*|*KEY*|*TOKEN*|*PASS*) echo "***" ;;
+    *SECRET*|*KEY*|*TOKEN*|*PASS*|*BIND_IP*) echo "***" ;;
     *) echo "$2" ;;
   esac
 }

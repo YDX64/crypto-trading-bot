@@ -25,6 +25,11 @@ TESTNET_HOSTS = (
 # karar verir ve o mumlardan türeyen chandelier seviyesi gerçek bir stop emrine
 # dönüşür. Bir yazım hatası (`fapi.binance.com.evil.tld`) sessizce geçmemeli.
 # Yeni bir Binance uç noktası gerekiyorsa bu demete BİLİNÇLİ olarak eklenir.
+# ⚠️ `testnet.binance.vision` BİLİNÇLİ olarak YOKTUR (düşmanca inceleme
+# bulgusu): orası Binance SPOT testnet'idir ve `/fapi/...` yollarını hiç
+# sunmaz. Buraya yazılsaydı bot her kline isteğinde 404 alır, hiçbir sinyal
+# üretemez ve operatör "URL kabul edildi" diye çalıştığını sanardı. Allowlist
+# yalnız USDⓈ-M Futures uçlarını içerir.
 MARKET_DATA_ALLOWED_HOSTS = (
     "fapi.binance.com",
     "fapi1.binance.com",
@@ -34,7 +39,6 @@ MARKET_DATA_ALLOWED_HOSTS = (
     "testnet.binancefuture.com",
     "demo-fapi.binance.com",
     "demo.binance.com",
-    "testnet.binance.vision",
 )
 # NOT: testnet.binancefuture.com ile demo-fapi.binance.com AYNI hesabı gösterir
 # (2026-08-06'da aynı API anahtarıyla doğrulandı: iki adreste de birebir aynı

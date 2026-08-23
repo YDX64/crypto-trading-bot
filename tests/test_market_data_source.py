@@ -20,7 +20,9 @@ Bu dosya dört sözleşmeyi kilitler:
 """
 
 import asyncio
+import re
 import time
+from collections import deque
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
@@ -455,6 +457,15 @@ def _ban_response(status: int = 418, msg: str = "Way too many requests; IP banne
     )
 
 
+def _fill_window(host: str, weight: int, age_seconds: float = 0.0) -> Any:
+    """Kayan ağırlık penceresini tek girdiyle doldur (yaş = kaç sn önce)."""
+    state = MarketDataGuard._state(host)
+    state.window.clear()
+    state.window_weight = 0
+    state.add(time.monotonic() - age_seconds, weight)
+    return state
+
+
 def _ok_response(rows: Optional[list] = None, used_weight: str = "12") -> httpx.Response:
     if rows is None:
         rows = [[0, "1", "2", "0.5", "1.5", "10", 1, "0", 0, "0", "0", "0"]]
@@ -525,9 +536,9 @@ class TestRateLimiterCoverage:
         60 sn'ye kadar bloklardı (tazelik limiti 30 sn) → watchdog restart'ı.
         Restart, tarihsel felaket yolunun ta kendisidir.
         """
-        state = MarketDataGuard._state(host_of(MAINNET))
-        state.window_start = time.monotonic()
-        state.window_weight = data_module._MARKET_DATA_WEIGHT_BUDGET_PER_MINUTE
+        state = _fill_window(
+            host_of(MAINNET), data_module._MARKET_DATA_WEIGHT_BUDGET_PER_MINUTE
+        )
 
         started = time.monotonic()
         with pytest.raises(data_module.MarketDataBudgetError):
@@ -537,20 +548,39 @@ class TestRateLimiterCoverage:
         assert state.window_weight == data_module._MARKET_DATA_WEIGHT_BUDGET_PER_MINUTE
 
     async def test_weight_budget_recovers_after_window(self):
-        """Pencere dolunca sayaç sıfırlanır — kalıcı susma yok."""
-        state = MarketDataGuard._state(host_of(MAINNET))
-        state.window_start = time.monotonic() - data_module._WEIGHT_WINDOW_SECONDS - 1
-        state.window_weight = data_module._MARKET_DATA_WEIGHT_BUDGET_PER_MINUTE
+        """60 sn'den eski girdiler pencereden düşer — kalıcı susma yok."""
+        state = _fill_window(
+            host_of(MAINNET),
+            data_module._MARKET_DATA_WEIGHT_BUDGET_PER_MINUTE,
+            age_seconds=data_module._WEIGHT_WINDOW_SECONDS + 1,
+        )
 
         await MarketDataGuard.acquire(MAINNET, 2)
         assert state.window_weight == 2
 
+    async def test_weight_window_slides_not_tumbles(self):
+        """Pencere KAYAR (dokümante edilen davranış), sabit sınırda
+        sıfırlanmaz (düşmanca inceleme bulgusu).
+
+        Tumbling pencerede sınır anında sayaç sıfırlandığı için 60 sn'lik
+        herhangi bir kayan aralığa bütçenin İKİ KATI sığabiliyordu. Burada
+        30 sn önce harcanan ağırlık HÂLÂ pencerededir.
+        """
+        budget = data_module._MARKET_DATA_WEIGHT_BUDGET_PER_MINUTE
+        state = _fill_window(host_of(MAINNET), budget - 2, age_seconds=30.0)
+        # 30 sn önceki girdi hâlâ sayılır: 2 birimlik bir istek daha sığar...
+        await MarketDataGuard.acquire(MAINNET, 2)
+        assert state.window_weight == budget
+        # ...ama bir sonraki reddedilir (tumbling olsaydı geçerdi).
+        with pytest.raises(data_module.MarketDataBudgetError):
+            await MarketDataGuard.acquire(MAINNET, 2)
+
     async def test_budget_error_is_not_retried_by_fetch(self):
         """Bütçe hatası httpx retry döngüsüne DÜŞMEZ (ayrı tip) — istek ağa
         hiç çıkmaz."""
-        state = MarketDataGuard._state(host_of(MAINNET))
-        state.window_start = time.monotonic()
-        state.window_weight = data_module._MARKET_DATA_WEIGHT_BUDGET_PER_MINUTE
+        _fill_window(
+            host_of(MAINNET), data_module._MARKET_DATA_WEIGHT_BUDGET_PER_MINUTE
+        )
         fetcher = _fetcher(MAINNET, [])          # istek ağa çıkarsa AssertionError
         with pytest.raises(data_module.MarketDataBudgetError):
             await fetcher._fetch("BTCUSDT", "5m", 250, None)
@@ -813,17 +843,25 @@ class TestBanSemantics:
 
 
 class TestTrailingPriceSpace:
-    """D17 düşmanca inceleme (HIGH): chandelier MUTLAK bir fiyat üretir ve bu
-    değer `pm.replace_stop_loss` ile İŞLEM borsasına emir olarak gider. Ayrı
-    market-data host'unda seviye YABANCI bir defterin fiyat uzayındadır; baz
-    farkı k×ATR'yi aşarsa Binance -2021 verir ve `position_manager` bunu
+    """D17 düşmanca inceleme (HIGH ×2): chandelier MUTLAK bir fiyat üretir ve
+    bu değer `pm.replace_stop_loss` ile İŞLEM borsasına emir olarak gider.
+    Ayrı market-data host'unda seviye YABANCI bir defterin fiyat uzayındadır;
+    baz farkı k×ATR'yi aşarsa Binance -2021 verir ve `position_manager` bunu
     "piyasa stop'u geçti" sayıp pozisyonu ACİL KAPATIR (kârlı koşucu piyasa
-    emriyle kapanır). Düzeltme girişteki desenin aynısıdır
-    (`executor._delay_adjusted_stop`): girişte ölçülen fark kadar ÖTELE.
+    emriyle kapanır; log "eski SL korunuyor" derken kayıt TRAIL etiketlenir).
+
+    İlk düzeltme STATİK bir baz kullanıyordu (`position.entry_price −
+    signal.entry_price`) ve iki yerde kırılıyordu:
+      1. baz yalnız GİRİŞ anında ölçülüp pozisyon ömrü boyunca sabit
+         uygulanıyordu — borsalar arası baz saatler içinde kayar;
+      2. `recover()` iki fiyatı da `trade.entry_price`'tan kurduğu için
+         restart sonrası baz 0 çıkıyor, düzeltme SESSİZCE no-op oluyordu.
+    Bu sınıf DİNAMİK bazı kilitler: `baz = işlem_host_güncel_fiyat −
+    veri_host_son_kapanış`, her turda yeniden ölçülür.
     """
 
     @staticmethod
-    def _exits(market_url: str) -> Any:
+    def _exits(market_url: str, price_age: float = 0.0) -> Any:
         from src.strategies.scalper.exits import ExitManager
 
         mgr = ExitManager.__new__(ExitManager)   # __init__ atlanır (ağ yok)
@@ -831,44 +869,75 @@ class TestTrailingPriceSpace:
             scalper_market_data_base_url=market_url,
             binance_base_url=TESTNET,
         )
+        mgr._trading_price_seen_at = {"BTCUSDT": time.monotonic() - price_age}
         return mgr
 
     @staticmethod
-    def _position(signal_price: float, fill_price: float) -> Any:
+    def _position(current_price: float) -> Any:
         return SimpleNamespace(
-            signal=SimpleNamespace(entry_price=signal_price),
-            position=SimpleNamespace(entry_price=fill_price),
+            signal=SimpleNamespace(entry_price=100.0),
+            position=SimpleNamespace(entry_price=100.0, current_price=current_price),
         )
 
     def test_same_host_is_noop(self):
-        """Varsayılan (tek host): bugünkü davranış BİREBİR korunur."""
+        """Varsayılan (tek host): bugünkü davranış BİREBİR korunur — çeviri
+        hiç uygulanmaz, `data_reference` okunmaz bile."""
         mgr = self._exits("")
-        sp = self._position(100.0, 100.5)
-        assert mgr._to_trading_price_space(sp, 99.0) == 99.0
+        sp = self._position(100.5)
+        assert mgr._to_trading_price_space(sp, 99.0, 88.0, "BTCUSDT") == 99.0
 
-    def test_separate_host_shifts_by_entry_basis(self):
+    def test_dynamic_basis_uses_current_prices(self):
+        """Baz = işlem host'u güncel fiyatı − veri host'u son kapanışı."""
         mgr = self._exits(MAINNET)
-        # Sinyal (mainnet mumu) 100.0, gerçek dolum (testnet) 100.4 → baz +0.4
-        sp = self._position(100.0, 100.4)
-        assert mgr._to_trading_price_space(sp, 99.0) == pytest.approx(99.4)
+        # İşlem host'u 100.4, veri host'unun son kapanışı 100.0 → baz +0.4
+        sp = self._position(100.4)
+        assert mgr._to_trading_price_space(
+            sp, 99.0, 100.0, "BTCUSDT"
+        ) == pytest.approx(99.4)
+
+    def test_basis_is_independent_of_entry_prices(self):
+        """`recover()` sonrası sinyal ve dolum fiyatı AYNIDIR (baz 0 olurdu);
+        dinamik baz yine de doğru çeviriyi yapar — restart'ta ek DB kolonu
+        gerekmez."""
+        mgr = self._exits(MAINNET)
+        sp = self._position(100.4)
+        sp.signal.entry_price = 55.0     # statik baz olsaydı sonuç değişirdi
+        sp.position.entry_price = 55.0
+        assert mgr._to_trading_price_space(
+            sp, 99.0, 100.0, "BTCUSDT"
+        ) == pytest.approx(99.4)
 
     def test_shift_preserves_distance(self):
         """Öteleme mesafeyi (birim riski) korur — ölçek değiştirmez."""
         mgr = self._exits(MAINNET)
-        sp = self._position(100.0, 100.4)
-        moved = mgr._to_trading_price_space(sp, 99.0)
+        sp = self._position(100.4)
+        moved = mgr._to_trading_price_space(sp, 99.0, 100.0, "BTCUSDT")
         assert (100.4 - moved) == pytest.approx(100.0 - 99.0)
 
-    def test_missing_prices_fall_back_to_raw(self):
-        mgr = self._exits(MAINNET)
-        assert mgr._to_trading_price_space(self._position(0.0, 100.0), 99.0) == 99.0
-        assert mgr._to_trading_price_space(self._position(100.0, 0.0), 99.0) == 99.0
-        assert mgr._to_trading_price_space(self._position(100.0, 100.0), 0.0) == 0.0
+    def test_stale_trading_price_is_refused(self):
+        """Bayat işlem fiyatı + taze veri kapanışı = SAHTE baz. En tehlikeli
+        hâli `recover()` sonrası ilk turdur (current_price = giriş fiyatı)."""
+        mgr = self._exits(MAINNET, price_age=999.0)
+        sp = self._position(100.4)
+        assert mgr._to_trading_price_space(sp, 99.0, 100.0, "BTCUSDT") is None
 
-    def test_negative_result_falls_back_to_raw(self):
+    def test_unknown_symbol_has_no_reference(self):
         mgr = self._exits(MAINNET)
-        sp = self._position(1000.0, 1.0)   # absürt baz
-        assert mgr._to_trading_price_space(sp, 5.0) == 5.0
+        sp = self._position(100.4)
+        assert mgr._to_trading_price_space(sp, 99.0, 100.0, "ETHUSDT") is None
+
+    def test_missing_prices_are_refused(self):
+        mgr = self._exits(MAINNET)
+        assert mgr._to_trading_price_space(self._position(0.0), 99.0, 100.0, "BTCUSDT") is None
+        assert mgr._to_trading_price_space(self._position(100.4), 99.0, 0.0, "BTCUSDT") is None
+        # price<=0 "hesaplanamadı" demektir; çağıran zaten ayıklar.
+        assert mgr._to_trading_price_space(self._position(100.4), 0.0, 100.0, "BTCUSDT") == 0.0
+
+    def test_absurd_basis_is_refused(self):
+        """%2'yi aşan baz = yanlış sembol/ölçek ya da donmuş bir defter."""
+        mgr = self._exits(MAINNET)
+        sp = self._position(100.0)
+        assert mgr._to_trading_price_space(sp, 99.0, 50.0, "BTCUSDT") is None
 
     def test_missing_cfg_fields_are_treated_as_same_host(self):
         """Eski test çiftleri (SimpleNamespace) alanı hiç tanımlamayabilir."""
@@ -877,6 +946,224 @@ class TestTrailingPriceSpace:
         mgr = ExitManager.__new__(ExitManager)
         mgr.cfg = SimpleNamespace()
         assert mgr._market_data_is_separate() is False
+
+
+class TestProtectiveSideGate:
+    """Çeviriden SONRAKİ ikinci kalkan: seviye işlem host'unun GÜNCEL fiyatına
+    göre yanlış taraftaysa emir HİÇ gönderilmez. Gönderilseydi Binance -2021
+    verir, `position_manager._replace_stop_loss` bunu bir çıkış kararı sayıp
+    pozisyonu PİYASA emriyle kapatırdı."""
+
+    @staticmethod
+    def _mgr(market_url: str, replace_ok: bool = True) -> Any:
+        from src.strategies.scalper.exits import ExitManager
+
+        mgr = ExitManager.__new__(ExitManager)
+        mgr.cfg = SimpleNamespace(
+            scalper_market_data_base_url=market_url,
+            binance_base_url=TESTNET,
+            scalper_tf_entry="5m",
+            scalper_chandelier_atr_period=22,
+            scalper_chandelier_atr_mult=3.0,
+        )
+        mgr.logger = SimpleNamespace(
+            info=lambda *a, **kw: None, debug=lambda *a, **kw: None,
+            warning=lambda *a, **kw: None, error=lambda *a, **kw: None,
+        )
+        mgr._market_data_down_reason = None
+        mgr._trading_price_seen_at = {}
+        mgr._trailing_space_skips = 0
+        mgr._trailing_gate_skips = 0
+        mgr._trailing_skip_log_at = {}
+        return mgr
+
+    def test_long_stop_must_be_below_current_price(self):
+        from src.strategies.scalper.exits import ExitManager
+
+        gate = ExitManager._is_protective_side
+        assert gate(Direction.LONG, 99.0, 100.0) is True
+        assert gate(Direction.LONG, 100.0, 100.0) is False
+        assert gate(Direction.LONG, 101.0, 100.0) is False
+        # Pay kadar uzak olmalı (mark/last farkı).
+        assert gate(Direction.LONG, 99.999, 100.0) is False
+
+    def test_short_stop_must_be_above_current_price(self):
+        from src.strategies.scalper.exits import ExitManager
+
+        gate = ExitManager._is_protective_side
+        assert gate(Direction.SHORT, 101.0, 100.0) is True
+        assert gate(Direction.SHORT, 100.0, 100.0) is False
+        assert gate(Direction.SHORT, 99.0, 100.0) is False
+
+    def test_missing_price_is_not_protective(self):
+        from src.strategies.scalper.exits import ExitManager
+
+        assert ExitManager._is_protective_side(Direction.LONG, 99.0, 0.0) is False
+        assert ExitManager._is_protective_side(Direction.LONG, 0.0, 100.0) is False
+
+
+class TestTrailingRoundIntegration:
+    """`_update_trailing` uçtan uca: aynı host'ta BİREBİR eski davranış, ayrı
+    host'ta dinamik çeviri + koruma kapısı."""
+
+    @staticmethod
+    def _candles(closes: List[float]) -> List[Any]:
+        from src.strategies.scalper.types import Candle
+
+        out = []
+        for i, close in enumerate(closes):
+            out.append(
+                Candle(
+                    open_time=i * 60_000,
+                    open=close,
+                    high=close * 1.002,
+                    low=close * 0.998,
+                    close=close,
+                    volume=100.0,
+                    close_time=i * 60_000 + 59_999,
+                )
+            )
+        return out
+
+    def _mgr(self, market_url: str, candles: List[Any], replaced: List[float]) -> Any:
+        from src.strategies.scalper.exits import ExitManager
+
+        mgr = ExitManager.__new__(ExitManager)
+        mgr.cfg = SimpleNamespace(
+            scalper_market_data_base_url=market_url,
+            binance_base_url=TESTNET,
+            scalper_tf_entry="5m",
+            scalper_chandelier_atr_period=14,
+            scalper_chandelier_atr_mult=3.0,
+            scalper_trail_mult_tiers="",
+        )
+        mgr.logger = SimpleNamespace(
+            info=lambda *a, **kw: None, debug=lambda *a, **kw: None,
+            warning=lambda *a, **kw: None, error=lambda *a, **kw: None,
+        )
+        mgr._market_data_down_reason = None
+        mgr._trading_price_seen_at = {"BTCUSDT": time.monotonic()}
+        mgr._trailing_space_skips = 0
+        mgr._trailing_gate_skips = 0
+        mgr._trailing_skip_log_at = {}
+
+        async def fetch(symbol, tf, limit):
+            return candles
+
+        mgr.kline_fetch = fetch
+
+        async def replace(position, new_stop):
+            replaced.append(new_stop)
+            return True
+
+        mgr.pm = SimpleNamespace(replace_stop_loss=replace)
+        return mgr
+
+    @staticmethod
+    def _sp(current_price: float) -> Any:
+        return SimpleNamespace(
+            signal=SimpleNamespace(direction=Direction.LONG, entry_price=100.0),
+            position=SimpleNamespace(
+                entry_price=100.0, current_price=current_price,
+                current_stoploss=90.0, symbol="BTCUSDT",
+            ),
+            plan=SimpleNamespace(
+                breakeven_price=100.1, runner_floor_price=None, tp1_price=101.0
+            ),
+            entry_candle_time=0,
+            mfe_pct=1.0,
+            tp2_done=False,
+        )
+
+    async def test_same_host_stop_is_byte_for_byte_unchanged(self):
+        """Ayar BOŞKEN gönderilen stop, çeviri/kapı eklenmeden ÖNCEKİ ile
+        birebir aynı olmalı — canlı davranış değişmedi."""
+        closes = [100.0 + i * 0.1 for i in range(60)]
+        candles = self._candles(closes)
+
+        same_host: List[float] = []
+        mgr = self._mgr("", candles, same_host)
+        await mgr._update_trailing("BTCUSDT", self._sp(106.0))
+
+        # Referans: çeviri/kapı OLMADAN saf chandelier + floor aritmetiği.
+        from src.strategies.scalper.indicators import chandelier_stop
+        from src.strategies.scalper.types import resolve_trail_mult
+
+        raw = chandelier_stop(
+            candles, direction=Direction.LONG,
+            atr_mult=resolve_trail_mult(mgr.cfg, 1.0), atr_period=14, since_index=0,
+        )
+        expected = max(100.1, raw)
+        assert same_host == [expected]
+
+    async def test_separate_host_shifts_and_still_sends(self):
+        """Ayrı host: veri kapanışı 100.0'ken işlem fiyatı 106.4 ise stop
+        (106.4 − son_kapanış) kadar ötelenir ve emir GİDER."""
+        closes = [100.0 + i * 0.1 for i in range(60)]
+        candles = self._candles(closes)
+        last_close = candles[-1].close
+
+        sent: List[float] = []
+        mgr = self._mgr(MAINNET, candles, sent)
+        trading_price = last_close + 0.4
+        await mgr._update_trailing("BTCUSDT", self._sp(trading_price))
+
+        from src.strategies.scalper.indicators import chandelier_stop
+        from src.strategies.scalper.types import resolve_trail_mult
+
+        raw = chandelier_stop(
+            candles, direction=Direction.LONG,
+            atr_mult=resolve_trail_mult(mgr.cfg, 1.0), atr_period=14, since_index=0,
+        )
+        assert sent == [pytest.approx(max(100.1, raw + 0.4))]
+
+    async def test_separate_host_wrong_side_is_not_sent(self):
+        """İşlem host'u çok daha düşükse ötelenmiş stop güncel fiyatın ÜSTÜNE
+        düşer: emir gönderilmez, sayaç artar, eski SL korunur."""
+        closes = [100.0 + i * 0.1 for i in range(60)]
+        candles = self._candles(closes)
+        sent: List[float] = []
+        mgr = self._mgr(MAINNET, candles, sent)
+        # İşlem host'u veri host'unun %1.5 altında (baz negatif ama %2 tavanının
+        # içinde) → ötelenmiş chandelier hâlâ güncel fiyatın üstünde kalır.
+        sp = self._sp(candles[-1].close * 0.985)
+        sp.plan.breakeven_price = sp.position.current_price * 1.01
+        await mgr._update_trailing("BTCUSDT", sp)
+
+        assert sent == [], "yanlış taraftaki stop borsaya gönderildi (-2021 riski)"
+        assert mgr.trailing_skip_snapshot()["protective_gate_skips"] == 1
+
+    async def test_separate_host_unmeasurable_basis_skips_round(self):
+        """Baz ölçülemiyorsa (işlem fiyatı bayat) tur atlanır — YABANCI
+        uzaydan emir gönderilmez."""
+        closes = [100.0 + i * 0.1 for i in range(60)]
+        candles = self._candles(closes)
+        sent: List[float] = []
+        mgr = self._mgr(MAINNET, candles, sent)
+        mgr._trading_price_seen_at = {}          # hiç taze fiyat yok
+        await mgr._update_trailing("BTCUSDT", self._sp(candles[-1].close + 0.4))
+
+        assert sent == []
+        assert mgr.trailing_skip_snapshot()["price_space_skips"] == 1
+
+    async def test_skip_warning_is_rate_limited(self):
+        """Safety turu 2 sn'de bir döner: sembol başına en fazla 60 sn'de bir
+        satır (aksi halde saatte 1800 satır)."""
+        closes = [100.0 + i * 0.1 for i in range(60)]
+        candles = self._candles(closes)
+        sent: List[float] = []
+        mgr = self._mgr(MAINNET, candles, sent)
+        mgr._trading_price_seen_at = {}
+        warnings: List[str] = []
+        mgr.logger = SimpleNamespace(
+            info=lambda *a, **kw: None, debug=lambda *a, **kw: None,
+            warning=lambda msg, *a, **kw: warnings.append(msg),
+            error=lambda *a, **kw: None,
+        )
+        for _ in range(5):
+            await mgr._update_trailing("BTCUSDT", self._sp(candles[-1].close + 0.4))
+        assert len(warnings) == 1
+        assert mgr.trailing_skip_snapshot()["price_space_skips"] == 5
 
 
 class TestExitsMarketDataOutage:
@@ -928,7 +1215,9 @@ class TestExitsMarketDataOutage:
 
 
 class TestBatchGuardMode:
-    """Harness (backtest) modu: bütçe dolunca ÖLMEZ, bekler."""
+    """Harness (backtest) modu: bütçe dolunca ÖLMEZ, bekler — ve canlıdan
+    DAHA GEVŞEK bir bütçe/aralık kullanır (araştırma aracını yavaşlatmak
+    kanıt üretmeyi yavaşlatır; düşmanca inceleme bulgusu)."""
 
     async def test_batch_mode_waits_instead_of_raising(self, monkeypatch):
         slept: List[float] = []
@@ -938,15 +1227,66 @@ class TestBatchGuardMode:
             slept.append(seconds)
             await real_sleep(0)
 
-        monkeypatch.setattr(data_module, "_sleep", fake_sleep)
-        state = MarketDataGuard._state(host_of(MAINNET))
-        state.window_start = time.monotonic()
-        state.window_weight = data_module._MARKET_DATA_WEIGHT_BUDGET_PER_MINUTE
+        state = _fill_window(
+            host_of(MAINNET), data_module._BATCH_WEIGHT_BUDGET_PER_MINUTE
+        )
+
+        async def advancing_sleep(seconds):
+            # Sahte uyku GERÇEK saati ilerletmez; pencereyi biz yaşlandırırız
+            # (aksi halde üretim döngüsü gerçek 60 sn boyunca dönerdi).
+            await fake_sleep(seconds)
+            state.window = deque((ts - seconds, w) for ts, w in state.window)
+
+        monkeypatch.setattr(data_module, "_sleep", advancing_sleep)
 
         await MarketDataGuard.acquire(MAINNET, 10, data_module._GUARD_MODE_BATCH)
 
         assert any(s > 1.0 for s in slept), f"batch modu beklemedi: {slept}"
-        assert state.window_weight == 10  # pencere sıfırlandı, istek geçti
+        # Eski girdi pencereden düştü, istek geçti.
+        assert state.window_weight == 10
+
+    async def test_batch_budget_is_looser_than_live(self):
+        """Canlı bütçenin TAM SINIRINDA batch modu geçer, live reddeder:
+        8 sembol × 30 günlük bir çekim (≈656 ağırlık) artık pencere
+        beklemeleriyle ~3× uzamaz."""
+        _fill_window(
+            host_of(MAINNET), data_module._MARKET_DATA_WEIGHT_BUDGET_PER_MINUTE
+        )
+        await MarketDataGuard.acquire(MAINNET, 10, data_module._GUARD_MODE_BATCH)
+
+        _fill_window(
+            host_of(TESTNET), data_module._MARKET_DATA_WEIGHT_BUDGET_PER_MINUTE
+        )
+        with pytest.raises(data_module.MarketDataBudgetError):
+            await MarketDataGuard.acquire(TESTNET, 10)
+
+    async def test_batch_spacing_is_shorter(self, monkeypatch):
+        """Sayfa başına 0.15 sn, yüzlerce sayfada dakikalar eder; harness tek
+        tüketicidir, burst riski yoktur. 429/418 koruması moddan bağımsızdır."""
+        slept: List[float] = []
+        real_sleep = asyncio.sleep
+
+        async def fake_sleep(seconds):
+            slept.append(seconds)
+            await real_sleep(0)
+
+        monkeypatch.setattr(data_module, "_sleep", fake_sleep)
+        await MarketDataGuard.acquire(MAINNET, 10, data_module._GUARD_MODE_BATCH)
+        await MarketDataGuard.acquire(MAINNET, 10, data_module._GUARD_MODE_BATCH)
+
+        assert slept and slept[0] <= data_module._BATCH_MIN_REQUEST_SPACING_SECONDS
+        assert (
+            data_module._BATCH_MIN_REQUEST_SPACING_SECONDS
+            < data_module._MIN_REQUEST_SPACING_SECONDS
+        )
+
+    async def test_batch_mode_still_respects_ban(self):
+        """Kesici moddan BAĞIMSIZDIR: harness de ban sırasında istek atmaz."""
+        MarketDataGuard.trip(host_of(MAINNET), "banned", 120.0)
+        with pytest.raises(MarketDataBanError):
+            await MarketDataGuard.acquire(
+                MAINNET, 10, data_module._GUARD_MODE_BATCH
+            )
 
     def test_backtest_uses_batch_mode(self):
         """8 sembol × 30 gün ≈ 656 ağırlık: "live" modda koşu ortada ölürdü."""
@@ -990,3 +1330,394 @@ class TestExternalSignalPath:
         assert result["accepted"] is False
         assert "piyasa verisi" in result["reason"].lower()
         assert any("piyasa verisi yok" in w for w in warnings)
+
+    async def test_symbol_scoped_error_also_returns_structured_rejection(self):
+        """İkinci tur bulgusu: `MarketDataRequestError` `MarketDataUnavailable`
+        DEĞİLDİR, yani eski `except` dalı onu YAKALAMIYORDU → /tv-signal HTTP
+        500. Ayrı market-data host'unda bu senaryo gerçekçidir: işlem host'unda
+        olup veri host'unda olmayan bir sembol için TV alarmı gelir ve her
+        tekrar yine 500 üretirdi."""
+        engine = ScalperEngine.__new__(ScalperEngine)
+        engine.running = True
+        engine.cfg = SimpleNamespace(scalper_tv_symbol_allowlist="")
+        engine.exits = SimpleNamespace(tracked_symbols=lambda: set())
+        engine.executor = SimpleNamespace(pending_symbols=lambda: set())
+        engine._entries_ready = lambda: True
+        warnings: List[str] = []
+        engine.logger = SimpleNamespace(
+            info=lambda *a, **kw: None,
+            warning=lambda msg, *a, **kw: warnings.append(msg),
+        )
+
+        async def boom(symbol, strategies):
+            raise data_module.MarketDataRequestError(
+                "HTTP 400 (code=-1121) fapi.binance.com: Invalid symbol."
+            )
+
+        engine._evaluate_symbol = boom
+        result = await engine.external_signal("XYZUSDT", Direction.LONG)
+
+        assert result["accepted"] is False
+        assert "bulunamadı" in result["reason"]
+        assert any("tanımıyor" in w for w in warnings)
+
+
+# ---------------------------------------------------------------------------
+# 6) Hata KAPSAMI: host geneli mi, sembol mü? (ikinci tur düşmanca inceleme)
+# ---------------------------------------------------------------------------
+
+def _error_response(status: int, code: int = -1000, msg: str = "blocked",
+                    headers: Optional[Dict[str, str]] = None) -> httpx.Response:
+    return httpx.Response(
+        status_code=status,
+        json={"code": code, "msg": msg},
+        headers=headers or {},
+        request=httpx.Request("GET", "https://example.invalid/fapi/v1/klines"),
+    )
+
+
+DEPLOY_BAN_PATTERN = re.compile(r"HTTP 418|banned")
+
+
+class TestHostScopedErrors:
+    """Bulgu (HIGH): 401/403 (kimlik/WAF) ve 451 (coğrafi engel) HOST
+    GENELİDİR ama D17'de SEMBOL kapsamlı `MarketDataRequestError` sayılıyordu:
+    12 sembolün 12'si de aynı yanıtı alıyor, tur kesilmiyor, kesici
+    kurulmuyor ve deploy ban kilidi kör kalıyordu."""
+
+    @pytest.mark.parametrize("status", [401, 403, 451])
+    async def test_host_wide_4xx_is_host_scoped(self, status):
+        fetcher = _fetcher(MAINNET, [_error_response(status)])
+        with pytest.raises(data_module.MarketDataHostError):
+            await fetcher._fetch("BTCUSDT", "5m", 250, None)
+        # Tekrar YOK (tek istek) ve kesici KURULDU.
+        assert len(fetcher._client.calls) == 1
+        snap = MarketDataGuard.snapshot(MAINNET)
+        assert snap["banned"] is True
+        # ...ama GERÇEK ban değil: deploy kilidi tetiklenmemeli.
+        assert snap["hard_ban"] is False
+
+    def test_host_error_is_market_data_unavailable(self):
+        """`_scan_tick` / `exits` / `/tv-signal` bu tipi zaten yakalıyor."""
+        assert issubclass(
+            data_module.MarketDataHostError, data_module.MarketDataUnavailable
+        )
+
+    @pytest.mark.parametrize("status", [400, 404])
+    async def test_symbol_scoped_4xx_stays_symbol_scoped(self, status):
+        fetcher = _fetcher(MAINNET, [_error_response(status, code=-1121,
+                                                     msg="Invalid symbol.")])
+        with pytest.raises(data_module.MarketDataRequestError):
+            await fetcher._fetch("XYZUSDT", "5m", 250, None)
+        assert len(fetcher._client.calls) == 1
+        # Tek bozuk sembol yüzünden HOST kesicisi kurulmaz.
+        assert MarketDataGuard.snapshot(MAINNET)["banned"] is False
+
+    async def test_host_block_honours_retry_after(self):
+        fetcher = _fetcher(
+            MAINNET, [_error_response(403, headers={"Retry-After": "120"})]
+        )
+        with pytest.raises(data_module.MarketDataHostError):
+            await fetcher._fetch("BTCUSDT", "5m", 250, None)
+        blocked_until = MarketDataGuard.blocked_until(host_of(MAINNET))
+        assert time.time() + 100 < blocked_until <= time.time() + 121
+
+    async def test_host_block_log_does_not_match_deploy_guard(self, monkeypatch):
+        """403 bir BAN değildir: deploy'u 15 dk kilitlememeli."""
+        lines: List[str] = []
+        fetcher = _fetcher(MAINNET, [_error_response(403, msg="Forbidden")])
+        fetcher.logger = SimpleNamespace(
+            critical=lambda msg, *a, **kw: lines.append(msg),
+            warning=lambda msg, *a, **kw: lines.append(msg),
+            error=lambda msg, *a, **kw: lines.append(msg),
+        )
+        with pytest.raises(data_module.MarketDataHostError):
+            await fetcher._fetch("BTCUSDT", "5m", 250, None)
+        assert lines and not any(DEPLOY_BAN_PATTERN.search(x) for x in lines)
+
+    async def test_exhausted_5xx_becomes_host_error(self, monkeypatch):
+        """3 deneme sonunda hâlâ 5xx ise sorun sembolde değil host'tadır:
+        kalan 11 sembol için 33 istek daha atmanın anlamı yok."""
+        real_sleep = asyncio.sleep
+        monkeypatch.setattr(data_module, "_sleep", lambda s: real_sleep(0))
+        error = _error_response(503, code=-1001, msg="internal")
+        fetcher = _fetcher(MAINNET, [error, error, error])
+        with pytest.raises(data_module.MarketDataHostError):
+            await fetcher._fetch("BTCUSDT", "5m", 250, None)
+        assert len(fetcher._client.calls) == 3
+        # Geçici hata: kesici KURULMAZ (bir sonraki tur yeniden dener).
+        assert MarketDataGuard.snapshot(MAINNET)["banned"] is False
+
+    async def test_scan_round_is_cut_on_host_wide_4xx(self):
+        """403 gören bir tur, 12 sembolün hepsini denemek yerine kesilir."""
+        engine = ScalperEngine.__new__(ScalperEngine)
+        engine.cfg = SimpleNamespace(
+            scalper_symbol_allowlist="AAAUSDT,BBBUSDT,CCCUSDT",
+            scalper_strategies="C", scalper_max_positions=3,
+        )
+        engine.client = SimpleNamespace(get_all_positions=lambda: _async_value([]))
+        engine.exits = SimpleNamespace(tracked_symbols=lambda: set())
+        engine.executor = SimpleNamespace(pending_symbols=lambda: set())
+        engine._universe = []
+        engine._scan_open_symbols = set()
+        evaluated: List[str] = []
+        engine.logger = SimpleNamespace(
+            warning=lambda *a, **kw: None, error=lambda *a, **kw: None,
+            info=lambda *a, **kw: None,
+        )
+        engine._entries_ready = lambda: True
+        engine._executor_entry_blocked = lambda symbol: False
+
+        async def boom(symbol, strategies):
+            evaluated.append(symbol)
+            raise data_module.MarketDataHostError("403", host_of(MAINNET))
+
+        engine._evaluate_symbol = boom
+        await engine._scan_tick()
+        assert evaluated == ["AAAUSDT"]
+        assert engine._scan_status() == "degraded:market_data"
+
+
+class TestSoftThrottleSemantics:
+    """Bulgu (MED): TEK bir 429, ayar BOŞKEN (kline'lar işlem host'undan)
+    90-180 sn'lik küresel bir kesici + 15 dk'lık deploy kilidi doğuruyordu.
+    429 tek başına BAN değildir."""
+
+    async def test_plain_429_is_short_and_not_a_ban(self):
+        fetcher = _fetcher(MAINNET, [_error_response(429, code=-1015,
+                                                     msg="Too many requests")])
+        with pytest.raises(MarketDataBanError):
+            await fetcher._fetch("BTCUSDT", "5m", 250, None)
+        blocked_until = MarketDataGuard.blocked_until(host_of(MAINNET))
+        assert blocked_until <= time.time() + data_module._BAN_DEFAULT_SECONDS_SOFT + 1
+        assert data_module._BAN_DEFAULT_SECONDS_SOFT == 30.0
+        assert MarketDataGuard.snapshot(MAINNET)["hard_ban"] is False
+
+    async def test_plain_429_log_does_not_lock_deploy(self):
+        lines: List[str] = []
+        fetcher = _fetcher(MAINNET, [_error_response(429, code=-1015,
+                                                     msg="Too many requests")])
+        fetcher.logger = SimpleNamespace(
+            critical=lambda msg, *a, **kw: lines.append(msg),
+            warning=lambda msg, *a, **kw: lines.append(msg),
+            error=lambda msg, *a, **kw: lines.append(msg),
+        )
+        with pytest.raises(MarketDataBanError):
+            await fetcher._fetch("BTCUSDT", "5m", 250, None)
+        assert lines and not any(DEPLOY_BAN_PATTERN.search(x) for x in lines)
+
+    async def test_ongoing_soft_breaker_log_does_not_lock_deploy(self, monkeypatch):
+        warnings: List[str] = []
+        monkeypatch.setattr(
+            data_module.app_logger, "warning",
+            lambda msg, *a, **kw: warnings.append(msg),
+        )
+        MarketDataGuard.trip(host_of(MAINNET), "slow down", 30.0, hard=False)
+        with pytest.raises(MarketDataBanError):
+            MarketDataGuard.ensure_allowed(host_of(MAINNET))
+        assert warnings and not DEPLOY_BAN_PATTERN.search(warnings[0])
+
+    async def test_429_uses_retry_after_header(self):
+        fetcher = _fetcher(
+            MAINNET,
+            [_error_response(429, code=-1015, msg="slow",
+                             headers={"Retry-After": "12"})],
+        )
+        with pytest.raises(MarketDataBanError):
+            await fetcher._fetch("BTCUSDT", "5m", 250, None)
+        blocked_until = MarketDataGuard.blocked_until(host_of(MAINNET))
+        assert time.time() + 5 < blocked_until <= time.time() + 13
+
+    async def test_429_over_ip_weight_waits_for_window(self):
+        """X-MBX-USED-WEIGHT-1M sınırın üstündeyse 1 dakikalık pencerenin
+        dolması gerekir — 30 sn yetmez."""
+        fetcher = _fetcher(
+            MAINNET,
+            [_error_response(
+                429, code=-1015, msg="slow",
+                headers={"X-MBX-USED-WEIGHT-1M": str(
+                    data_module._IP_WEIGHT_LIMIT_PER_MINUTE + 10)},
+            )],
+        )
+        with pytest.raises(MarketDataBanError):
+            await fetcher._fetch("BTCUSDT", "5m", 250, None)
+        blocked_until = MarketDataGuard.blocked_until(host_of(MAINNET))
+        assert time.time() + 45 < blocked_until <= time.time() + 61
+
+    async def test_real_ban_still_locks_deploy(self):
+        """418 / -1003 / "banned until" DEĞİŞMEDİ: hâlâ hard ban."""
+        lines: List[str] = []
+        fetcher = _fetcher(MAINNET, [_ban_response()])
+        fetcher.logger = SimpleNamespace(
+            critical=lambda msg, *a, **kw: lines.append(msg),
+            warning=lambda msg, *a, **kw: lines.append(msg),
+            error=lambda msg, *a, **kw: lines.append(msg),
+        )
+        with pytest.raises(MarketDataBanError):
+            await fetcher._fetch("BTCUSDT", "5m", 250, None)
+        assert any(DEPLOY_BAN_PATTERN.search(x) for x in lines)
+        assert MarketDataGuard.snapshot(MAINNET)["hard_ban"] is True
+
+    async def test_soft_then_hard_stays_hard(self):
+        host = host_of(MAINNET)
+        MarketDataGuard.trip(host, "slow", 30.0, hard=False)
+        assert MarketDataGuard.is_hard_ban(host) is False
+        MarketDataGuard.trip(host, "banned", 180.0, hard=True)
+        assert MarketDataGuard.is_hard_ban(host) is True
+
+
+class TestScanDegradedStatus:
+    """Bulgu: piyasa verisi kesintisiyle KESİLEN tur "başarılı" sayılıyordu
+    (success_count ↑, consecutive_errors sıfır, last_scan_at tazeleniyor,
+    sağlık YEŞİL) — operatörün tek izi bir log satırıydı."""
+
+    @staticmethod
+    def _engine() -> Any:
+        engine = ScalperEngine.__new__(ScalperEngine)
+        engine.logger = SimpleNamespace(
+            warning=lambda *a, **kw: None, error=lambda *a, **kw: None,
+            info=lambda *a, **kw: None,
+        )
+        engine._scan_degraded_reason = None
+        engine._scan_degraded_kind = "market_data"
+        engine._scan_degraded_at = None
+        engine._scan_degraded_count = 0
+        engine._scan_degraded_log_at = 0.0
+        return engine
+
+    def test_status_is_ok_by_default(self):
+        engine = self._engine()
+        assert engine._scan_status() == "ok"
+        assert engine._scan_degraded_snapshot()["scan_degraded_count"] == 0
+
+    def test_degraded_marks_status_and_counter(self):
+        engine = self._engine()
+        engine._mark_scan_degraded("market_data: ban")
+        snap = engine._scan_degraded_snapshot()
+        assert snap["scan_status"] == "degraded:market_data"
+        assert snap["scan_degraded_count"] == 1
+        assert snap["scan_degraded_at"] is not None
+
+    def test_degraded_warning_is_rate_limited(self):
+        engine = self._engine()
+        warnings: List[str] = []
+        engine.logger = SimpleNamespace(
+            warning=lambda msg, *a, **kw: warnings.append(msg),
+            error=lambda *a, **kw: None, info=lambda *a, **kw: None,
+        )
+        for _ in range(5):
+            engine._mark_scan_degraded("market_data: ban")
+        assert len(warnings) == 1
+        assert engine._scan_degraded_count == 5
+
+    async def test_degraded_round_does_not_count_as_success(self):
+        """`_loop`'un muhasebesi: kesilen tur success_count'u ARTIRMAZ ve
+        `last_scan_at`'ı tazelemez; freshness (watchdog) BİLİNÇLİ tazelenir."""
+        engine = ScalperEngine.__new__(ScalperEngine)
+        engine.cfg = SimpleNamespace(
+            scalper_symbol_allowlist="AAAUSDT", scalper_strategies="C",
+            scalper_max_positions=3, scalper_scan_interval_seconds=30,
+        )
+        engine.client = SimpleNamespace(get_all_positions=lambda: _async_value([]))
+        engine.exits = SimpleNamespace(tracked_symbols=lambda: set())
+        engine.executor = SimpleNamespace(pending_symbols=lambda: set())
+        engine.logger = SimpleNamespace(
+            warning=lambda *a, **kw: None, error=lambda *a, **kw: None,
+            info=lambda *a, **kw: None,
+        )
+        engine._universe = []
+        engine._scan_open_symbols = set()
+        engine._entries_ready = lambda: True
+        engine._executor_entry_blocked = lambda symbol: False
+        engine._scan_success_count = 7
+        engine._scan_consecutive_errors = 2
+        engine._last_scan_at = "önceki"
+        engine._scan_degraded_reason = None
+        engine._scan_degraded_count = 0
+        engine._scan_degraded_log_at = 0.0
+        engine._scan_last_success_monotonic = None
+
+        async def boom(symbol, strategies):
+            raise MarketDataBanError("ban", host_of(MAINNET), time.time() + 60)
+
+        engine._evaluate_symbol = boom
+
+        # _loop gövdesinin muhasebe kısmı (döngüsüz):
+        await engine._scan_tick()
+        engine._scan_last_success_monotonic = time.monotonic()
+        if not engine._scan_degraded_reason:
+            engine._scan_consecutive_errors = 0
+            engine._scan_success_count += 1
+            engine._last_scan_at = "yeni"
+
+        assert engine._scan_success_count == 7, "kesilen tur başarı sayıldı"
+        assert engine._scan_consecutive_errors == 2, "hata serisi silindi"
+        assert engine._last_scan_at == "önceki"
+        # Watchdog freshness'ı BİLİNÇLİ tazelenir (ban ortasında restart =
+        # 2026-08-14 felaket yolu).
+        assert engine._scan_last_success_monotonic is not None
+
+
+class TestCacheTtlProfile:
+    """Bulgu: `_TTL_BY_INTERVAL`'de `1m` yoktu → CANLI profil
+    (`SCALPER_TF_ENTRY=1m`) `_DEFAULT_TTL`=60 sn'ye düşüyordu: trailing ve
+    giriş TAM BİR MUM bayat veriyle karar veriyordu."""
+
+    def test_one_minute_ttl_exists_and_is_short(self):
+        fetcher = KlineFetcher(base_url=MAINNET)
+        assert fetcher._ttl_for("1m") <= 5.0
+        assert fetcher._ttl_for("1m") < data_module._DEFAULT_TTL
+
+    def test_live_profile_timeframes_all_have_explicit_ttl(self):
+        """Canlı profil 1m/5m/15m; hiçbiri varsayılana düşmemeli."""
+        for tf in ("1m", "5m", "15m"):
+            assert tf in data_module._TTL_BY_INTERVAL
+
+    def test_ttl_is_a_fraction_of_the_candle_period(self):
+        periods = {"1m": 60.0, "5m": 300.0, "15m": 900.0}
+        for tf, period in periods.items():
+            assert data_module._TTL_BY_INTERVAL[tf] <= period * 0.10
+
+
+class TestAllowlistHygiene:
+    """Bulgu: `testnet.binance.vision` Binance SPOT testnet'idir; `/fapi/...`
+    yollarını hiç sunmaz. Allowlist'te kalırsa ayar kabul edilir ama bot her
+    kline isteğinde 404 alır ve operatör "URL geçerli" diye çalıştığını sanır."""
+
+    def test_spot_testnet_is_not_allowed(self):
+        from src.core.config import MARKET_DATA_ALLOWED_HOSTS
+
+        assert "testnet.binance.vision" not in MARKET_DATA_ALLOWED_HOSTS
+        with pytest.raises(ValueError, match="bilinmeyen host"):
+            _settings(scalper_market_data_base_url="https://testnet.binance.vision")
+
+    def test_futures_hosts_still_allowed(self):
+        for good in (MAINNET, TESTNET, "https://demo-fapi.binance.com"):
+            assert _settings(scalper_market_data_base_url=good)
+
+
+class TestOpsScripts:
+    """İşletme betiklerinin iki sessiz kusuru (düşmanca inceleme)."""
+
+    @staticmethod
+    def _read(rel: str) -> str:
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[1]
+        return (root / rel).read_text(encoding="utf-8")
+
+    def test_ring_env_diff_masks_bind_ip(self):
+        """`BINANCE_BIND_IP` sunucunun Binance'e çıktığı IP'dir; ban/ağırlık
+        muhasebesi IP başınadır — diff çıktısında değeri görünmemeli."""
+        src = self._read("scripts/ring_env_diff.sh")
+        assert "*BIND_IP*" in src
+        mask_line = [ln for ln in src.splitlines() if "*SECRET*" in ln]
+        assert mask_line and "BIND_IP" in mask_line[0]
+
+    def test_deploy_ban_window_uses_local_time(self):
+        """`logs/bot.log` damgaları YEREL saattir (loguru {time}); kesim
+        noktası `date -u` ile üretilirse pencere TZ ofseti kadar kayar."""
+        src = self._read("scripts/server_deploy.sh")
+        assert "date -u -d '15 minutes ago'" not in src
+        assert "date -d '15 minutes ago'" in src
+        assert "BAN_SINCE" in src

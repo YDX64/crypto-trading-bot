@@ -32,8 +32,19 @@ mkdir -p backups logs
 
 # ── Ön kontroller ──────────────────────────────────────────────────────────
 [ -f state/scalper_entry_halt.json ] && die "entry-halt aktif — önce nedenini çöz (deploy iptal)"
-if grep -qE 'HTTP 418|banned' <(tail -n 2000 logs/bot.log 2>/dev/null | awk -v s="$(date -u -d '15 minutes ago' '+%Y-%m-%d %H:%M')" '($1" "substr($2,1,5))>=s'); then
-  die "son 15 dk'da Binance ban izi var — ban aktifken restart YASAK"
+# Ban kilidi: son 15 dk'da `HTTP 418` ya da `banned` izi varsa deploy/restart YASAK.
+# ⚠️ ZAMAN DİLİMİ (düşmanca inceleme bulgusu): `logs/bot.log` damgaları loguru'nun
+# `{time:YYYY-MM-DD HH:mm:ss}` biçimidir ve SUNUCUNUN YEREL saatini kullanır
+# (src/core/logger.py). Kesim noktası `date -u` ile hesaplanırsa UTC+X bir sunucuda
+# pencere "15 dk" değil "15 dk + X saat" olur: saatler önce sönmüş bir ban deploy'u
+# kilitlemeye devam eder (UTC−X'te ise pencere kapanır ve AKTİF ban görülmez —
+# tehlikeli yön). Bu yüzden kesim noktası da YEREL saatle üretilir; karşılaştırma
+# aynı ölçekte iki dize arasındadır. `date -d` GNU coreutils gerektirir (sunucu
+# Debian/Ubuntu); yoksa fail-closed davranıp deploy'u reddet.
+BAN_SINCE="$(date -d '15 minutes ago' '+%Y-%m-%d %H:%M' 2>/dev/null || true)"
+[ -n "$BAN_SINCE" ] || die "ban kilidi hesaplanamadı (date -d desteklenmiyor) — fail-closed, deploy iptal"
+if grep -qE 'HTTP 418|banned' <(tail -n 2000 logs/bot.log 2>/dev/null | awk -v s="$BAN_SINCE" '($1" "substr($2,1,5))>=s'); then
+  die "son 15 dk'da Binance ban izi var (yerel saat penceresi: >= $BAN_SINCE) — ban aktifken restart YASAK"
 fi
 [ -n "$(git status --porcelain --untracked-files=no)" ] && die "çalışma ağacında commit'lenmemiş değişiklik var; deploy yalnız temiz ağaçta"
 

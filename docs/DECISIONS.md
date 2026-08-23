@@ -306,8 +306,10 @@ küçültmek yalnız erken BE ile birlikte çalışır. Günlük kesici harness'
 `docs/superpowers/specs/2026-08-22-reversal-day-loss-design.md`.
 **Beklenti:** SL = sermayenin %2'si; kazançlar yarı ölçek; 22 Ağu benzeri gün ≈ −50; her rejimde
 PF > 1.4 ama boğada toplam PnL tabanın ~%42'si (bilinçli tercih: "her rejimde ayakta kal").
-**Soak:** D6+D16 DEMET; başlangıç 2026-08-23 02:57 sunucu saati (00:57 UTC) → `scripts/ledger_report.py --since
-"2026-08-23 02:57"`; değerlendirme ≥28 Ağu + ≥1 DOWN günü.
+**Soak (PLANLANMIŞTI, GEÇERSİZ):** D6+D16 DEMET; başlangıç 2026-08-23 02:57 sunucu saati
+(00:57 UTC) → `scripts/ledger_report.py --since "2026-08-23 02:57"`; değerlendirme ≥28 Ağu +
+≥1 DOWN günü. ⚠️ Bu demet 03:10'da geri alma ile DAĞILDI — yürüyen tek soak **D6**'dır;
+başka kararların metinlerinde "D6+D16 soak" görülürse eskimiştir.
 **Geri alma:** `cp backups/env.bak-20260823-025623-riskpaketi .env && supervisorctl restart tradingbot_v2`.
 
 ### D17 — Piyasa verisi ayrı host: `SCALPER_MARKET_DATA_BASE_URL` · 2026-08-23 · **ADAY, VARSAYILAN KAPALI** (canlıda uygulanmadı)
@@ -378,8 +380,8 @@ commit'e girmeden düzeltildi — bu kod hiçbir zaman kusurlu haliyle canlıya 
    Binance -2021 verir ve `position_manager._replace_stop_loss` bunu "piyasa stop'u geçti" sayıp
    pozisyonu ACİL KAPATIR — kârlı bir koşucu borsalar arası fiyat farkı yüzünden piyasa emriyle
    kapanabilirdi; ters yönde de gerçekleşen risk boyutlamadan sapıp canlı defteri kirletirdi.
-   Düzeltme: `_to_trading_price_space` — girişte ölçülen fark kadar ÖTELE (mesafe korunur),
-   `executor._delay_adjusted_stop` ile AYNI desen; aynı host'ta (varsayılan) NO-OP.
+   İlk düzeltme `_to_trading_price_space` ile GİRİŞTE ölçülen farkı öteliyordu; **ikinci tur
+   incelemesi bunu yetersiz buldu ve DİNAMİK baza çevirdi** — aşağıya bak (D17-R2 #1/#2).
 2. **Ağırlık bütçesi backtest harness'ini öldürüyordu (HIGH, araştırma aracı).** Harness
    `limit=1500` (ağırlık 10) ile sayfalar: 8 sembol × 30 gün ≈ 656 > 600 → koşu ortada
    `MarketDataBudgetError` ile düşerdi (altın backtest testleri ağsız olduğu için görmezdi).
@@ -431,7 +433,7 @@ parite testi iki tarafın AYNI host'a getirilebildiğini kilitler
 (`tests/test_market_data_source.py::TestHarnessParity`). (3) `BINANCE_BIND_IP` public
 istemciye uygulanmadı (ayrı bir karar; bugünkü canlı davranış değişmesin).
 
-**Kanıt:** `tests/test_market_data_source.py` — 65 test: ayar/doğrulama (https zorunlu,
+**Kanıt:** `tests/test_market_data_source.py` — **109 test** (ilk tur 65, ikinci tur +44): ayar/doğrulama (https zorunlu,
 sondaki `/` ve yol reddi, boşluk = boş, mainnet'te testnet URL'i REDDEDİLİR), motor
 kablolaması (boş ayar → bugünkü yol; dolu ayar → fetcher; `client`/`scanner` işlem host'unda
 kalır; `ExitManager` aynı fetcher'ı paylaşır), harness paritesi, teşhis (status alanları +
@@ -445,15 +447,107 @@ durdurur, public ban imzalıyı durdurmaz, ayrı host izolasyonu, 429 yumuşak b
 turu tek WARNING ile kesmesi, TTL önbelleğinin korunması, anahtar başına kilit) + inceleme
 düzeltmeleri (trailing fiyat-uzayı ötelemesi ve aynı-host no-op'u, batch/live guard modları,
 `/tv-signal` yapısal reti, exits tur-başına tek uyarısı, host allowlist'i, guard durumunun
-status'ta görünmesi).
-`python3 -m pytest tests -q` → **741 passed, 1 skipped** (önceki taban: 676 passed, 1 skipped).
+status'ta görünmesi). **İkinci tur (+44 test):** dinamik baz (giriş fiyatlarından BAĞIMSIZ →
+`recover()` no-op'u kapandı, bayat/absürt bazda tur atlanır), koruma-tarafı kapısı (LONG/SHORT
+simetrik, pay), aynı-host'ta BİREBİR aynı stop (uçtan uca `_update_trailing`), atlama
+sayaçları + oran-sınırlı uyarı, hata kapsamı (401/403/451 → host, 400/404 → sembol, tükenmiş
+5xx → host, `Retry-After`), soft 429 (süre + deploy kalıbına UYMAYAN log, hard ban'ın aynen
+kilitlemesi), `/tv-signal`'in sembol kapsamlı hatada da yapısal ret dönmesi,
+`scan_status=degraded:market_data` muhasebesi, kayan pencerenin tumbling OLMADIĞI, `1m` TTL
+profili, batch bütçe/aralık gevşemesi (ban korumasının moddan bağımsızlığı), SPOT testnet'in
+allowlist'ten çıkması, `ring_env_diff.sh` IP maskesi, deploy ban penceresinin yerel saat
+kullanması.
+`python3 -m pytest tests -q` → **741 passed, 1 skipped** (önceki taban: 676 passed, 1 skipped);
+ikinci tur incelemesinden sonra **785 passed, 1 skipped**.
 Backtest ÇALIŞTIRILMADI ve P2 kuralı bu adaya doğrudan UYGULANAMAZ: harness'ın "testnet
 mumu" modu yoktur, yani "kapalı vs açık" farkı simüle edilemez — bu bir strateji parametresi
 değil, veri KAYNAĞI değişikliğidir. Terfi yolu: (a) tek sembolde mum sapmasını yeniden ölç,
-(b) `SCALPER_SHADOW_MODE` ile ya da mevcut D6+D16 soak'ı BİTTİKTEN sonra testnet'te ≥5 gün
-(değişiklikler üst üste bindirilmez — soak kirlenir), (c) bir tarama turu boyunca
+(b) `SCALPER_SHADOW_MODE` ile ya da yürüyen soak BİTTİKTEN sonra testnet'te ≥5 gün
+(değişiklikler üst üste bindirilmez — soak kirlenir). ⚠️ Bu metin önce "D6+D16 soak" diyordu;
+**D16 risk paketi 2026-08-23 03:10 sunucu saatinde kullanıcı kararıyla GERİ ALINDI**, yani
+bugün geçerli demet yalnız **D6**'dır. (c) bir tarama turu boyunca
 `X-MBX-USED-WEIGHT-1M`'i GERÇEKTEN oku (telemetri artık var) ve 600'lük bütçeyi ölçüme göre
-kalibre et, (d) insan onayı.
+kalibre et — CANLI profil (1m/5m/15m) için hesap 140-180 ağırlık/dk'dır, (d) insan onayı.
+
+**İkinci tur düşmanca inceleme (19 ajan, 2 tur) — hepsi bu commit'te düzeltildi (D17-R2):**
+1. **Fiyat-uzayı bazı YALNIZ giriş anında ölçülüyordu (HIGH).** `position.entry_price −
+   signal.entry_price` pozisyon ömrü boyunca SABİT uygulanıyordu; iki defter arasındaki baz ise
+   saatler içinde kayar. Koruma-tarafı kapısı da yoktu → baz kayınca chandelier stop'u işlem
+   host'unda piyasanın YANLIŞ tarafına gönderilir, Binance -2021 verir ve
+   `position_manager._emergency_close` kârlı koşucuyu PİYASA emriyle kapatır (log "eski SL
+   korunuyor" derken kayıt TRAIL etiketlenir).
+2. **`recover()` düzeltmeyi sessizce no-op yapıyordu (HIGH).** `_recover_one` hem
+   `signal.entry_price`'ı hem `position.entry_price`'ı AYNI değerden (`trade.entry_price`)
+   kuruyor — DB'de sinyal-anı fiyatı kolonu yok — yani restart sonrası baz **0** çıkıyor ve
+   çeviri hiç uygulanmıyordu.
+   **Tek tasarım düzeltmesi ikisini birlikte kapatır:** baz artık DİNAMİKTİR —
+   `baz = işlem_host_güncel_fiyat − veri_host_son_kapanış`, her çıkış turunda yeniden ölçülür
+   (`sp.position.current_price` `_step_one`'da işlem host'undan tazelenir; veri referansı
+   chandelier'ı besleyen serinin son KAPANMIŞ mumudur). Ölçülemezse (bayat işlem fiyatı,
+   |baz| > %2) çeviri `None` döner ve TUR ATLANIR. Ardından **koruma-tarafı kapısı**: LONG stop
+   güncel fiyatın %0.05 altında (SHORT: üstünde) değilse emir HİÇ gönderilmez (eski SL kalır +
+   oran-sınırlı WARNING + `trailing_skips` sayacı). BE tabanı (`floor`) işlem uzayında kalır.
+   Restart'ta ek alan/migrasyon GEREKMEZ (dinamik). Aynı host'ta (varsayılan) ikisi de NO-OP:
+   test `TestTrailingRoundIntegration::test_same_host_stop_is_byte_for_byte_unchanged` gönderilen
+   stop'un çeviri/kapı eklenmeden önceki değerle BİREBİR aynı olduğunu kilitler.
+   `executor._delay_adjusted_stop` ile DESEN aynıdır ama referansları farklıdır (tek seferlik
+   gecikme telafisi + giriş fiyatına göre kapı ↔ sürekli borsa-arası baz + güncel fiyata göre
+   kapı); docstring bunu artık doğru anlatıyor.
+3. **Host geneli 4xx SEMBOL bazlı sayılıyordu (HIGH).** 401/403 (kimlik/WAF) ve 451 (coğrafi
+   engel) `MarketDataRequestError` üretiyordu: 12 sembolün 12'si de aynı yanıtı alıyor, tur
+   kesilmiyor, kesici kurulmuyor, deploy ban kilidi kör kalıyordu. Düzeltme: yalnız **400/404**
+   sembol kapsamlı; 401/403/451 ve diğer 4xx'ler yeni `MarketDataHostError`
+   (`MarketDataUnavailable` alt sınıfı) + kısa kesici; tükenmiş 5xx denemeleri de host geneli
+   sayılır. `Retry-After` başlığı okunur, `X-MBX-USED-WEIGHT-1M` yorumlanır.
+   ⚠️ **Bilinen ödünç:** tek bir sembol İNATLA 5xx döndürürse tur her seferinde o sembolde
+   kesilir ve allowlist'te ondan SONRAKİ semboller taranmaz (önce yalnız o sembol atlanırdı).
+   Binance 5xx'i tanım gereği sunucu tarafıdır ve tek sembole özgü kalıcı 5xx gerçekçi değildir;
+   ayrıca bu durum artık SESSİZ değil: `scan_status=degraded:market_data` + sayaç + oran-sınırlı
+   uyarı. Kalıcı sembol hataları Binance'te 400/`-1121` gelir ve SEMBOL kapsamlı kalmıştır.
+4. **Tek bir 429 küresel kesici + deploy kilidi doğuruyordu (MED).** Ayar BOŞKEN (kline'lar
+   işlem host'undan) tek bir "yavaşla" yanıtı 90-180 sn sinyal üretimini durduruyor ve
+   `server_deploy.sh`'nin `HTTP 418|banned` kilidini 15 dk kapatıyordu. Düzeltme: 429 tek
+   başına **soft throttle**'dır — süre `Retry-After` → ağırlık başlığı (sınır aşıldıysa pencere
+   sonu) → 30 sn; log satırı "banned"/"HTTP 418" İÇERMEZ. Gerçek ban (418 / `-1003` /
+   "banned until") aynen hard kalır; `MarketDataGuard` artık `hard_ban` bayrağını taşır ve
+   `/scalper/status.market_data_guard`'ta gösterir.
+5. **`/tv-signal` hâlâ 500 üretebiliyordu (MED).** `external_signal` yalnız
+   `MarketDataUnavailable`'ı yakalıyordu; `MarketDataRequestError` (sembol veri host'unda yok —
+   ayrı host'ta GERÇEKÇİ) FastAPI'ye sızıyordu. Düzeltme: yapısal ret + log.
+6. **RUNBOOK doğrulaması olmayan bir dizeyi arıyordu (MED).** İlk-saat kontrolü
+   `Kline çekme hatası` diyordu; bilinmeyen-sembol yolu `Kline çekme kalıcı hata` basar.
+   RUNBOOK adımları koddan doğrulanan dizelerle yeniden yazıldı (banner satırı,
+   `/scalper/status.kline_source`+`scan_status`+`market_data_guard`, `.env` satır grep'i).
+7. **Kesilen tarama turu "başarılı" sayılıyordu (MED).** `success_count` artıyor,
+   `consecutive_errors` sıfırlanıyor, `last_scan_at` tazeleniyordu → sağlık YEŞİL, tek iz bir
+   log satırı. Düzeltme: ayrı sayaç + `scan_status="degraded:market_data"` + oran-sınırlı (60 sn)
+   uyarı. Freshness alanları BİLİNÇLİ tazelenmeye devam eder (ban sırasında unhealthy göstermek
+   watchdog restart'ını davet eder — 2026-08-14 felaket yolu). Motorda Telegram istemcisi
+   olmadığı için uyarı log tarafındadır.
+8. **Ağırlık penceresi "kayan" belgelenmiş, "tumbling" kodlanmıştı (MED).** Sabit sınırda sayaç
+   sıfırlandığı için 60 sn'lik herhangi bir kayan aralığa bütçenin İKİ KATI sığabiliyordu.
+   Düzeltme: gerçek kayan pencere (deque, `prune`/`add`/`seconds_until_free`).
+9. **`_TTL_BY_INTERVAL`'de `1m` yoktu (MED).** CANLI profil `SCALPER_TF_ENTRY=1m`'dir; giriş
+   dilimi `_DEFAULT_TTL`=60 sn'ye düşüyor, yani trailing/giriş TAM BİR MUM bayat veriyle karar
+   veriyordu. Düzeltme: `1m → 5 sn`. Ağırlık hesabı canlı profile göre yeniden yapıldı
+   (8 sembol + 3 pozisyon → 70 istek/dk ≈ **140 ağırlık/dk**; TOP_N=12 → 180) —
+   `docs/ARCHITECTURE.md` §2.
+10. **Harness `batch` modu ~3× yavaşlıyordu (MED).** `limit=1500` sayfaları ağırlık 10 eder;
+    canlı 600/dk tavanı araştırma koşusunu pencere beklemeleriyle uzatıyordu. Düzeltme: batch
+    profili (bütçe 1200/dk, aralık 0.05 sn) + sonsuz döngü kalkanı. Ban koruması moddan
+    BAĞIMSIZ. Golden backtest testleri ağsızdır, süreleri değişmedi.
+11. **`testnet.binance.vision` allowlist'teydi (MED).** Orası Binance SPOT testnet'idir,
+    `/fapi/...` sunmaz: ayar kabul edilir, her kline isteği 404 alır ve operatör "URL geçerli"
+    diye çalıştığını sanardı. Demetten çıkarıldı.
+12. **`ring_env_diff.sh` `BINANCE_BIND_IP` değerini basıyordu (MED).** Ban/ağırlık muhasebesi IP
+    başınadır; değer maskelendi (`*BIND_IP*`).
+13. **Deploy ban kilidi penceresi TZ ofseti kadar kayıyordu (MED).** `logs/bot.log` damgaları
+    loguru `{time}` = YEREL saattir, kesim noktası ise `date -u` ile üretiliyordu: UTC+2 bir
+    sunucuda pencere "15 dk" değil "2 sa 15 dk" oluyordu (ve negatif ofsette AKTİF ban
+    görünmeyebilirdi — tehlikeli yön). Düzeltme: kesim noktası da yerel saatle (`date -d`),
+    `date -d` yoksa fail-closed.
+14. **D17 terfi yolundaki "D6+D16 soak" ifadesi (LOW, dürüstlük).** D16 GERİ ALINDI; metin
+    düzeltildi (bu bölümün başı).
 
 **Geri alma:** `.env`'den `SCALPER_MARKET_DATA_BASE_URL` satırını sil (veya boşalt) + restart —
 kod geri alınmasına gerek yok, davranış bugünküyle birebir aynıya döner. Tam geri alma
