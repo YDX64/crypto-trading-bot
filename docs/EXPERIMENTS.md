@@ -430,6 +430,28 @@ YATAY 145 +2392.3 / 1.29 · BOĞA 90 +3901.7 / 2.43.
 > boşalan slota sonraki sinyal giriyor. Aşağıdaki "alt sınır" uyarısı tam da bu yüzden
 > konmuştu; **karar için §E7'nin sayıları kullanılmalı**, buradakiler yöntem karşılaştırması
 > olarak bırakıldı.
+>
+> **Yöntem sonucu (iki ölçüm birleştirilince — ileride işe yarar):** post-hoc Δ ile motor-içi Δ
+> çelişmiyor, biri diğerinin BİR TERİMİ. D15 ajanının bacak atfı (AYI, eşik %1.3, işlemleri
+> `symbol+entry_time+direction` ile eşleştirerek) benim post-hoc sayılarımla birebir toplanıyor:
+>
+> | Bacak | motor-içi Δ | = post-hoc Δ (**kapı etkisi**) | + yeni giren işlemler (**kapasite**) |
+> |---|---|---|---|
+> | LONG | +1136.1 | **+76.1** (engellenen 24 işlem, ≈başabaş) | +1060.0 (9 yeni işlem) → ~%93 kapasite |
+> | SHORT | +2091.8 | **+1934.3** (engellenen 42 işlem, gerçek kaybedenler) | +157.5 (2 yeni işlem) → ~%92 KAPI |
+>
+> Artık kalan yok (LONG 1136.1−76.1 = 1060.0; SHORT 2091.8−1934.3 = 157.5, ikisi de tam),
+> ortak işlemlerin PnL'i iki koşuda aynı. Yani: **post-hoc filtre = saf kapı etkisi; motor-içi
+> koşu = kapı + kapasite yeniden tahsisi; fark = kapasite terimi.** Bu, E8.5'teki defter-üstü
+> simülasyonların da nasıl okunacağını belirler (onlar da saf kapı etkisidir) ve gelecekteki
+> kapı adayları için ucuz bir ön-eleme verir: post-hoc terim negatifse kapının KENDİSİ
+> zararlıdır, pozitifse motor-içi koşu bunu kapasite kazancıyla ancak BÜYÜTÜR.
+>
+> **Bacak hükmü (çözüldü):** aşağıdaki "kazancın tamamına yakını SHORT bacağından" okuması
+> motor-içi veriyle DOĞRULANDI (SHORT ~%92 kapı / LONG ~%7 kapı). D15 ajanının "LONG bacağı da
+> değerli" itirazı bu atıfla geri alındı — LONG'daki +1136'nın ~%93'ü boşalan slota giren YENİ
+> işlemlerdi, kapının kendisi değil. Bacak-ayrık eşik (SHORT %1.0 / LONG %1.3) artık iki
+> ölçümle de destekleniyor ama uygulanmadı: ayrı tasarım kararı + kullanıcı onayı gerektirir.
 
 **Yöntem sınırı (önemli):** kapı **post-hoc** uygulandı — harness JSON'undaki her işlem giriş
 zamanıyla yeniden zenginleştirilip filtrelendi. Engellenen bir işlem harness'ta
