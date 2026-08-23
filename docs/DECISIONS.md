@@ -1509,6 +1509,81 @@ canlı testnet davranışı HER İKİ durumda da aynıdır). Bulgu 3 → giriş 
 çıkar. Hiçbiri `.env` değişikliği gerektirmez.
 
 
+### D21 — İşlem adli kaydı (trade forensics) · 2026-08-23 · **AKTİF (yalnız gözlemlenebilirlik — DAVRANIŞ DEĞİŞİKLİĞİ YOK)**
+
+**Ne:** her scalp işlemi için giriş ve çıkış ANINDA bilinen bağlamın tamamı tek
+bir JSON belgesine yazılır (`scalp_trades.forensics` + append-only
+`logs/trades.jsonl`), kural tabanlı etiketlerle (`verdict`) sınıflandırılır ve
+üç HTTP ucundan + panodaki "adli kart"tan okunur.
+
+**Neden (kullanıcı talebi, 2026-08-23):** "kayıplar/kazançlar: hangi coin, hangi
+hareket, hangi sinyal, hangi giriş/çıkış, neler etkiliyor — %100 görürsek
+önler, düzeltir, geliştiririz." Bugüne kadar bir kaybın nedeni ancak
+`logs/bot.log` içinde elle arayarak, çoğu zaman da hiç bulunamayarak
+çıkarılıyordu (XRP #152 analizi bunun tipik örneğidir). Sinyal-öncelik kuralı
+(kullanıcı kararı, 2026-08-23) boyut/TP/stop ayarıyla kayıp küçültmeyi YASAKLAR;
+geriye kalan tek yol sinyal kalitesini ÖLÇMEKTİR ve ölçüm için önce KAYIT gerekir.
+
+**Kapsam sınırı (bağlayıcı):** bu bir GÖZLEM katmanıdır, güvenlik kilidi değildir.
+- Hiçbir kapı, boyutlama, stop/TP seviyesi ya da çıkış kararı `forensics`
+  alanını OKUMAZ. `BOT_MODE=scalper` emir akışı byte-for-byte aynıdır.
+- Kayıt kurulumundaki her hata yutulur ve TEK SEFER WARNING'e düşer
+  (`_forensics_warn`); işlem açılmaya/kapanmaya devam eder
+  (`tests/test_forensics.py::TestForensicsNeverBlocksTrading`).
+- Backtest harness'ına DOKUNULMADI (P1 paritesi bu maddede gerekmez: harness
+  zaten borsaya çıkmaz ve adli kayıt bir karar kuralı değildir).
+- **AlgoPro takipçi halkası (D20):** `FollowerExitManager`, `ExitManager`ın
+  `_finalize_close`'unu MİRAS ALIR, bu yüzden takipçi kapanışları da bir `exit`
+  belgesi + çıkış etiketleri yazar (kendi DB'sine, kendi `logs/trades.jsonl`'ine).
+  `entry` bölümü orada YOKTUR (takipçinin kendi executor'ı bağlam üretmez) ve
+  BE damgası da yoktur (takipçinin ayrı `_check_tp1_breakeven` yolu). Davranışı
+  ETKİLEMEZ; halkanın giriş/çıkış mantığına dokunulmadı.
+
+**Nerede:**
+- `src/strategies/scalper/forensics.py` — SAF katman: etiket kuralları
+  (`classify_entry`/`classify_exit`), belge kurucuları, `summarize`. IO/saat yok.
+- `src/strategies/scalper/forensics_log.py` — `logs/trades.jsonl` (günlük
+  rotasyon, 30 gün saklama, secret YOK).
+- `engine._forensics_entry_context` (giriş bağlamı; YENİ REST ÇAĞRISI YOK — yalnız
+  `_market_gate_status`, `tv_events` ve `ctx`'teki hazır seriler),
+  `executor._build_entry_forensics` (gerçek dolum sayılarıyla birleştirir),
+  `exits._build_exit_forensics` (zaman çizgisi + etiketler),
+  `engine._forensics_postmortem_tick` (kapanıştan N dk SONRA).
+- `tracker.record_open/record_close/record_postmortem` + okuma yardımcıları;
+  şema `database._ensure_schema_migrations` (idempotent `ALTER TABLE`).
+- Uçlar: `GET /scalper/trades/{id}/forensics`, `/scalper/forensics/recent`,
+  `/scalper/forensics/summary?since=`. Pano: "Son İşlemler" satırına tıklayınca
+  açılan adli kart + "Neler Etkiliyor" paneli.
+- Rapor: `scripts/ledger_report.py --forensics` (etiket × sonuç tablosu).
+
+**Etiketler (kural tabanlı, dürüst):** `counter_drift_long`,
+`relief_rally_short`, `late_entry_after_run`, `tv_single_family`,
+`stale_signal`, `gate_bypassed` (giriş anı); `fee_dominated`, `mfe_giveback`
+(kapanış anı); `noise_stop` (post-mortem). Her etiket için pozitif VE negatif
+test vardır. Eşikler `SCALPER_FORENSICS_*` ile ayarlanır.
+
+**Look-ahead:** `entry`/`exit` yalnız o anda bilinen değerleri taşır.
+Kapanıştan SONRA ölçülebilen tek büyüklük (`noise_stop` — "stop yedikten sonra
+fiyat girişe döndü mü") AYRI bir `postmortem` alanındadır, kapanış zamanından
+SONRAKİ mumlarla ve pencere DOLDUKTAN sonra hesaplanır, hiçbir karar yolunda
+okunmaz (`tests/test_forensics.py::TestPostmortem::
+test_candles_before_close_are_ignored`).
+
+**Maliyet:** giriş/çıkış tarafında SIFIR ek REST isteği. Post-mortem turu safety
+turunda ama dakikada en fazla bir kez ve tur başına EN FAZLA BİR sembol çalışır;
+istek `1m` limit 150 (ağırlık 2) — pratikte saatte birkaç istek.
+`SCALPER_FORENSICS_POSTMORTEM_MIN=0` bu turu tamamen kapatır.
+
+**Kanıt:** `tests/test_forensics.py` (97 test) + tüm paket yeşil (1722 test).
+Canlı defterden bir "etiket → PnL" hükmü HENÜZ YOKTUR — kayıt bugün başlıyor;
+ilk hüküm en az bir haftalık testnet verisiyle `--forensics` raporundan
+çıkarılacaktır. Yani bu karar bir STRATEJİ kanıtı değil, kanıt ÜRETME
+altyapısıdır.
+
+**Geri alma:** `.env`'de `SCALPER_FORENSICS_ENABLED=false` (kayıt durur, motor
+aynen çalışır). Tam geri alma: bu commit'i revert et; `scalp_trades.forensics`
+sütunu kalırsa zararsızdır (hiçbir kod yolu okumaz).
+
 ## Reddedilen kararlar (kanıtla)
 
 | Fikir | Tarih | Sonuç | Neden reddedildi |

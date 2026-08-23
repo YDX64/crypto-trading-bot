@@ -105,6 +105,7 @@ class ExitManager:
         kline_fetch: KlineFetch,
         loss_cooldown_cb: Optional[Callable[[str], None]] = None,
         data_price_fetch: Optional[PriceFetch] = None,
+        forensics_context_cb: Optional[Callable[[str], Dict[str, Any]]] = None,
     ):
         self.client = client
         self.pm = pm
@@ -124,6 +125,12 @@ class ExitManager:
         # SL/negatif kapanışta executor'ın sembol cooldown'unu başlatır.
         # Opsiyonel: verilmezse (eski kurulum/testler) davranış değişmez.
         self._loss_cooldown_cb = loss_cooldown_cb
+        # D21 adli kayıt: kapanış anındaki piyasa bağlamı (sembol rejimi,
+        # lider gün sapması, BTC fiyatı) motordan SENKRON okunur — ek REST
+        # çağrısı YOKTUR. Opsiyonel: verilmezse alanlar boş kalır, davranış
+        # birebir aynıdır.
+        self._forensics_context_cb = forensics_context_cb
+        self._forensics_error_logged: bool = False
         # D17: piyasa verisi host GENELİ kesildiğinde (ban/bütçe) her tur her
         # sembol için ayrı WARNING basılmasın — tur başına bir kez.
         self._market_data_down_reason: Optional[str] = None
@@ -303,6 +310,10 @@ class ExitManager:
             sp.trailing_active = True
             if not already_tighter:
                 sp.position.current_stoploss = target
+            # D21 zaman çizgisi (yalnız gözlem): TP1 → BE geçişinin anı.
+            self._mark_path(sp, "tp1_at")
+            self._mark_path(sp, "be_at")
+            sp.be_price = sp.position.current_stoploss
             self.logger.info(
                 f"✅ {symbol}: ücret-dahil break-even aktif, "
                 f"SL={sp.position.current_stoploss}"
@@ -351,6 +362,7 @@ class ExitManager:
         sp.trailing_active = True
         if not already_tighter:
             sp.position.current_stoploss = floor
+        self._mark_path(sp, "tp2_at")   # D21 zaman çizgisi (yalnız gözlem)
         self.logger.info(
             f"✅ {symbol}: TP2 gerçek fill doğrulandı; runner sabit tabanı "
             f"TP1={floor} (aktif SL={sp.position.current_stoploss})"
@@ -757,6 +769,12 @@ class ExitManager:
         ok = await self.pm.replace_stop_loss(sp.position, new_stop)
         if ok:
             sp.position.current_stoploss = new_stop
+            # D21 zaman çizgisi (yalnız gözlem): kaç kez ve nereye çekildi.
+            try:
+                sp.trail_updates = int(getattr(sp, "trail_updates", 0) or 0) + 1
+                sp.last_trail_stop = new_stop
+            except Exception:  # pragma: no cover - SimpleNamespace fixture'ları
+                pass
             self.logger.info(f"📈 {symbol}: chandelier trailing SL güncellendi -> {new_stop}")
         else:
             self.logger.warning(f"⚠️ {symbol}: trailing SL güncellenemedi, eski SL korunuyor")
@@ -1097,6 +1115,19 @@ class ExitManager:
         )
         notes = ";".join(verification_notes) or None
 
+        # D21 adli kayıt: "nasıl çıkıldı" + kural tabanlı etiketler. Hesap
+        # hatası kapanışı ASLA engellemez (aşağıda try/except).
+        forensics_exit, verdict = self._build_exit_forensics(
+            symbol=symbol,
+            sp=sp,
+            exit_price=exit_price,
+            realized_pnl=realized_pnl,
+            gross_pnl=estimated_gross,
+            pnl_source=pnl_source,
+            exit_reason=exit_reason,
+            verification_notes=verification_notes,
+        )
+
         try:
             await self.tracker.record_close(
                 trade_id=sp.trade_id,
@@ -1107,9 +1138,19 @@ class ExitManager:
                 mfe_pct=sp.mfe_pct,
                 pnl_source=pnl_source,
                 notes=notes,
+                forensics_exit=forensics_exit,
+                verdict=verdict,
             )
         except Exception as e:
             self.logger.error(f"❌ {symbol}: kapanış kaydı yazılamadı (#{sp.trade_id}): {e}")
+
+        if forensics_exit is not None:
+            self._forensics_event(
+                symbol=symbol,
+                trade_id=sp.trade_id,
+                exit_document=forensics_exit,
+                verdict=verdict or [],
+            )
 
         loss_threshold = (
             0.0
@@ -1125,6 +1166,137 @@ class ExitManager:
             f"kaynak={pnl_source} neden={exit_reason}",
             extra={"trade": True},
         )
+
+    # ------------------------------------------------------------------
+    # İşlem adli kaydı (D21) — YALNIZ GÖZLEM, kapanışı ASLA engellemez
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _mark_path(sp: Any, field: str) -> None:
+        """Zaman çizgisi damgası; İLK damga korunur (yeniden yazılmaz)."""
+        try:
+            if getattr(sp, field, None) is None:
+                setattr(
+                    sp,
+                    field,
+                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                )
+        except Exception:  # pragma: no cover - fixture savunması
+            pass
+
+    def _forensics_enabled(self) -> bool:
+        return bool(getattr(self.cfg, "scalper_forensics_enabled", True))
+
+    def _forensics_warn(self, message: str) -> None:
+        if not getattr(self, "_forensics_error_logged", False):
+            self._forensics_error_logged = True
+            self.logger.warning(
+                f"⚠️ Adli kayıt (çıkış) kurulamadı ({message}) — bu uyarı bir "
+                f"kez loglanır, kapanış akışı ETKİLENMEZ"
+            )
+
+    def _build_exit_forensics(
+        self,
+        *,
+        symbol: str,
+        sp: ScalpPosition,
+        exit_price: Any,
+        realized_pnl: Any,
+        gross_pnl: Any,
+        pnl_source: Optional[str],
+        exit_reason: Optional[str],
+        verification_notes: List[str],
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[List[str]]]:
+        """(çıkış sözlüğü, etiket listesi) — hata hâlinde (None, None)."""
+        if not self._forensics_enabled():
+            return None, None
+        try:
+            from src.strategies.scalper import forensics as fx
+
+            now = time.time()
+            opened_epoch = getattr(sp, "opened_epoch", None)
+            opened_at = getattr(sp.position, "opened_at", None)
+            if opened_epoch is None and opened_at is not None:
+                opened_epoch = opened_at.replace(tzinfo=timezone.utc).timestamp()
+            duration = None if opened_epoch is None else max(0.0, now - opened_epoch)
+
+            context: Dict[str, Any] = {}
+            if self._forensics_context_cb is not None:
+                try:
+                    context = dict(self._forensics_context_cb(symbol) or {})
+                except Exception as e:
+                    self._forensics_warn(f"context_cb {type(e).__name__}: {e}")
+
+            path = {
+                "tp1_at": getattr(sp, "tp1_at", None),
+                "tp1_price": getattr(sp.plan, "tp1_price", None),
+                "tp1_done": bool(getattr(sp, "tp1_done", False)),
+                "tp2_at": getattr(sp, "tp2_at", None),
+                "tp2_price": getattr(sp.plan, "tp2_price", None),
+                "tp2_done": bool(getattr(sp, "tp2_done", False)),
+                "be_at": getattr(sp, "be_at", None),
+                "be_price": getattr(sp, "be_price", None),
+                "trail_updates": int(getattr(sp, "trail_updates", 0) or 0),
+                "last_trail_stop": getattr(sp, "last_trail_stop", None),
+                "trailing_active": bool(getattr(sp, "trailing_active", False)),
+                "initial_stop": getattr(sp.plan, "initial_stop", None),
+                "final_stop": getattr(sp.position, "current_stoploss", None),
+                "age_hours": None if duration is None else round(duration / 3600.0, 3),
+            }
+
+            exit_doc = fx.build_exit(
+                at=datetime.fromtimestamp(now, tz=timezone.utc).isoformat(
+                    timespec="seconds"
+                ),
+                reason=exit_reason or "UNKNOWN",
+                exit_price=exit_price,
+                entry_price=sp.position.entry_price,
+                quantity=sp.position.quantity,
+                leverage=sp.position.leverage,
+                direction=sp.signal.direction,
+                realized_pnl=realized_pnl,
+                gross_pnl=gross_pnl,
+                pnl_source=pnl_source,
+                mae_roi_pct=getattr(sp, "mae_pct", None),
+                mfe_roi_pct=getattr(sp, "mfe_pct", None),
+                duration_sec=duration,
+                path=path,
+                leader_day_drift_pct=context.get("leader_day_drift_pct"),
+                regime=context.get("regime"),
+                btc_price=context.get("btc_price"),
+                verification_notes=verification_notes,
+            )
+            thresholds = fx.thresholds_from_cfg(self.cfg)
+            entry_doc = getattr(sp, "forensics_entry", None)
+            verdict = fx.classify(entry_doc, exit_doc, thresholds)
+            return exit_doc, verdict
+        except Exception as e:
+            self._forensics_warn(f"{type(e).__name__}: {e}")
+            return None, None
+
+    def _forensics_event(
+        self,
+        *,
+        symbol: str,
+        trade_id: int,
+        exit_document: Dict[str, Any],
+        verdict: List[str],
+    ) -> None:
+        """`logs/trades.jsonl`'e tek satır yaz (fail-safe)."""
+        try:
+            from src.strategies.scalper import forensics_log
+
+            forensics_log.append(
+                "exit",
+                {
+                    "trade_id": int(trade_id),
+                    "symbol": str(symbol),
+                    "verdict": list(verdict),
+                    "exit": exit_document,
+                },
+            )
+        except Exception as e:  # pragma: no cover - savunma
+            self._forensics_warn(f"{type(e).__name__}: {e}")
 
     async def _verified_close_ledger(
         self,

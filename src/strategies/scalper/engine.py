@@ -227,6 +227,10 @@ class ScalperEngine:
             # CANLI fiyatı da AYNI fetcher'dan (aynı host, aynı ağırlık
             # bütçesi/kesici) gelir. Aynı host'ta hiç çağrılmaz.
             data_price_fetch=self.fetcher.get_price,
+            # D21: kapanış anındaki piyasa bağlamı (sembol rejimi, lider gün
+            # sapması, BTC fiyatı). SENKRON ve önbellekten okunur — ek REST
+            # çağrısı YOKTUR; yalnız adli kayda yazılır.
+            forensics_context_cb=self._forensics_close_context,
         )
 
         # _task eski iç kullanımlar için scan task alias'ı olarak korunur.
@@ -276,6 +280,10 @@ class ScalperEngine:
         # yeniden DENENMEZ (boşa REST + kline kilidi tutmayı önler).
         self._market_gate_retry_after: float = 0.0
         self._market_gate_warn_at: Dict[str, float] = {}
+        # D21 adli kayıt: kurulum hatası bir kez uyarılır, akış etkilenmez.
+        self._forensics_error_logged: bool = False
+        # Post-mortem turu (kapanıştan N dk sonra) için son çalıştırma anı.
+        self._forensics_postmortem_at: float = 0.0
         self._balance_cache: Tuple[Optional[float], float] = (None, 0.0)
         self._daily_pnl: float = 0.0
         self._daily_pnl_source: str = "unavailable"
@@ -1078,6 +1086,9 @@ class ScalperEngine:
         # "yaş" değil "TV_EVENT" olarak etiketlenmeli.
         await self._apply_tv_event_exits()
         await self._reap_aged_positions()
+        # D21 post-mortem: TÜM çıkış/koruma işlerinden SONRA (bir teşhis işi
+        # asla bir koruma işini geciktirmez) ve dakikada en fazla bir kez.
+        await self._forensics_postmortem_tick()
         self._sync_scalper_reservations()
         was_blocked = self._kill_switch or self._entry_halted
         await self._update_kill_switch()
@@ -1513,7 +1524,18 @@ class ScalperEngine:
             ),
         }
 
-    async def _evaluate_symbol(self, symbol: str, enabled_strategies: list) -> None:
+    async def _evaluate_symbol(
+        self,
+        symbol: str,
+        enabled_strategies: list,
+        *,
+        external_meta: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """`external_meta` (D21): TV kaynağı/sağlama özeti — YALNIZ adli kayıt.
+
+        Hiçbir kapıya girmez; None (varsayılan) verildiğinde bu fonksiyon
+        eskisiyle birebir aynıdır.
+        """
         owner = symbol_reservations.owner(symbol)
         if owner is not None and owner != self._RESERVATION_OWNER:
             return
@@ -1583,6 +1605,9 @@ class ScalperEngine:
             sig = strat.evaluate(ctx)
             if sig is None:
                 continue
+            # D21 adli kayıt: sinyalin doğduğu an. Kapılar + emir gecikmesi
+            # (`stale_signal`) buradan ölçülür. Karar yoluna GİRMEZ.
+            signal_epoch = time.time()
             # 2026-08-16 rejim kapisi: C, DOWN rejimde LONG / UP rejimde SHORT
             # acamaz (30 saatlik RANGE/DOWN penceresinde rejime ters girisler
             # -35 USDT kanatti). 2026-08-18: TV muafiyeti KALDIRILDI (ayrı
@@ -1731,8 +1756,30 @@ class ScalperEngine:
                 self._opening_symbols.add(symbol)
                 unsafe_failure = False
                 sp = None
+                # D21: giriş-anı bağlamı. Yalnız hazır anlık görüntüleri okur
+                # (yeni REST çağrısı YOK) ve hata hâlinde None döner —
+                # girişi ASLA engellemez.
+                forensics_ctx = self._forensics_entry_context(
+                    symbol=symbol,
+                    signal=sig,
+                    ctx=ctx,
+                    structure_state=structure_state,
+                    is_external=is_external,
+                    signal_epoch=signal_epoch,
+                    open_positions=open_count,
+                    external_meta=external_meta,
+                )
                 try:
-                    sp = await self.executor.try_open(sig, ctx)
+                    # `forensics=` YALNIZ bağlam kurulabildiyse geçilir:
+                    # executor yerine iki-argümanlı bir çift koyan
+                    # test/entegrasyon kurulumları bu yolla bozulmaz ve adli
+                    # kaydın kapalı olması giriş akışını hiç değiştirmez.
+                    if forensics_ctx is not None:
+                        sp = await self.executor.try_open(
+                            sig, ctx, forensics=forensics_ctx
+                        )
+                    else:
+                        sp = await self.executor.try_open(sig, ctx)
                 except UnprotectedPositionError:
                     # Sembol, outer loop kalıcı entry latch'i etkinleştirene
                     # kadar in-flight kümesinde kalır. Bu kısa aralıkta safety
@@ -1773,6 +1820,258 @@ class ScalperEngine:
             # Sembol başına tek deneme: sinyal bulunduğu an (başarılı ya da
             # başarısız) bu sembol için tur biter.
             break
+
+    # ------------------------------------------------------------------
+    # İşlem adli kaydı (D21) — YALNIZ GÖZLEM
+    # ------------------------------------------------------------------
+
+    def _forensics_enabled(self) -> bool:
+        return bool(getattr(self.cfg, "scalper_forensics_enabled", True))
+
+    def _forensics_warn(self, message: str) -> None:
+        """Adli kayıt arızasını BİR KEZ duyur; hiçbir akışı kesme."""
+        if not getattr(self, "_forensics_error_logged", False):
+            self._forensics_error_logged = True
+            self.logger.warning(
+                f"⚠️ Adli kayıt bağlamı kurulamadı ({message}) — bu uyarı bir "
+                f"kez loglanır, giriş/çıkış akışı ETKİLENMEZ"
+            )
+
+    def _forensics_entry_context(
+        self,
+        *,
+        symbol: str,
+        signal: Any,
+        ctx: StrategyContext,
+        structure_state: Any,
+        is_external: bool,
+        signal_epoch: float,
+        open_positions: int,
+        external_meta: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Giriş anındaki "neden girildi" bağlamı.
+
+        YENİ REST ÇAĞRISI YOKTUR: yalnız `ctx`'te zaten bulunan seriler ve
+        senkron anlık görüntüler (`_market_gate_status`, `tv_events.snapshot`,
+        `_kline_source_snapshot`) okunur. Hata hâlinde None döner ve giriş
+        normal biçimde sürer — bu bir gözlem katmanıdır, güvenlik kilidi
+        DEĞİLDİR.
+        """
+        if not self._forensics_enabled():
+            return None
+        try:
+            from src.strategies.scalper import forensics as fx
+
+            direction = getattr(signal.direction, "value", str(signal.direction))
+            gate_status = self._market_gate_status()
+            leader_gate = fx.leader_gate_snapshot(gate_status)
+
+            # Lider (BTC) fiyatı: kapı görüntüsü BAYAT değilse okunur.
+            btc_price = None
+            if not gate_status.get("stale"):
+                cached = getattr(self, "_market_gate_cache", {}).get(
+                    self._market_gate_leader()
+                )
+                if cached:
+                    btc_price = (cached[0] or {}).get("last_close")
+
+            regime_filter_on = bool(
+                getattr(self.cfg, "scalper_regime_filter", True)
+            ) and (
+                not is_external
+                or bool(getattr(self.cfg, "scalper_tv_regime_filter", True))
+            )
+            tv_mode = self._tv_events_mode()
+            gates = {
+                "regime": "passed" if regime_filter_on else "off",
+                "leader": {
+                    "kapalı": "off",
+                    "geçti": "passed",
+                    "etkin_değil": "degraded",
+                }.get(leader_gate.get("verdict"), "off"),
+                "structure": (
+                    "passed"
+                    if bool(getattr(self.cfg, "scalper_structure_gate", False))
+                    else "off"
+                ),
+                "tv_structure": {
+                    "off": "off", "shadow": "shadow", "active": "passed",
+                }.get(tv_mode, "off"),
+                "capacity": "passed",
+                "cooldown": "passed",
+            }
+
+            tv_structure = None
+            ledger = self._tv_ledger()
+            if ledger is not None and tv_mode != "off":
+                verdict, rows = ledger.structure_verdict(symbol)
+                tv_structure = {
+                    "mode": tv_mode,
+                    "verdict": verdict,
+                    "sources": sorted(
+                        {str(row.get("source")) for row in rows if row.get("source")}
+                    ),
+                }
+
+            entry_candles = list(getattr(ctx, "candles_5m", None) or [])
+            candle_age = None
+            if entry_candles:
+                candle_age = max(
+                    0.0, signal_epoch - entry_candles[-1].close_time / 1000.0
+                )
+
+            context: Dict[str, Any] = {
+                "source": "TV" if is_external else "C",
+                "signal_epoch": signal_epoch,
+                "signal_at": datetime.fromtimestamp(
+                    signal_epoch, tz=timezone.utc
+                ).isoformat(timespec="seconds"),
+                "candle_age_sec": None if candle_age is None else round(candle_age, 1),
+                "indicators": fx.indicator_snapshot(ctx, self.cfg),
+                "regime": {
+                    "value": getattr(ctx.regime, "value", str(ctx.regime)),
+                    "tf": str(getattr(self.cfg, "scalper_tf_regime", "4h") or "4h"),
+                    "direction": direction,
+                },
+                "leader_gate": leader_gate,
+                "structure": structure_snapshot(structure_state) or None,
+                "tv_structure": tv_structure,
+                "gates": gates,
+                "kline_source": self._kline_source_snapshot().get("kline_source"),
+                "open_positions": int(open_positions),
+                "daily_pnl": self._daily_pnl,
+                "btc_price": btc_price,
+            }
+            if external_meta:
+                context["tv"] = dict(external_meta)
+            return context
+        except Exception as e:
+            self._forensics_warn(f"{type(e).__name__}: {e}")
+            return None
+
+    def _forensics_close_context(self, symbol: str) -> Dict[str, Any]:
+        """Kapanış anındaki piyasa bağlamı — SENKRON, hiç IO yapmaz."""
+        try:
+            gate_status = self._market_gate_status()
+            btc_price = None
+            if not gate_status.get("stale"):
+                cached = getattr(self, "_market_gate_cache", {}).get(
+                    self._market_gate_leader()
+                )
+                if cached:
+                    btc_price = (cached[0] or {}).get("last_close")
+            return {
+                "regime": self._regimes.get(str(symbol).upper()),
+                "leader_day_drift_pct": gate_status.get("day_drift_pct"),
+                "btc_price": btc_price,
+            }
+        except Exception as e:
+            self._forensics_warn(f"close_context {type(e).__name__}: {e}")
+            return {}
+
+    async def _forensics_postmortem_tick(self) -> None:
+        """Kapanıştan N dk SONRA "fiyat girişe döndü mü" alanını doldur.
+
+        **Look-ahead değildir:** yalnız kapanış zamanından SONRAKİ mumlara
+        bakar ve sonucu kaydın AYRI `postmortem` alanına yazar; hiçbir kapı,
+        boyutlama ya da çıkış kararı bu alanı okumaz.
+
+        Maliyet: tur başına EN FAZLA BİR sembol (2026-08-14 watchdog dersi:
+        bir safety turu asla uzun sürmemeli) ve mum isteği tarama turununkiyle
+        AYNI biçimdedir (`KlineFetcher` TTL önbelleğine düşebilir). Post-mortem
+        penceresi `SCALPER_FORENSICS_POSTMORTEM_MIN=0` ile tamamen kapatılır.
+        """
+        if not self._forensics_enabled():
+            return
+        window_min = float(
+            getattr(self.cfg, "scalper_forensics_postmortem_min", 60.0) or 0.0
+        )
+        if window_min <= 0:
+            return
+        now = time.monotonic()
+        # Dakikada bir yeter: bu bir teşhis işidir, bir koruma değil.
+        if now - float(getattr(self, "_forensics_postmortem_at", 0.0)) < 60.0:
+            return
+        self._forensics_postmortem_at = now
+
+        row: Optional[Dict[str, Any]] = None
+        try:
+            from src.strategies.scalper import forensics as fx
+
+            candidates = await self.tracker.postmortem_candidates(
+                now=datetime.utcnow(),
+                min_age_minutes=window_min,
+            )
+            if not candidates:
+                return
+            row = candidates[0]           # tur başına EN FAZLA BİR sembol
+            symbol = str(row.get("symbol") or "").upper()
+            closed_at = row.get("closed_at")
+            if not symbol or closed_at is None:
+                return
+            closed_ms = int(
+                closed_at.replace(tzinfo=timezone.utc).timestamp() * 1000
+            )
+            tf_entry = str(getattr(self.cfg, "scalper_tf_entry", "5m") or "5m")
+            candles = await self.fetcher.get_klines(symbol, tf_entry, 150)
+            postmortem = fx.postmortem_from_candles(
+                entry=row.get("entry"),
+                exit_=row.get("exit"),
+                candles=candles,
+                closed_at_ms=closed_ms,
+                th=fx.thresholds_from_cfg(self.cfg),
+            )
+            if not postmortem.get("candles_seen"):
+                # Pencereyi kapsayan mum yok (ör. sembol veri kaynağında yok):
+                # boş bir kayıt yazıp konuyu kapat — sonsuz yeniden deneme yok.
+                postmortem["note"] = (
+                    "pencereyi kapsayan mum bulunamadı; ölçüm yapılamadı"
+                )
+            await self.tracker.record_postmortem(int(row["id"]), postmortem)
+            try:
+                from src.strategies.scalper import forensics_log
+
+                forensics_log.append(
+                    "postmortem",
+                    {
+                        "trade_id": int(row["id"]),
+                        "symbol": symbol,
+                        "postmortem": postmortem,
+                    },
+                )
+            except Exception as e:  # pragma: no cover - savunma
+                self._forensics_warn(f"postmortem_log {type(e).__name__}: {e}")
+        except MarketDataRequestError as e:
+            # SEMBOL kapsamlı ve KALICI hata (ör. `-1121 Invalid symbol` —
+            # ayrı market-data host'unda gerçekçidir). Her dakika yeniden
+            # denemek hem boşunadır hem de kuyruğu TIKAR: aday listesi
+            # kapanış zamanına göre sıralıdır, bu satır çözülene kadar
+            # arkasındaki hiçbir işlem ölçülemez. "Ölçülemedi" diye işaretle
+            # ve geç (bir kayıt eksiği, kilitlenmiş bir kuyruktan iyidir).
+            if row is not None:
+                await self._forensics_mark_unmeasured(
+                    row, f"sembol veri kaynağında bulunamadı ({e})"
+                )
+        except MarketDataUnavailable as e:
+            # HOST geneli (ban/bütçe): geçicidir, işaretleme YAPILMAZ —
+            # sonraki turda aynı satır yeniden denenir. Teşhis işi için tek
+            # WARNING satırı bile fazladır (tarama turu zaten uyarıyor).
+            self.logger.debug(f"Post-mortem atlandı (piyasa verisi yok): {e}")
+        except Exception as e:
+            self._forensics_warn(f"postmortem {type(e).__name__}: {e}")
+
+    async def _forensics_mark_unmeasured(
+        self, row: Dict[str, Any], note: str
+    ) -> None:
+        """Post-mortem kuyruğunu tıkamasın diye "ölçülemedi" kaydı yaz."""
+        try:
+            await self.tracker.record_postmortem(
+                int(row["id"]),
+                {"window_minutes": 0.0, "candles_seen": 0,
+                 "returned_to_entry": None, "tags": [], "note": note},
+            )
+        except Exception as e:  # pragma: no cover - savunma
+            self._forensics_warn(f"postmortem_mark {type(e).__name__}: {e}")
 
     def _safety_interval_seconds(self) -> float:
         """Hatalı/negatif ayarı yoğun bir busy-loop'a çevirmeden sınırla."""
@@ -2541,11 +2840,20 @@ class ScalperEngine:
             )
             return True
 
-    async def external_signal(self, symbol: str, direction: Direction) -> Dict[str, Any]:
+    async def external_signal(
+        self,
+        symbol: str,
+        direction: Direction,
+        *,
+        tv_meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """TradingView webhook köprüsü: dış sinyali normal giriş hattına sok.
 
         Dönen sözlük teşhis içindir; kabul edilen sinyal bile risk
         kapılarında reddedilebilir — kesin sonuç log + DB'dedir.
+
+        `tv_meta` (D21): hangi TV kaynakları oy verdi / sağlama penceresi —
+        YALNIZ adli kayıt içindir, hiçbir kapıya girmez.
         """
         symbol = str(symbol).upper()
         if not self.running:
@@ -2588,7 +2896,19 @@ class ScalperEngine:
             extra={"trade": True},
         )
         try:
-            await self._evaluate_symbol(symbol, [_ExternalSignalStrategy(direction)])
+            # `external_meta` YALNIZ dolu olduğunda geçilir: `_evaluate_symbol`
+            # yerine iki-argümanlı bir çift koyan test/entegrasyon kurulumları
+            # (ör. tests/test_market_data_source.py) bu yolla bozulmaz.
+            if tv_meta:
+                await self._evaluate_symbol(
+                    symbol,
+                    [_ExternalSignalStrategy(direction)],
+                    external_meta=tv_meta,
+                )
+            else:
+                await self._evaluate_symbol(
+                    symbol, [_ExternalSignalStrategy(direction)]
+                )
         except MarketDataUnavailable as e:
             # D17: piyasa verisi host geneli kesikken (ban/ağırlık bütçesi) bu
             # istisna FastAPI'ye sızıp /tv-signal'i HTTP 500'e düşürürdü;

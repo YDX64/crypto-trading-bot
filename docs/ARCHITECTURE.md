@@ -281,7 +281,9 @@ inceleme bulgusu; çelişki görürsen D19a bağlayıcıdır).
 | `src/services/tv_events.py` | TV ÇIKIŞ + YAPI/DÖNÜŞ olay defteri (D19/D19a; sağlamaya GİRMEZ) | `TvEvents.ingest`, `fresh_gate_structures`, `structure_verdict` (MIXED), `pending_exit`, `consumed_seq`/`mark_consumed`/`note_attempt` (kalıcı tüketim), `protect` (budama muafiyeti), `config_health`, `snapshot`, `reset`; süreç-tekili `tv_events` |
 | `src/trading/binance_client_improved.py` | İmzalı/imzasız REST istemcisi, okuma önbellekleri, ağırlık telemetrisi | `_get_account:711`, `get_position_risk:1360`, `get_all_positions:1424`, `_request_with_retry:329` (weight header, satır 391-415), `_invalidate_read_caches:161` |
 | `src/trading/position_manager.py` | Güvenli pozisyon açma/kapama, boşluksuz SL değişimi, acil kapatma | `UnprotectedPositionError:32`, `open_position:63`, `_emergency_close:416`, `replace_stop_loss:803` |
-| `src/models/scalp_trade.py` | `scalp_trades` ORM modeli | `ScalpTradeModel:16` |
+| `src/strategies/scalper/forensics.py` | İşlem adli kaydı — SAF katman (D21): etiket kuralları, belge kurucuları, özet | `classify_entry`, `classify_exit`, `classify`, `build_entry`, `build_exit`, `postmortem_from_candles`, `summarize`, `TAG_LABELS` |
+| `src/strategies/scalper/forensics_log.py` | `logs/trades.jsonl` append-only olay akışı (günlük rotasyon, 30 gün) | `append`, `log_path` |
+| `src/models/scalp_trade.py` | `scalp_trades` ORM modeli | `ScalpTradeModel:16`, `forensics` (D21, JSON metni) |
 
 ### `config.py` — öne çıkan `SCALPER_*` ayarları (varsayılan → anlam)
 
@@ -486,6 +488,71 @@ için `_step_one` çağırır (`exits.py:133-181`):
    negatif kapanışta sembolü `scalper_loss_cooldown_minutes` süre kilitler;
    mevcut daha uzun bir cooldown asla kısaltılmaz (`_set_cooldown:548-560`).
 
+### 5.1 İşlem adli kaydı (trade forensics, D21) — YALNIZ GÖZLEM
+
+Her scalp işleminin "neden girildi / nasıl çıkıldı / ne ters gitti" kaydı tek
+bir JSON belgesinde toplanır. **Hiçbir kapı, boyutlama ya da çıkış kararı bu
+belgeyi OKUMAZ**; emir akışı D21 öncesiyle birebir aynıdır (bkz.
+`docs/DECISIONS.md` D21).
+
+Belge şekli (`scalp_trades.forensics`, TEXT/JSON; eski satırlarda NULL):
+
+```json
+{"v":1, "entry":{...}, "exit":{...}, "verdict":["counter_drift_long"], "postmortem":{...}}
+```
+
+| Bölüm | Ne zaman yazılır | İçerik (özet) |
+|---|---|---|
+| `entry` | `executor._finalize_position` (GERÇEK dolumdan sonra) | zaman, kaynak (`C`/`TV` + oy veren TV kaynakları/oy yaşları/pencere), `signal_reason`, C girdileri (RSI giriş/bağlam, BB %B, diverjans, ATR%), rejim + EMA50/200, lider kapısı anlık görüntüsü (gün sapması %, üç-durumlu `verdict`), yapı/TV-yapı durumu, geçilen-atlanan kapılar, kline kaynağı, sinyal fiyatı vs dolum (kayma %), kaldıraç/marj/nominal, stop mesafesi % ve ROI, TP1/TP2, R:R, o anki açık pozisyon sayısı, günlük PnL, BTC fiyatı |
+| `exit` | `exits._finalize_close` | zaman, neden, çıkış yolu (TP1/TP2 anı, BE anı+fiyatı, trailing güncelleme sayısı ve son stop, ilk/son stop, yaş), MAE/MFE (ROI ve fiyat %), süre, net/brüt PnL + ücret tahmini, `pnl_source`, kapanış anındaki sembol rejimi ve lider gün sapması |
+| `verdict` | girişte (giriş etiketleri) → kapanışta (tam liste) | kural tabanlı etiketler, aşağıdaki tablo |
+| `postmortem` | kapanıştan `SCALPER_FORENSICS_POSTMORTEM_MIN` dk SONRA | pencerede fiyat girişe döndü mü, kaç dakikada, pencerede en iyi hareket |
+
+**Etiket kuralları** (`forensics.classify_*`, saf fonksiyonlar; her biri için
+pozitif ve negatif test vardır):
+
+| Etiket | Aşama | Kural |
+|---|---|---|
+| `counter_drift_long` | giriş | lider gün sapması ≤ −`COUNTER_DRIFT_PCT` iken LONG |
+| `relief_rally_short` | giriş | lider gün sapması ≥ +`COUNTER_DRIFT_PCT` iken SHORT |
+| `late_entry_after_run` | giriş | lider çok-günlük koşusu ≥ `RUN_PCT` ve giriş AYNI yönde |
+| `tv_single_family` | giriş | sağlama ≥2 oyla doldu ama tüm kaynaklar AYNI aileden (`luxso_*` → `luxalgo`) |
+| `stale_signal` | giriş | sinyal → dolum > `STALE_SIGNAL_SEC` |
+| `gate_bypassed` | giriş | lider kapısı AÇIK ama `gate_effective=false` (fail-open) iken girildi |
+| `fee_dominated` | çıkış | brüt > 0 ve net < `FEE_RATIO` × brüt |
+| `mfe_giveback` | çıkış | tepe ROI ≥ TP1 hedefini gördü ama net < 0 |
+| `noise_stop` | post-mortem | zararla/SL ile kapandı VE pencerede fiyat girişe LEHTE geri döndü |
+
+**Look-ahead yoktur.** `entry`/`exit` yalnız o anda bilinen değerleri taşır.
+`noise_stop` ancak kapanış SONRASI ölçülebilir; bu yüzden AYRI `postmortem`
+alanındadır, `forensics.postmortem_from_candles` yalnız `closed_at`'ten SONRA
+kapanmış mumlara bakar (daha eskiler açıkça elenir) ve sonuç hiçbir karar
+yolunda okunmaz.
+
+**Restart davranışı:** `exits.recover()` ile kurtarılan bir pozisyonun
+BELLEKTEKİ giriş belgesi yoktur (DB'deki `entry` bölümü aynen durur), bu yüzden
+kapanışta yalnız ÇIKIŞ etiketleri türetilebilir. `tracker.record_close` bu
+nedenle `verdict`i ÜZERİNE YAZMAZ, mevcutla BİRLEŞTİRİR — aksi hâlde restart
+bir veri kaybına dönerdi. Maker modunda giriş bağlamı dolum anına kadar
+bellekte bekler (`executor._pending_forensics`); restart'ta kaybolur ve o tek
+işlemin kaydı eksik kalır — işlem akışı ETKİLENMEZ.
+
+**REST maliyeti:** giriş/çıkış tarafında **sıfır** ek istek — bağlam yalnız
+senkron anlık görüntülerden (`_market_gate_status`, `tv_events.snapshot`,
+`_kline_source_snapshot`) ve `StrategyContext`'te ZATEN çekilmiş serilerden
+türetilir (`structure.py` ile aynı ilke). Tek ek istek post-mortem turundadır:
+`engine._forensics_postmortem_tick` safety turunda ama **dakikada en fazla bir
+kez** ve **tur başına EN FAZLA BİR sembol** için `1m` limit 150 (ağırlık 2)
+çeker — pratikte saatte birkaç istek, §2 ağırlık tablosunu anlamlı biçimde
+değiştirmez. `SCALPER_FORENSICS_POSTMORTEM_MIN=0` bu turu tamamen kapatır.
+
+**Okuma yolları:** `GET /scalper/trades/{id}/forensics` (tek işlem),
+`GET /scalper/forensics/recent?limit=` (liste),
+`GET /scalper/forensics/summary?since=7d` (etiket × sonuç), pano "Son
+İşlemler" satırındaki adli kart + "Neler Etkiliyor" paneli,
+`scripts/ledger_report.py --forensics`, ve `logs/trades.jsonl`
+(satır başına tek JSON: `entry`/`exit`/`postmortem`; günlük rotasyon, 30 gün).
+
 ## 6. Kalıcı durum ve dosyalar
 
 - **DB**: `settings.database_url` (varsayılan `sqlite:///./tradingbot.db`,
@@ -516,6 +583,12 @@ sembolün kapanışını borsa üzerinde doğruladıktan SONRA `exits._handle_cl
 `forced_exit_reason="RISK_EVENT"` ile çağırır; doğrulanamayan sembol izlemede kalır
 (SL/TP asla doğrulanmadan iptal edilmez). Backtest harness'ına BİLİNÇLİ olarak
 dokunulmadı — risk-olayları yalnız canlı motoru etkiler.
+- **logs/trades.jsonl** (D21): işlem adli kaydının append-only olay akışı —
+  satır başına TEK JSON (`event` = `entry`/`exit`/`postmortem`). Loguru'dan
+  AYRIDIR (`trades.log` insan-okur bir denetim izidir, makine sözleşmesi
+  değildir), günlük rotasyonludur (`trades-<YYYY-MM-DD>.jsonl`) ve 30 gün
+  saklanır. Secret İÇERMEZ. Dizin `TRADINGBOT_LOG_DIR` ile değiştirilir
+  (testler prod izini kirletmesin).
 - **logs/**: `logs/` dizini repoda mevcut (115 girdi görüldü); loguru
   yapılandırması `src/core/logger.py`'dedir — içerik bu görevde satır bazlı
   incelenmedi (kapsam dışı, ana odak scalper akışı).

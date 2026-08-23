@@ -8,7 +8,8 @@ yaşam döngüsü sorumluluğu bindirmez.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import json
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import func, select
@@ -16,6 +17,7 @@ from sqlalchemy import func, select
 from src.core.database import AsyncSessionLocal
 from src.core.logger import app_logger
 from src.models.scalp_trade import ScalpTradeModel
+from src.strategies.scalper.forensics import FORENSICS_VERSION
 from src.strategies.scalper.types import ScalpSignal
 
 
@@ -28,6 +30,41 @@ class ScalpTracker:
         # önbelleği bunu karşılaştırarak kapanış sonrası TTL beklemeden
         # taze okur (kill switch tepkisi kapanışa kilitli, TTL'e değil).
         self.close_seq: int = 0
+        # Adli kayıt (D21) serileştirme hatası bir kez uyarılır; işlem akışı
+        # ASLA etkilenmez (gözlem, güvenlik kilidi değildir).
+        self._forensics_error_logged: bool = False
+
+    # ------------------------------------------------------------------
+    # İşlem adli kaydı (D21) — JSON sütunu yardımcıları
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def parse_forensics(raw: Optional[str]) -> Optional[Dict[str, Any]]:
+        """`scalp_trades.forensics` metnini sözlüğe çevir; bozuksa None."""
+        if not raw:
+            return None
+        try:
+            document = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        return document if isinstance(document, dict) else None
+
+    def _dump_forensics(self, document: Optional[Dict[str, Any]]) -> Optional[str]:
+        """Belgeyi JSON metnine çevir. Hata çağıranı ASLA etkilemez."""
+        if not document:
+            return None
+        payload = dict(document)
+        payload.setdefault("v", FORENSICS_VERSION)
+        try:
+            return json.dumps(payload, ensure_ascii=False, default=str)
+        except Exception as e:  # pragma: no cover - savunma
+            if not self._forensics_error_logged:
+                self._forensics_error_logged = True
+                self.logger.warning(
+                    f"⚠️ Adli kayıt JSON'a çevrilemedi ({e}) — bu uyarı bir kez "
+                    f"loglanır, işlem akışı ETKİLENMEZ"
+                )
+            return None
 
     async def record_open(
         self,
@@ -41,11 +78,16 @@ class ScalpTracker:
         tp2_algo_id: Optional[str],
         entry_order_id: Optional[str] = None,
         tp3_algo_id: Optional[str] = None,
+        forensics: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Yeni scalp işlemini OPEN durumunda kaydet; satır id'sini döner.
 
         ``tp3_algo_id`` yalnız AlgoPro takipçi halkası (D20, 3 parça çıkış)
         tarafından verilir; scalper çağrılarında None kalır — davranış aynı.
+
+        ``forensics`` (D21) adli kaydın GİRİŞ belgesidir
+        (``{"entry": {...}, "verdict": [...]}``). None ise sütun NULL kalır ve
+        davranış birebir eskisidir.
         """
         async with AsyncSessionLocal() as session:
             trade = ScalpTradeModel(
@@ -64,6 +106,7 @@ class ScalpTracker:
                 tp2_algo_id=tp2_algo_id,
                 tp3_algo_id=tp3_algo_id,
                 entry_order_id=entry_order_id or None,
+                forensics=self._dump_forensics(forensics),
             )
             session.add(trade)
             await session.commit()
@@ -122,6 +165,8 @@ class ScalpTracker:
         mfe_pct: float = 0.0,
         pnl_source: Optional[str] = None,
         notes: Optional[str] = None,
+        forensics_exit: Optional[Dict[str, Any]] = None,
+        verdict: Optional[List[str]] = None,
     ) -> None:
         """İşlemi kapat: exit fiyatı, gerçekleşen PNL, ROI% ve MAE/MFE yaz.
 
@@ -150,6 +195,28 @@ class ScalpTracker:
             )
             trade.status = "CLOSED"
             trade.closed_at = datetime.utcnow()
+            # D21: adli kaydın ÇIKIŞ bölümü. Giriş belgesi (varsa) korunur,
+            # yalnız `exit`/`verdict` eklenir. Serileştirme hatası kapanış
+            # kaydını ENGELLEMEZ (sütun eski hâlinde kalır).
+            if forensics_exit is not None or verdict is not None:
+                document = self.parse_forensics(trade.forensics) or {}
+                if forensics_exit is not None:
+                    document["exit"] = forensics_exit
+                if verdict is not None:
+                    # BİRLEŞİM, üzerine yazma DEĞİL: giriş etiketleri giriş
+                    # ANINDA tam veriyle hesaplandı ve GİRİŞ hakkında bir
+                    # olgudur. Restart sonrası kurtarılan bir pozisyonun
+                    # bellekteki giriş belgesi YOKTUR (`exits.recover`), o
+                    # yüzden kapanışta yalnız çıkış etiketleri türetilebilir —
+                    # üzerine yazmak, restart'ı bir veri kaybına çevirirdi.
+                    merged_verdict = list(document.get("verdict") or [])
+                    for tag in verdict:
+                        if tag not in merged_verdict:
+                            merged_verdict.append(tag)
+                    document["verdict"] = merged_verdict
+                merged = self._dump_forensics(document)
+                if merged is not None:
+                    trade.forensics = merged
             await session.commit()
             self.close_seq += 1
 
@@ -389,3 +456,173 @@ class ScalpTracker:
                 select(ScalpTradeModel).where(ScalpTradeModel.status == "OPEN")
             )
             return list(result.scalars().all())
+
+    # ------------------------------------------------------------------
+    # Adli kayıt okuma/güncelleme (D21) — yalnız GÖZLEM yolları
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def forensics_row(trade: ScalpTradeModel) -> Dict[str, Any]:
+        """Bir DB satırını uçların/panonun beklediği adli kayıt biçimine çevir."""
+        document = ScalpTracker.parse_forensics(trade.forensics) or {}
+        return {
+            "id": trade.id,
+            "strategy": trade.strategy,
+            "symbol": trade.symbol,
+            "direction": trade.direction,
+            "status": trade.status,
+            "entry_price": trade.entry_price,
+            "exit_price": trade.exit_price,
+            "realized_pnl": trade.realized_pnl,
+            "roi_pct": trade.roi_pct,
+            "exit_reason": trade.exit_reason,
+            "opened_at": trade.opened_at.isoformat() if trade.opened_at else None,
+            "closed_at": trade.closed_at.isoformat() if trade.closed_at else None,
+            "signal_reason": trade.signal_reason,
+            "pnl_source": (
+                None if trade.status == "SHADOW"
+                else ScalpTracker._pnl_source(trade.notes)
+            ),
+            "has_forensics": bool(document),
+            "verdict": list(document.get("verdict") or []),
+            "entry": document.get("entry"),
+            "exit": document.get("exit"),
+            "postmortem": document.get("postmortem"),
+        }
+
+    async def forensics_for(self, trade_id: int) -> Optional[Dict[str, Any]]:
+        """Tek bir işlemin adli kaydı (yoksa None)."""
+        async with AsyncSessionLocal() as session:
+            trade = await session.get(ScalpTradeModel, int(trade_id))
+            if trade is None:
+                return None
+            return self.forensics_row(trade)
+
+    async def recent_forensics(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """En yeni kapanmış işlemlerin adli kaydı (en yeni önce)."""
+        capped = max(1, min(int(limit or 50), 500))
+        order_col = func.coalesce(ScalpTradeModel.closed_at, ScalpTradeModel.opened_at)
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(ScalpTradeModel)
+                .where(ScalpTradeModel.status == "CLOSED")
+                .order_by(order_col.desc())
+                .limit(capped)
+            )
+            return [self.forensics_row(row) for row in result.scalars().all()]
+
+    async def forensics_summary(
+        self,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Etiket × sonuç tablosu — "neler etkiliyor" sorusunun cevabı."""
+        from src.strategies.scalper.forensics import summarize
+
+        filters = [ScalpTradeModel.status == "CLOSED"]
+        if since is not None:
+            filters.append(ScalpTradeModel.closed_at >= since)
+        if until is not None:
+            filters.append(ScalpTradeModel.closed_at <= until)
+        # YALNIZ iki sütun: bu uç pano tarafından düzenli yoklanır ve tam
+        # satırları (uzun `forensics` JSON'ları dahil) ORM nesnesine
+        # çevirmek gereksiz iştir (bkz. "dashboard polling açlığı" dersi).
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(
+                    ScalpTradeModel.realized_pnl, ScalpTradeModel.forensics
+                ).where(*filters)
+            )
+            trades = list(result.all())
+
+        rows = []
+        tagged = 0
+        for realized_pnl, raw_forensics in trades:
+            document = self.parse_forensics(raw_forensics) or {}
+            if document:
+                tagged += 1
+            rows.append({
+                "tags": document.get("verdict") or [],
+                "pnl": float(realized_pnl or 0.0),
+            })
+        summary = summarize(rows)
+        summary["since"] = since.isoformat() if since else None
+        summary["until"] = until.isoformat() if until else None
+        # Kapsama: adli kaydı OLMAYAN işlemler etiketsiz görünür ama bu bir
+        # "temiz işlem" değil "ölçülmemiş işlem"tir — ayrımı görünür kıl.
+        summary["with_forensics"] = tagged
+        summary["without_forensics"] = len(trades) - tagged
+        return summary
+
+    async def postmortem_candidates(
+        self,
+        *,
+        now: datetime,
+        min_age_minutes: float,
+        max_age_hours: float = 12.0,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Post-mortem penceresi DOLMUŞ ama henüz doldurulmamış kapanışlar.
+
+        Pencere ALT sınırı: kapanıştan en az `min_age_minutes` geçmiş olmalı
+        (aksi hâlde "60 dakikada döndü mü" sorusu henüz yanıtlanamaz).
+        ÜST sınır: eski kayıtları sonsuza dek yeniden denemeyelim.
+        """
+        if min_age_minutes <= 0:
+            return []
+        newest = now - timedelta(minutes=min_age_minutes)
+        oldest = now - timedelta(hours=max(1.0, float(max_age_hours)))
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(ScalpTradeModel)
+                .where(
+                    ScalpTradeModel.status == "CLOSED",
+                    ScalpTradeModel.forensics.isnot(None),
+                    ScalpTradeModel.closed_at <= newest,
+                    ScalpTradeModel.closed_at >= oldest,
+                )
+                .order_by(ScalpTradeModel.closed_at.desc())
+                .limit(max(1, int(limit)))
+            )
+            trades = list(result.scalars().all())
+
+        out: List[Dict[str, Any]] = []
+        for trade in trades:
+            document = self.parse_forensics(trade.forensics)
+            if not document or document.get("postmortem") is not None:
+                continue
+            out.append({
+                "id": int(trade.id),
+                "symbol": trade.symbol,
+                "closed_at": trade.closed_at,
+                "entry": document.get("entry") or {},
+                "exit": document.get("exit") or {},
+            })
+        return out
+
+    async def record_postmortem(
+        self, trade_id: int, postmortem: Dict[str, Any]
+    ) -> bool:
+        """Kapanıştan SONRA ölçülen alanı yaz; etiketlerini `verdict`e ekle.
+
+        Look-ahead değildir: `postmortem` yalnız kapanış zamanından SONRAKİ
+        mumlardan türetilir ve AYRI bir alanda saklanır (bkz.
+        `forensics.postmortem_from_candles`).
+        """
+        async with AsyncSessionLocal() as session:
+            trade = await session.get(ScalpTradeModel, int(trade_id))
+            if trade is None:
+                return False
+            document = self.parse_forensics(trade.forensics) or {}
+            document["postmortem"] = postmortem
+            verdict = list(document.get("verdict") or [])
+            for tag in postmortem.get("tags") or []:
+                if tag not in verdict:
+                    verdict.append(tag)
+            document["verdict"] = verdict
+            merged = self._dump_forensics(document)
+            if merged is None:
+                return False
+            trade.forensics = merged
+            await session.commit()
+            return True

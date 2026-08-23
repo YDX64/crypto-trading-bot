@@ -73,6 +73,11 @@ class TvConfluence:
             "sources": sorted(sources.keys()),
             "window_seconds": self.window_seconds,
             "triggered": count >= self.required,
+            # D21 adli kayıt: hangi oy kaç saniye önce geldi. Yalnız GÖZLEM —
+            # eşik kararı yukarıdaki `count` ile verilir, bu alan okunmaz.
+            "vote_ages_sec": {
+                src: round(now - ts, 1) for src, ts in sorted(sources.items())
+            },
         }
         if verdict["triggered"]:
             self._votes.pop(key, None)
