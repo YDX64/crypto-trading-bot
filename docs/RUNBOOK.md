@@ -244,3 +244,12 @@ startup'ta reddeder (docs/MAINNET_PLAN.md §5.3); doldurmadan kapatamazsın.
    541 testle doğrulandı, `mv` ile değiştirildi (cryptography 50, python-multipart 0.0.31, pytest 9).
    Geri alma: `mv .venv .venv-failed && mv .venv-old .venv && supervisorctl restart tradingbot_v2`.
    `.venv-old` 1 hafta sonra silinebilir. Reçete: yeni venv → test → swap → restart → sağlık yokla.
+
+## A-plus risk paketi (D16, 2026-08-23 02:56 UTC) — canlı taban değişti
+`SCALPER_MAX_MARGIN_PCT=5`, `SCALPER_FIXED_STOP_ROI_PCT=40`, `SCALPER_TP1_ROI=8`,
+`SCALPER_DAILY_LOSS_LIMIT_PCT=6` (önce 10/50/10/10). Yeni giriş: stop = 20x'te %2.0 fiyat, SL =
+sermayenin %2'si; günlük kesici ≈ 3 net SL. Geri alma:
+`cp backups/env.bak-20260823-025623-riskpaketi .env && supervisorctl restart tradingbot_v2`
+(+240 sn sağlık). Soak raporu: `scripts/ledger_report.py --since "2026-08-23 02:57"`.
+Backtest/autoresearch tabanı: `scripts/.scalper_env_snapshot.txt` güncellendi — eski sayılarla
+(E4/E5/E6 tabanı) karşılaştırırken ölçek farkını (marj %10→5 = PnL/DD ×0.5) hesaba kat.

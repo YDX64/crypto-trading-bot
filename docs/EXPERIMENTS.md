@@ -240,3 +240,13 @@ tabanla birebir aynı (AYI 1.04 / YATAY 1.29 / BOĞA 2.43), maxDD yarı (1841/16
 3683/3229/735) → negatif kontrol GEÇTİ (risk katmanı sinyali değiştirmez). E6c = E4f (TP1 %8)
 yarım ölçekte: PF 1.12/1.38/3.71, DD 1302/1077/257. E6a (`TF_REGIME=5m`) gerçek RED: AYI 1.01,
 YATAY 0.99, BOĞA +1944 (−%50). Karar/kapsam: `docs/superpowers/specs/2026-08-22-reversal-day-loss-design.md`.
+| E6d | AYI | 219 | 84.5 | +2664.58 | 1.20 | 2911.99 | - |
+| E6d | YATAY | 155 | 83.9 | +1574.64 | 1.17 | 2396.01 | - |
+| E6d | BOGA | 97 | 89.7 | +2764.36 | 1.67 | 683.56 | - |
+| E6d | KARAR | - | - | +125.25 | - | - | REDDEDILDI (BOGA PnL kaybi >%20) |
+| E6d | hipotez | Sabit ROI stop %50->%40: kayip/islem kucultur; E3a (%30) SL sayisini 2x yapmisti, %40 ara nokta. | | | | | |
+| E6e | AYI | 231 | 89.2 | +3923.22 | 1.40 | 1936.70 | - |
+| E6e | YATAY | 166 | 88.6 | +2888.13 | 1.43 | 1733.67 | - |
+| E6e | BOGA | 109 | 92.7 | +3280.18 | 1.99 | 653.34 | - |
+| E6e | KARAR | - | - | +3213.20 | - | - | ADAY (AYI PF=1.40) |
+| E6e | hipotez | Stop %40 + TP1 %8 birlikte: odeme orani (kazanc/kayip) 0.22'den ~0.25'e, BE daha erken. | | | | | |
