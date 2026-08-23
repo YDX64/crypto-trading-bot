@@ -992,7 +992,17 @@ GİDERİLDİ:** gerçek yetim artık "hiçbir motorun izlemediği pozisyon"dur �
 `symbol_reservations`ta BAŞKA bir sahibi olan semboller denetimden düşülür. (iv) Sunucuda
 çalıştırılmadı: bu dalda deploy YAPILMADI (worktree; canlıya/`.env`'e dokunulmadı).
 
-### D20b — GÖMÜLÜ AlgoPro takipçisi (`FOLLOWER_EMBEDDED`, aynı hesap + 1000 USD SANAL defter) · 2026-08-23 · **AKTİF (kod), VARSAYILAN KAPALI** — kanıt: YOK (testnet ölçümü kanıt olacak)
+### D20b — GÖMÜLÜ AlgoPro takipçisi (`FOLLOWER_EMBEDDED`, aynı hesap + 1000 USD SANAL defter) · 2026-08-23 · **CANLI (testnet, 2026-08-23 23:24 UTC)** — kanıt: YOK (testnet ölçümü kanıt olacak)
+> **Canlı durum (2026-08-23 23:24 UTC, commit c2f9849, pid 257848):** `.env`'de
+> `FOLLOWER_EMBEDDED=true FOLLOWER_SYMBOLS=TUTUSDT FOLLOWER_VIRTUAL_CAPITAL_USDT=1000`
+> `FOLLOWER_MAX_POSITIONS=1 FOLLOWER_DAILY_LOSS_LIMIT_PCT=10` (yedek:
+> `backups/env.bak-20260823-232144-deploy` ve `-232402-embedded-follower-tut`).
+> Coin seçimi: 40-coin 1m taraması + TV AlgoPro panel okumaları + 3 hakem + çürütücü →
+> **TUTUSDT** (yedek ZEC); testnet bracket TUT 25x/5k$ mmr %2 → motor ~20x. TV alarmı:
+> mevcut 1dk any-alert() AlgoPro alarmı (eski BTCUSDT testi) TUTUSDT.P'ye yeniden bağlandı
+> (URL'ye dokunulmadı); alarm serisi **Heikin Ashi** grafikten (kullanıcının grafiği HA —
+> panel ölçümleriyle tutarlı; seviyeler mesajdan geldiği için motor tarafı etkilenmez, not).
+
 **Bağlayıcılık:** D20/D20a ile çelişen her noktada **D20b geçerlidir**; takipçi
 artık ayrı hesap/süreç/panel GEREKTİRMEZ. D20a'nın kapılarından şunlar
 **DEĞİŞMEDEN** yürürlüktedir: katı AlgoPro tanıyıcısı, ücret eşiği
