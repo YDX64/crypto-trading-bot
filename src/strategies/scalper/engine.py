@@ -37,12 +37,15 @@ from src.strategies.scalper.data import KlineFetcher
 from src.strategies.scalper.executor import ScalpExecutor
 from src.strategies.scalper.exits import ExitManager
 from src.strategies.scalper.indicators import atr as compute_atr
+from urllib.parse import urlsplit
+
 from src.strategies.scalper.market_gate import (
     MARKET_GATE_INTRADAY_LIMIT,
     MARKET_GATE_INTRADAY_TF,
     evaluate_market_gate,
     market_gate_metrics,
     resolve_day_open,
+    utc_day_start_ms,
 )
 from src.strategies.scalper.regime import detect_regime
 from src.strategies.scalper.scanner import UniverseScanner
@@ -58,6 +61,14 @@ from src.trading.binance_client_improved import ImprovedBinanceClient
 from src.trading.position_manager import PositionManager, UnprotectedPositionError
 from src.trading.symbol_reservations import symbol_reservations
 from src.trading.user_stream import BinanceUserDataStream
+
+
+# Lider piyasa kapısı (D15): günlük seri talebinin ASGARİ üstüne eklenen pay.
+# Uzama alt-kapısı N günlük koşu için N+1 TAMAMLANMIŞ kapanış ister; oluşmakta
+# olan mum atıldığı için asgari N+2'dir. Tam asgariyi istemek SIFIR PAYLIDIR:
+# borsanın tek bir eksik/geç günlük mumu alt-kapıyı sessizce fail-open yapar.
+# Ağırlık değişmez (limit ≤ 100 → ağırlık 1), bu yüzden pay ucuzdur.
+_LEADER_DAILY_LIMIT_MARGIN = 5
 
 
 def _utcnow_iso() -> str:
@@ -135,11 +146,29 @@ class ScalperEngine:
     # Lider piyasa kapısı (D15): sembol BAŞINA değil, LİDER başına tek
     # anlık görüntü. 60 sn TTL — REST ağırlık diyeti (docs/RUNBOOK.md
     # "418/ban" + docs/ARCHITECTURE.md ağırlık bölümü): 20 sembol × 3 istek
-    # yerine dakikada 3 istek — 1d (limit N+2), giriş TF (limit 3) ve 15m
-    # (limit 100, gerçek gün açılışı için); ÜÇÜ DE limit ≤ 100 olduğundan
-    # ağırlık 1, toplam 3 ağırlık/dakika (bütçe 2400/dk). Tarama aralığı
-    # 60 sn olduğu için pratikte tur başına en çok bir tazeleme yapılır.
+    # yerine dakikada 3 istek — 1d (limit RUN_DAYS + _LEADER_DAILY_LIMIT_MARGIN,
+    # tavan 100), giriş TF (limit 3) ve 15m (limit 100, gerçek gün açılışı
+    # için); ÜÇÜ DE limit ≤ 100 olduğundan ağırlık 1, toplam 3 ağırlık/dakika
+    # (bütçe 2400/dk). Tarama aralığı 60 sn olduğu için pratikte tur başına
+    # en çok bir tazeleme yapılır — ama kapı AÇIKSA her tur bir tazeleme
+    # YAPILIR (bkz. _refresh_leader_snapshot): alt sınır 0 değil ~3/dk.
     _MARKET_GATE_CACHE_TTL = 60.0
+    # Kapı WARNING'lerinin oran sınırı (sn): lider verisi KALICI olarak
+    # alınamıyorsa her sinyal denemesinde bir satır basmak bot.log'u boğar ve
+    # gerçek arızayı gizler — dakikada en çok bir satır.
+    _MARKET_GATE_WARN_INTERVAL = 60.0
+    # Başlangıçtaki lider doğrulamasının zaman sınırı (sn) — motor açılışı
+    # ulaşılamayan bir borsada dakikalarca beklememeli.
+    _MARKET_GATE_VALIDATE_TIMEOUT = 15.0
+    # Tur başı lider tazelemesinin zaman sınırı (sn). KRİTİK: tazeleme
+    # `_scan_tick`'in İLK adımı ve `await`li; `KlineFetcher` 3 deneme ×
+    # (15 sn okuma timeout'u + 1s/2s backoff) yaptığı için sınırsız bırakılsa
+    # lider erişilemezken TARAMA TURUNU ~48 sn bloke eder. Kapı tavsiye
+    # niteliğinde bir alt-sistemdir: giriş hattı ONUN yüzünden GECİKMEMELİ.
+    _MARKET_GATE_REFRESH_TIMEOUT = 10.0
+    # Anlık görüntü bu katsayı × tarama aralığından eskiyse BAYAT sayılır:
+    # `gate_effective` false olur ve türetilmiş metrikler null verilir.
+    _MARKET_GATE_STALE_SCANS = 2.0
 
     def __init__(self) -> None:
         self.cfg = settings
@@ -178,12 +207,28 @@ class ScalperEngine:
         self._universe: List[str] = []
         self._regimes: Dict[str, str] = {}
         self._regime_cache: Dict[str, Tuple[Regime, float]] = {}
-        # Lider piyasa kapısı (D15): {lider: (anlık_görüntü, monotonic_ts)}.
-        # Anlık görüntü türetilmiş metrikleri de taşır ki senkron snapshot()
-        # hiç IO yapmadan /scalper/status'e yazabilsin.
-        self._market_gate_cache: Dict[str, Tuple[Dict[str, Any], float]] = {}
+        # Lider piyasa kapısı (D15): {lider: (anlık_görüntü, monotonic_ts,
+        # utc_gün_damgası)}. Anlık görüntü türetilmiş metrikleri de taşır ki
+        # senkron snapshot() hiç IO yapmadan /scalper/status'e yazabilsin.
+        # Gün damgası: "gün açılışı" UTC gün sınırında DEĞİŞİR — TTL'i (60 sn)
+        # gün sınırına taşan bir önbellek DÜNÜN açılışıyla karar verirdi.
+        self._market_gate_cache: Dict[str, Tuple[Dict[str, Any], float, int]] = {}
         self._market_gate_rejects: Dict[str, int] = {}
         self._market_gate_last_reason: Optional[str] = None
+        self._market_gate_last_block_at: Optional[str] = None
+        # Kapının GÖRÜNÜRLÜĞÜ (fail-open sessiz kalmasın): lider doğrulaması ve
+        # son veri denemesinin sonucu. leader_ok None = henüz denenmedi.
+        self._market_gate_leader_ok: Optional[bool] = None
+        self._market_gate_last_ok_at: Optional[str] = None
+        self._market_gate_last_error: Optional[str] = None
+        self._market_gate_consecutive_failures: int = 0
+        # Kümülatif: toparlanmada SIFIRLANMAZ (dönüşümlü arıza görünür kalsın).
+        self._market_gate_failures_total: int = 0
+        self._market_gate_last_failure_at: Optional[str] = None
+        # Negatif önbellek: başarısızlıktan sonra bu monotonic ana kadar
+        # yeniden DENENMEZ (boşa REST + kline kilidi tutmayı önler).
+        self._market_gate_retry_after: float = 0.0
+        self._market_gate_warn_at: Dict[str, float] = {}
         self._balance_cache: Tuple[Optional[float], float] = (None, 0.0)
         self._daily_pnl: float = 0.0
         self._daily_pnl_source: str = "unavailable"
@@ -286,6 +331,12 @@ class ScalperEngine:
             f"stratejiler={self.cfg.scalper_strategies}, kaldıraç={self.cfg.scalper_leverage}x"
         )
         if await self._probe_exchange():
+            # Kapı açıksa liderin borsada GERÇEKTEN var olduğunu doğrula:
+            # yanlış yazılmış bir sembol kapıyı SESSİZCE devre dışı bırakırdı
+            # (fail-open). Borsa HAZIRSA anlamlı — bu yüzden probe'un içinde;
+            # probe başarısızsa `leader_ok` None kalır (= "henüz denenmedi",
+            # `gate_effective` false) ve ilk tarama turu kendiliğinden çözer.
+            await self._validate_market_gate_leader()
             await self._attempt_recovery()
             await self._update_kill_switch()
 
@@ -1126,6 +1177,14 @@ class ScalperEngine:
         if not self._entries_ready():
             return
 
+        # Lider piyasa kapısı (D15): anlık görüntü TUR BAŞINDA bir kez
+        # tazelenir; turdaki tüm semboller AYNI görüntüyü kullanır (harness
+        # paritesi — bkz. _refresh_leader_snapshot). REST maliyetinin ÜST
+        # sınırı değişmez (tur başına yine en çok 3 istek) ama ALT sınırı
+        # 0'dan 3 ağırlık/dakikaya çıkar: eskiden sinyal gelmeyen turda hiç
+        # istek gitmiyordu, artık her tur tazeleniyor.
+        await self._refresh_leader_snapshot()
+
         # Sembol başına tek strateji denemesi.
         enabled_strategies = get_enabled(self.cfg.scalper_strategies)
         if not enabled_strategies:
@@ -1840,17 +1899,175 @@ class ScalperEngine:
         raw = getattr(self.cfg, "scalper_market_gate_symbol", "") or ""
         return str(raw).strip().upper() or "BTCUSDT"
 
+    def _market_gate_retry_seconds(self) -> float:
+        """Negatif önbellek süresi (sn) — okunamazsa 60."""
+        try:
+            value = float(getattr(self.cfg, "scalper_market_gate_retry_sec", 60.0))
+        except (TypeError, ValueError):
+            return 60.0
+        return value if value > 0.0 else 0.0
+
+    def _leader_source_host(self) -> Optional[str]:
+        """Lider mumlarının geldiği HOST (secret YOK — public base_url'in
+        yalnız ana bilgisayar kısmı).
+
+        Neden durumda: harness mainnet verisiyle ölçüyor, canlı motor
+        `settings.binance_base_url`'i (testnet) kullanıyor — E7/E8 sayılarını
+        soak ile kıyaslarken hangi kaynakla karar verildiği GÖRÜNÜR olmalı
+        (bkz. docs/DECISIONS.md D15 "Veri kaynağı paritesi").
+        """
+        fetcher = getattr(self, "fetcher", None)
+        raw = getattr(fetcher, "base_url", None)
+        if not raw:
+            return None
+        # urlsplit: elle string bölme `user:pass@host` biçimindeki userinfo'yu
+        # sıyırmaz ve kimlik bilgisini status'e/log'a taşırdı (CLAUDE.md #5).
+        try:
+            host = urlsplit(str(raw)).hostname
+        except ValueError:
+            return None
+        return host or None
+
+    def _market_gate_warn(self, kind: str, message: str) -> None:
+        """Kapı WARNING'i — TÜR BAŞINA dakikada en çok bir satır.
+
+        Kalıcı bir arızada (yanlış lider sembolü, ağ) her sinyal denemesi bir
+        satır basmamalı: log gürültüsü gerçek arızayı gizler. Bastırılan
+        satırların sayısı `/scalper/status` → `consecutive_failures`'ta durur.
+
+        Neden TÜR başına ve tek bir küresel sayaç değil: tek sayaçla, önce
+        basılan ÖNEMSİZ bir uyarı (ör. "uzama serisi kısa") hemen ardından
+        gelen ÖNEMLİ olanı (fail-open) susturur. Tür sayısı sabit ve küçük
+        olduğu için üst sınır yine dakikada birkaç satırdır.
+        """
+        now = time.monotonic()
+        stamps = getattr(self, "_market_gate_warn_at", None)
+        if not isinstance(stamps, dict):
+            stamps = {}
+            self._market_gate_warn_at = stamps
+        last = stamps.get(kind, 0.0)
+        if last and (now - last) < self._MARKET_GATE_WARN_INTERVAL:
+            return
+        stamps[kind] = now
+        self.logger.warning(message)
+
+    def _market_gate_note_failure(
+        self, detail: str, *, suppress_retry: bool = True
+    ) -> None:
+        """Lider verisi denemesi başarısız — sayaçlar, negatif önbellek, durum.
+
+        `suppress_retry=False`: negatif önbelleğe DOKUNMA. Başlangıçtaki lider
+        doğrulaması bunu kullanır — o çağrı İMZALI istemcinin `/exchangeInfo`
+        ucudur, lider mumları ise AYRI bir istemciden (`KlineFetcher`,
+        `/klines`) gelir. Geçici bir exchangeInfo hatası (ya da 15 sn timeout)
+        yüzünden sapasağlam kline yolunu bir tam tarama turu susturmak
+        gereksiz koruma kaybıdır.
+        """
+        self._market_gate_leader_ok = False
+        self._market_gate_last_error = detail
+        self._market_gate_last_failure_at = _utcnow_iso()
+        self._market_gate_consecutive_failures = (
+            getattr(self, "_market_gate_consecutive_failures", 0) + 1
+        )
+        # Kümülatif sayaç TOPARLANMADA SIFIRLANMAZ: dönüşümlü (flapping) bir
+        # arıza — 60 sn bozuk / 60 sn sağlıklı — yalnız `consecutive_failures`
+        # ile bakıldığında tertemiz görünür, oysa zamanın yarısında KORUMA
+        # YOKTUR. Soak değerlendirmesi bu sayaç olmadan yapılamaz.
+        self._market_gate_failures_total = (
+            getattr(self, "_market_gate_failures_total", 0) + 1
+        )
+        if not suppress_retry:
+            return
+        retry = self._market_gate_retry_seconds()
+        if retry > 0.0:
+            self._market_gate_retry_after = time.monotonic() + retry
+
+    @staticmethod
+    def _looks_like_unknown_symbol(exc: Exception) -> bool:
+        """Hata "sembol borsada yok" mu (KALICI), yoksa ağ/ban mı (GEÇİCİ)?"""
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+            return False
+        text = str(exc).lower()
+        return (
+            "bulunamadı" in text
+            or "invalid symbol" in text
+            or "-1121" in text
+        )
+
+    async def _validate_market_gate_leader(self) -> bool:
+        """Başlangıçta lider sembolünün borsada GERÇEKTEN var olduğunu doğrula.
+
+        Neden: kapı fail-open'dır (spec §C) — yanlış yazılmış bir lider
+        sembolü (`SCALPER_MARKET_GATE_SYMBOL=BTCUSD`) kapıyı SESSİZCE devre
+        dışı bırakırdı; operatör `enabled: true` görüp korunduğunu sanırdı.
+        `get_symbol_filters` exchangeInfo'yu okur ve sembol listede yoksa
+        `BinanceAPIError` yükseltir. Başarısızlık kapıyı KAPATMAZ (fail-open
+        semantiği korunur) ama `gate_effective=false` ile GÖRÜNÜR olur.
+        """
+        if not bool(getattr(self.cfg, "scalper_market_gate", False)):
+            return False
+        leader = self._market_gate_leader()
+        try:
+            # ZAMAN SINIRI ŞART: `ImprovedBinanceClient._request_with_retry`
+            # 3 deneme × 60 sn timeout + backoff yapar — sınırsız bırakılırsa
+            # ulaşılamayan bir borsada motor AÇILIŞINI dakikalarca bloke eder.
+            # Aşarsa kapı "degraded" işaretlenir (fail-open korunur) ve ilk
+            # tarama turunda kendiliğinden yeniden denenir.
+            await asyncio.wait_for(
+                self.client.get_symbol_filters(leader),
+                timeout=self._MARKET_GATE_VALIDATE_TIMEOUT,
+            )
+        except Exception as e:
+            detail = f"{type(e).__name__}: {e}"
+            # Doğrulama hatası kline yolunu SUSTURMAZ (ayrı istemci/uç).
+            self._market_gate_note_failure(detail, suppress_retry=False)
+            # Kalıcı (config) hata ile geçici (ağ/ban) hatayı AYIR: aynı metni
+            # basmak operatörü doğru olan .env'i kurcalamaya, 418 sırasında ise
+            # restart'a (CLAUDE.md yasak #3) itiyordu.
+            if self._looks_like_unknown_symbol(e):
+                tavsiye = (
+                    f"SCALPER_MARKET_GATE_SYMBOL={leader} borsada YOK — değeri "
+                    f"düzeltip yeniden başlatın (KALICI hata)"
+                )
+            else:
+                tavsiye = (
+                    "borsaya ULAŞILAMADI (geçici olabilir: ağ, timeout, 418 ban). "
+                    "Ban aktifken RESTART YASAK (CLAUDE.md #3) — kapı ilk başarılı "
+                    "tarama turunda kendiliğinden toparlar"
+                )
+            self.logger.error(
+                f"⛔ PİYASA KAPISI DOĞRULANAMADI (degraded) — lider {leader} "
+                f"({detail}). Kapı fail-open'dır: girişler BUGÜNKÜ GİBİ devam "
+                f"eder ama KORUMA YOKTUR. {tavsiye}. Durum: /scalper/status → "
+                f"market_gate.gate_effective"
+            )
+            return False
+        self._market_gate_leader_ok = True
+        self._market_gate_last_error = None
+        self._market_gate_consecutive_failures = 0
+        self._market_gate_retry_after = 0.0
+        self.logger.info(f"🧭 Piyasa kapısı lideri doğrulandı: {leader}")
+        return True
+
     async def _market_gate_reason(self, direction: Any) -> Optional[str]:
         """Kapı bu yönü engelliyorsa neden dizesi, aksi hâlde None.
 
         Kapı kapalıysa (varsayılan) HİÇ veri çekilmez — mevcut REST ağırlığı
         birebir korunur. Lider verisi alınamazsa kapı UYGULANMAZ (fail-open,
-        spec §C) ve WARNING loglanır: lider verisinin gelmemesi bir risk
-        olayı değildir, giriş hattı bugünkü davranışını sürdürür.
+        spec §C) ve oran-sınırlı WARNING loglanır: lider verisinin gelmemesi
+        bir risk olayı değildir, giriş hattı bugünkü davranışını sürdürür.
+
+        Tazelik: anlık görüntü tarama TURU BAŞINDA bir kez yenilenir
+        (`_scan_tick`), tur içindeki tüm semboller AYNI görüntüyü kullanır.
+        TV `external_signal` tur dışında da gelebildiği için burada azami yaş
+        `min(TTL, tarama aralığı)` ile sınırlanır — yani TV yolu hiçbir zaman
+        bir tarama turundan daha bayat bir liderle karar vermez.
         """
         if not bool(getattr(self.cfg, "scalper_market_gate", False)):
             return None
-        snapshot = await self._leader_market_snapshot()
+        snapshot = await self._leader_market_snapshot(
+            max_age=self._market_gate_max_age()
+        )
         if snapshot is None:
             return None
         reason = evaluate_market_gate(
@@ -1860,21 +2077,120 @@ class ScalperEngine:
             snapshot.get("daily_closes"),
             self.cfg,
         )
-        self._market_gate_last_reason = reason
+        # `last_reason` YALNIZ engellemede yazılır: serbest geçişte de
+        # yazılırsa (ilk sürümdeki hata) her serbest sinyal onu None'a
+        # döndürür ve `/scalper/status` pratikte HER ZAMAN null gösterir —
+        # operatör "kapı hiç tetiklenmedi" sanır. Sayaçlar (`rejects`)
+        # kümülatiftir, `last_reason`/`last_block_at` ise SON ENGELLEME.
         if reason is not None:
+            self._market_gate_last_reason = reason
+            self._market_gate_last_block_at = _utcnow_iso()
             self._market_gate_rejects[reason] = (
                 self._market_gate_rejects.get(reason, 0) + 1
             )
         return reason
 
-    async def _leader_market_snapshot(self) -> Optional[Dict[str, Any]]:
-        """Lider sembolün (günlük kapanışlar + giriş TF son kapanış) anlık
-        görüntüsü; `_MARKET_GATE_CACHE_TTL` boyunca yeniden çekilmez."""
+    def _market_gate_max_age(self) -> float:
+        """Kapı kararında kabul edilen azami anlık görüntü yaşı (sn)."""
+        try:
+            scan_interval = float(
+                getattr(self.cfg, "scalper_scan_interval_seconds", 60) or 60
+            )
+        except (TypeError, ValueError):
+            scan_interval = 60.0
+        return min(self._MARKET_GATE_CACHE_TTL, max(0.0, scan_interval))
+
+    async def _refresh_leader_snapshot(self) -> None:
+        """Tarama turu başında lider görüntüsünü BİR KEZ tazele.
+
+        Parite (CLAUDE.md #2): harness kararı tam o mumun kapanışıyla verir;
+        canlıda ise anlık görüntü TTL'i kadar bayat olabilirdi. Tur başında
+        zorla tazeleyip tur boyunca aynı görüntüyü kullanmak, "bir tarama turu
+        = bir lider görüntüsü" diyerek bu sapmayı tur süresine indirir.
+
+        REST maliyeti: ÜST sınır değişmez (tur başına yine en çok 3 istek =
+        3 ağırlık, bütçe 2400/dk) ama ALT sınır 0'dan 3 ağırlık/dakikaya
+        ÇIKAR — eskiden kapı yalnız bir sinyal geldiğinde veri çekiyordu,
+        sinyalsiz turda hiç istek gitmiyordu; artık kapı AÇIKSA her tur
+        tazelenir. "Maliyet değişmez" ifadesi bu yüzden yanlıştı.
+        """
+        if not bool(getattr(self.cfg, "scalper_market_gate", False)):
+            return
+        try:
+            await asyncio.wait_for(
+                self._leader_market_snapshot(max_age=0.0),
+                timeout=self._MARKET_GATE_REFRESH_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            # Zaman sınırı ŞART: lider erişilemezken `KlineFetcher`'ın
+            # 3 deneme × (okuma timeout'u + backoff) zinciri tarama turunu
+            # ~48 sn bloke edebilirdi. Kapı tavsiye niteliğindedir; TRADE
+            # HATTI ONUN YÜZÜNDEN DURMAZ. Negatif önbellek de kurulur ki
+            # sonraki turlar aynı bedeli ödemesin.
+            self._market_gate_note_failure(
+                f"TimeoutError: tur başı tazeleme "
+                f"{self._MARKET_GATE_REFRESH_TIMEOUT:g} sn içinde bitmedi"
+            )
+            self._market_gate_warn(
+                "refresh_timeout",
+                f"⚠️ Piyasa kapısı: lider tazelemesi "
+                f"{self._MARKET_GATE_REFRESH_TIMEOUT:g} sn'de bitmedi — tur "
+                f"BEKLETİLMEDİ, kapı bu turda UYGULANMADI (fail-open)"
+            )
+        except Exception as e:
+            # Kapı, tarama turunu düşürmeye yetkili DEĞİLDİR.
+            self._market_gate_note_failure(f"{type(e).__name__}: {e}")
+            self._market_gate_warn(
+                "refresh_error",
+                f"⚠️ Piyasa kapısı: tur başı tazeleme hata verdi "
+                f"({type(e).__name__}: {e}) — tarama turu SÜRÜYOR (fail-open)"
+            )
+
+    async def _leader_market_snapshot(
+        self, max_age: Optional[float] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Lider sembolün (gün açılışı + günlük kapanışlar + giriş TF son
+        kapanış) anlık görüntüsü.
+
+        `max_age` (sn) verilmezse `_MARKET_GATE_CACHE_TTL` kullanılır; 0.0
+        zorla tazeler. Önbellek AYRICA UTC gün damgasıyla anahtarlanır: gün
+        sınırında (00:00 UTC) "gün açılışı" değişir, TTL'i gün sınırına taşan
+        bir görüntü DÜNÜN açılışıyla karar verirdi.
+
+        Negatif önbellek: son deneme başarısızsa `SCALPER_MARKET_GATE_RETRY_SEC`
+        (vars. 60 sn) boyunca YENİDEN DENENMEZ — aksi hâlde kalıcı bir arızada
+        (yanlış lider sembolü, ağ) her sinyal 3 seri × `KlineFetcher` yeniden
+        denemeleri kadar boşa istek açar ve `KlineFetcher`'ın PAYLAŞILAN
+        önbellek kilidini saniyelerce tutar (tüm sembollerin mum çekimi durur).
+        """
         leader = self._market_gate_leader()
         now = time.monotonic()
+
+        ttl = self._MARKET_GATE_CACHE_TTL if max_age is None else max(0.0, max_age)
+        # Gün damgası önbelleğin İÇERİĞİNİN gününü temsil etmeli. İlk sürüm
+        # bunu DUVAR SAATİNDEN türetiyordu; oysa `day_open`'ın hangi güne ait
+        # olduğunu son KAPANAN giriş mumunun `close_time`'ı belirler. İkisi
+        # 00:00 UTC'de değil, yeni günün İLK giriş mumu kapandığında hizalanır
+        # — yani guard, tam da yazıldığı pencereyi (00:00-00:0X) kaçırıyordu ve
+        # o pencerede DÜNÜN açılışıyla karar veriliyordu (üstelik
+        # `day_open_source: intraday_open` etiketiyle). Artık damga içerikten
+        # (`cutoff_ms`) türetilir; duvar saati yeni güne geçtiği andan itibaren
+        # içerik de geçene kadar tazelemeye devam edilir.
+        wall_day = utc_day_start_ms(int(time.time() * 1000))
         cached = self._market_gate_cache.get(leader)
-        if cached is not None and (now - cached[1]) < self._MARKET_GATE_CACHE_TTL:
+        if (
+            cached is not None
+            and (now - cached[1]) < ttl
+            and (len(cached) < 3 or cached[2] == wall_day)
+        ):
             return cached[0]
+
+        # Negatif önbellek önbellek OKUMASINDAN SONRA: aksi hâlde araya giren
+        # TEK bir geçici hata, elde TAZE ve geçerli bir görüntü VARKEN kapıyı
+        # `RETRY_SEC` boyunca tamamen kör bırakıyordu. Negatif önbelleğin işi
+        # yeni ÇEKİMİ engellemektir, mevcut görüntüyü saklamak değil.
+        if now < getattr(self, "_market_gate_retry_after", 0.0):
+            return None
 
         try:
             run_days = int(getattr(self.cfg, "scalper_market_gate_run_days", 3) or 3)
@@ -1882,11 +2198,18 @@ class ScalperEngine:
             run_days = 3
         run_days = max(1, run_days)
         # N günlük koşu N+1 TAMAMLANMIŞ kapanış ister; KlineFetcher oluşmakta
-        # olan günlük mumu attığı için (+1) bir mum daha istenir → N+2.
+        # olan günlük mumu attığı için (+1) bir mum daha gerekir → asgari N+2.
+        # Talep N+5: asgari sınırda istemek SIFIR PAYLI'dır — borsanın tek bir
+        # eksik/geç günlük mumu uzama alt-kapısını sessizce fail-open yapardı.
+        # Ek 3 mum ağırlığı DEĞİŞTİRMEZ (limit ≤ 100 → ağırlık 1).
         tf_entry = str(getattr(self.cfg, "scalper_tf_entry", "5m") or "5m")
+        # min(100, ...): limit > 100 Binance'te ağırlığı 1'den 2'ye çıkarır.
+        # `SCALPER_MARKET_GATE_RUN_DAYS` büyük verilirse sessizce ağırlık
+        # ödememek için tavan konur (varsayılan 3 → 8, tavana çok uzak).
+        daily_limit = min(100, run_days + _LEADER_DAILY_LIMIT_MARGIN)
 
         try:
-            daily = await self.fetcher.get_klines(leader, "1d", run_days + 2)
+            daily = await self.fetcher.get_klines(leader, "1d", daily_limit)
             entry = await self.fetcher.get_klines(leader, tf_entry, 3)
             # Gerçek gün açılışı için 00:00 UTC 15m mumu (bkz.
             # market_gate.day_open_from_intraday): 100 mum = 25 saat ve
@@ -1896,9 +2219,14 @@ class ScalperEngine:
                 leader, MARKET_GATE_INTRADAY_TF, MARKET_GATE_INTRADAY_LIMIT
             )
         except Exception as e:
-            self.logger.warning(
+            detail = f"{type(e).__name__}: {e}"
+            self._market_gate_note_failure(detail)
+            self._market_gate_warn(
+                "fetch_error",
                 f"⚠️ Piyasa kapısı: lider {leader} verisi alınamadı, kapı bu "
-                f"turda UYGULANMADI ({type(e).__name__}: {e})"
+                f"turda UYGULANMADI ({detail}); "
+                f"{self._market_gate_retry_seconds():g} sn yeniden denenmeyecek "
+                f"(üst üste {self._market_gate_consecutive_failures} hata)"
             )
             return None
 
@@ -1915,13 +2243,36 @@ class ScalperEngine:
             cutoff_ms,
         )
         if day_open is None or last_close is None:
-            self.logger.warning(
-                f"⚠️ Piyasa kapısı: lider {leader} serisi yetersiz "
-                f"(1d={len(daily_closes)}, {tf_entry}={len(entry)}, "
-                f"{MARKET_GATE_INTRADAY_TF}={len(intraday)}), kapı bu "
-                f"turda UYGULANMADI"
+            detail = (
+                f"seri yetersiz (1d={len(daily_closes)}, "
+                f"{tf_entry}={len(entry)}, "
+                f"{MARKET_GATE_INTRADAY_TF}={len(intraday)})"
+            )
+            self._market_gate_note_failure(detail)
+            self._market_gate_warn(
+                "insufficient_series",
+                f"⚠️ Piyasa kapısı: lider {leader} {detail}, kapı bu turda "
+                f"UYGULANMADI"
             )
             return None
+
+        # Uzama alt-kapısı AÇIKKEN günlük seri kısa kalırsa o alt-kapı
+        # SESSİZCE inert olurdu (saf fonksiyon veri yetersizliğinde atlar).
+        # Gün-içi alt-kapısı çalışmaya devam ettiği için bu hata değil uyarı.
+        try:
+            run_pct_active = float(
+                getattr(self.cfg, "scalper_market_gate_run_pct", 0.0) or 0.0
+            ) > 0.0
+        except (TypeError, ValueError):
+            run_pct_active = False
+        if run_pct_active and len(daily_closes) < run_days + 1:
+            self._market_gate_warn(
+                "short_daily_series",
+                f"⚠️ Piyasa kapısı: lider {leader} günlük serisi kısa "
+                f"({len(daily_closes)} mum; uzama alt-kapısı {run_days + 1} "
+                f"TAMAMLANMIŞ kapanış ister, talep {daily_limit}) — uzama "
+                f"alt-kapısı bu turda İNERT"
+            )
 
         snapshot: Dict[str, Any] = {
             "leader": leader,
@@ -1931,12 +2282,68 @@ class ScalperEngine:
             "daily_closes": daily_closes,
             **market_gate_metrics(day_open, last_close, daily_closes, self.cfg),
         }
-        self._market_gate_cache[leader] = (snapshot, now)
+        self._market_gate_cache[leader] = (
+            snapshot, now, utc_day_start_ms(cutoff_ms)
+        )
+        self._market_gate_leader_ok = True
+        self._market_gate_last_ok_at = _utcnow_iso()
+        self._market_gate_last_error = None
+        self._market_gate_consecutive_failures = 0
+        self._market_gate_retry_after = 0.0
+        # Uyarı zaman damgalarını da sıfırla: aksi hâlde T=0 arıza → T=30
+        # toparlanma → T=40 YENİ arıza dizisinde ikinci epizot hiç loglanmaz
+        # (60 sn penceresi ilk epizottan sayılırdı) ve operatör tek bir arıza
+        # olduğunu sanır. `failures_total` yine de kümülatiftir.
+        stamps = getattr(self, "_market_gate_warn_at", None)
+        if isinstance(stamps, dict):
+            stamps.clear()
         return snapshot
+
+    def _market_gate_thresholds(self) -> Dict[str, Optional[float]]:
+        """Yürürlükteki EŞİKLER — `/scalper/status`'te dışa verilir.
+
+        D15'in kendi ilkesi "log'daki WARNING bir KONTROL DEĞİLDİR" (D14
+        bulgusu #4). Eşiklerin doğru olduğunun tek kanıtı açılış banner'ıysa
+        o ilke ihlal edilmiş olur: RUNBOOK'un doğrulaması log-DIŞI bir yüzeyde
+        eşikleri görebilmeli.
+        """
+        def _f(name: str) -> Optional[float]:
+            try:
+                return float(getattr(self.cfg, name, 0.0) or 0.0)
+            except (TypeError, ValueError):
+                return None
+
+        try:
+            run_days: Optional[int] = int(
+                getattr(self.cfg, "scalper_market_gate_run_days", 0) or 0
+            )
+        except (TypeError, ValueError):
+            run_days = None
+        return {
+            "day_pct": _f("scalper_market_gate_day_pct"),
+            "run_pct": _f("scalper_market_gate_run_pct"),
+            "run_days": run_days,
+        }
 
     def _market_gate_status(self) -> Dict[str, Any]:
         """`/scalper/status` alt-sözlüğü — SENKRON, hiç IO yapmaz (yalnız
         önbellekteki son anlık görüntüyü okur).
+
+        **`gate_effective` = kapı GERÇEKTEN koruyor mu.** Üç şart birden:
+        (1) `enabled`, (2) lider verisi ALINABİLDİ (`leader_ok` ve en az bir
+        başarılı çekim), (3) görüntü BAYAT değil, (4) en az bir alt-kapı
+        eşiği > 0. `enabled` bunların hiçbirini söylemez — kapı fail-open'dır.
+        İnceleme bulguları: (a) yalnız `enabled AND leader_ok` bakmak, tek bir
+        mum bile çekilmeden (sadece exchangeInfo doğrulamasıyla) `true`
+        veriyordu; (b) `DAY_PCT=0` + `RUN_PCT=0` iken kapı hiçbir şey
+        engellemezken `true` veriyordu — ikisi de RUNBOOK'un ZORUNLU
+        doğrulamasını yanlış-yeşil yapardı.
+
+        Türetilmiş metrikler (`day_drift_pct`, `run_drift_pct`,
+        `day_open_source`) BAYAT görüntüde `null` verilir: karar yolu tazelik
+        ve gün-sınırı testlerini uygularken status onları uygulamıyordu, yani
+        "kapının ŞU AN gördüğü değer" diye sınırsız yaşta bir sayı
+        gösterilebiliyordu.
 
         getattr savunması: `object.__new__(ScalperEngine)` ile kurulan test
         çiftleri (tests/test_runtime_liveness.py) __init__'i çalıştırmaz —
@@ -1946,15 +2353,65 @@ class ScalperEngine:
         cache = getattr(self, "_market_gate_cache", {})
         cached = cache.get(leader)
         snapshot = cached[0] if cached is not None else {}
+
+        age: Optional[float] = None
+        if cached is not None:
+            age = max(0.0, time.monotonic() - cached[1])
+        # Gün sınırı da bayatlatır: içerik dünün gününe aitse metrik yanlıştır.
+        day_rolled = (
+            cached is not None
+            and len(cached) >= 3
+            and cached[2] != utc_day_start_ms(int(time.time() * 1000))
+        )
+        stale = age is None or age > self._stale_after_seconds() or day_rolled
+
+        enabled = bool(getattr(self.cfg, "scalper_market_gate", False))
+        leader_ok = getattr(self, "_market_gate_leader_ok", None)
+        last_ok_at = getattr(self, "_market_gate_last_ok_at", None)
+        thresholds = self._market_gate_thresholds()
+        active = any(
+            (thresholds.get(k) or 0.0) > 0.0 for k in ("day_pct", "run_pct")
+        )
         return {
-            "enabled": bool(getattr(self.cfg, "scalper_market_gate", False)),
+            "enabled": enabled,
+            "gate_effective": bool(
+                enabled and leader_ok is True and last_ok_at is not None
+                and not stale and active
+            ),
             "leader": leader,
-            "day_drift_pct": snapshot.get("day_drift_pct"),
-            "day_open_source": snapshot.get("day_open_source"),
-            "run_pct": snapshot.get("run_pct"),
+            "leader_ok": leader_ok,
+            "leader_source_host": self._leader_source_host(),
+            "thresholds": thresholds,
+            "stale": bool(stale),
+            "snapshot_age_sec": None if age is None else round(age, 1),
+            # Ölçülen büyüklükler. `run_drift_pct` adı bilerek eşikten
+            # (`thresholds.run_pct`) FARKLI: ikisine de `run_pct` demek,
+            # "uzama kapısı %4.2'de açık kalmış" gibi gerçekçi bir
+            # yanlış-teşhis üretiyordu.
+            "day_drift_pct": None if stale else snapshot.get("day_drift_pct"),
+            "run_drift_pct": None if stale else snapshot.get("run_pct"),
+            "day_open_source": None if stale else snapshot.get("day_open_source"),
+            "last_ok_at": last_ok_at,
+            "last_error": getattr(self, "_market_gate_last_error", None),
+            "last_failure_at": getattr(self, "_market_gate_last_failure_at", None),
+            "consecutive_failures": getattr(
+                self, "_market_gate_consecutive_failures", 0
+            ),
+            "failures_total": getattr(self, "_market_gate_failures_total", 0),
             "last_reason": getattr(self, "_market_gate_last_reason", None),
+            "last_block_at": getattr(self, "_market_gate_last_block_at", None),
             "rejects": dict(getattr(self, "_market_gate_rejects", {})),
         }
+
+    def _stale_after_seconds(self) -> float:
+        """Anlık görüntü bu yaştan sonra BAYAT (varsayılan 2 × tarama aralığı)."""
+        try:
+            scan_interval = float(
+                getattr(self.cfg, "scalper_scan_interval_seconds", 60) or 60
+            )
+        except (TypeError, ValueError):
+            scan_interval = 60.0
+        return max(1.0, scan_interval) * self._MARKET_GATE_STALE_SCANS
 
     # ------------------------------------------------------------------
     # Günlük zarar kesici

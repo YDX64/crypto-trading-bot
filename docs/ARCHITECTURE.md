@@ -111,8 +111,9 @@ satır 56-63). `?src=` yoksa kaynak, AlgoPro'nun varsayılan mesaj biçiminden
 | `scalper_tv_regime_filter` | `True` | Rejim kapısının TV sinyaline de uygulanıp uygulanmayacağı |
 | `scalper_market_gate` | `False` | Lider piyasa kapısı (§4.1) — ters-gün kapısı, varsayılan KAPALI |
 | `scalper_market_gate_symbol` | `BTCUSDT` | Kapının baktığı lider sembol |
-| `scalper_market_gate_day_pct` | `1.0` | Gün-içi alt-kapısı eşiği (%; 0 = kapalı) |
-| `scalper_market_gate_run_pct` / `_run_days` | `15.0` / `3` | Uzama alt-kapısı eşiği ve gün sayısı (0 = kapalı) |
+| `scalper_market_gate_day_pct` | `1.3` | Gün-içi alt-kapısı eşiği (%; 0 = kapalı) — E7+E8 ölçümü |
+| `scalper_market_gate_run_pct` / `_run_days` | `0.0` / `3` | Uzama alt-kapısı — **varsayılan KAPALI**, iki bağımsız ölçüm çürüttü (D15) |
+| `scalper_market_gate_retry_sec` | `60.0` | Lider verisi alınamazsa negatif önbellek (sn; 0 = kapalı) |
 | `scalper_tf_entry/context/regime` | `5m/15m/4h` | Giriş/bağlam/rejim zaman dilimleri |
 | `scalper_c_rsi_long_max/short_min` | `25.0/75.0` | C'nin RSI uç eşiği |
 | `scalper_c_require_divergence` | `True` | C'de RSI diverjans şartı |
@@ -193,13 +194,28 @@ günlük kapanış vekiline düşer; hangisinin kullanıldığı `/scalper/statu
 `market_gate.day_open_source` alanındadır.
 
 REST ağırlığı: lider **başına** ~60 sn TTL önbellek (`_MARKET_GATE_CACHE_TTL`),
-sembol başına değil — tarama turu başına en çok **3 istek**: `1d` (limit N+2),
-giriş TF (limit 3) ve `15m` (limit 100); üçü de limit ≤ 100 olduğu için
-ağırlık 1, toplam 3 ağırlık/dakika. Kapı kapalıyken tek istek bile gitmez.
-Lider verisi alınamazsa kapı **uygulanmaz** (fail-open) ve WARNING loglanır —
-lider verisinin gelmemesi bir risk olayı değildir. `/scalper/status`
-`market_gate` alt-sözlüğü (enabled/leader/day_drift_pct/run_pct/last_reason/
-rejects) teşhis için dışa verilir; harness'ta engellenen sinyaller
+sembol başına değil — tarama turu başına en çok **3 istek**: `1d`
+(limit `RUN_DAYS+5`, tavan 100), giriş TF (limit 3) ve `15m` (limit 100);
+üçü de limit ≤ 100 olduğu için ağırlık 1. Kapı AÇIKKEN anlık görüntü her
+tarama turunun başında tazelendiği için maliyet **≈3 ağırlık/dakika**
+(bütçe 2400/dk); kapalıyken **tek istek bile gitmez** — yani alt sınır
+0'dan 3'e çıkar, "değişmez" değil.
+Lider verisi alınamazsa kapı **uygulanmaz** (fail-open) ve oran-sınırlı WARNING
+loglanır — lider verisinin gelmemesi bir risk olayı değildir. Fail-open GÖRÜNÜR:
+lider sembolü başlangıçta exchangeInfo'da doğrulanır (yoksa ERROR + "degraded"),
+başarısızlık `SCALPER_MARKET_GATE_RETRY_SEC` boyunca negatif önbelleğe alınır
+(boşa REST + paylaşılan kline kilidi), ve `/scalper/status` →
+`market_gate.gate_effective` kapının GERÇEKTEN koruyup korumadığını söyler —
+`enabled` bunu söylemez (D15). `gate_effective` BEŞ şartı birden ister:
+`enabled` + lider doğrulandı + en az bir BAŞARILI anlık görüntü + görüntü
+BAYAT değil (yaş ≤ 2 × tarama aralığı, UTC günü dönmemiş) + en az bir eşik > 0. Anlık görüntü
+tarama turu başında bir kez tazelenir (tur içi tüm semboller aynı görüntüyü
+kullanır) ve önbellek UTC gün damgasıyla anahtarlanır. `/scalper/status`
+`market_gate` alt-sözlüğü (enabled/gate_effective/leader/leader_ok/
+leader_source_host/thresholds/stale/snapshot_age_sec/day_drift_pct/
+run_drift_pct/day_open_source/last_ok_at/last_error/last_failure_at/
+consecutive_failures/failures_total/last_reason/last_block_at/rejects)
+teşhis için dışa verilir; harness'ta engellenen sinyaller
 `missed_counter["market_gate_day"/"market_gate_run"]` altında raporlanır.
 Ölçüm ve P2 hükmü: `docs/EXPERIMENTS.md` "2026-08-23 — Lider piyasa kapısı (E7)".
 

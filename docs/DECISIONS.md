@@ -284,11 +284,12 @@ haline döndür — üçü de bağımsız, birbirine muhtaç değil.
 ### D15 — Lider piyasa kapısı ("ters-gün kapısı") · 2026-08-23 · ADAY, UYGULANMADI (varsayılan KAPALI)
 **Ne:** `SCALPER_MARKET_GATE` (varsayılan `false`) ile iki BAĞIMSIZ alt-kapı
 (`src/strategies/scalper/market_gate.py`, saf fonksiyon, IO yok):
-1. **gün-içi** (`SCALPER_MARKET_GATE_DAY_PCT`, varsayılan 1.0): lider sembolün
+1. **gün-içi** (`SCALPER_MARKET_GATE_DAY_PCT`, varsayılan **1.3**): lider sembolün
    (`SCALPER_MARKET_GATE_SYMBOL`, varsayılan BTCUSDT) son kapanışı gün açılışının ≥%X
    ALTINDAYSA yeni LONG, ≥%X ÜSTÜNDEYSE yeni SHORT açılmaz.
-2. **uzama** (`SCALPER_MARKET_GATE_RUN_PCT`=15 / `_RUN_DAYS`=3): lider son N TAMAMLANMIŞ günde
-   ≥+%Y koştuysa LONG, ≤−%Y düştüyse SHORT açılmaz (koşu = `kapanış[-1]/kapanış[-1-N] − 1`).
+2. **uzama** (`SCALPER_MARKET_GATE_RUN_PCT`, varsayılan **0 = KAPALI** / `_RUN_DAYS`=3): lider son
+   N TAMAMLANMIŞ günde ≥+%Y koştuysa LONG, ≤−%Y düştüyse SHORT açılmaz
+   (koşu = `kapanış[-1]/kapanış[-1-N] − 1`).
 Her alt-kapı kendi yüzdesi 0 yapılarak ayrı ayrı kapatılır. Rejim kapısından (D5) FARKLIDIR:
 D5 sembolün KENDİ EMA50/200 trendine bakar, bu kapı yalnız LİDERE bakıp kararı tüm evrene uygular.
 
@@ -297,26 +298,95 @@ içinde — yani C taraması VE TV `external_signal` AYNI tek giriş noktasında
 ayrı bir TV muafiyet bayrağı YOKTUR; TV zaten aynı fonksiyondan geçiyor). Harness tarafı
 `backtest.simulate_symbol` + `LeaderSeries` — İKİ TARAF AYNI FONKSİYON NESNESİNİ çağırır (P1).
 
-**Girdi türetme paritesi (bilinçli tasarım kararı):** "gün açılışı" iki tarafta da SON
-TAMAMLANMIŞ GÜNLÜK KAPANIŞ'tır (`day_open_from_daily_closes`). Gerekçe: `KlineFetcher.
-_drop_unclosed` oluşmakta olan mumu HER ZAMAN atar (repaint koruması), bu yüzden canlı motor
-oluşmakta olan GÜNLÜK mumu hiç göremez — gerçek "bugünün open'ı" canlıda TÜRETİLEMEZ.
-Harness'ta türetilebilirdi ama o zaman iki taraf farklı bir büyüklük hesaplar ve parite bozulurdu.
-7/24 açık bir piyasada günlük open ile önceki close arasındaki fark tik mertebesindedir (eşik %1).
+**Girdi türetme paritesi:** "gün açılışı" iki tarafta da `market_gate.resolve_day_open` ile
+bulunur — önce GERÇEK açılış (o günün 00:00 UTC `15m` mumunun `open`'ı), o elde edilemezse
+(günün ilk 15 dakikası) son tamamlanmış günlük kapanış vekili. Ayrıntı ve ölçüm aşağıda
+"**'Gün açılışı' türetmesi**" bölümünde. (Bu paragraf ilk sürümde "gerçek open canlıda
+TÜRETİLEMEZ" diyordu — o gerekçe E8 tarafından çürütüldü ve düzeltildi.)
+
+**Tazelik paritesi (2026-08-23 inceleme bulgusu):** harness kararı verirken liderin TAM O ANKİ
+mumunu kullanır; canlı motor ise lider anlık görüntüsünü önbelleğe alır. İlk sürümde görüntü
+60 sn'ye kadar BAYAT olabiliyordu (harness'ta böyle bir gecikme yok). Düzeltme: görüntü TARAMA
+TURU BAŞINDA bir kez zorla tazelenir (`engine._refresh_leader_snapshot`, `_scan_tick`'in ilk
+adımı) ve tur içindeki TÜM semboller AYNI görüntüyü kullanır — sapma artık TTL'e değil TUR
+SÜRESİNE bağlı. Tur dışında gelebilen TV `external_signal` yolu için azami yaş
+`min(TTL, SCALPER_SCAN_INTERVAL_SECONDS)` ile sınırlanır, yani TV hiçbir zaman bir tarama
+turundan daha bayat bir liderle karar vermez. REST maliyetinin ÜST sınırı değişmez (tur başına
+yine en çok 3 istek) ama ALT sınırı **0'dan ~3 ağırlık/dakikaya ÇIKAR**: kapı eskiden yalnız bir
+sinyal geldiğinde veri çekiyordu, sinyalsiz turda hiç istek gitmiyordu; artık kapı AÇIKSA her tur
+tazelenir ("maliyet değişmez" ifadesi bu yüzden yanlıştı — 2026-08-23 inceleme bulgusu).
+Ayrıca önbellek anahtarına **UTC gün damgası** eklendi: gün sınırında
+(00:00 UTC) "gün açılışı" değişir, TTL'i sınıra taşan bir görüntü DÜNÜN açılışıyla karar verirdi
+(gün başına ~1 dakikalık pencere).
 
 **REST ağırlığı:** lider BAŞINA ~60 sn TTL önbellek (sembol başına DEĞİL) — tarama turu başına
-en çok **3 istek**: `1d` (limit N+2), giriş TF (limit 3) ve `15m` (limit 100, gerçek gün
-açılışı için — aşağıya bakın); ÜÇÜ DE limit ≤ 100 olduğu için ağırlık 1, toplam 3 ağırlık/dakika
-(bütçe 2400/dk). Kapı kapalıyken TEK istek bile gitmez (`test_gate_off_makes_no_request_at_all`). Lider verisi alınamazsa kapı
-UYGULANMAZ (fail-open) + WARNING — lider verisi eksikliği bir risk olayı değildir (spec §C).
+en çok **3 istek**: `1d` (limit `RUN_DAYS+5`, tavan 100 — asgari N+2'nin üstüne PAY; bkz.
+`_LEADER_DAILY_LIMIT_MARGIN`), giriş TF (limit 3) ve `15m` (limit 100, gerçek gün açılışı için —
+aşağıya bakın); ÜÇÜ DE limit ≤ 100 olduğu için ağırlık 1, toplam ~3 ağırlık/dakika
+(bütçe 2400/dk). Kapı kapalıyken TEK istek bile gitmez (`test_gate_off_makes_no_request_at_all`);
+yani kapıyı açmanın REST maliyeti "sıfır" değil, **alt sınırı 0 → ~3 ağırlık/dakika**dır.
+
+**Fail-open GÖRÜNÜR olmalı (2026-08-23 inceleme bulgusu — high).** Lider verisi alınamazsa kapı
+UYGULANMAZ (fail-open, spec §C: lider verisi eksikliği bir risk OLAYI değildir). Sorun semantikte
+değil görünürlükteydi: ilk sürümde yanlış yazılmış bir lider sembolü
+(`SCALPER_MARKET_GATE_SYMBOL=BTCUSD`) ya da kalıcı bir ağ arızası kapıyı **sessizce** devre dışı
+bırakıyordu — operatör `/scalper/status` → `enabled: true` görüp korunduğunu sanıyordu — ve
+üstelik başarısızlık ÖNBELLEĞE ALINMADIĞI için her sinyal denemesi 3 seri × `KlineFetcher`'ın 3
+iç denemesi kadar boşa REST isteği açıyor, `KlineFetcher`'ın **paylaşılan** önbellek kilidini
+saniyelerce tutuyordu (o sırada tüm sembollerin mum çekimi bekliyor). Dört düzeltme:
+1. **Başlangıçta lider doğrulaması** (`engine._validate_market_gate_leader`, `start()` içinde
+   `_probe_exchange()` başarılıysa): `get_symbol_filters` ile exchangeInfo'da aranır; yoksa
+   **ERROR** (`⛔ PİYASA KAPISI DOĞRULANAMADI (degraded)`) ve `leader_ok=false`; mesaj KALICI
+   (yanlış sembol) ile GEÇİCİ (ağ/timeout/418) hatayı ayırır — ikincisinde restart TAVSİYE
+   EDİLMEZ (CLAUDE.md yasak #3). Kapı yine de girişleri
+   engellemez — fail-open korunur. Çağrı `asyncio.wait_for` ile 15 sn'ye bağlıdır: istemci 3
+   deneme × 60 sn timeout yaptığı için sınırsız bırakılsaydı ulaşılamayan bir borsada motor
+   AÇILIŞINI dakikalarca bloke ederdi. Probe başarısızsa `leader_ok` `null` kalır
+   ("henüz denenmedi", `gate_effective` false) ve ilk tarama turu kendiliğinden çözer.
+2. **Negatif önbellek** `SCALPER_MARKET_GATE_RETRY_SEC` (vars. 60 sn): başarısızlıktan sonra bu
+   süre boyunca YENİDEN DENENMEZ. Ölçüldü (test): 20 sinyal denemesi → 60 istek yerine **1**.
+3. **Oran-sınırlı WARNING** (tür başına dakikada en çok 1). Tür başına, çünkü tek küresel sayaçla
+   önce basılan önemsiz bir tavsiye ("uzama serisi kısa") hemen ardından gelen ÖNEMLİ fail-open
+   uyarısını susturuyordu.
+4. **`/scalper/status.market_gate` teşhis alanları:** `gate_effective` — **operatörün ve
+   dashboard'un bakması gereken alan budur**, `enabled` değil. BEŞ şart birden: (1) `enabled`,
+   (2) lider doğrulandı (`leader_ok is True`), (3) en az BİR başarılı anlık görüntü alındı
+   (`last_ok_at is not None`), (4) görüntü BAYAT değil (yaş ≤ 2 × tarama aralığı ve UTC günü
+   dönmemiş), (5) en az bir alt-kapı eşiği > 0. (2) ve (5) inceleme sırasında eklendi: yalnız
+   `enabled AND leader_ok` bakmak, tek bir mum bile çekilmeden (sadece exchangeInfo
+   doğrulamasıyla) ve `DAY_PCT=0 RUN_PCT=0` iken bile `true` veriyordu — ikisi de RUNBOOK'un
+   ZORUNLU doğrulamasını yanlış-yeşil yapardı. Yanında: `leader_ok`, `last_ok_at`, `last_error`,
+   `last_failure_at`, `consecutive_failures`, `failures_total` (toparlanmada SIFIRLANMAZ —
+   dönüşümlü arıza görünür kalsın), `leader_source_host`, `thresholds` (yürürlükteki eşikler),
+   `stale` + `snapshot_age_sec`, `last_block_at`. Türetilmiş metrikler (`day_drift_pct`,
+   `run_drift_pct`, `day_open_source`) BAYAT görüntüde `null` verilir. `run_drift_pct` adı
+   bilerek eşikten (`thresholds.run_pct`) FARKLIDIR: ikisine de `run_pct` demek "uzama kapısı
+   %4.2'de açık kalmış" gibi gerçekçi bir yanlış-teşhis üretiyordu.
+   `src/main.py::_EMPTY_SCALPER_STATUS` aynı şekli motorsuz yolda da verir ve bir sözleşme
+   testi ikisinin AYRIŞMASINI engeller (bu ayrışma fiilen olmuştu: `day_open_source` motora
+   eklenmiş, boş sözlüğe eklenmemişti).
+
+Ayrıca `last_reason` eskiden SERBEST geçişlerde de yazılıyordu; her serbest sinyal onu `null`'a
+döndürdüğü için status pratikte HER ZAMAN `null` gösteriyordu ("kapı hiç tetiklenmedi"
+yanılsaması). Artık yalnız ENGELLEMEDE yazılır ve yanına `last_block_at` (UTC) eklenir.
+
+**Veri kaynağı paritesi (bilinen sapma).** Kapı lider serisini motorun KENDİ `KlineFetcher`'ından
+alır (ayrı istemci YOK) — yani canlıda `settings.binance_base_url` = **TESTNET**, E7'de ise
+harness **mainnet**'ten okur. İki taraf aynı kuralı aynı kodla uygular ama VERİ farklıdır;
+testnet soak'u E7 sayılarıyla birebir kıyaslanamaz. Kapı tek noktadan beslendiği için
+`SCALPER_MARKET_DATA_BASE_URL` (D17 — AYRI dal, bu dalda YOK) ile piyasa verisi mainnet'e
+alındığında parite kendiliğinden sağlanır; kapı için ek bir iş gerekmez, çünkü lider serisi
+motorun tek `KlineFetcher`'ından gelir (`test_leader_series_comes_from_the_engine_kline_fetcher`). Hangi hostla karar verildiği `/scalper/status` → `market_gate.leader_source_host`
+alanındadır (yalnız ana bilgisayar adı — secret yok).
 
 **Kanıt (E7, `docs/EXPERIMENTS.md` "2026-08-23 — Lider piyasa kapısı"):** 8 varyant × 3 pencere,
 loglar `logs/market_gate/<varyant>_<pencere>.log`. V0 (kapı kapalı) mevcut tabanı BİREBİR üretti
 (AYI 1.04/DD 3683 · YATAY 1.29/3229 · BOĞA 2.43/735).
 - **V1 (gün-içi %1.0)** — AYI 1.04→**1.33** (+584→+2999, DD 3683→2956) · YATAY 1.29→**1.36**
   (+2392→+2593) · BOĞA 2.43→2.37 (+3902→+3725, −%4.5). P2'nin HER İKİ kolunu da geçer.
-  Mekanizma doğrulandı: AYI'da SL 29→17, SL zararı −14907→−8738; LONG −956→−121 (düşen-bıçak),
-  SHORT +1541→+3120 (rahatlama-rallisi) — kapı simetrik çalışıyor; RANGE günleri −1029→+425.
+  Mekanizma doğrulandı: AYI'da SL 29→17, SL zararı −14907→−8738; LONG −956→−121,
+  SHORT +1541→+3120; RANGE günleri −1029→+425. (Bunlar DEFTER farkları, atıf DEĞİL — aşağıdaki
+  "AYRIŞTIRMA" bölümü: yalnız-engelleme bakiyesi AYI'da SHORT +1523 / LONG −225.)
 - **V2 (uzama %15/3g)** — AYI 1.04→1.24 (+2909), YATAY/BOĞA hiç tetiklenmiyor. P2'yi geçer AMA
   60 tetiğin TAMAMI TEK bir lider olayından (2026-02-06, 3 günlük −%20.1). %15 ve %20 eşikleri
   BİREBİR aynı sonucu veriyor (arada olay yok) → n=1, kanıt ZAYIF.
@@ -331,6 +401,60 @@ loglar `logs/market_gate/<varyant>_<pencere>.log`. V0 (kapı kapalı) mevcut tab
   (+2392→+2791) · BOĞA 2.43→2.39 (−%2.7). Üç pencerede de V1'i (%1.0) DOMİNE ediyor, maxDD hiçbir
   yerde kötüleşmiyor. AYI yön kırılımı: LONG 79/−956 → 64/**+180**, SHORT 134/+1541 → 94/**+3632**,
   SL 29→17.
+
+**AYRIŞTIRMA — kazanç NEREDEN geliyor? (2026-08-23 inceleme, dürüstlük notu).** E7'nin ΔPnL'i
+İKİ ayrı etkinin toplamıdır ve karıştırılırsa kapıya hak etmediği bir güç atfedilir:
+(a) **engelleme** — vetolanan işlemlerin GERÇEKLEŞMEMESİ; (b) **yeniden tahsis** — vetolanan
+sinyalin boşalttığı slota giren YENİ işlemler. İki koşunun işlem listeleri
+`(symbol, entry_time, direction)` ile eşleştirilerek ayrıldı; **yeni backtest YOK**. Araç:
+`scripts/decompose_gate_runs.py` (rapor yollarını log dosyalarından türetir; aritmetiği
+`tests/test_market_gate.py::TestDecomposeGateRuns` ile çivilenmiştir). Ortak işlemlerin PnL'i iki
+koşuda birebir aynı → atıf temiz (V1 ve V1c için ayrı ayrı 0 uyuşmazlık).
+
+⚠️ **Sonuç EŞİĞE DUYARLI ve benimsenen eşikte TERSİNE DÖNÜYOR.** İlk ayrıştırma yalnız V1 (%1.0)
+üzerinde yapılmıştı; varsayılan olarak benimsenen eşik ise **V1c (%1.3)**:
+
+| Ölçü (V0 →) | V1 (%1.0) | **V1c (%1.3) — VARSAYILAN** |
+|---|---|---|
+| Yalnız-engelleme bakiyesi (3 pencere) | +224.82 | **+2063.05** |
+| — AYI / YATAY / BOĞA | +1297.71 / **−831.56** / −241.34 | +2010.41 / **+156.69** / −104.05 |
+| Yeniden tahsis payı | %90.8 | **%41.4** |
+| AYI yalnız-engelleme PF | 1.039 → 1.210 | 1.039 → **1.289** |
+| AYI LONG / SHORT bacağı (engelleme) | −224.87 / +1522.59 | **+76.12 / +1934.29** |
+
+- **%1.0'da** kazancın ~%91'i yeniden tahsisten gelir, YATAY ve BOĞA'da engellemenin KENDİSİ net
+  negatiftir. **%1.3'te** kazancın **%59'u doğrudan engellemedendir** ve YATAY'da bile engelleme
+  net POZİTİFTİR. Daha sıkı eşik daha AZ ama daha İSABETLİ engelliyor (AYI 74 → 66 engelleme,
+  bakiye +1298 → +2010). "Kapı ağırlıklı olarak bir slot yeniden tahsis mekanizmasıdır" hükmü
+  **yalnız %1.0 için** doğrudur — varsayılan eşikte DEĞİL.
+- **İki eşikte de değişmeyen tek nitel bulgu:** LONG bacağının engellemesi ≈başabaş, koruma
+  **SHORT bacağında**. Bu yüzden ilk sürümdeki "düşen-bıçak LONG'ları kesiliyor" cümlesi
+  kaldırıldı (defter farkını engellemeye atfediyordu; LONG düzelmesinin çoğu YENİ işlemlerden).
+  Bacak başına atıf (V1c, AYI): SHORT defter iyileşmesinin (+2091.75) **%92'si engelleme**
+  (+1934.29), LONG'unkinin (+1136.11) **%93'ü ikinci-derece** (+1059.99). İki bacak İKİ FARKLI
+  mekanizmadır; "kapı LONG'ları koruyor" demek ölçüme aykırıdır.
+- **İkinci-derece terimin MEKANİZMASI: sembol-içi işgal penceresi (%100), kapasite 0,
+  cooldown 0.** İlk sürüm bunu küresel kapasiteye (`scalper_max_positions`) atfediyordu;
+  `scripts/decompose_gate_runs.py --mechanism` bunu çürüttü: V1c'de yeni işlemlerin **14/14'ü**
+  (AYI 11/+1217.45, YATAY 3/+242.39) kapının engellediği işlemin AYNI SEMBOLDEKİ
+  `[giriş, çıkış]` penceresinin İÇİNDE açılıyor — `simulate_symbol` bir sembolde tek pozisyon
+  tutar (`i = trade.exit_idx + 1`), yani bunlar taban koşuda kapasiteye SIRA GELMEDEN
+  imkânsızdı. Kapasite fiilen bağlayıcı değil (`capacity` sayacı V0'da 3, V1c'de 2). E8.6'nın
+  bağımsız ölçümüyle aynı sonuç. Sınıflandırıcının aritmetiği
+  `tests/test_market_gate.py::TestDecomposeGateRuns` ile çivilenmiştir.
+- **AYI maxDD iyileşmesinin tamamı engellemeden** — ölçüldü (yalnız-engelleme kümesi 3682.60 →
+  2956.08 = tam koşunun DD'si). Teorem DEĞİL: V1 YATAY'da yeniden tahsis DD'yi ayrıca düşürüyor
+  (3032.30 → 2882.04).
+- **Engellenen 12 AYI SL'i = −6169.50**, defter farkıyla (29→17 SL) **tesadüfen** birebir aynıdır:
+  kapılı koşuda yeni giren hiçbir işlem SL olmamıştır. Atıf hatası değildir.
+- **P2 KRİTERLERİ yalnız-engelleme kümesinde de sağlanıyor** (AYI PF 1.210/1.289 ≥ 1.1; BOĞA
+  −%6.19/−%2.67 ≤ %20). Bu yeni bir P2 **hükmü değil**, dayanıklılık kontrolüdür — P2 gerçek bir
+  koşu üzerinde tanımlıdır, bu küme ise V0'dan işlem çıkarılarak kurulmuş sentetiktir (kapasite
+  kapısı yeniden koşulmadı).
+- **İkinci-derece terim bir ölçüm eseri DEĞİL:** sembol-içi işgal penceresi canlıda da gerçektir
+  (motor da bir sembolde tek pozisyon tutar) — kazanca sayılır, yalnız ATFI doğru yapmak gerekir.
+  Ama harness'ın en zayıf modellediği kanal tam da budur: 8 saatlik reaper canlıda pencereyi
+  ERKEN kapatır, harness'ta hiç kapatmaz (aşağıdaki reaper maddesi).
 
 **Çapraz kontrol (E8 sinyal otopsisi, aynı gün):** E8 kapıyı bağımsız olarak harness JSON'u
 üzerinde POST-HOC ölçtü. Yöntem farkı önemli: E8'de engellenen sinyal kapasiteyi serbest
@@ -360,17 +484,18 @@ alt-kapısının üstüne HİÇBİR katkısı yok (V3 ≡ V1). (2) E8 canlı def
 (−152.7; LONG eşiği %12'de −382.9, 50 kazanan engelleniyor) ve spec'in hipotezinin İŞARETİNİ ters
 buldu: kazananların `align_btc_run_3d` ortalaması 7.50, kaybedenlerin 2.28 (AUC 0.292, p<0.001) —
 yani lider koşusuyla AYNI yönde açılan işlemler KAZANIYOR, kapının varsaydığının tersi.
-Varsayılan `SCALPER_MARKET_GATE_RUN_PCT=15` spec §C'de onaylandığı için **sessizce
-değiştirilmedi**; bunun yerine motor açılışta AÇIKÇA uyarıyor
-(`ScalperEngine._maybe_log_market_gate_banner` — kapı açık + `RUN_PCT>0` ise ikinci bir WARNING).
-Varsayılanı 0'a çekmek kullanıcı kararıdır — **AÇIK KARAR MADDESİ**.
+Varsayılan bir süre `15` (spec §C'de onaylı) bırakıldı ve sessizce değiştirilmedi; bunun yerine
+motor açılışta AÇIKÇA uyarıyordu (`ScalperEngine._maybe_log_market_gate_banner` — kapı açık +
+`RUN_PCT>0` ise ikinci bir WARNING). **2026-08-23'te varsayılan 0'a çekildi** (aşağıdaki
+"Varsayılanlar" maddesi); banner uyarısı KALDI, çünkü `.env`'de elle yazılmış bir `RUN_PCT>0`
+varsayılanı hiç devreye sokmaz.
 E8'in ek gerekçesi (bende olmayan bir ölçüm): harness'ın "üç pencerede inert" hükmü BUGÜNKÜ
 piyasaya taşınmıyor. O pencerelerde BTC 3 günde %15 koşmadığı için kapı hiç tetiklenmiyordu;
 botun ŞU AN soak ettiği dönemde koşuyor — 7–22 Ağu canlı defterinde `RUN_PCT=15` 202 işlemin
-35'inde tetikleniyor ve **net −152.7** ediyor. Yani `SCALPER_MARKET_GATE=true` çıplak
-varsayılanlarla açılırsa uzama alt-kapısı inert DEĞİL, aktif ve negatiftir. Ayrıca `DAY_PCT`
-varsayılanı 1.0 iken tüm kanıt 1.3 diyor: çıplak varsayılanlar hiçbir ölçümün önermediği
-(1.0 + 15) çiftini verir. Bu yüzden `docs/RUNBOOK.md` "Lider piyasa kapısı" bölümündeki açma
+35'inde tetikleniyor ve **net −152.7** ediyor. Yani (o günkü) çıplak varsayılanlarla açılsaydı
+uzama alt-kapısı inert DEĞİL, aktif ve negatif olurdu — ve `DAY_PCT` varsayılanı 1.0 iken tüm
+kanıt 1.3 diyordu; yani çıplak varsayılanlar hiçbir ölçümün önermediği (1.0 + 15) çiftini
+veriyordu. **Bu tuzak varsayılanlar 1.3 / 0'a çekilerek kapatıldı**; yine de `docs/RUNBOOK.md` "Lider piyasa kapısı" bölümündeki açma
 komutu üç değişkeni de AÇIKÇA yazar ve restart'tan önce `assert` ile doğrular — log'daki WARNING
 bir KONTROL DEĞİLDİR (D14 review bulgusu #4 emsali: sessizce başarısız olan `sed`).
 
@@ -394,15 +519,60 @@ AYNI (V1c AYI 158/+3812.25/PF 1.43/DD 2956.08 · YATAY 137/+2791.37/1.38/2840.06
 89/+3797.60/2.39/734.59) — E7 tablosu her iki tanım altında geçerli, testnet belirsizliği kalktı.
 Eski loglar `logs/market_gate_prevclose/`.
 
-**Kanıt (kod):** `tests/test_market_gate.py` — 67 test (saf fonksiyon: her alt-kapı/yön/eşik
-sınırı/eksik-geçersiz veri; motor: önbellek, fail-open+WARNING, ret sayaçları, `/scalper/status`
-`market_gate` alanı, GERÇEK `_evaluate_symbol` üzerinden C ve TV yolunun ikisi de; harness:
-look-ahead yasağı, `missed_counter` anahtarları; PARİTE: iki modülün aynı fonksiyon nesnesini
-aynı argümanlarla çağırdığı; Settings env parse). `python3 -m pytest tests -q` → 743 passed,
-1 skipped (önceki: 676). `tests/test_golden_backtest.py` DEĞİŞMEDEN geçer.
+**Varsayılanlar — 1.3 / 0 (KARAR: ana oturum, 2026-08-23).** `SCALPER_MARKET_GATE_DAY_PCT`
+1.0 → **1.3**, `SCALPER_MARKET_GATE_RUN_PCT` 15 → **0**. Gerekçe: **iki bağımsız ölçüm uyuşuyor**
+— gün-içi eşiği için E7 (motor-içi kapı, 3 pencere: V1c üç pencerede de V1'i domine ediyor,
+maxDD hiçbir yerde kötüleşmiyor) ve E8 (canlı defter post-hoc taraması aynı eşiği önerdi);
+uzama alt-kapısı için E7 (n=1 olay, gün-içinin üstüne katkı YOK) ve E8 (canlı defterde −152.7,
+hipotezin işareti ters). Önceki varsayılanlar spec §C'den geliyordu ve HİÇBİR ölçümün önermediği
+(1.0 + 15) çiftini veriyordu — "çıplak" `SCALPER_MARKET_GATE=true` yazan operatörün eline geçen
+şey buydu. Değişiklik **canlı davranışı DEĞİŞTİRMEZ**: `SCALPER_MARKET_GATE` varsayılanı `false`
+ve `.env`'de tanımlı değil; değişen tek şey, kapı açıldığında hangi eşiklerin devreye gireceği.
+Uzama alt-kapısının başlangıç WARNING'i KALDI (`RUN_PCT>0` bırakan operatör yine uyarılır) ve
+RUNBOOK'un açma komutu üç değişkeni de açıkça yazmaya devam ediyor — varsayılana güvenmek bir
+kontrol değildir. `env.example` uyumlu. Geri alma: `.env`'de eski değerleri açıkça yaz.
+
+**Bilinen sapma — 8 saatlik reaper harness'ta MODELLENMİYOR (2026-08-23 inceleme).** Canlı motor
+`SCALPER_MAX_HOLD_HOURS` (D4, sunucuda 8) dolan ve TP1 görmemiş pozisyonu reduce-only MARKET ile
+kapatır (`engine._reap_aged_positions`); `backtest.simulate_symbol`'de böyle bir çıkış YOKTUR —
+pozisyon SL/TP/trail'e kadar açık kalır. İki ters etki: (a) uzun sürünen kaybedenler harness'ta
+tam SL'ye taşınır (kapının "kestiği zarar" olduğundan büyük görünür), (b) slot canlıda 8 saatte
+boşalırken harness'ta daha uzun dolu kalır — ki bu tam olarak yukarıdaki **yeniden tahsis**
+kanalını vurur.
+**Büyüklük değil, MARUZ KALAN KÜME ölçüldü** (`scripts/decompose_gate_runs.py --reaper`): AYI
+penceresinde reaper'ın gerçek popülasyonu (>8 sa **ve** TP1 görmemiş) V0'da 13 işlem / −6681.25,
+V1 ve V1c'de 9 işlem / −4624.75. Kapının engellediği işlemlerin **4'ü** bu tanıma girer ve
+**−2056.50** taşır → V1 AYI Δ'sının (+2415) **%85'i**, V1c'nin (+3228) **%64'ü** bu 4 işlemin
+harness'ta SL'ye kadar taşınmasına dayanıyor. **Net işaret ÖLÇÜLMEDİ ve tek bir yüzdeyle
+özetlenemez**; ama etkinin dokunduğu taban Δ'nın çoğunluğu olduğu için **E7'nin AYI sayıları
+yukarı yanlı kabul edilmelidir.** (Bu not önce "~%17" diyordu — kaynağı ve yöntemi olmayan,
+ham veriden yeniden üretilemeyen ve etkiyi KÜÇÜK gösteren bir sayıydı; CLAUDE.md yasak #6 gereği
+çıkarıldı.) Kod tarafındaki karşılığı: `backtest.py` `_apply_capacity_gate` "BİLİNEN SAPMALAR"
+madde 3. Reaper'ı harness'a eklemek AYRI bir iştir (kendi parite testiyle).
+
+**Kanıt (kod):** `tests/test_market_gate.py` — 149 test (saf fonksiyon: her alt-kapı/yön/eşik
+sınırı/eksik-geçersiz veri; gün açılışı türetmesi: gerçek 00:00 UTC açılışı + vekil yolu; motor:
+önbellek, fail-open+WARNING, ret sayaçları, `/scalper/status` `market_gate` alanı, GERÇEK
+`_evaluate_symbol` üzerinden C ve TV yolunun ikisi de; **görünürlük**: lider doğrulaması,
+negatif önbellek (20 deneme → 1 istek), oran-sınırlı WARNING, `gate_effective`, status şekli
+sözleşmesi (`main.py` ile ayrışmaya karşı); **tazelik**: tur başı tazeleme, tur içi paylaşım,
+TV azami yaşı, UTC gün sınırı; harness: look-ahead yasağı, `missed_counter` anahtarları,
+strateji zaman dilimi doğrulaması, rapor `market_gate` provenance'ı ve
+`run_metadata` yayılımı (bu ikincisi UÇTAN UCA koşuda yakalanan gerçek bir hatanın regresyonu:
+`run_metadata.update()` sığ kopya olduğu için sonradan eklenen `market_gate` anahtarı rapora
+HİÇ ulaşmıyordu); PARİTE: iki modülün aynı
+fonksiyon nesnesini aynı argümanlarla çağırdığı VE harness'ın KENDİ türetme fonksiyonuyla
+(`gather_leader_series`) kurulan serinin canlı motorun ürettiği üçlüyle birebir aynı olduğu;
+Settings env parse; ayrıca `scripts/decompose_gate_runs.py`'nin ARİTMETİĞİ ve ikinci-derece
+MEKANİZMA sınıflandırıcısı — belgedeki atıf iddiasının kanıtı).
+`python3 -m pytest tests -q` → **825 passed, 1 skipped** (önceki: 761 passed, 1 skipped).
+`tests/test_golden_backtest.py` DEĞİŞMEDEN geçer; kapı kapalıyken harness çıktısı bit düzeyinde
+aynıdır. V1c AYI penceresi kapı sertleştirmesinden SONRA yeniden koşuldu ve değişmedi
+(aşağıdaki E7 kaydına bakın).
 
 **Geri alma:** `.env`'den `SCALPER_MARKET_GATE`'i kaldır/`false` yap — varsayılan zaten `false`,
-davranış değişmez, kod geri alınmasına gerek yok. Tam geri alma gerekirse commit `ece8bd8`
+davranış değişmez, kod geri alınmasına gerek yok. Tek satırlık reçete ve ZORUNLU doğrulama
+(`gate_effective`) `docs/RUNBOOK.md` "Lider piyasa kapısı" bölümünde. Tam geri alma gerekirse commit `ece8bd8`
 (`market_gate.py`, `engine.py` kapı bloğu + `_market_gate_*` metodları + snapshot alanı,
 `backtest.py` `LeaderSeries`/`gather_leader_series`/`_fetch_series_cached`/`simulate_symbol`
 `leader` parametresi, `kline_cache.py` "1d" girdisi, `config.py` 5 alan, `main.py`

@@ -1047,10 +1047,29 @@ _EMPTY_SCALPER_STATUS = {
     # (dashboard alan yokluğunu "kapı yok" ile karıştırmasın).
     "market_gate": {
         "enabled": settings.scalper_market_gate,
+        # Kapı fail-open'dır: "enabled" KORUYOR demek değildir. Motor yokken
+        # hiçbir lider verisi çekilmemiştir → gate_effective=False.
+        "gate_effective": False,
         "leader": (settings.scalper_market_gate_symbol or "BTCUSDT").strip().upper(),
+        "leader_ok": None,
+        "leader_source_host": None,
+        "thresholds": {
+            "day_pct": settings.scalper_market_gate_day_pct,
+            "run_pct": settings.scalper_market_gate_run_pct,
+            "run_days": settings.scalper_market_gate_run_days,
+        },
+        "stale": True,
+        "snapshot_age_sec": None,
         "day_drift_pct": None,
-        "run_pct": None,
+        "run_drift_pct": None,
+        "day_open_source": None,
+        "last_ok_at": None,
+        "last_error": None,
+        "last_failure_at": None,
+        "consecutive_failures": 0,
+        "failures_total": 0,
         "last_reason": None,
+        "last_block_at": None,
         "rejects": {},
     },
     "daily_pnl": 0.0,

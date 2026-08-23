@@ -241,10 +241,13 @@ Liderin (varsayılan BTCUSDT) gün-içi sapmasına bakıp o yöne yeni giriş ka
 kapalı ve canlıya UYGULANMADI** — bu bölüm, kullanıcı onayı geldiğinde doğru değerlerle
 açılabilmesi içindir; onaysız açma.
 
-⚠️ **Çıplak varsayılanlarla AÇMA.** `SCALPER_MARKET_GATE=true`'yu tek başına yazarsan
-`config.py` varsayılanları devreye girer: `DAY_PCT=1.0` (ölçülen en iyi **1.3**) ve
-`RUN_PCT=15` (**iki bağımsız ölçüm bunu desteklemiyor**, aşağı). Yani hiçbir ölçümün
-önermediği bir çift alırsın. Aşağıdaki komut üç değişkeni de AÇIKÇA yazar.
+⚠️ **Yine de çıplak varsayılanlara GÜVENME.** `config.py` varsayılanları 2026-08-23'te
+ölçümün önerdiği çifte çekildi (`DAY_PCT=1.3`, `RUN_PCT=0` — bkz. D15 "Varsayılanlar"), yani
+`SCALPER_MARKET_GATE=true`'yu tek başına yazmak artık ÖNCEKİ kadar tehlikeli değil. Ama
+**varsayılan bir KONTROL değildir**: sunucudaki `.env` eski bir değer taşıyabilir (ör. daha önce
+elle yazılmış `SCALPER_MARKET_GATE_RUN_PCT=15`) ve o zaman varsayılan hiç devreye girmez.
+Aşağıdaki komut bu yüzden üç değişkeni de AÇIKÇA yazar ve restart'tan önce `assert` ile
+geri-okur — okuduğun değer `.env`'in gerçeği, varsayılanın değil.
 
 ⚠️ **Uzama alt-kapısı (`RUN_PCT`) KAPALI kalmalı** — E7 (harness): yalnız ayı penceresinde
 ve tek lider olayında tetikleniyor, gün-içi kapısının üstüne katkısı YOK. E8 (canlı defter,
@@ -262,22 +265,74 @@ ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date +%Y%m%d)-market
 grubuyla yazılır ve restart'tan ÖNCE `assert`'li config geri-okuması yapılır (D14 review
 bulgusu #4 ile aynı disiplin).
 
-**ZORUNLU doğrulama — soak bu ikisi geçmeden BAŞLAMIŞ SAYILMAZ:**
+**ZORUNLU doğrulama — soak bu ÜÇÜ geçmeden BAŞLAMIŞ SAYILMAZ:**
 1. Komutun kendi `assert`'leri restart'tan ÖNCE `gate= True day= 1.3 run= 0.0` basmalı
    (basmazsa `AssertionError` ile durur ve restart hiç çalışmaz).
-2. Restart sonrası (~90 sn): `curl -sS http://127.0.0.1:9091/scalper/status | python3 -c
-   "import sys,json; g=json.load(sys.stdin)['market_gate']; assert g['enabled'] is True; print(g)"`
+   ⚠️ **Bu geri-okuma TEK BAŞINA yetmez.** `DAY_PCT`/`RUN_PCT` varsayılanları artık zaten
+   `1.3`/`0`; yani `sed` sessizce HİÇBİR ŞEY yazmasa bile geri-okuma aynı değerleri basar ve
+   YEŞİL görünür — D14 bulgusu #4'ün (sessizce başarısız olan `sed`) tam olarak bu biçimi.
+   Bu yüzden `.env` SATIRLARININ varlığı ayrıca `grep` ile doğrulanır (tam satır eşleşmesi,
+   dört anahtar):
+```bash
+ssh awa 'cd /opt/tradingbot-v2 && for kv in "SCALPER_MARKET_GATE=true" "SCALPER_MARKET_GATE_SYMBOL=BTCUSDT" "SCALPER_MARKET_GATE_DAY_PCT=1.3" "SCALPER_MARKET_GATE_RUN_PCT=0"; do grep -qxF "$kv" .env || { echo "EKSİK/YANLIŞ .env satırı: $kv"; exit 1; }; done && echo ".env 4/4 satır DOĞRU"'
+```
+2. Restart sonrası (~90 sn) — **`enabled` DEĞİL, `gate_effective` bak.** Kapı fail-open'dır:
+   lider verisi gelmiyorsa (yanlış sembol, ağ) `enabled: true` görünür ama HİÇBİR KORUMA YOKTUR.
+   `stale` da açıkça `false` olmalı: bayat bir görüntü kapının ÖLÜ olduğunu gizler.
+```bash
+ssh awa 'curl -sS http://127.0.0.1:9091/scalper/status' | python3 -c "
+import sys, json
+g = json.load(sys.stdin)['market_gate']
+assert g['gate_effective'] is True, f'KAPI ETKİSİZ: {g}'
+assert g['stale'] is False, f'LİDER GÖRÜNTÜSÜ BAYAT: {g}'
+assert g['leader_ok'] is True and g['leader'] == 'BTCUSDT', g
+assert g['thresholds'] == {'day_pct': 1.3, 'run_pct': 0.0, 'run_days': 3}, g
+print('gate_effective=', g['gate_effective'], 'stale=', g['stale'],
+      'age=', g['snapshot_age_sec'], 'leader=', g['leader'],
+      'host=', g['leader_source_host'], 'day_open_source=', g['day_open_source'])"
+```
+   (`stale` ve `leader_ok` mantıken `gate_effective`'in İÇİNDEDİR — ayrı yazılmalarının sebebi
+   arıza anında HANGİ şartın düştüğünü hata mesajından okuyabilmek. `thresholds` ise ayrı bir
+   kontrol: `gate_effective` yalnız "en az bir eşik > 0" ister, DOĞRU eşikler olduğunu değil.)
+3. Açılış logunda `🧭 Piyasa kapısı lideri doğrulandı: BTCUSDT` satırı olmalı; `⛔ PİYASA KAPISI
+   DOĞRULANAMADI (degraded)` satırı OLMAMALI:
+```bash
+ssh awa "grep -E 'PİYASA KAPISI|kapısı lideri' /opt/tradingbot-v2/logs/bot.log | tail -5"
+```
 
 **Ne görürsün:**
 - Restart loglarında `🧭 PİYASA KAPISI AÇIK — lider BTCUSDT, gün-içi %1.3, uzama %0.0/3g`.
   `RUN_PCT>0` bırakıldıysa ayrıca sert bir WARNING — görürsen komutu yanlış çalıştırmışsın.
 - Engellenen her sinyalde `⛔ <SEMBOL>: piyasa kapısı — gün-içi sapma (BTCUSDT gün −1.42%,
   koşu +2.10%) nedeniyle LONG girişi engellendi (SCALPER_MARKET_GATE)`.
-- `GET /scalper/status` → `market_gate: {enabled, leader, day_drift_pct, day_open_source,
-  run_pct, last_reason, rejects}`. `rejects` süreç ömrü boyunca `market_gate_day` /
-  `market_gate_run` sayaçlarıdır — soak sonunda tetik sayısını buradan oku.
-- `day_open_source` normalde `intraday_open` (gerçek 00:00 UTC açılışı). Günün ilk 15
-  dakikasında `prev_daily_close`'a düşer — beklenen davranış, hata değil.
+- `GET /scalper/status` → `market_gate`. Alanlar ve NE İŞE YARADIKLARI:
+
+| Alan | Anlamı / ne zaman bakılır |
+|---|---|
+| `enabled` | `.env`'de kapı açık mı. **Koruma garantisi DEĞİLDİR.** |
+| `gate_effective` | **Kapı GERÇEKTEN koruyor mu — tek bakılacak alan.** BEŞ şart birden: `enabled` + `leader_ok` + en az bir BAŞARILI görüntü (`last_ok_at`) + `stale: false` + en az bir eşik > 0. |
+| `leader` / `leader_ok` | Lider sembol ve son veri denemesinin sonucu (`null` = hiç denenmedi). |
+| `leader_source_host` | Lider mumlarının geldiği host. Testnet'te `testnet.binancefuture.com` — E7 mainnet'ten ölçtü, soak sayıları birebir kıyaslanamaz (D15 "Veri kaynağı paritesi"). |
+| `thresholds` | Yürürlükteki EŞİKLER (`day_pct`/`run_pct`/`run_days`). Log banner'ı bir KONTROL değildir; eşiklerin doğruluğu buradan doğrulanır. |
+| `stale` / `snapshot_age_sec` | Görüntü 2 × tarama aralığından eskiyse (ya da UTC günü döndüyse) `true` — o an kapı KÖRDÜR. Yaş saniye cinsindendir. |
+| `day_drift_pct` / `run_drift_pct` | Kapının ŞU AN ÖLÇTÜĞÜ iki büyüklük (`null` = hesaplanamadı ya da BAYAT — 0.0 ile karıştırma). Eşik değil: eşikler `thresholds` altındadır. |
+| `day_open_source` | `intraday_open` (gerçek 00:00 UTC açılışı) ya da günün ilk 15 dakikasında `prev_daily_close` — beklenen davranış, hata değil. Bayat görüntüde `null`. |
+| `last_ok_at` | Son BAŞARILI lider çekimi (UTC). Uzun süre eskiyorsa kapı sessizce ölmüş demektir. |
+| `last_error` / `last_failure_at` / `consecutive_failures` | Son hata metni, zamanı ve ÜST ÜSTE hata sayısı (0 = şu an sağlıklı). |
+| `failures_total` | Süreç ömrü boyunca TOPLAM hata — toparlanmada SIFIRLANMAZ. Dönüşümlü (flapping) arıza yalnız `consecutive_failures`'a bakınca tertemiz görünür; soak değerlendirmesi bu sayaç olmadan yapılamaz. |
+| `last_reason` / `last_block_at` | **SON ENGELLEME** — serbest geçişler bunu silmez. `null` ve `rejects` boşsa kapı hiç tetiklenmemiştir. |
+| `rejects` | Süreç ömrü boyunca `market_gate_day` / `market_gate_run` sayaçları — soak sonunda tetik sayısını buradan oku. |
+
+**Arıza: kapı açık ama `gate_effective: false`.** Kapı fail-open olduğu için girişler devam eder;
+KORUMA yoktur. Sırayla bak:
+1. `last_error` ne diyor? "bulunamadı" → `SCALPER_MARKET_GATE_SYMBOL` yanlış yazılmış
+   (`BTCUSD` vb.). Düzelt + restart.
+2. Ağ/418 hatası → `consecutive_failures` artıyor. Kapı `SCALPER_MARKET_GATE_RETRY_SEC`
+   (vars. 60 sn) boyunca yeniden DENEMEZ (bilerek: boşa REST isteği + paylaşılan kline kilidi).
+   Ban aktifken **restart YASAK** (CLAUDE.md yasak #3) — banın geçmesini bekle, kapı kendiliğinden
+   toparlar (`leader_ok` true'ya döner, `last_error` null olur).
+3. Log'da uyarılar tür başına dakikada en çok bir satırdır — az satır görmek "az hata" demek
+   DEĞİLDİR; sayı `consecutive_failures`'tadır.
 
 **Kapatmak:**
 ```bash
