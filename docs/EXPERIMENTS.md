@@ -1239,3 +1239,49 @@ başlangıcından beridir** ve restart'ta sıfırlanır (`window: "process_start
 `horizon_end_at`/`invalid_if`/`confidence`/`model_version` alanları şemaya girdi ama
 onları DOLDURAN bir yol henüz yok (D23 ajanı bağlayacak) → rapor bugün
 `with_expectation: 0` döner. Bu **doğru** sonuçtur: null = "ölçülmedi".
+
+## E10 — Permütasyon testi: C stratejisinin girişi şanstan ayırt edilebiliyor mu? (2026-08-24)
+
+**Soru.** Bugüne kadar hiç yanıtlanmadı: bir backtest sonucunun (PF 1.43) şans eseri
+olma olasılığı nedir? `compute_stats` tek koşunun sayısını verir, null dağılım yoktu.
+
+**Yöntem.** D24 ile gelen Monte-Carlo permütasyon testi (`--permutations`), AYI
+penceresi (2026-01-23→02-13), C, 8 sembol, 50 tur, tohum 12345, süre 2177 sn.
+Null KOŞULLU: yalnız giriş dilimi permüte edilir, bağlam/rejim ondan türetilir →
+soru "rejim arka planı aynıyken giriş sinyalinin kendisi şanstan ayırt edilebilir mi".
+OHLC tutarlılığı için High/Low kelepçesi zorunlu (barların %53.7'si düzeltildi;
+kelepçesiz null TP/trail aleyhine sistematik bozuk — bkz. D24).
+
+| Metrik | Yön | Gerçek | Null ort. | Null p05 | Null p95 | p |
+|---|---|---|---|---|---|---|
+| total_pnl | büyük iyi | **3812.25** | −7476.28 | −13439.68 | −1569.01 | **0.0196** |
+| profit_factor | büyük iyi | **1.43** | 0.75 | 0.60 | 0.93 | **0.0196** |
+| winrate | büyük iyi | 87.97 | 86.03 | 83.44 | 88.58 | 0.1373 |
+| max_drawdown | küçük iyi | 2956.08 | 9161.00 | 5013.71 | 14046.27 | 0.0392 |
+| bar_max_drawdown | küçük iyi | 2973.70 | 9330.25 | 5199.42 | 14373.33 | 0.0392 |
+
+**Sonuç.** Ayı penceresinde giriş sinyali şanstan ayırt edilebilir: 50 turun HİÇBİRİ
+gerçek PnL'i geçemedi (p = 1/51 = bu tur sayısının tabanı; gerçek p daha küçük olabilir,
+daha fazla tur daraltır). Rastgele girişle aynı kurallar ortalama **−7476** kaybediyor.
+
+**Kritik ayrıntı — kenar NEREDEN gelmiyor:** kazanma oranı anlamlı DEĞİL (p=0.137).
+Rastgele girişler de %86 kazanıyor, çünkü %85 başabaş oranı TP/SL asimetrisinin
+YAPISAL sonucu. Kenar kazanma oranından değil, kayıp büyüklüğünün kontrolünden
+(PnL + düşüş) geliyor. "Kazanma oranımız %88" cümlesi bu yüzden tek başına kanıt değildir.
+
+**Çekinceler.** (1) Null KOŞULLUDUR, koşulsuz değil. (2) Tek pencere — YATAY ve BOĞA
+ayrıca koşulmalı (koşuluyor). (3) 50 tur p tabanını 0.0196'ya kilitler. (4) Bu test
+stratejinin CANLIDA kâr edeceğini söylemez; yalnız backtest sonucunun rastgelelikle
+açıklanamadığını söyler. (5) Aynı üç pencere sorunu (bkz. yukarıdaki metodoloji kutusu)
+burada da geçerlidir.
+
+**Yan ölçümler (aynı pencere, tek koşu):**
+| Senaryo | İşlem | WR% | PnL | PF |
+|---|---|---|---|---|
+| Taban | 158 | 88.0 | 3812.25 | 1.43 |
+| Maliyet 2× (`--fee-stress`) | 158 | 88.0 | 1602.18 | 1.17 |
+| Giriş 1 mum geç (`--entry-delay-candles 1`) | 133 | 85.7 | 1923.37 | 1.21 |
+
+Kenar iki strese de dayanıyor ama ince: maliyet iki katına çıkarsa kârın %58'i, giriş
+bir mum gecikirse %50'si gidiyor. Mainnet kayması testnet'ten yüksektir — bu tablo
+canlı para kararında bağlayıcıdır.
