@@ -35,9 +35,10 @@ import os
 import queue
 import threading
 import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, NamedTuple, Optional, Tuple
 
 from src.core.logger import app_logger
 
@@ -107,9 +108,30 @@ def _prune(directory: Path, now: float) -> None:
                 pass
 
 
-#: `read_events` bir çağrıda okuyacağı AZAMİ satır sayısı. Kalıcı tarihçe 30
+#: `read_events` bir çağrıda DÖNDÜRECEĞİ azami satır sayısı. Kalıcı tarihçe 30
 #: günlüktür; sınırsız okuma bir HTTP isteğini dakikalara uzatabilir.
+#:
+#: ⚠️ D27 düşmanca incelemesi (K1) — bu tavan bir zamanlar TARANAN her satırı
+#: sayıyordu ve `since_iso` süzgeci tavandan SONRA uygulanıyordu. Sonuç:
+#: dosya büyüdüğünde "bu pencerede kayıt yok" denip veri diskte kalıyordu —
+#: yani kapıları sorgulamak için yazılmış defter güvenle YANLIŞ "kanıt yok"
+#: üretiyordu. Artık tavan YALNIZ süzgeçten geçen satırları sayar, dosyalar
+#: YENİDEN→ESKİYE okunur (tavan dolarsa EN YENİ satırlar korunur) ve tavana
+#: değildiyse `truncated=True` döner.
 READ_MAX_LINES = 200_000
+
+
+class ReadResult(NamedTuple):
+    """`read_events_detailed` çıktısı.
+
+    `truncated`: satır tavanı doldu ve OKUNMAYAN daha eski veri KALDI. Rapor
+    ve uç bu bayrağı GÖRÜNÜR kılmalıdır — "veri yok" ile "hepsini okuyamadık"
+    aynı şey değildir.
+    """
+
+    rows: List[Dict[str, Any]]
+    truncated: bool
+    scanned: int
 
 
 def read_events(
@@ -117,38 +139,88 @@ def read_events(
     *,
     since_iso: Optional[str] = None,
     limit: int = READ_MAX_LINES,
+    directory: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Arşivler dahil JSONL'den `event` türündeki satırları oku (ESKİ→YENİ).
 
+    Geriye uyumlu ince sarmalayıcı; kırpma bilgisi gerekiyorsa
+    `read_events_detailed` kullanın.
+    """
+    return read_events_detailed(
+        event, since_iso=since_iso, limit=limit, directory=directory
+    ).rows
+
+
+def read_events_detailed(
+    event: str,
+    *,
+    since_iso: Optional[str] = None,
+    limit: int = READ_MAX_LINES,
+    directory: Optional[str] = None,
+) -> ReadResult:
+    """Arşivler dahil JSONL'den `event` satırlarını oku — ESKİ→YENİ sırayla.
+
     **Yalnız İSTEK ÜZERİNE çağrılır** (rapor/uç), motor yolundan ASLA:
     burada gerçek disk okuması vardır ve `append_soon`ın O(1) sözleşmesini
-    bozmamalıdır (bkz. modül başlığındaki D21-R3 notu).
+    bozmamalıdır (bkz. modül başlığındaki D21-R3 notu). Çağıran bir olay
+    döngüsü içindeyse `asyncio.to_thread` ile sarmalıdır (ölçüldü: 200k
+    satırda ≈1.4 sn blokaj).
 
     `since_iso` verilirse satırın `ts` alanı (ya da yoksa `at`) bundan küçük
     olanlar atlanır — ISO metinleri leksikografik olarak da doğru sıralanır
-    (hepsi UTC ve aynı biçimde yazılır).
+    (hepsi UTC ve aynı biçimde yazılır). **Süzgeç satır bütçesinden ÖNCE
+    uygulanır** (K1).
+
+    `limit` DÖNEN satır sayısının tavanıdır. Dosyalar yeniden→eskiye okunur:
+    tavan dolarsa EN YENİ satırlar korunur ve `truncated=True` döner. Çıktı
+    listesi yine ESKİ→YENİ sıralıdır (rapor sırası değişmez).
+
+    `directory` verilirse `TRADINGBOT_LOG_DIR` ortam değişkeni yerine O dizin
+    okunur — çağıranın süreç ortamını KALICI olarak değiştirmesi gerekmez
+    (D27 incelemesi D10).
 
     Bozuk satır SESSİZCE atlanır: yarım yazılmış tek bir satır tüm raporu
     düşürmemeli. Dosya yoksa boş liste döner.
     """
     wanted = str(event)
-    rows: List[Dict[str, Any]] = []
-    directory = log_dir()
+    # Hızlı ret: olay adı ham satırda hiç geçmiyorsa JSON ayrıştırmaya gerek
+    # yok. YALNIZ ASCII adlarda güvenlidir (`ensure_ascii=False` ile yazılan
+    # JSON'da ASCII bir ad kaçışsız durur); değilse devre dışı bırakılır.
+    fast_reject = wanted if wanted.isascii() and wanted else None
+
+    base = Path(directory) if directory else log_dir()
     try:
-        archives = sorted(directory.glob(f"{ARCHIVE_PREFIX}*.jsonl"))
+        archives = sorted(base.glob(f"{ARCHIVE_PREFIX}*.jsonl"))
     except OSError:
         archives = []
-    paths = list(archives) + [directory / FILE_NAME]
-    seen = 0
-    for path in paths:
+    paths = list(archives) + [base / FILE_NAME]  # ESKİ → YENİ
+
+    try:
+        budget = max(0, int(limit))
+    except (TypeError, ValueError):
+        budget = READ_MAX_LINES
+
+    chunks: List[List[Dict[str, Any]]] = []  # yeni dosyadan eskiye
+    truncated = False
+    scanned = 0
+    remaining = budget
+
+    for path in reversed(paths):  # YENİ → ESKİ
         if not path.exists():
             continue
+        if remaining <= 0:
+            # Bütçe bitti ama okunmamış (daha eski) veri kaldı.
+            truncated = True
+            break
+        buf: Deque[Dict[str, Any]] = deque(maxlen=remaining)
+        matched = 0
+        newest_stamp: Optional[str] = None
         try:
             with path.open("r", encoding="utf-8") as handle:
                 for line in handle:
-                    seen += 1
-                    if seen > max(0, int(limit)):
-                        return rows
+                    scanned += 1
+                    if fast_reject is not None and fast_reject not in line:
+                        continue
                     line = line.strip()
                     if not line:
                         continue
@@ -158,14 +230,31 @@ def read_events(
                         continue
                     if not isinstance(row, dict) or row.get("event") != wanted:
                         continue
-                    if since_iso:
-                        stamp = row.get("ts") or row.get("at")
-                        if isinstance(stamp, str) and stamp < since_iso:
-                            continue
-                    rows.append(row)
+                    stamp = row.get("ts") or row.get("at")
+                    if isinstance(stamp, str) and (
+                        newest_stamp is None or stamp > newest_stamp
+                    ):
+                        newest_stamp = stamp
+                    if since_iso and isinstance(stamp, str) and stamp < since_iso:
+                        continue
+                    matched += 1
+                    buf.append(row)
         except OSError:
             continue
-    return rows
+        if matched > len(buf):
+            # `deque` maxlen'i taştı: bu dosyada okunmayan satır KALDI.
+            truncated = True
+        chunks.append(list(buf))
+        remaining -= len(buf)
+        if since_iso and newest_stamp is not None and newest_stamp < since_iso:
+            # Bu dosyanın EN YENİ satırı bile pencerenin dışında; arşivler
+            # tarih sıralı olduğu için daha eskileri okumanın anlamı yok.
+            break
+
+    rows: List[Dict[str, Any]] = []
+    for chunk in reversed(chunks):  # ESKİ dosyadan YENİYE
+        rows.extend(chunk)
+    return ReadResult(rows=rows, truncated=truncated, scanned=scanned)
 
 
 def append(event: str, payload: Dict[str, Any], *, now: Optional[float] = None) -> bool:

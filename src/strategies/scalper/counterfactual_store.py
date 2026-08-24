@@ -27,12 +27,25 @@ Sözleşme (D21/D24 ile aynı disiplin)
   `dedup_sec` ile sınırlıdır; JSONL'in kendi günlük rotasyonu + 30 gün
   saklaması zaten vardır (`forensics_log`).
 
-Dürüstlük notu (bekleyenler kalıcı DEĞİL)
------------------------------------------
-`_pending` **süreç-içidir**: restart'ta çözülmemiş niyetler kaybolur. Kalıcı
-iz, niyetin KENDİSİDİR (`event="intent"`, fiyat/stop/TP1 alanlarıyla
-zenginleştirildi) — yani bir restart ölçümü geciktirir ama kaydı yok etmez.
-Çözülmüş satırlar `event="counterfactual"` olarak kalıcıdır.
+Dürüstlük notu (bekleyenler restart'ta KAYBOLUR)
+------------------------------------------------
+`_pending` **süreç-içidir**: restart'ta çözülmemiş niyetlerin ÖLÇÜMÜ kalıcı
+olarak KAYBOLUR. D27 kaydı bir dönem "restart ölçümü geciktirir, kaydı yok
+etmez" diyordu; **bu yanlıştı** (düşmanca inceleme, Y3): `event="intent"`
+satırlarını yeniden simüle eden HİÇBİR kod yolu yoktur (`grep read_events`
+→ yalnız `"counterfactual"`). Kalıcı olan yalnız şudur:
+
+* niyetin KENDİSİ (`event="intent"`, fiyat/stop/TP1/kaldıraç alanlarıyla) —
+  yani "böyle bir niyet vardı ve reddedildi" bilgisi kaybolmaz;
+* ZATEN ÇÖZÜLMÜŞ satırlar (`event="counterfactual"`).
+
+Kaybolan, o niyetin "girilseydi ne olurdu" ÖLÇÜMÜdür. 8 saatlik ufuk +
+her deploy'da restart demek, bekleyen ölçümlerin çözülmeden düşmesi demektir;
+rapor bunu `counters.pending` ve `registered` farkından değil, ancak
+`logs/trades.jsonl`'deki `intent`/`counterfactual` satır sayılarını
+kıyaslayarak görebilir. Rehidrasyon (intent satırlarından yeniden kurma)
+BİLİNÇLİ olarak yapılMAdı: `configure()` motor `__init__`'inde senkron
+çağrılır ve orada 30 günlük JSONL okumak başlangıcı bloklar.
 """
 
 from __future__ import annotations
@@ -67,6 +80,11 @@ DEFAULT_DEDUP_SEC = 300.0
 #: evreninden çıkmış olabilir). En büyük ufkun çok üstünde tutulur.
 DEFAULT_MAX_AGE_H = 48.0
 
+#: Yaş süpürmesinin (`sweep_expired`) EN SIK koşacağı aralık (sn). Süpürme
+#: O(bekleyen) saf bellek işidir (tavan `max_pending`), ama her tarama
+#: turunda her sembol için koşmasının anlamı yok.
+SWEEP_MIN_INTERVAL_SEC = 60.0
+
 #: Planı olmayan bir niyet için referans girişin niyet anından AZAMİ gecikmesi
 #: (sn). Giriş dilimi 5m, bağlam dilimi 15m'dir; 900 sn ikisini de bir mum +
 #: pay ile karşılar. Bundan uzak bir "ilk mum" referans giriş sayılamaz.
@@ -93,6 +111,8 @@ _policy_leverage: int = 0
 #: sembol → bekleyen kayıtlar (kayıt sırasına göre).
 _pending: Dict[str, List[Dict[str, Any]]] = {}
 _pending_count: int = 0
+#: Son GLOBAL yaş süpürmesinin anı (çağıranın saatiyle, saniye).
+_last_sweep_epoch: float = 0.0
 
 _registered: int = 0
 _dedup_hits: int = 0
@@ -229,7 +249,10 @@ def register(
             if not key or not row.get("direction") or row.get("at_epoch") is None:
                 return None
 
-            bucket = _pending.setdefault(key, [])
+            # D27 incelemesi (D2): `setdefault` KAPASİTE KONTROLÜNDEN SONRA
+            # çalışır. Aksi hâlde defter doluyken her yeni sembol için kalıcı
+            # bir BOŞ liste kalırdı (sınırsız anahtar birikimi).
+            bucket = _pending.get(key) or []
             # Dedup: aynı (sembol, yön, gerekçe) penceresi içinde YENİ kayıt
             # açma; ağırlığı `dup_count`ta biriktir.
             if _dedup_sec > 0:
@@ -250,10 +273,16 @@ def register(
                         return None
 
             if _max_pending and _pending_count >= _max_pending:
+                # Tavan dolduysa ÖNCE yaşı geçmişleri süpür: aksi hâlde
+                # tarama evreninden çıkmış bir avuç sembol defteri kalıcı
+                # olarak kilitler (D27 incelemesi Y2).
+                _sweep_expired_locked(row["at_epoch"], force=True)
+            if _max_pending and _pending_count >= _max_pending:
                 _dropped_full += 1
                 return None
 
             bucket.append(row)
+            _pending[key] = bucket
             _pending_count += 1
             _registered += 1
             return row
@@ -326,6 +355,67 @@ def _fill_plan(row: Dict[str, Any], candles: Sequence[Any]) -> None:
     extra["plan_ref_epoch"] = first_epoch
 
 
+def _sweep_expired_locked(now_epoch: Any, *, force: bool = False) -> int:
+    """Yaş sınırını aşan TÜM bekleyenleri düşür — SEMBOLDEN BAĞIMSIZ.
+
+    NEDEN GEREKLİ (D27 incelemesi Y2 / inceleme-2 bulgu 7). Yaş kapısı bir
+    zamanlar YALNIZ `resolve_symbol` içindeydi, yani **yalnız o an taranan
+    sembolün** kovasına uygulanıyordu. Tarama evreninden çıkan bir sembolün
+    satırları hiç iterate edilmiyor, dolayısıyla ASLA sona ermiyordu; probe:
+    100 saatlik 5 kayıt, `max_age_h=48` → `expired: 0`, `pending: 5` kalıcı.
+    `max_pending=500` dolduğunda defter TÜM semboller için sessizce ölçmeyi
+    bırakıyordu — yani "hacim koruması" ölçümü öldürerek çalışıyordu.
+    (`scalper_top_n=12` rotasyonu ve top-12'de olmak zorunda olmayan
+    `/tv-signal` sembolleri bu senaryoyu sıradan kılar.)
+
+    Kilit ÇAĞIRAN tarafından tutulur. Döner: düşürülen satır sayısı.
+    """
+    global _pending_count, _expired, _last_sweep_epoch
+    try:
+        now = float(now_epoch)
+    except (TypeError, ValueError):
+        return 0
+    if not _max_age_h:
+        return 0
+    if not force and (now - _last_sweep_epoch) < SWEEP_MIN_INTERVAL_SEC:
+        return 0
+    _last_sweep_epoch = now
+
+    cutoff = now - _max_age_h * cf.SECONDS_PER_HOUR
+    dropped = 0
+    for key in list(_pending.keys()):
+        bucket = _pending.get(key) or []
+        keep = []
+        for row in bucket:
+            try:
+                at_epoch = float(row.get("at_epoch") or 0.0)
+            except (TypeError, ValueError):
+                at_epoch = 0.0
+            if at_epoch < cutoff:
+                dropped += 1
+                continue
+            keep.append(row)
+        if keep:
+            _pending[key] = keep
+        else:
+            _pending.pop(key, None)
+    if dropped:
+        _expired += dropped
+        _pending_count -= dropped
+    return dropped
+
+
+def sweep_expired(now_epoch: float, *, force: bool = True) -> int:
+    """`_sweep_expired_locked`in dışarıya açık hâli (teşhis/test/operasyon)."""
+    try:
+        with _lock:
+            if not _enabled:
+                return 0
+            return _sweep_expired_locked(now_epoch, force=force)
+    except Exception:  # pragma: no cover - teşhis kaydı akışı ASLA kesmez
+        return 0
+
+
 def resolve_symbol(
     symbol: Any,
     candles: Sequence[Any],
@@ -337,11 +427,14 @@ def resolve_symbol(
     SONRA çağırır: mumlar zaten oradadır, **yeni REST çağrısı YOKTUR**.
 
     Olgunlaşmamış kayıt kuyrukta KALIR. Olgunlaşmış ama mum penceresi boş
-    olan kayıt `measured=False` ile çözülür — "ölçemedik" demek, uydurmaktan
-    iyidir. `max_age_h`ı aşan kayıtlar düşürülür (sembol evrenden çıkmış
-    olabilir; sınırsız kuyruk bir teşhis kaydına göre pahalıdır).
+    (ya da ufkun başını KAPSAMAYAN) kayıt `measured=False` ile çözülür —
+    "ölçemedik" demek, uydurmaktan iyidir.
+
+    Yaş kapısı bu çağrıda AMA sembolden BAĞIMSIZ koşar
+    (`_sweep_expired_locked`, en sık `SWEEP_MIN_INTERVAL_SEC`'te bir): tarama
+    evreninden çıkmış sembollerin kayıtları da böylece sona erer.
     """
-    global _pending_count, _resolved, _measured, _expired, _logged, _log_dropped
+    global _pending_count, _resolved, _measured, _logged, _log_dropped
     out: List[Dict[str, Any]] = []
     try:
         with _lock:
@@ -350,46 +443,61 @@ def resolve_symbol(
             key = cf._symbol(symbol)
             bucket = _pending.get(key or "")
             if not bucket:
+                # Kova boş olsa bile GLOBAL süpürme koşar: bu çağrının asıl
+                # ikinci işi, tarama evreninden ÇIKMIŞ sembollerin
+                # kayıtlarını sona erdirmektir (Y2).
+                _sweep_expired_locked(now_epoch)
                 return out
 
             keep: List[Dict[str, Any]] = []
-            for row in bucket:
-                # SATIR BAŞINA `try`: tek bir bozuk kayıt, AYNI sembolün
-                # diğer kayıtlarını kuyrukta öksüz bırakmamalı ve sayaçları
-                # yarım güncellenmiş hâlde terk etmemeli. Bozuk satır
-                # kuyrukta KALIR ve yaş sınırında düşer.
-                try:
-                    age_h = (
-                        float(now_epoch) - float(row.get("at_epoch") or 0.0)
-                    ) / cf.SECONDS_PER_HOUR
-                    if row.get("price") is None:
-                        # Planı olmayan niyet (ör. TV sağlaması): referans
-                        # girişi niyet anından SONRAKİ ilk mumdan tak.
-                        # Look-ahead YOK.
-                        _fill_plan(row, candles)
-                    resolved = cf.resolve(
-                        pending=row, candles=candles, now_epoch=now_epoch
-                    )
-                except Exception:  # pragma: no cover - bozuk satır savunması
-                    keep.append(row)
-                    continue
-                if resolved is None:
-                    if _max_age_h and age_h > _max_age_h:
-                        _expired += 1
-                        _pending_count -= 1
+            islenen = 0
+            try:
+                for row in bucket:
+                    islenen += 1
+                    # SATIR BAŞINA `try`: tek bir bozuk kayıt, AYNI sembolün
+                    # diğer kayıtlarını kuyrukta öksüz bırakmamalı ve
+                    # sayaçları yarım güncellenmiş hâlde terk etmemeli.
+                    # Bozuk satır kuyrukta KALIR ve yaş sınırında düşer.
+                    try:
+                        if row.get("price") is None:
+                            # Planı olmayan niyet (ör. TV sağlaması):
+                            # referans girişi niyet anından SONRAKİ ilk
+                            # mumdan tak. Look-ahead YOK.
+                            _fill_plan(row, candles)
+                        resolved = cf.resolve(
+                            pending=row, candles=candles, now_epoch=now_epoch
+                        )
+                    except Exception:  # pragma: no cover - bozuk satır savunması
+                        keep.append(row)
                         continue
-                    keep.append(row)
-                    continue
-                _pending_count -= 1
-                _resolved += 1
-                if resolved.get("measured"):
-                    _measured += 1
-                _recent.append(resolved)
-                out.append(resolved)
-            if keep:
-                _pending[key] = keep
-            else:
-                _pending.pop(key, None)
+                    if resolved is None:
+                        keep.append(row)
+                        continue
+                    # SIRA ÖNEMLİ: sayaç, satırı kuyruktan düşürmeye KARAR
+                    # verildiği anda azalır; aşağıdaki adımlardan biri
+                    # patlarsa `finally` kovayı bu karara uygun yazar.
+                    _pending_count -= 1
+                    _resolved += 1
+                    if resolved.get("measured"):
+                        _measured += 1
+                    _recent.append(resolved)
+                    out.append(resolved)
+            finally:
+                # D27 incelemesi (D3): geri-yazım `finally`dedir. Aksi hâlde
+                # döngüden kaçan bir istisna, ÇÖZÜLMÜŞ satırları kovada
+                # bırakırdı (bir sonraki turda yeniden çözülüp yeniden
+                # loglanırlardı) ve `_pending_count` bucket ile tutarsız
+                # kalırdı — o sayaç `register` kapasite kapısını besliyor.
+                kalan = keep + list(bucket[islenen:])
+                if kalan:
+                    _pending[key] = kalan
+                else:
+                    _pending.pop(key, None)
+            # GLOBAL yaş süpürmesi ÇÖZÜMDEN SONRA koşar: bu turda taranan
+            # sembolün kayıtları önce ÖLÇÜLME şansını alır (yaşı geçmiş ama
+            # mumları elde olan bir satırı sessizce düşürmek, ölçebilecekken
+            # ölçmemek olurdu); geri kalan semboller burada sona erer.
+            _sweep_expired_locked(now_epoch)
     except Exception:  # pragma: no cover - teşhis kaydı akışı ASLA kesmez
         return out
 
@@ -472,11 +580,23 @@ def pending_for(symbol: Any) -> List[Dict[str, Any]]:
         return [dict(row) for row in _pending.get(cf._symbol(symbol) or "", [])]
 
 
+def bucket_keys() -> List[str]:
+    """YALNIZ testler/teşhis: bekleyen kovası olan semboller (sıralı).
+
+    Boş kova KALMAMALIDIR (D27 incelemesi D2): kapasite reddi ya da tam
+    süpürme sonrası anahtar da silinir.
+    """
+    with _lock:
+        return sorted(_pending.keys())
+
+
 def reset() -> None:
     """YALNIZ testler için: durumu ve sayaçları sıfırla."""
     global _pending_count, _registered, _dedup_hits, _dropped_full
     global _expired, _resolved, _measured, _logged, _log_dropped
+    global _last_sweep_epoch
     with _lock:
+        _last_sweep_epoch = 0.0
         _pending.clear()
         _recent.clear()
         _pending_count = 0

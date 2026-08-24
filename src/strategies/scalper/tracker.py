@@ -689,20 +689,26 @@ class ScalpTracker:
             filters.append(ScalpTradeModel.closed_at >= since)
         if until is not None:
             filters.append(ScalpTradeModel.closed_at <= until)
-        # YALNIZ iki sütun: bu uç pano tarafından düzenli yoklanır ve tam
-        # satırları (uzun `forensics` JSON'ları dahil) ORM nesnesine
+        # YALNIZ gerekli sütunlar: bu uç pano tarafından düzenli yoklanır ve
+        # tam satırları (uzun `forensics` JSON'ları dahil) ORM nesnesine
         # çevirmek gereksiz iştir (bkz. "dashboard polling açlığı" dersi).
+        # `exit_reason` KISA bir varchar'dır ve D27/A1 kırılımının TEMELİdir:
+        # yalnız forensics JSON'undan okumak, adli kaydı OLMAYAN her işlemi
+        # `_bilinmiyor_` kovasına düşürüyordu — hâlbuki neden DB'de yazılı
+        # (D27 incelemesi O2; A1'in %27 başlık rakamı tam bu kırılıma dayanır).
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(
-                    ScalpTradeModel.realized_pnl, ScalpTradeModel.forensics
+                    ScalpTradeModel.realized_pnl,
+                    ScalpTradeModel.forensics,
+                    ScalpTradeModel.exit_reason,
                 ).where(*filters)
             )
             trades = list(result.all())
 
         rows = []
         tagged = 0
-        for realized_pnl, raw_forensics in trades:
+        for realized_pnl, raw_forensics, db_exit_reason in trades:
             document = self.parse_forensics(raw_forensics) or {}
             if document:
                 tagged += 1
@@ -713,12 +719,14 @@ class ScalpTracker:
                 # D24/madde 6: "ne BEKLEDİK" bloğu. Doldurulmadıysa None =
                 # ÖLÇÜLMEDİ (beklenti kurulmamıştı DEĞİL).
                 "expectation": expectation_from_entry(document.get("entry")),
-                # D27/A1: çıkış nedeni × sonuç kırılımı için. Adli kaydı
-                # OLMAYAN satırlarda `None` → `_bilinmiyor_` kovası
-                # ("ölçülmedi", "nedensiz kapandı" DEĞİL).
+                # D27/A1: çıkış nedeni × sonuç kırılımı için. ÖNCELİK adli
+                # kayıttadır (D27 sonrası REAPER ayrımını YALNIZ o taşır);
+                # adli kayıt yoksa DB sütununa düşülür. İkisi de yoksa `None`
+                # → `_bilinmiyor_` kovası ("nedensiz kapandı" DEĞİL).
                 "exit_reason": (
-                    exit_block.get("reason")
-                    if isinstance(exit_block, dict) else None
+                    (exit_block.get("reason")
+                     if isinstance(exit_block, dict) else None)
+                    or db_exit_reason
                 ),
             })
         summary = summarize(rows)

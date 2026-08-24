@@ -1377,12 +1377,6 @@ class ExitManager:
                 exit_price = sp.position.current_price or sp.position.entry_price
 
         estimated_gross = self._estimate_gross_pnl(direction, entry, exit_price, qty)
-        # D27/A2 — ADLİ KAYIT İÇİN merdiven-farkında brüt. `estimated_gross`
-        # PnL merdivenindeki rolünü (son çare `realized_pnl` kaynağı)
-        # DEĞİŞTİRMEDEN korur; yalnız forensics'e giden brüt ayrışır.
-        forensics_gross, gross_source = self._forensics_gross(
-            sp=sp, ledger=ledger, estimated_gross=estimated_gross
-        )
         income_net = await self._fetch_net_income(
             symbol=symbol,
             opened_at=sp.position.opened_at,
@@ -1408,6 +1402,20 @@ class ExitManager:
             realized_pnl = estimated_gross
             pnl_source = "estimated_gross"
             verification_notes.append("close_verification=unverified")
+
+        # D27/A2 — ADLİ KAYIT İÇİN merdiven-farkında brüt. `estimated_gross`
+        # PnL merdivenindeki rolünü (son çare `realized_pnl` kaynağı)
+        # DEĞİŞTİRMEDEN korur; yalnız forensics'e giden brüt ayrışır.
+        # SIRA: `pnl_source` BELİRLENDİKTEN sonra çağrılır — `_forensics_gross`
+        # SAF bir fonksiyondur (IO yok), yer değiştirmesi motor kararlarını
+        # ETKİLEMEZ; ama `pnl_source`u görmeden "komisyon = 0" uyduruyordu
+        # (D27 incelemesi O1).
+        forensics_gross, gross_source = self._forensics_gross(
+            sp=sp,
+            ledger=ledger,
+            estimated_gross=estimated_gross,
+            pnl_source=pnl_source,
+        )
 
         exit_reason = (
             forced_exit_reason
@@ -1560,6 +1568,10 @@ class ExitManager:
     GROSS_SOURCE_LEDGER = "ledger_legs"        # borsa fill'lerinden, merdiven dahil
     GROSS_SOURCE_SINGLE = "single_leg_estimate"  # tek çıkış fiyatı — merdiven YOK
     GROSS_SOURCE_UNMEASURED = "unmeasured_ladder"  # merdiven VAR ama ledger YOK
+    #: D27 incelemesi (O1): NET de aynı tahminden geliyor (`estimated_gross`)
+    #: → brüt ≡ net → komisyon FARKI 0 çıkar. Hiçbir şeyin doğrulanmadığı bu
+    #: hâlde "komisyonu 0 ÖLÇTÜK" demek, A2'nin kendi kuralının ihlalidir.
+    GROSS_SOURCE_SELF_REFERENTIAL = "self_referential_estimate"
 
     @staticmethod
     def _forensics_gross(
@@ -1567,10 +1579,11 @@ class ExitManager:
         sp: ScalpPosition,
         ledger: Optional[_CloseLedger],
         estimated_gross: Optional[float],
+        pnl_source: Optional[str] = None,
     ) -> Tuple[Optional[float], str]:
         """Adli kayda yazılacak BRÜT PnL ve kaynağı — SAF, IO yok.
 
-        Üç durum vardır ve üçü de AYRI raporlanır:
+        Dört durum vardır ve dördü de AYRI raporlanır:
 
         1. **`ledger_legs`** — borsa `userTrades` satırları doğrulandı:
            brüt = Σ(realizedPnl), merdivenin (TP1/TP2/runner) her bacağı
@@ -1586,6 +1599,13 @@ class ExitManager:
            `fee_estimate` de `None` olur: **uydurma sayı YASAK**, rapor
            "ölçülemedi" der.
 
+        4. **`self_referential_estimate`** — `pnl_source == "estimated_gross"`,
+           yani NET de aynı tahminden geliyor. Brüt ≡ net olduğu için
+           `fee_estimate = brüt − net = 0.0` çıkar ve adli kayıt "komisyonu
+           SIFIR ölçtük" der. Hiçbir şeyin doğrulanmadığı tam da bu hâlde bu
+           iddia yanlıştır (D27 incelemesi O1) → brüt **`None`**, komisyon
+           `None`, rapor "ölçülemedi" der.
+
         `realized_pnl` (defter) bu fonksiyondan ETKİLENMEZ; `_finalize_close`
         PnL merdivenini (income → ledger net → brüt tahmin) aynen sürdürür.
         """
@@ -1598,6 +1618,8 @@ class ExitManager:
         )
         if laddered:
             return None, ExitManager.GROSS_SOURCE_UNMEASURED
+        if str(pnl_source or "") == "estimated_gross":
+            return None, ExitManager.GROSS_SOURCE_SELF_REFERENTIAL
         return estimated_gross, ExitManager.GROSS_SOURCE_SINGLE
 
     def _build_exit_forensics(

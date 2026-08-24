@@ -626,7 +626,22 @@ def build_exit(
 #: D27/A3 MAE kaynakları.
 MAE_SOURCE_SAMPLED = "sampled"        # yoklamanın gördüğü değer geçerli
 MAE_SOURCE_CORRECTED = "corrected"    # yoklama fiziksel kelepçeyi ihlal etti
+MAE_SOURCE_SLIPPAGE = "slippage"      # ihlal KAYMA/mark-vs-fill boyutunda
 MAE_SOURCE_UNMEASURED = "unmeasured"  # hiç ölçülemedi (veri yok)
+
+#: `corrected` ile `slippage` arasındaki sınır — **FİYAT yüzdesi** cinsinden.
+#: D27 incelemesi (O6): kelepçe, çıkış fill'i HER örneklenen fiyattan bir tık
+#: kötü olduğunda da tetikleniyor ve o hâlde "yoklama fitili kaçırdı" demek
+#: YANLIŞ oluyordu — sebep kayma/mark-vs-fill farkıdır (probe: `mae=-5.0`,
+#: `exit_roi=-6.0`, 10x → ihlal 1.0 ROI puanı = **%0.1 fiyat**). Bu, A3'ün
+#: ölçmek istediği "yoklama kusuru" sayısını şişiriyordu.
+#:
+#: Eşik neden ROI değil FİYAT: kayma fiyat düzeyinde bir olaydır, kaldıraçla
+#: büyümez. Aynı %0.1'lik fill farkı 20x'te 2.0, 1x'te 0.1 ROI puanı eder;
+#: ROI eşiği 1x'te gerçek bir fitil kaçırmasını "kayma" sayardı.
+#: Değer İKİ hâlde de kelepçelenir (fizik eşiğe göre değişmez); ayrışan
+#: yalnız ETİKETtir.
+MAE_SLIPPAGE_TOLERANCE_PRICE_PCT = 0.10
 
 
 def reconcile_mae(
@@ -648,6 +663,14 @@ def reconcile_mae(
 
     Düzeltme sessiz DEĞİLDİR: çağıran ham örneklemi ayrı alanda saklar ve
     kaynak `corrected` olur.
+
+    D27 incelemesi (O6) — İKİ TÜR İHLAL AYRIŞIR. İhlalin FİYAT karşılığı
+    `MAE_SLIPPAGE_TOLERANCE_PRICE_PCT`ten küçükse sebep neredeyse kesinlikle
+    KAYMA/mark-vs-fill farkıdır (çıkış fill'i her örneklenen fiyattan bir
+    tık kötü): kaynak `slippage` olur. Büyükse yoklama gerçekten bir fitili
+    kaçırmıştır: kaynak `corrected` kalır. Değer İKİ hâlde de kelepçelenir —
+    fizik eşiğe göre değişmez; ayrışan yalnız "bu bir YOKLAMA kusuru mu"
+    sorusunun cevabıdır ve A3 tam onu saymak için yazıldı.
     """
     if mae_roi_pct is None:
         return None, MAE_SOURCE_UNMEASURED
@@ -656,6 +679,9 @@ def reconcile_mae(
     lev = int(leverage or 0) or 1
     exit_roi = price_move_pct * lev
     if mae_roi_pct > exit_roi:
+        breach_price_pct = (mae_roi_pct - exit_roi) / lev
+        if breach_price_pct <= MAE_SLIPPAGE_TOLERANCE_PRICE_PCT:
+            return exit_roi, MAE_SOURCE_SLIPPAGE
         return exit_roi, MAE_SOURCE_CORRECTED
     return mae_roi_pct, MAE_SOURCE_SAMPLED
 
@@ -878,6 +904,17 @@ OTHER_BUCKET = "_diger_"
 #: eklenecek bir etiket sınırsız kova büyütmemeli.
 EXIT_REASON_BUCKET_MAX = 20
 
+#: D27/A1 sınır notu. Rapor katmanı (`scripts/ledger_report.py`) bunu zaten
+#: basıyordu; API katmanı BASMIYORDU (D27 incelemesi O5) — uçtan okuyan
+#: 2026-08-24 öncesi/sonrası iki dönemi aynı tabloda karıştırabiliyordu.
+#: `scripts/ledger_report.REAPER_SPLIT_NOTE` ile AYNI metindir (bekçi test:
+#: tests/test_d27_review_fixes.py::TestO5ReaperNotu).
+REAPER_SPLIT_NOTE = (
+    "REAPER ayrımı 2026-08-24'ten itibaren geçerlidir (D27/A1): daha eski yaş "
+    "kesmeleri (D4) defterde hâlâ 'SL' olarak durur — geriye dönük veri "
+    "düzeltmesi YAPILMADI."
+)
+
 
 def summarize(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     """Etiket × sonuç tablosu — "neler etkiliyor" sorusunun cevabı.
@@ -1022,6 +1059,10 @@ def summarize(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         # **2026-08-24 ÖNCESİ** kapanan yaş kesmeleri defterde hâlâ "SL"dir
         # (geriye dönük veri düzeltmesi YAPILMADI) — pencereyi buna göre böl.
         "exit_reasons": exit_table,
+        # Sınır notu YANITIN İÇİNDE (D27 incelemesi O5): rapor katmanı bunu
+        # basıyordu, API katmanı basmıyordu; uçtan okuyan iki dönemi
+        # karıştırabiliyordu.
+        "exit_reason_note": REAPER_SPLIT_NOTE,
         "expectation": {
             "with_expectation": with_expectation,
             # null = ÖLÇÜLMEDİ (beklenti kurulmamıştı DEĞİL).

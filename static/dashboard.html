@@ -1557,9 +1557,21 @@
     // else-if zincirine GİRMEZ (ikisi aynı anda olabilir).
     var apOh = f.order_health || {};
     var apTp1Missing = isNum(apOh.tp1_missing) ? apOh.tp1_missing : 0;
+    // D27 incelemesi (D8): `tp_wrong_side` `tp1_missing`ten DAHA KÖTÜ bir
+    // arızadır (TP emri ters yöne konmuş = koruma değil, ters pozisyon
+    // riski) ve panoda HİÇ okunmuyordu.
+    var apWrongSide = isNum(apOh.tp_wrong_side) ? apOh.tp_wrong_side : 0;
+    var apSplit = isNum(apOh.partial_fill_split) ? apOh.partial_fill_split : 0;
+    if (apWrongSide > 0){
+      warn = '<span class="ap-warn">TP TERS YÖN ×' + apWrongSide +
+        ' — emir reddedildi, koruma EKSİK</span>' + (warn ? " · " + warn : "");
+    }
     if (apTp1Missing > 0){
       warn = '<span class="ap-warn">TP1 EMRİ KONULAMADI ×' + apTp1Missing +
         ' — break-even yok, tam risk stopu</span>' + (warn ? " · " + warn : "");
+    }
+    if (apSplit > 0){
+      notes.push("kısmi dolum bölünmesi ×" + apSplit);
     }
     qs("ap-note").innerHTML = (warn ? warn + (notes.length ? " · " : "") : "") + notes.join(" · ");
   }
@@ -1949,14 +1961,39 @@
     var oh = d.order_health || {};
     var tp1Missing = isNum(oh.tp1_missing) ? oh.tp1_missing : 0;
     var tp2Missing = isNum(oh.tp2_missing) ? oh.tp2_missing : 0;
-    if (tp1Missing > 0 || tp2Missing > 0){
+    // D27 incelemesi (O7): "emir kabul edildi ama kimliği okunamadı" AYRI ve
+    // DAHA KÖTÜ bir arızadır (emir canlı, izlenemiyor). (D8): `tp_wrong_side`
+    // ve `partial_fill_split` panoda HİÇ okunmuyordu; `tp_wrong_side`
+    // `tp1_missing`ten daha ağır bir arızadır.
+    var tp1Unid = isNum(oh.tp1_unidentified) ? oh.tp1_unidentified : 0;
+    var tp2Unid = isNum(oh.tp2_unidentified) ? oh.tp2_unidentified : 0;
+    var tpWrongSide = isNum(oh.tp_wrong_side) ? oh.tp_wrong_side : 0;
+    var partialSplit = isNum(oh.partial_fill_split) ? oh.partial_fill_split : 0;
+    // (O8): teşhis bloğu arızalanırsa `{}` yerine `error` gelir — sessizce
+    // "0" (yani "sorun yok") okumak tam da bu bloğun engellemek için
+    // yazıldığı şeydir.
+    if (oh.error){
+      var ohErr = el("div", "order-health-banner");
+      ohErr.innerHTML =
+        '<strong>🚨 Emir sağlığı sayaçları OKUNAMADI</strong>' +
+        '<span>' + escapeHtml(String(oh.error)) + '</span>' +
+        '<span class="order-health-note">bu "sorun yok" DEMEK DEĞİLDİR — ölçüm yok.</span>';
+      panel.appendChild(ohErr);
+    }
+    if (tp1Missing > 0 || tp2Missing > 0 || tp1Unid > 0 || tp2Unid > 0 ||
+        tpWrongSide > 0 || partialSplit > 0){
       var ohParts = [];
-      if (tp1Missing > 0) ohParts.push("TP1 ×" + tp1Missing);
-      if (tp2Missing > 0) ohParts.push("TP2 ×" + tp2Missing);
+      if (tp1Missing > 0) ohParts.push("TP1 yok ×" + tp1Missing);
+      if (tp1Unid > 0) ohParts.push("TP1 kimliksiz ×" + tp1Unid);
+      if (tp2Missing > 0) ohParts.push("TP2 yok ×" + tp2Missing);
+      if (tp2Unid > 0) ohParts.push("TP2 kimliksiz ×" + tp2Unid);
+      if (tpWrongSide > 0) ohParts.push("TP TERS YÖN ×" + tpWrongSide);
+      if (partialSplit > 0) ohParts.push("kısmi dolum ×" + partialSplit);
       var ohRow = el("div", "order-health-banner");
       ohRow.innerHTML =
-        '<strong>🚨 TP emri konulamadı (' + ohParts.join(" · ") + ')</strong>' +
-        '<span>TP1 yoksa break-even kurulamaz; işlem TAM RİSK stopuyla taşınır.</span>' +
+        '<strong>🚨 TP emri sorunu (' + ohParts.join(" · ") + ')</strong>' +
+        '<span>TP1 yoksa break-even kurulamaz; işlem TAM RİSK stopuyla taşınır. ' +
+        '"Kimliksiz" = emir borsada CANLI olabilir ama izlenemiyor.</span>' +
         (oh.last_symbol
           ? '<span>son: <b>' + escapeHtml(String(oh.last_symbol)) + '</b> ' +
             fmtClock(oh.last_at) + '</span>'
@@ -1985,12 +2022,26 @@
     var cfx = d.counterfactual || {};
     if (cfx.enabled){
       var cfxRow = el("div", "cf-note");
-      cfxRow.textContent =
+      var cfxText =
         "karşı-olgu defteri: " + (isNum(cfx.pending) ? cfx.pending : 0) + " bekleyen · " +
         (isNum(cfx.resolved) ? cfx.resolved : 0) + " çözüldü (" +
         (isNum(cfx.measured) ? cfx.measured : 0) + " ölçüldü) · " +
         (isNum(cfx.dedup_hits) ? cfx.dedup_hits : 0) + " katlandı · ufuk " +
         ((cfx.horizons_h || []).join("/") || "—") + " sa";
+      // D27 incelemesi (D9): "neden `measured` 0?" sorusunun cevabı TAM
+      // OLARAK bu üç sayaçtadır — yaş sınırında düşenler, kapasite dolduğu
+      // için hiç kaydedilemeyenler ve JSONL kuyruğu taşınca kaybolanlar.
+      // Görünmedikleri sürece defter "ölçüm yok" der ve kimse nedenini
+      // bilmez. Yalnız >0 iken çıkarlar.
+      var cfxKayip = [];
+      if (isNum(cfx.expired) && cfx.expired > 0)
+        cfxKayip.push(cfx.expired + " yaş sınırında düştü");
+      if (isNum(cfx.dropped_full) && cfx.dropped_full > 0)
+        cfxKayip.push(cfx.dropped_full + " kuyruk dolu (kaydedilemedi)");
+      if (isNum(cfx.log_dropped) && cfx.log_dropped > 0)
+        cfxKayip.push(cfx.log_dropped + " JSONL'e yazılamadı");
+      if (cfxKayip.length) cfxText += " · ⚠️ " + cfxKayip.join(" · ");
+      cfxRow.textContent = cfxText;
       panel.appendChild(cfxRow);
     }
 

@@ -287,6 +287,7 @@ class ScalperEngine:
                 stop_roi_pct=getattr(self.cfg, "scalper_fixed_stop_roi_pct", 0.0),
                 policy_leverage=getattr(self.cfg, "scalper_leverage", 0),
             )
+            self._warn_counterfactual_horizon_fit()
         except Exception as e:  # pragma: no cover - teşhis kurulumu motoru düşürmez
             self.logger.warning(f"⚠️ Karşı-olgu defteri kurulamadı ({e}); kapalı kalıyor")
 
@@ -2550,7 +2551,17 @@ class ScalperEngine:
             if not self._forensics_enabled():
                 return
             at = _utcnow_iso()
-            price, stop_price, tp1_price, leverage = self._counterfactual_plan(signal)
+            # D27 incelemesi (D1): plan hesabı DEFTER BAYRAĞINA da bağlıdır.
+            # Eskiden yalnız `_forensics_enabled()`e bakıyordu, yani defteri
+            # kapatmak fazladan `apply_stop_policy` çağrısını ve intent
+            # satırlarındaki dört yeni alanı DURDURMUYORDU (ALLOW/PROPOSED
+            # niyetlerde de koşuyordu).
+            if counterfactual_store.enabled():
+                price, stop_price, tp1_price, leverage = self._counterfactual_plan(
+                    signal
+                )
+            else:
+                price = stop_price = tp1_price = leverage = None
             intent.record(
                 at=at,
                 symbol=symbol,
@@ -3939,6 +3950,49 @@ class ScalperEngine:
             "risk/kapasite/cooldown kapısında reddedildi (log'a bakın)",
         }
 
+    #: `_evaluate_symbol`in giriş diliminde çektiği mum sayısı. Karşı-olgu
+    #: penceresi BUDUR (yeni REST ağırlığı sıfır sözleşmesi).
+    COUNTERFACTUAL_CANDLE_COUNT = 150
+
+    _TF_SECONDS: Dict[str, float] = {
+        "1m": 60.0, "3m": 180.0, "5m": 300.0, "15m": 900.0, "30m": 1800.0,
+        "1h": 3600.0, "2h": 7200.0, "4h": 14400.0,
+    }
+
+    def _warn_counterfactual_horizon_fit(self) -> None:
+        """D27 incelemesi (D6): ufuk mum penceresine SIĞIYOR mu?
+
+        Karşı-olgu çözümü tarama turunun ZATEN çektiği ~150 giriş-dilimi
+        mumuyla yapılır. 5m dilimde bu ≈12.5 saattir ve en büyük varsayılan
+        ufku (8 sa) kapsar. **Hızlı profilde (1m) pencere 2.5 saate düşer** ve
+        8 saatlik ufuk ARTIK KAPSANMAZ: her karşı-olgu kısmi pencereye düşer
+        ve `no_data` olarak kapanır (bkz. `counterfactual._covers`). İkisi
+        arasında bugüne dek HİÇBİR doğrulama yoktu; sessizce ölçmeyen bir
+        defter, yanlış ölçen bir defter kadar kötüdür.
+
+        Yalnız UYARIR: bir teşhis kaydı motoru başlatmayı engellememeli.
+        """
+        try:
+            if not counterfactual_store.enabled():
+                return
+            tf = str(getattr(self.cfg, "scalper_tf_entry", "5m") or "5m")
+            step = self._TF_SECONDS.get(tf)
+            if not step:
+                return
+            window_h = self.COUNTERFACTUAL_CANDLE_COUNT * step / 3600.0
+            horizons = counterfactual_store.horizons()
+            largest = max(horizons) if horizons else 0.0
+            if largest >= window_h:
+                self.logger.warning(
+                    f"⚠️ Karşı-olgu ufku ({largest:g} sa) giriş dilimi mum "
+                    f"penceresinden ({tf} × {self.COUNTERFACTUAL_CANDLE_COUNT} "
+                    f"= {window_h:.1f} sa) BÜYÜK — ölçümler kısmi pencereye "
+                    f"düşer ve `no_data` olarak kapanır. "
+                    f"SCALPER_COUNTERFACTUAL_HORIZONS_H değerini küçültün."
+                )
+        except Exception:  # pragma: no cover - teşhis uyarısı motoru düşürmez
+            return
+
     def _executor_reject_snapshot(self) -> Dict[str, int]:
         """Kapı ret sayaçlarını güvenli/geriye uyumlu oku (eski executor'da yok)."""
         snapshotter = getattr(self.executor, "reject_snapshot", None)
@@ -3955,15 +4009,27 @@ class ScalperEngine:
 
         Eski/çıplak executor çiftlerinde alan olmayabilir; teşhis bloğu
         `/scalper/status`'u ASLA düşürmemeli.
+
+        D27 incelemesi (O8): arıza hâlinde ARTIK `{}` DÖNMEZ. Boş sözlük
+        panoda "0" gibi okunuyordu, yani "TP sorunu yok" — oysa bu blok tam
+        da SESSİZ KALMAMAK için yazıldı. Takipçi tarafı
+        (`follower/engine._order_health_snapshot`) aynı tuzağa karşı iki ayrı
+        `try` kullanıyor; burada eşdeğeri, hatayı GÖRÜNÜR kılmaktır.
         """
         snapshotter = getattr(self.executor, "order_health_snapshot", None)
         if not callable(snapshotter):
-            return {}
+            return {
+                "error": "executor.order_health_snapshot YOK",
+                "window": "process_start",
+            }
         try:
             return dict(snapshotter())
         except Exception as e:
             self.logger.error(f"Scalper order_health snapshot okunamadı: {e}")
-            return {}
+            return {
+                "error": f"{type(e).__name__}: {e}",
+                "window": "process_start",
+            }
 
     def _executor_cooldown_snapshot(self) -> List[Dict[str, Any]]:
         """Dashboard için secret içermeyen cooldown telemetrisi."""

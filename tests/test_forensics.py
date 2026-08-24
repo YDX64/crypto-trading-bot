@@ -72,17 +72,34 @@ def _exit(**overrides):
         "direction": "LONG",
     }
     base.update(overrides)
-    # D27/A2: `classify_exit` artık `fee_estimate`i ÖLÇÜM olarak okur —
-    # `None`/eksik = "ölçülemedi" ve `fee_dominated` etiketi ATILMAZ. Bu
-    # yardımcı `build_exit`in çıktısını taklit eder ki etiket kuralları
-    # gerçek belgeyle AYNI girdiyle sınansın. Testler `fee_estimate`i
-    # açıkça geçirerek "ölçülemedi" hâlini de kurabilir.
+    # D27/A2: `classify_exit` `fee_estimate`i ÖLÇÜM olarak okur — `None`/eksik
+    # = "ölçülemedi" ve `fee_dominated` etiketi ATILMAZ.
+    #
+    # ⚠️ D27 incelemesi-2 (bulgu 3): bu blok bir zamanlar `build_exit`in ücret
+    # KURALINI (`gross − net`, negatifse `None`) TEST İÇİNDE YENİDEN
+    # UYGULUYORDU. Kanıt: `forensics.py`de `if raw_fee >= 0:` → `if True:`
+    # mutasyonu bu dosyanın 140 testini SESSİZ bıraktı (kendi kendini
+    # doğrulayan sahte). Artık değer GERÇEK `fx.build_exit` çıktısından
+    # okunur; kural kodda değişirse testler ısırır.
     if "fee_estimate" not in base:
-        net, gross = base.get("realized_pnl"), base.get("gross_pnl")
-        if net is not None and gross is not None and gross - net >= 0:
-            base["fee_estimate"] = round(gross - net, 6)
-        else:
-            base["fee_estimate"] = None
+        gercek = fx.build_exit(
+            at="2026-08-24T00:00:00+00:00",
+            reason=base.get("reason"),
+            exit_price=100.0,
+            entry_price=100.0,
+            quantity=1.0,
+            leverage=int(base.get("leverage") or 10),
+            direction=base.get("direction"),
+            realized_pnl=base.get("realized_pnl"),
+            gross_pnl=base.get("gross_pnl"),
+            pnl_source="binance_income_net",
+            mae_roi_pct=None,
+            mfe_roi_pct=base.get("mfe_roi_pct"),
+            duration_sec=60.0,
+            path={},
+            verification_notes=[],
+        )
+        base["fee_estimate"] = gercek["fee_estimate"]
     return base
 
 
@@ -581,14 +598,20 @@ class TestSummarize:
         assert summary["exit_reasons"][0]["reason"] == "_bilinmiyor_"
 
     def test_cikis_nedeni_kovalari_SINIRLIDIR(self):
+        """D27 incelemesi-2 (bulgu 9): sınır LİTERALDİR.
+
+        Beklenen değeri `fx.EXIT_REASON_BUCKET_MAX`ten türetmek hafif bir
+        tautolojiydi: sabit 999 yapılsa test yine geçerdi.
+        """
+        assert fx.EXIT_REASON_BUCKET_MAX == 20
         rows = [
             {"tags": [], "pnl": 1.0, "exit_reason": f"X{i}"}
-            for i in range(fx.EXIT_REASON_BUCKET_MAX + 5)
+            for i in range(25)
         ]
         summary = fx.summarize(rows)
         names = {row["reason"] for row in summary["exit_reasons"]}
         assert fx.OTHER_BUCKET in names
-        assert len(names) <= fx.EXIT_REASON_BUCKET_MAX + 1
+        assert len(names) <= 21
 
     def test_empty_input_is_safe(self):
         # D24/madde 6.3: `expectation` bloğu HER ZAMAN vardır (hiç beklenti
@@ -600,6 +623,10 @@ class TestSummarize:
             # D27/A1: çıkış nedeni × sonuç bloğu da HER ZAMAN vardır (boş
             # liste = "hiç kapanış yok", "alan yok" DEĞİL).
             "exit_reasons": [],
+            # D27 incelemesi (O5): REAPER sınır notu API katmanında da
+            # DÖNMELİDİR — uçtan okuyan 08-24 öncesi/sonrası iki dönemi
+            # karıştırmasın.
+            "exit_reason_note": fx.REAPER_SPLIT_NOTE,
             "expectation": {
                 "with_expectation": 0,
                 "without_expectation": 0,

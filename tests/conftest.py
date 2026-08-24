@@ -20,6 +20,7 @@ import os
 import pytest
 
 from src.core.config import settings
+from src.strategies.scalper import counterfactual_store
 from src.strategies.scalper.data import MarketDataGuard
 from src.trading.binance_client_improved import ImprovedBinanceClient
 
@@ -29,6 +30,26 @@ def _reset_market_data_guard():
     MarketDataGuard.reset()
     yield
     MarketDataGuard.reset()
+
+
+@pytest.fixture(autouse=True)
+def _reset_counterfactual_store():
+    """D27/B karşı-olgu defteri de SÜREÇ-GENELİ MODÜL durumudur.
+
+    D27 düşmanca incelemesi-2 (bulgu 5): GERÇEK bir `ScalpEngine` kuran her
+    test (`test_market_data_source.py`, `test_tv_events.py`,
+    `test_market_gate.py`, `test_shadow_mode.py`, `test_runtime_liveness.py`)
+    defteri `enabled=True` yapıyor ve HİÇBİR YERDE sıfırlanmıyordu; tam
+    paket sonunda `enabled=True, pending=4, registered=4` kalıyordu.
+    Bugün zararsız, ama `counters_snapshot()` okuyan HERHANGİ bir yeni test
+    sıra-bağımlı (dolayısıyla sahte-yeşil) olurdu. `MarketDataGuard` ve
+    `reset_weight_state` ile AYNI gerekçe.
+    """
+    counterfactual_store.reset()
+    counterfactual_store.configure(enabled=False)
+    yield
+    counterfactual_store.reset()
+    counterfactual_store.configure(enabled=False)
 
 
 @pytest.fixture(autouse=True)

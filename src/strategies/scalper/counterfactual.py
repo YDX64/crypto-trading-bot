@@ -257,12 +257,26 @@ def build_pending(
 # 2. Mum seçicileri
 # --------------------------------------------------------------------------
 
-def price_at(candles: Sequence[Candle], target_epoch: float) -> Optional[float]:
+def price_at(
+    candles: Sequence[Candle],
+    target_epoch: float,
+    *,
+    min_epoch: Optional[float] = None,
+) -> Optional[float]:
     """`target_epoch` (SANİYE) anındaki ya da ondan ÖNCEKİ son KAPANMIŞ fiyat.
 
     `Candle.close_time` MİLİSANİYE olduğundan ölçüt `close_time/1000 <=
     target_epoch`'tur. Uygun mum yoksa `None` döner — en yakın mumu "yeterince
     yakın" sayıp kullanmak look-ahead'e kapı açardı.
+
+    `min_epoch` verilirse ALT SINIR da uygulanır (`close_time/1000 >=
+    min_epoch`). D27 incelemesi (O3): alt sınır yokken veri boşluğunda niyet
+    anından ÖNCE kapanmış bir mumun `close`'u dönebiliyordu ve o sayı
+    `measured=True` bir satırın `horizons[].roi_pct` alanına UYDURMA bir değer
+    olarak giriyordu. (Bu geçmişe bakıştır, geleceğe değil — yani look-ahead
+    değil; ama "o anda geçerli fiyat" iddiası yine de yanlıştır.) `resolve`
+    DAİMA `min_epoch=at_epoch` geçer; alt sınır verilmezse davranış eskisiyle
+    birebir aynıdır.
 
     Liste eski→yeni sıralı VARSAYILMAZ: en büyük `close_time` aranarak
     bulunur, böylece sırasız bir girdi sessiz bir yanlış fiyat üretemez.
@@ -270,12 +284,15 @@ def price_at(candles: Sequence[Candle], target_epoch: float) -> Optional[float]:
     target = _f(target_epoch)
     if target is None:
         return None
+    floor = _f(min_epoch)
 
     best_epoch: Optional[float] = None
     best_close: Optional[float] = None
     for candle in candles or []:
         closed_at = _close_epoch(candle)
         if closed_at is None or closed_at > target:
+            continue
+        if floor is not None and closed_at < floor:
             continue
         close = _f(getattr(candle, "close", None))
         if close is None:
@@ -328,9 +345,14 @@ def window(
 # 3. Bar-bar simülasyon
 # --------------------------------------------------------------------------
 
-def _no_data() -> Dict[str, Any]:
-    """Ölçülemeyen senaryonun kaydı — TÜM sayı alanları `None`."""
-    return {
+def _no_data(gap: Optional[str] = None) -> Dict[str, Any]:
+    """Ölçülemeyen senaryonun kaydı — TÜM sayı alanları `None`.
+
+    `gap` NEDEN ölçülemediğini söyler (`None` = mum hiç yoktu). Bugünkü tek
+    değer `GAP_PARTIAL_WINDOW`'dur; rapor "hiç mum yoktu" ile "pencere ufku
+    kapsamıyordu"yu ayırt edebilsin diye ayrı tutulur.
+    """
+    out: Dict[str, Any] = {
         "outcome": OUTCOME_NO_DATA,
         "exit_price": None,
         "bars": 0,
@@ -338,6 +360,80 @@ def _no_data() -> Dict[str, Any]:
         "price_move_pct": None,
         "model": MODEL_ID,
     }
+    if gap:
+        out["gap"] = gap
+    return out
+
+
+#: `sim.gap` — pencere VARDI ama ufkun BAŞINI kapsamıyordu (bkz. `_covers`).
+GAP_PARTIAL_WINDOW = "partial_window"
+
+
+def _time_ordered(rows: Sequence[Any]) -> List[Any]:
+    """Mumları açılış zamanına göre KARARLI sırala (savunma).
+
+    `window()` zaten sıralı döndürür; ama `simulate` doğrudan da çağrılabilir
+    ve sırasız bir liste "önce hangi seviye vuruldu" sorusuna SESSİZCE yanlış
+    cevap verirdi (D27 incelemesi-2, bulgu 12). `price_at`/`window` ile aynı
+    ilke: sırasız girdi sessiz bir yanlış sonuç üretemez.
+
+    Açılış zamanı OKUNAMAYAN mumlar sona alınır ve kendi aralarındaki sıraları
+    korunur (kararlı sıralama) — atılmazlar, çünkü `simulate` onların
+    `high`/`low`'unu yine de görmelidir.
+    """
+    keyed = []
+    for index, candle in enumerate(rows):
+        opened = _open_epoch(candle)
+        keyed.append(
+            ((0, opened, index) if opened is not None else (1, 0.0, index), candle)
+        )
+    keyed.sort(key=lambda item: item[0])
+    return [candle for _, candle in keyed]
+
+
+def _bar_seconds(candles: Sequence[Any]) -> Optional[float]:
+    """Mum aralığını (saniye) VERİDEN çıkar — sabit varsayılmaz.
+
+    Önce ardışık açılışların en küçük pozitif farkı; o yoksa tek bir mumun
+    `close_time - open_time` süresi kullanılır. Hiçbiri okunamıyorsa `None`.
+    """
+    opens = [o for o in (_open_epoch(c) for c in candles or []) if o is not None]
+    diffs = [b - a for a, b in zip(opens, opens[1:]) if b > a]
+    if diffs:
+        return min(diffs)
+    for candle in candles or []:
+        opened = _open_epoch(candle)
+        closed = _close_epoch(candle)
+        if opened is not None and closed is not None and closed > opened:
+            return closed - opened
+    return None
+
+
+def _covers(candles: Sequence[Any], start_epoch: float) -> bool:
+    """Pencere ufkun BAŞINI gerçekten kapsıyor mu?
+
+    D27 incelemesi (Y1): sembol bir süre tarama evreninden çıkarsa
+    `window()` ufkun yalnız KUYRUĞUNU döndürür ve simülasyon o kuyruğu tüm
+    ufuk sanıp `measured=True` yazardı. Probe: 20 saat önceki niyet, 12.5
+    saatlik mum penceresi → `bars: 6`, `measured: True`, `pnl_roi_pct: 0.0`.
+    Yani "ölçemedik" demesi gereken satır, kendinden emin bir sayı yazıyordu.
+
+    Ölçüt: İLK mum niyet anına EN ÇOK BİR MUM uzaklıkta açılmış olmalıdır.
+    (Niyet anını içeren yarım mum look-ahead yüzünden dışlandığı için bir
+    mumluk boşluk NORMALDİR; iki mum ve fazlası veri boşluğudur.)
+    """
+    rows = list(candles or [])
+    if not rows:
+        return False
+    first_open = _open_epoch(rows[0])
+    start = _f(start_epoch)
+    if first_open is None or start is None:
+        return False
+    step = _bar_seconds(rows)
+    if step is None or step <= 0:
+        return False
+    # Kayan nokta toleransı: `<=` sınırındaki mum KABUL edilir.
+    return (first_open - start) <= step * 1.000001
 
 
 def simulate(
@@ -375,7 +471,9 @@ def simulate(
     """
     side = _direction(direction)
     entry = _positive(entry_price)
-    rows = [candle for candle in (candles or [])]
+    # SIRALAMA SAVUNMASI: sırasız bir liste "önce hangi seviye vuruldu"
+    # sorusuna sessizce yanlış cevap verirdi (bkz. `_time_ordered`).
+    rows = _time_ordered(candles or [])
     if entry is None or side not in ("LONG", "SHORT") or not rows:
         return _no_data()
 
@@ -462,6 +560,11 @@ def resolve(
       boştur ve `no_data` olarak kapanır.
     * Pencerede hiç mum yoksa `sim` `no_data`, `measured` `False`'tur ve TÜM
       sayı alanları `None` kalır.
+    * **KISMİ pencere de `no_data`'dır** (D27 incelemesi Y1): mumlar var ama
+      ilk mum niyet anından bir mumdan fazla uzaktaysa ufkun BAŞI eksiktir.
+      O kuyruğu tüm ufuk sanıp ölçmek uydurma sayı üretir; satır
+      `sim.gap="partial_window"` ile kapatılır. Ertelemenin faydası YOKTUR:
+      mum penceresi zamanla İLERİ kayar, eksik baş geri gelmez.
     """
     row = pending if isinstance(pending, dict) else {}
 
@@ -483,7 +586,12 @@ def resolve(
     horizon_rows: List[Dict[str, Any]] = []
     for hours in horizons:
         target = None if at_epoch is None else at_epoch + hours * SECONDS_PER_HOUR
-        price = None if target is None else price_at(candles, target)
+        # ALT SINIR (O3): niyet anından ÖNCE kapanmış bir mumun fiyatı bu
+        # ufkun fiyatı DEĞİLDİR — veri boşluğunda `None` yazılır, uydurulmaz.
+        price = (
+            None if target is None
+            else price_at(candles, target, min_epoch=at_epoch)
+        )
         move = _move_pct(entry, price, side)
         roi = None if (move is None or lev is None) else _round(move * lev, 6)
         horizon_rows.append(
@@ -496,13 +604,21 @@ def resolve(
         picked = window(
             candles, at_epoch, at_epoch + horizon_h * SECONDS_PER_HOUR
         )
-    sim = simulate(
-        direction=side,
-        entry_price=entry,
-        stop_price=row.get("stop_price"),
-        tp1_price=row.get("tp1_price"),
-        candles=picked,
-    )
+    if picked and at_epoch is not None and not _covers(picked, at_epoch):
+        # KISMİ PENCERE (Y1): mumlar var ama ufkun BAŞI eksik. Bunu ölçmek,
+        # ufkun yalnız kuyruğunu tüm ufuk sanmaktır — "uydurma sayı YASAK"
+        # kuralının ihlali. Ertelemek ÇÖZMEZ (mum penceresi ileri kayar,
+        # eksik baş bir daha GERİ GELMEZ); bu yüzden satır dürüstçe
+        # `no_data` olarak KAPATILIR ve nedeni `sim.gap`te durur.
+        sim = _no_data(GAP_PARTIAL_WINDOW)
+    else:
+        sim = simulate(
+            direction=side,
+            entry_price=entry,
+            stop_price=row.get("stop_price"),
+            tp1_price=row.get("tp1_price"),
+            candles=picked,
+        )
     sim["horizon_h"] = horizon_h
 
     sim_move = _f(sim.get("price_move_pct"))
@@ -550,6 +666,23 @@ def _label(reason: str) -> str:
     return intent.REASON_LABELS.get(reason, "")
 
 
+#: `profit_factor is None` iki ZIT anlama gelebiliyordu: "hiç ölçüm yok" ve
+#: "hiç kayıp yok" (payda 0 → PF matematiksel olarak sonsuz). D27 incelemesi
+#: (D4): ayrımı `profit_factor_note` taşır, böylece rapor satırı sıralanırken
+#: ve okunurken karıştırılamaz.
+PF_NOTE_NO_LOSS = "no_loss"        # payda 0 — kayıp yok, PF "sonsuz"
+PF_NOTE_NO_SAMPLE = "no_sample"    # ölçülmüş ROI yok — hesap YAPILAMADI
+
+#: `extra.plan_source` etiketi olmayan satırların kovası. TV kapısı yolunda
+#: etiket `roi_policy`, tarama-içi retlerde `signal`dır (bkz. `summarize`).
+PLAN_SOURCE_UNKNOWN = "_yok_"
+PLAN_SOURCE_LABELS: Dict[str, str] = {
+    "signal": "sinyal planı (gerçek yapısal stop)",
+    "roi_policy": "ROI politikası yaklaşıklığı (TV kapısı yolu)",
+    PLAN_SOURCE_UNKNOWN: "plan kaynağı etiketsiz",
+}
+
+
 def _blank(reason: str) -> Dict[str, Any]:
     """Boş kova — anahtar SIRASI rapor sırasıdır."""
     return {
@@ -558,12 +691,25 @@ def _blank(reason: str) -> Dict[str, Any]:
         "n": 0,
         "measured": 0,
         "collapsed": 0,
+        # D27 incelemesi (D5): `collapsed` toplamı sonuç bazında AYRIŞMADAN
+        # raporlanıyordu, yani ağırlıklı görünüm rapordan yeniden
+        # kurulamıyordu. Bu iki alan onu mümkün kılar.
+        "collapsed_tp1": 0,
+        "collapsed_stop": 0,
         OUTCOME_TP1: 0,
         OUTCOME_STOP: 0,
         OUTCOME_OPEN: 0,
         OUTCOME_NO_DATA: 0,
         "_rois": [],
     }
+
+
+def _blank_plan_source(source: str) -> Dict[str, Any]:
+    acc = _blank(REASON_TOTAL)
+    acc.pop("reason")
+    acc["plan_source"] = source
+    acc["label"] = PLAN_SOURCE_LABELS.get(source, "")
+    return acc
 
 
 def _accumulate(
@@ -577,6 +723,10 @@ def _accumulate(
     acc["n"] += 1
     acc["collapsed"] += dup
     acc[outcome] += 1
+    if outcome == OUTCOME_TP1:
+        acc["collapsed_tp1"] += dup
+    elif outcome == OUTCOME_STOP:
+        acc["collapsed_stop"] += dup
     if measured:
         acc["measured"] += 1
     if measured and roi is not None:
@@ -587,10 +737,15 @@ def _finalize(acc: Dict[str, Any]) -> Dict[str, Any]:
     """Kovayı rapor satırına çevir: ortalama, toplam, PF ve %95 GA.
 
     ROI istatistikleri YALNIZ `measured` ve `pnl_roi_pct` DOLU satırlardan
-    hesaplanır; ölçülemeyen satırlar sayıma girer ama ortalamayı bozmaz.
+    hesaplanır; ölçülemeyen satırlar sayıma girer ama ortalamayı bozmaz. Kaç
+    satırın hesaba girdiği `roi_n` alanında AYRICA raporlanır: `measured=True`
+    olup `pnl_roi_pct` `None` kalan satır mümkündür (ör. kaldıraç okunamadı)
+    ve okuyan `avg`/`PF`/`GA`'nın hangi örneklemden geldiğini bilmelidir
+    (D27 incelemesi O4).
     """
     rois: List[float] = acc.pop("_rois")
     count = len(rois)
+    acc["roi_n"] = count
 
     if count:
         mean = sum(rois) / count
@@ -603,16 +758,31 @@ def _finalize(acc: Dict[str, Any]) -> Dict[str, Any]:
 
     positive = sum(value for value in rois if value > 0)
     negative = -sum(value for value in rois if value < 0)
-    # Payda 0 iken PF matematiksel olarak sonsuzdur; JSON'da sonsuz yoktur ve
-    # "∞" bir rapor satırında yanlış bir kesinlik hissi verir → None.
-    acc["profit_factor"] = round(positive / negative, 3) if negative > 0 else None
+    if negative > 0:
+        acc["profit_factor"] = round(positive / negative, 3)
+        acc["profit_factor_note"] = None
+    elif count:
+        # Payda 0 iken PF matematiksel olarak sonsuzdur; JSON'da sonsuz yoktur
+        # ve "∞" bir rapor satırında yanlış bir kesinlik hissi verir → None +
+        # AÇIK bir not (hepsi kayıp iken PF `0.0`'dır; ikisi karışmamalı).
+        acc["profit_factor"] = None
+        acc["profit_factor_note"] = PF_NOTE_NO_LOSS
+    else:
+        acc["profit_factor"] = None
+        acc["profit_factor_note"] = PF_NOTE_NO_SAMPLE
 
-    if count >= 2:
-        variance = sum((value - mean) ** 2 for value in rois) / (count - 1)
+    variance = (
+        sum((value - mean) ** 2 for value in rois) / (count - 1)
+        if count >= 2 else 0.0
+    )
+    if count >= 2 and variance > 0:
         half = Z95 * math.sqrt(variance) / math.sqrt(count)
         acc["ci95_roi_pct"] = [round(mean - half, 3), round(mean + half, 3)]
     else:
-        # Tek gözlemin güven aralığı YOKTUR (ddof=1 → 0'a bölme).
+        # Tek gözlemin güven aralığı YOKTUR (ddof=1 → 0'a bölme). SIFIR
+        # varyansta da yoktur: `[0.0, 0.0]` genişliksiz bir aralıktır ve
+        # "kesin biliyoruz" gibi okunur — oysa elimizde tek bir tekrar eden
+        # değer vardır (D27 incelemesi D4).
         acc["ci95_roi_pct"] = None
 
     return acc
@@ -632,8 +802,20 @@ def summarize(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     Gerekçe kovalama `intent._bucket_reason` ile AYNI kuraldır: gerekçesiz
     satır `_yok_`, tanınmayan gerekçe `_diger_` kovasına düşer (bir yazım
     hatası sınırsız kova büyütmesin).
+
+    **`by_plan_source` (D27 incelemesi Y6) — NEDEN ZORUNLU.** Tarama-içi
+    retlerin planı GERÇEK sinyalden gelir (yapısal stop); TV sağlaması
+    `/tv-signal`'da reddettiğinde ortada `ScalpSignal` YOKTUR ve stop/TP1 ROI
+    POLİTİKASINDAN yaklaşıklanır (`counterfactual_store._fill_plan`).
+    Varsayılan configle ölçüldü: ROI politikası stopu ≈%2.5, TP1'i ≈%1.0
+    fiyat mesafesine oturur (2.5:1) — yani TV kovası diğer bütün kovalara
+    göre SİSTEMATİK olarak "girseydik kazanırdık" tarafına kayar. Etiket
+    JSONL'de vardı ama tabloya hiç ulaşmıyordu; bu kırılım olmadan defterin
+    var oluş sebebi olan soru ("TV kapısı 150+ sinyali doğru mu reddetti?")
+    yanlış cevaplanır. `roi_policy` satırları AYRI okunmalıdır.
     """
     groups: Dict[str, Dict[str, Any]] = {}
+    plan_groups: Dict[str, Dict[str, Any]] = {}
     overall = _blank(REASON_TOTAL)
     total = 0
     measured_total = 0
@@ -643,12 +825,17 @@ def summarize(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
 
         if not isinstance(row, dict):
             reason_key = intent._bucket_reason(None)
+            plan_key = PLAN_SOURCE_UNKNOWN
             outcome = OUTCOME_NO_DATA
             measured = False
             dup = 1
             roi: Optional[float] = None
         else:
             reason_key = intent._bucket_reason(_token(row.get("reason")))
+            extra = row.get("extra")
+            plan_key = (
+                _token(extra.get("plan_source")) if isinstance(extra, dict) else None
+            ) or PLAN_SOURCE_UNKNOWN
             sim = row.get("sim")
             outcome = _token(sim.get("outcome")) if isinstance(sim, dict) else None
             if outcome not in KNOWN_OUTCOMES:
@@ -664,16 +851,22 @@ def summarize(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
 
         bucket = groups.setdefault(reason_key, _blank(reason_key))
         _accumulate(bucket, outcome=outcome, measured=measured, dup=dup, roi=roi)
+        plan_bucket = plan_groups.setdefault(plan_key, _blank_plan_source(plan_key))
+        _accumulate(plan_bucket, outcome=outcome, measured=measured, dup=dup, roi=roi)
         _accumulate(overall, outcome=outcome, measured=measured, dup=dup, roi=roi)
 
     table = [_finalize(bucket) for bucket in groups.values()]
     # Çoktan aza; eşitlikte ada göre (kararlı sıra = kararlı rapor).
     table.sort(key=lambda item: (-item["n"], item["reason"]))
 
+    plan_table = [_finalize(bucket) for bucket in plan_groups.values()]
+    plan_table.sort(key=lambda item: (-item["n"], item["plan_source"]))
+
     return {
         "total": total,
         "measured": measured_total,
         "unmeasured": total - measured_total,
         "by_reason": table,
+        "by_plan_source": plan_table,
         "overall": _finalize(overall),
     }

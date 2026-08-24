@@ -261,7 +261,18 @@ class ScalpExecutor:
         # görünürlük var — motor davranışı BİREBİR aynı.
         self._order_health: Dict[str, Any] = {
             "tp1_missing": 0,
+            # D27 incelemesi (O7): emir KABUL EDİLDİ ama kimliği okunamadı —
+            # `tp1_missing`ten FARKLI ve daha kötü bir arıza (emir canlı,
+            # izlenemiyor). Aynı sayaca yazmak durumu yanlış tarif ediyordu.
+            "tp1_unidentified": 0,
             "tp2_missing": 0,
+            "tp2_unidentified": 0,
+            # D27 incelemesi (D8): iki halkanın (scalper + takipçi) ORTAK
+            # alan kümesi. Takipçide `follower/executor` bunları sayar;
+            # scalper'da bugün 0'dır ama ŞEKİL aynı olmalı ki pano tek bir
+            # uyarı satırıyla iki halkayı da gösterebilsin.
+            "tp_wrong_side": 0,
+            "partial_fill_split": 0,
             "last_symbol": None,
             "last_at": None,
         }
@@ -1593,23 +1604,45 @@ class ScalpExecutor:
         tp2_qty = filled_qty * self.cfg.scalper_tp2_fraction
         runner_qty = max(filled_qty - tp1_qty - tp2_qty, 0.0)
 
-        tp1_algo_id = await self._place_tp_safely(symbol, sl_side, tp1_price, tp1_qty, "TP1")
-        tp2_algo_id = await self._place_tp_safely(symbol, sl_side, tp2_price, tp2_qty, "TP2")
+        tp1_algo_id, tp1_fail = await self._place_tp_safely(
+            symbol, sl_side, tp1_price, tp1_qty, "TP1"
+        )
+        tp2_algo_id, tp2_fail = await self._place_tp_safely(
+            symbol, sl_side, tp2_price, tp2_qty, "TP2"
+        )
         # D27/A4 — SESSİZ KALMA. TP1 emri yoksa break-even hiç kurulamaz ve
         # pozisyon tam risk stopuyla taşınır (ölçüldü: 3 işlem, −18.4 USDT).
         # YENİ DENEME YOK (yeni REST ağırlığı sıfır sözleşmesi) ve YENİ KAPI
         # YOK: yalnız sayaç + CRITICAL. `tp1_qty <= 0` hâli AYRI bir olaydır
         # (miktar bölünemedi) ve `_place_tp_safely` onu zaten uyarır.
+        #
+        # D27 incelemesi (O7): "emir kabul edildi, kimliği okunamadı" hâli
+        # AYRI sayılır — orada emir CANLIdır (pozisyon TP1'de kısmen
+        # kapanabilir) ama izlenemez; mesaj da bu yüzden farklıdır.
         if tp1_algo_id is None and tp1_qty > 0:
-            self._count_order_health("tp1_missing", symbol)
-            self.logger.critical(
-                f"🚨 {symbol}: TP1 emri KONULAMADI — break-even bu pozisyonda "
-                f"HİÇ kurulamayacak, işlem tam risk stopuyla taşınıyor. "
-                f"/scalper/status → order_health.tp1_missing",
-                extra={"trade": True},
-            )
+            if tp1_fail == self.TP_FAIL_UNIDENTIFIED:
+                self._count_order_health("tp1_unidentified", symbol)
+                self.logger.critical(
+                    f"🚨 {symbol}: TP1 emri KABUL EDİLDİ ama KİMLİĞİ OKUNAMADI — "
+                    f"emir canlı olabilir, pozisyon TP1'de kısmen kapanabilir "
+                    f"ama break-even YİNE kurulamaz (fill doğrulanamıyor). "
+                    f"/scalper/status → order_health.tp1_unidentified",
+                    extra={"trade": True},
+                )
+            else:
+                self._count_order_health("tp1_missing", symbol)
+                self.logger.critical(
+                    f"🚨 {symbol}: TP1 emri KONULAMADI ({tp1_fail}) — break-even bu "
+                    f"pozisyonda HİÇ kurulamayacak, işlem tam risk stopuyla "
+                    f"taşınıyor. /scalper/status → order_health.tp1_missing",
+                    extra={"trade": True},
+                )
         if tp2_algo_id is None and tp2_qty > 0:
-            self._count_order_health("tp2_missing", symbol)
+            self._count_order_health(
+                "tp2_unidentified"
+                if tp2_fail == self.TP_FAIL_UNIDENTIFIED else "tp2_missing",
+                symbol,
+            )
 
         entry_fee_rate, exit_fee_rate, fee_rate_source = await self._resolve_commission_rates(
             symbol
@@ -2814,30 +2847,55 @@ class ScalpExecutor:
                 opened.append(sp)
         return opened
 
+    #: `_place_tp_safely` başarısızlık nedenleri (D27 incelemesi O7).
+    TP_FAIL_ZERO_QTY = "zero_qty"          # miktar bölünemedi — emir GÖNDERİLMEDİ
+    TP_FAIL_REJECTED = "rejected"          # borsa REDDETTİ — emir YOK
+    TP_FAIL_ERROR = "error"                # beklenmeyen hata — emir durumu bilinmiyor
+    TP_FAIL_UNIDENTIFIED = "unidentified"  # emir KABUL EDİLDİ ama kimlik okunamadı
+
     async def _place_tp_safely(
         self, symbol: str, side: str, price: float, quantity: float, label: str
-    ) -> Optional[str]:
-        """TP emrini koymayı dene; başarısızlık pozisyonu İPTAL ETTİRMEZ (SL zaten var)."""
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """TP emrini koymayı dene; başarısızlık pozisyonu İPTAL ETTİRMEZ (SL zaten var).
+
+        Döner: `(algo_id, fail_reason)`. Başarıda `fail_reason` `None`'dır.
+
+        D27 incelemesi (O7) — DÖRT NEDEN AYNI DEĞİLDİR. Fonksiyon dört ayrı
+        sebeple `None` döner ve bunlardan biri (`unidentified`) diğerlerinden
+        **DAHA KÖTÜDÜR**: emir borsaya gitti ve KABUL EDİLDİ, ama yanıttan
+        `algoId`/`orderId` okunamadı. O hâlde pozisyon TP1'de kısmen
+        kapanabilir; ama `exits._check_tp1_breakeven` `algo_id=None` ile
+        `_confirmed_algo_fill` çağıramaz → break-even YİNE kurulmaz. Yani
+        "TP1 emri KONULAMADI" mesajı durumu YANLIŞ tarif ediyordu. Sayaç
+        `tp1_missing` / `tp1_unidentified` diye ayrışır.
+        """
         if quantity <= 0:
             self.logger.warning(f"⚠️ {symbol}: {label} miktarı sıfır, atlanıyor")
-            return None
+            return None, self.TP_FAIL_ZERO_QTY
         try:
             order = await self.client.place_take_profit(
                 symbol=symbol, side=side, stop_price=price, quantity=quantity
             )
-            return self._extract_id(order)
+            algo_id = self._extract_id(order)
+            if algo_id is None:
+                self.logger.error(
+                    f"🚨 {symbol}: {label} emri borsaca KABUL EDİLDİ ama kimliği "
+                    f"okunamadı — emir CANLI olabilir, izlenemiyor."
+                )
+                return None, self.TP_FAIL_UNIDENTIFIED
+            return algo_id, None
         except BinanceAPIError as e:
             self.logger.error(
                 f"⚠️ {symbol}: {label} konulamadı (kod={e.code}: {e.msg}). "
                 f"Pozisyon SL ile korunuyor, {label} olmadan devam ediliyor."
             )
-            return None
+            return None, self.TP_FAIL_REJECTED
         except Exception as e:
             self.logger.error(
                 f"⚠️ {symbol}: {label} konulurken beklenmeyen hata ({e}). "
                 f"Pozisyon SL ile korunuyor, {label} olmadan devam ediliyor."
             )
-            return None
+            return None, self.TP_FAIL_ERROR
 
     @staticmethod
     def _extract_id(order: dict) -> Optional[str]:
