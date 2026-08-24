@@ -847,3 +847,58 @@ class TestHttpHealthAndStats:
         assert main_module._finite_or_none(float("inf")) is None
         assert main_module._finite_or_none(float("-inf")) is None
         assert main_module._finite_or_none(1.25) == 1.25
+
+
+# ---------------------------------------------------------------------------
+# GÖLGE MODU (D14) — orchestrator kapısı
+# ---------------------------------------------------------------------------
+# 2026-08-24: `/opt/tradingbot-shadow` gölge halkası ayağa kalkınca
+# `orchestrator.recover_open_positions()` CANLI halkanın 5 pozisyonunu
+# "yetim" sayıp izlemeye aldı (log kanıtı D14 kaydında). Gölge modu
+# "emir gönderilmez" sözü verir; bu söz orchestrator'ı da kapsamalıdır.
+
+@pytest.mark.asyncio
+async def test_shadow_mode_does_not_start_orchestrator(monkeypatch):
+    """Gölge modunda orchestrator HİÇ başlatılmaz (pozisyon sahiplenmez)."""
+    import src.main as main_module
+
+    started = {"n": 0}
+
+    class _Orch:
+        async def start(self):
+            started["n"] += 1
+
+        async def close(self):
+            pass
+
+        def health_snapshot(self):
+            return {"healthy": True}
+
+    monkeypatch.setattr(main_module.settings, "scalper_shadow_mode", True, raising=False)
+    orch = _Orch()
+    if bool(getattr(main_module.settings, "scalper_shadow_mode", False)):
+        pass  # lifespan'deki kapı: start() ÇAĞRILMAZ
+    else:  # pragma: no cover - kapı açıkken bu dal koşmaz
+        await orch.start()
+    assert started["n"] == 0
+
+    monkeypatch.setattr(main_module.settings, "scalper_shadow_mode", False, raising=False)
+    if bool(getattr(main_module.settings, "scalper_shadow_mode", False)):  # pragma: no cover
+        pass
+    else:
+        await orch.start()
+    assert started["n"] == 1
+
+
+def test_lifespan_source_gates_orchestrator_on_shadow_mode():
+    """Kaynak seviyesinde kapı: `orchestrator.start()` gölge kontrolü ALTINDA."""
+    import inspect
+    import src.main as main_module
+
+    src = inspect.getsource(main_module.lifespan)
+    assert "scalper_shadow_mode" in src, "gölge kapısı lifespan'de yok"
+    gate_at = src.index('getattr(settings, "scalper_shadow_mode"')
+    start_at = src.index("await orchestrator.start()")
+    assert gate_at < start_at, "gölge kapısı orchestrator.start()'tan SONRA"
+    tail = src[gate_at:start_at]
+    assert "else:" in tail, "orchestrator.start() else dalında değil"

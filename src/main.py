@@ -358,8 +358,24 @@ async def lifespan(app: FastAPI):
 
         # Geriye kalan (scalper sahipliğinde olmayan) açık pozisyonları genel
         # orchestrator kurtarır ve izlemeye alır.
-        await orchestrator.start()
-        app_logger.info("✅ Trading Orchestrator başlatıldı")
+        #
+        # ⚠️ GÖLGE MODU (D14) KAPISI — 2026-08-24'te ölçülerek eklendi.
+        # `SCALPER_SHADOW_MODE=true` "emir gönderilmez" DEMEKTİR, ama bu söz
+        # yalnız scalper motorunu kapsıyordu: orchestrator ayrı bir bileşen ve
+        # `recover_open_positions()` borsadaki HER pozisyonu "yetim" sayıp
+        # izlemeye alıyordu. Gölge halkası CANLI halkayla aynı Binance hesabına
+        # bakınca (ölçüldü: /opt/tradingbot-shadow, 2026-08-24 10:44) canlının
+        # 5 pozisyonunu sahiplendi → aynı pozisyonun İKİ yöneticisi, D20b
+        # incelemesindeki kritik sınıfın aynısı. Gölgede orchestrator HİÇ
+        # başlatılmaz; kurtarma da izleme de yapılmaz.
+        if bool(getattr(settings, "scalper_shadow_mode", False)):
+            app_logger.warning(
+                "👻 GÖLGE MODU: Trading Orchestrator BAŞLATILMADI — "
+                "borsadaki pozisyonlar sahiplenilmez (canlı halkanın işleri)"
+            )
+        else:
+            await orchestrator.start()
+            app_logger.info("✅ Trading Orchestrator başlatıldı")
 
         # --- GÖMÜLÜ TAKİPÇİ (D20b, kullanıcı kararı 2026-08-23) -----------
         # Scalper'ın YANINDA, AYNI süreçte/hesapta/panoda; boyutlaması SANAL

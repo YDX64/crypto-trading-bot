@@ -2759,6 +2759,47 @@ bayrağı okur) + CLI bayraklarını kullanmamak. Backtest tarafında `--permuta
 `--fee-stress`, `--entry-delay-candles` verilmezse kod yolu eskisiyle birebir aynıdır.
 >>>>>>> worktree-agent-af27869057747ff76
 
+### D26 — Gölge halkası (`/opt/tradingbot-shadow`) + gölge modunun orchestrator kapısı · 2026-08-24 · **AKTİF (kod), halka ÖLÇÜM İÇİN**
+
+**Ne.** Kullanıcı isteği (2026-08-24): *"4 gün önce güzel çalışan versiyonu da
+çalıştırsak … şu anki ayarları da bozmak istemiyorum"*. Kurulan: AYRI dizin
+(`/opt/tradingbot-shadow`), AYRI süreç (supervisord `tradingbot_shadow`, :9092),
+AYRI DB (`tradingbot_shadow.db`) / state / log; kod BUGÜNKÜ main, `.env` ise
+**21 Ağustos yedeği** (`backups/env.bak-20260821-122630-deploy`) + gölge modu.
+
+**Neden bu biçim.** 21 Ağustos `.env`'i ile bugünkü `.env` DEĞER BAZINDA
+karşılaştırıldı (ölçüm, 2026-08-24): **hiçbir mevcut ayarın değeri değişmemiş**;
+fark yalnız EKLENEN anahtarlar. Scalper davranışını etkileyen yalnız İKİ tanesi:
+`SCALPER_MARKET_GATE=true` (D15) ve `SCALPER_MARKET_DATA_BASE_URL=fapi.binance.com`
+(D17). Kalan eklenenler (FOLLOWER_*, SCALPER_AI_GATE_*) ayrı defter ya da gölge =
+scalper karar yoluna etkisiz. Yani "4 gün önceki sürüm" ≡ bugünkü kod + bu iki
+anahtar kapalı; eski COMMIT'i koşturmak gerekmiyor (üstelik c585840'ta gölge modu
+YOK — `git show c585840:src/core/config.py | grep shadow` boş).
+
+**BULGU — gölge modu orchestrator'ı kapsamıyordu (bu kayıtla düzeltildi).**
+Halka ilk kez ayağa kalkınca (10:43:50 gölge banner'ı doğru bastı) orchestrator
+`recover_open_positions()` çalıştı ve CANLI halkanın 5 pozisyonunu **"YETİM
+pozisyon kurtarıldı"** diye izlemeye aldı (10:44:10–10:44:23, ETH/XRP/BTC/SOL/BNB).
+Aynı Binance hesabında aynı pozisyonun İKİ yöneticisi = D20b incelemesindeki
+kritik sınıf. Halka 5 dakikada durduruldu; **zarar yok** — borsada 5 pozisyon ve
+her birinde 3 koruma emri sağlam kaldı (ölçüldü 10:49). Düzeltme: `src/main.py`
+lifespan'de `scalper_shadow_mode` doğruysa orchestrator **HİÇ başlatılmaz**
+(WARNING loglar); iki test kilitler (`tests/test_runtime_liveness.py`).
+
+**Sınırlılık (dürüst).** Gölge halkası TradingView webhook'larını ALMAZ (alarmlar
+yalnız :9091'e gider; nginx `mirror` ile çoğaltmak CANLI giriş yoluna gecikme
+riski ekler — bilinçli olarak YAPILMADI). Bu yüzden karşılaştırma yalnız
+**C tarayıcı yolunu** kapsar (defterde işlemlerin ~%70'i). TV kaynaklı girişler
+kıyas dışıdır.
+
+**Geri alma.** `supervisorctl stop tradingbot_shadow` (canlıya etkisi yok);
+kalıcı kaldırma: `rm /etc/supervisor/conf.d/tradingbot-shadow.conf && supervisorctl update`.
+
+**Kanıt kapısı.** Halka ancak orchestrator kapısı deploy edildikten SONRA
+yeniden başlatılır. Karşılaştırma: `scripts/ledger_report.py --db tradingbot_shadow.db`
+ile canlı defterin C satırları; soru "lider kapısı + mainnet kline açık/kapalı
+girişleri nasıl değiştiriyor".
+
 ## Reddedilen kararlar (kanıtla)
 
 | Fikir | Tarih | Sonuç | Neden reddedildi |
