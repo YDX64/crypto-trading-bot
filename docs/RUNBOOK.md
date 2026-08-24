@@ -116,6 +116,12 @@ scripts/deploy.sh awa <commit>               # elle geri alma; önceki commit ba
 scripts/deploy.sh awa --ring follower        # takipçi halkası (aynı repo, ayrı dizin/süreç)
 scripts/deploy.sh awa v1.2.0 --ring mainnet  # yalnız etiketli sürüm + elle 'MAINNET' onayı
 ```
+
+> **Container yolu (EK dağıtım).** Botu tek bir görüntüde başka sunucuya taşımak için
+> `scripts/docker_run.sh` + "Container ile çalıştırma / başka sunucuya taşıma" bölümüne
+> bakın. ⛔ supervisord ile container **AYNI ANDA ÇALIŞTIRILAMAZ** (aynı Binance hesabı,
+> aynı pozisyonlar → çift yönetim).
+
 Deploy ön koşulları (script kendisi denetler): entry-halt dosyası yok, son 15 dk ban izi yok,
 temiz ağaç, yerel HEAD == origin/main. Geri alma mantığı ÜÇ halkada da ORTAKtır
 (`scripts/server_deploy.sh`; `RING=` log etiketini, halka-özel entry-halt dosyasını
@@ -604,6 +610,233 @@ görünür (motor yok — bu bir arıza DEĞİL). Takipçinin durumu `/follower/
   akış test + restart + sağlık + otomatik geri alma ile AYNI).
 - İki halkanın `.env` farkını (secret DEĞERLERİ maskeli) görmek için:
   `MAIN_ENV=/opt/tradingbot-ap/.env scripts/ring_env_diff.sh awa`
+
+## Container ile çalıştırma / başka sunucuya taşıma
+
+Container, supervisord'un **YERİNE GEÇEN** değil **YANINA EKLENEN** ikinci bir dağıtım
+yoludur. Bugün canlı olan yol supervisord'dur (`tradingbot_v2`, `/opt/tradingbot-v2`);
+container yolu botu tek bir görüntüye paketler ki **başka bir sunucuya taşınabilsin**.
+
+### ⛔⛔ EN ÖNEMLİ KURAL: SUPERVISORD İLE CONTAINER **AYNI ANDA ÇALIŞAMAZ** ⛔⛔
+
+**AYNI `.env` = AYNI BİNANCE HESABI = AYNI POZİSYONLAR.** İki motor aynı anda
+çalışırsa:
+
+* ikisi de açılışta **aynı açık pozisyonları devralır** ve her biri kendi SL/TP
+  merdivenini yerleştirir → **çift bracket**, biri diğerinin emrini "yetim" sanar;
+* ikisi de `state/*.json` yazar (cooldown, entry-halt, pending journal) →
+  **son yazan kazanır**, fail-closed giriş kilitleri sessizce kaybolur;
+* ikisi de tarar ve emir açar → **çift giriş**, iki katı REST ağırlığı → **418 ban**;
+* kapanış kayıtları iki motora bölünür → defter (`scalp_trades`) güvenilmez olur.
+
+Bu, `docs/DECISIONS.md` D20b incelemesindeki **"ayrı halka + gömülü takipçi aynı anda"**
+kritik sınıfının birebir aynısıdır. **Geçiş sırası her zaman: ÖNCE DURDUR, SONRA BAŞLAT.**
+
+`scripts/docker_run.sh` bu kapıyı uygular: hedef makinede `supervisorctl status`
+`tradingbot_v2|tradingbot_ap|tradingbot_main` programlarından birini RUNNING gösterirse
+**başlatmaz**. Uzak bir sunucuyu da yoklatmak için `DOCKER_PEER_SSH_HOST=awa` verin
+(ssh başarısız olursa fail-closed davranır: yoklanamayan sunucuda motor çalışıyor
+olabilir). Bilinçli istisna — **yalnız container AYRI bir Binance hesabının `.env`'ini
+kullanıyorsa** — `DOCKER_ALLOW_ALONGSIDE=1`.
+
+### Ne çalıştırılır
+```bash
+scripts/docker_run.sh              # build + up + sağlık bekle (kapılar dahil)
+scripts/docker_run.sh --no-build   # yalnız up
+scripts/docker_run.sh --down       # graceful durdur (stop_grace_period'a saygı)
+scripts/docker_run.sh --logs       # son 200 satır, secret REDAKSİYONLU
+```
+Çıplak `docker compose up` **KULLANILMAZ**: entry-halt kilidini, 418 ban penceresini ve
+supervisord kapısını atlar (aynı gerekçe `restart_safe.sh` ile çıplak `supervisorctl
+restart` arasındaki farkta yazılıdır).
+
+Testleri **container içinde** koşmak (deploy kapısı — görüntü `tests/`, `conftest.py`,
+`pytest.ini` ve `.github/workflows/ci.yml`'i taşır; taban Python sürümü CI/sunucu ile
+aynıdır):
+```bash
+docker compose -p tradingbot exec tradingbot python -m pytest tests -q -p no:cacheprovider
+# ölçüldü (2026-08-24): 2021 passed, 2 skipped — host ile AYNI
+```
+Görüntüyü + container'ı **uçtan uca** doğrulayan duman testi (build → ayağa kalk →
+`/health` → defter kalıcı volume'de → zarif SIGTERM kapanışı). **Opt-in'dir**: her
+`pytest tests` koşusuna ~715 MB'lık bir derleme eklememek için varsayılan KAPALI
+(`server_deploy.sh` test adımı `timeout 300` ile sarılıdır — kazara tetiklenen bir
+derleme deploy'u geri aldırırdı):
+```bash
+TRADINGBOT_DOCKER_SMOKE=1 python3 -m pytest \
+  tests/test_container.py::test_smoke_build_and_health -q
+```
+
+### Kalıcı veri nerede
+Container **durum tutmaz**; her şey compose dosyasının yanındaki dizinlere bind-mount
+edilir:
+
+| Host yolu | Container | İçerik |
+|---|---|---|
+| `./.env` | `/app/.env` *(salt okunur)* | ayarlar + **SIRLAR** — görüntüye GÖMÜLMEZ |
+| `./state/` | `/app/state` | cooldown, entry-halt, pending journal, TV olay durumu |
+| `./logs/` | `/app/logs` | `bot.log`, `trades.jsonl`, `deploy.log` |
+| `./backups/` | `/app/backups` | `.env` yedekleri (**anahtar içerir**) |
+| `./data/` | `/app/data` | **`tradingbot.db`** + `klines_cache/` |
+
+> ⚠️ **Defterin yeri container'da DEĞİŞİR.** Sunucuda `sqlite:///./tradingbot.db` (repo
+> kökü). Container'da repo kökü *görüntünün içidir* ve kalıcı değildir. Tek bir DOSYAYI
+> mount etmek de çözüm değildir: `src/core/database.py` `PRAGMA journal_mode=WAL`
+> uygular ve sqlite `tradingbot.db-wal` / `-shm` kardeşlerini **aynı dizinde** üretir;
+> yalnız `.db` mount edilseydi WAL container katmanında kalır ve container silindiğinde
+> **checkpoint edilmemiş işlem kayıtları kaybolurdu.** Bu yüzden `docker-compose.yml`
+> `DATABASE_URL=sqlite:///./data/tradingbot.db` verir. Süreç ortamı `.env`'i EZER
+> (pydantic-settings önceliği: env > dotenv), yani **taşınan `.env` düzenlenmeden
+> çalışır**.
+
+### Başka sunucuya taşıma reçetesi
+
+**0) Hedef makinede hazırlık** — docker + docker compose v2 kurulu, saat doğru.
+
+**1) KAYNAKTA motoru durdur VE bir daha kendiliğinden kalkmayacağından emin ol**
+(pozisyon varken bile: kapanış pozisyonu KAPATMAZ, yalnız bekleyen MAKER girişlerini
+iptal eder ve pozisyonları borsada bırakır — yeni motor devralır).
+```bash
+ssh awa 'supervisorctl stop tradingbot_v2 && supervisorctl status tradingbot_v2'
+# STOPPED görmeden devam etme (CLAUDE.md kural 6)
+```
+> ⛔⛔ **`autostart=false` YAPMADAN GEÇME.** `supervisorctl stop` YALNIZ ŞU ANI
+> durdurur. supervisord program tanımı `autostart=true` ise **sunucu yeniden
+> başladığında motor kendiliğinden geri gelir** — ve hedef makinedeki container
+> `restart: unless-stopped` ile zaten ayaktadır. Sonuç: **İKİ MOTOR, AYNI HESAP**,
+> kimse fark etmeden. Bu, bu bölümün en başındaki felaketin sessiz hâlidir.
+> ```bash
+> ssh awa 'grep -n autostart /etc/supervisor/conf.d/tradingbot_v2.conf'   # önce oku
+> ssh awa 'sed -i "s/^autostart=.*/autostart=false/" /etc/supervisor/conf.d/tradingbot_v2.conf \
+>          && supervisorctl reread && supervisorctl update && supervisorctl status'
+> ```
+> Geri dönüşte (adım 6) bunu `autostart=true` yapmayı unutma.
+
+**2) Veriyi tarball'la** (durdurduktan SONRA — sqlite WAL yazarken kopyalama tutarsız
+olabilir). Tarball **ANAHTAR İÇERİR** (`backups/env.bak-*` = `.env` tam kopyaları), bu
+yüzden `umask 077` + erişim logu hariç + transfer sonrası **imha**:
+```bash
+ssh awa 'cd /opt/tradingbot-v2 && umask 077 && tar czf /tmp/tradingbot-data.tgz \
+  --exclude="logs/supervisor.log" \
+  tradingbot.db tradingbot.db-wal tradingbot.db-shm state logs backups data 2>/dev/null; \
+  chmod 600 /tmp/tradingbot-data.tgz; ls -la /tmp/tradingbot-data.tgz'
+scp awa:/tmp/tradingbot-data.tgz .
+ssh awa 'shred -u /tmp/tradingbot-data.tgz 2>/dev/null || rm -f /tmp/tradingbot-data.tgz'
+```
+*(`logs/supervisor.log` erişim logudur ve **secret içerir** — CLAUDE.md kural 5; tarball'a
+alınmaz. `-wal`/`-shm` yoksa `tar` uyarır, sorun değil: temiz kapanışta checkpoint
+edilmiştir.)*
+> Hedefe açtıktan sonra yerel kopyayı da imha et:
+> `shred -u tradingbot-data.tgz` (yoksa `rm -P` / `rm -f`).
+
+**3) Hedefte kodu al ve veriyi yerleştir** — kod **GitHub'dan** gelir, scp ile dosya
+kopyalama YASAKTIR (CLAUDE.md):
+```bash
+git clone https://github.com/YDX64/crypto-trading-bot.git tradingbot && cd tradingbot
+tar xzf ../tradingbot-data.tgz
+mkdir -p data && [ -f tradingbot.db ] && mv tradingbot.db* data/   # defteri data/ altına al
+```
+
+**4) `.env`'i ELLE taşı** — tarball'da `backups/` içindeki `.env` yedekleri **anahtar
+içerir**; `.env`in kendisi ayrıca taşınmalıdır. **Asla** log/çıktı/commit'e dökmeyin
+(CLAUDE.md kural 5):
+```bash
+ssh awa 'cat /opt/tradingbot-v2/.env' > .env && chmod 600 .env
+```
+> ⚠️ **İZİN TUZAĞI.** Container non-root (`bot`, uid 10001) koşar. `.env` root'a ait
+> ve `600` ise container onu **OKUYAMAZ**; `settings` modül düzeyinde kurulduğu için
+> uygulama **import'ta** `ValidationError` ile ölür ve `restart: unless-stopped`
+> sonsuz bir çökme döngüsü kurar. `scripts/docker_run.sh` bunu kendisi düzeltir
+> (sahipliği container uid'sine verir, `640` yapar) ve sonucu log satırında basar.
+> Elle yapıyorsanız: `sudo chown 10001:10001 .env && chmod 640 .env`.
+Genel kural: **`.env` olduğu gibi taşınır**, yalnız aşağıdakiler elden geçirilir
+(sırayla — 1. madde en sık unutulan ve en sinsi olanıdır):
+
+1. **`BINANCE_BIND_IP` → BOŞALTIN.** Bu değer **eski sunucunun çıkış IP'sidir**.
+   Yeni makinede o IP yoktur; `src/core/config.py` doğrulayıcısı geçerli bir IP
+   gördüğü için ayar **kabul edilir** ve hata ancak ilk Binance çağrısında
+   jenerik bir bağlantı hatası olarak görünür — teşhisi zordur.
+2. **Binance API anahtarının IP allowlist'ini taşımadan ÖNCE güncelleyin.**
+   Anahtar eski sunucunun IP'sine kilitliyse yeni makineden gelen imzalı her
+   istek reddedilir. Bu, bot tarafında düzeltilemez (Binance hesap ayarı).
+3. **Hedefte NTP açık olsun** (`timedatectl` / `chronyd`). İmzalı istekler
+   `recvWindow` ile zaman damgası doğrular; saat kayarsa Binance
+   **`-1021 Timestamp for this request is outside of the recvWindow`** döner ve
+   bot hiç emir açamaz. Container host'un saatini kullanır (`TZ=UTC` yalnız
+   biçimi sabitler, saati DÜZELTMEZ).
+4. `TELEGRAM_*` webhook/tünel adresleri hedef makineye göre.
+5. `FOLLOWER_FORWARD_URL` → gömülü modda (D20b) **boş olmalı**.
+
+**5) Başlat ve doğrula:**
+```bash
+scripts/docker_run.sh
+curl -s localhost:9091/health | python3 -m json.tool
+curl -s localhost:9091/scalper/status | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("scan_status"), d.get("entries_blocked_by"), d.get("kline_source"))'
+docker compose -p tradingbot exec tradingbot python -m pytest tests -q -p no:cacheprovider
+```
+Defterin taşındığını kanıtla (sayı KAYNAKTAKİYLE aynı olmalı):
+```bash
+docker compose -p tradingbot exec tradingbot \
+  python -c "import sqlite3;print(sqlite3.connect('data/tradingbot.db').execute('select count(*) from scalp_trades').fetchone())"
+```
+
+**6) Geri dönüş** — container'ı durdur, eski sunucuda supervisord'u geri aç:
+```bash
+scripts/docker_run.sh --down
+ssh awa 'cd /opt/tradingbot-v2 && RESTART_LABEL=container-rollback scripts/restart_safe.sh testnet'
+```
+Container'ın ürettiği yeni işlem kayıtları eski sunucunun defterinde **YOKTUR**; geri
+dönerken hangi defterin geçerli olduğuna karar verin (ikisini birleştirmeyin — aynı
+`entry_order_id` iki kez girer).
+
+### Container yolunun tuzakları
+
+| Tuzak | Neden | Ne yapılır |
+|---|---|---|
+| **`BINANCE_BIND_IP` dolu** | Sunucudaki NordVPN policy routing çözümü soketi belirli bir **yerel IP**'ye bind eder. Bridge ağında container'ın ağ ad alanı ayrıdır, o IP orada **yoktur** → `EADDRNOTAVAIL`. | `.env`'de boşaltın (418 weight riski geri gelir, bkz. "REST ağırlık bütçesi"), ya da **yalnız Linux'ta** `docker-compose.yml`'de `network_mode: host` açıp `ports:`i kaldırın. ⛔ O durumda `command:`i de `--host 127.0.0.1` yapın: host ağında `--host 0.0.0.0` panoyu **TÜM arayüzlere** açar ve `ports:`in sağladığı localhost kısıtı kalkar. `docker_run.sh` bunu UYARIR. |
+| **`--workers 2` cazibesi** | Bot **tek asyncio sürecidir**; state dosyaları, cooldown, sembol rezervasyonu ve pozisyon devralma süreç-genelidir. worker>1 = iki bağımsız motor = yukarıdaki "iki motor" felaketi. | `--workers 1` `Dockerfile`'da sabittir ve `tests/test_container.py` ile kilitlidir. Değiştirmeyin. |
+| **Pano dışarı açık** | Erişim logu `?secret=` içerir. | Varsayılan yayın `127.0.0.1:9091` — dışarı açmak için bilinçli `TRADINGBOT_BIND=0.0.0.0`. Uzaktan bakmak için ssh tüneli kullanın. |
+| **`unhealthy` damgası** | Docker `unhealthy` container'ı **yeniden başlatmaz** — bu KASITLIDIR: açık pozisyonu olan motoru sağlık yoklaması yüzünden restart döngüsüne sokmak zararlıdır. | Damgayı teşhis olarak okuyun; `scripts/docker_run.sh --logs` ile bakın. **autoheal benzeri araç KURMAYIN.** |
+| **`restart: unless-stopped` ↔ "418'de restart yasak"** | Süreç ÇÖKERSE docker onu `docker_run.sh` kapılarını (ban penceresi, entry-halt) atlayarak geri getirir — CLAUDE.md yasak #3 ile gerilim. | Bilinçli seçim: alternatifi (`restart: no`) açık pozisyonlu botu süresiz kapalı bırakır ki bu daha büyük zarardır. Emniyet, uygulamanın KENDİ fail-closed kapılarıdır (yukarıdaki `state/` satırı: kilit kalıcı ve bozuk dosya bile halt sayılıyor — ölçüldü). Tekrarlayan çökmede doğru tepki `docker_run.sh --down` ile DURDURUP nedeni incelemektir. |
+| **Kapanış süresi** | SIGTERM → lifespan `finally` → bekleyen MAKER girişleri iptal edilir (ağ çağrısı). Süre yetmezse SIGKILL gelir, iptal edilmemiş LIMIT emirleri **borsada asılı kalır**. | `stop_grace_period: 120s` verilidir; `docker stop -t 120` ya da `docker_run.sh --down` kullanın, `docker kill` **kullanmayın**. |
+| **İkinci halka kazara açılır** | `docker-compose.yml` `tradingbot-follower` servisini taşır. | `profiles: ["follower"]` ile **varsayılan kapalıdır**; `docker compose up` başlatmaz. Zaten tercih edilen kurulum gömülü moddur (D20b). |
+| **Zaman dilimi** | Ban penceresi ve loguru damgaları **yerel** saattir; modellerde naive `utcnow` kullanılır, yani günlük PnL rollover'ı ve cooldown pencereleri TZ'ye duyarlıdır. | Container `TZ=UTC` sabitlenmiştir (ölçüldü: `date -u +%Z` → `UTC`), host'un TZ'sinden bağımsızdır. Ama **saatin DOĞRU olması** ayrı bir iştir — host'ta NTP açık olmalı (yoksa Binance `-1021`). |
+| **`state/` kalıcı olmazsa** | `state/scalper_entry_halt.json`, `risk_event_halt.json`, `tv_events.json` **fail-closed güvenlik dosyalarıdır**. Kalıcı olmasalardı restart entry-halt kilidini SESSİZCE siler ve bot kilitten sonra işlem açmaya devam ederdi. | `./state` kalıcı bind-mount'tur. **Ölçüldü:** host'a yazılan halt dosyası container içinde görüldü, uygulama `entry_halted=true` raporladı; dosya BOZUK olduğunda da `🚨 entry halt state okunamadı … fail-closed kapalı` (CRITICAL) ile **halt aktif** sayıldı. |
+| **sqlite'ı ağ dosya sistemine koymak** | NFS/SMB/bazı overlay katmanları POSIX kilitlerini doğru uygulamaz; sqlite WAL **bozulur**. | `./data` **yerel** disk üstünde olmalı. Uzak depolama gerekiyorsa yedeği oraya kopyalayın, canlı defteri değil. |
+| **Adli kayıt (forensics) kuyruğu** | `src/strategies/scalper/forensics_log.py` satırları bir **daemon** yazıcı iş parçacığının kuyruğunda tutar; `drain()` fonksiyonu VARDIR ama üretim kapanış yolunda **ÇAĞRILMAZ** — kapanışta kuyrukta bekleyen satırlar kaybolabilir. | Container'a ÖZGÜ değildir (supervisord restart'ında da aynı). D21 gereği forensics **yalnız gözlemdir**, motor davranışını etkilemez → işlem riski yok, teşhis boşluğu var. Ayrı bir değişiklikte lifespan kapanışına `forensics_log.drain()` eklenmeli. |
+
+### Container ↔ supervisord farkları (bilerek)
+* **Bind adresi:** supervisord `--host 127.0.0.1`, container `--host 0.0.0.0` (container
+  ağ ad alanının içi) + host'ta `127.0.0.1:9091` yayını. Dışarıya açıklık aynıdır.
+* **Defter yolu:** `./tradingbot.db` → `./data/tradingbot.db` (yukarıdaki WAL gerekçesi).
+* **Kullanıcı:** container root DEĞİL (`bot`, uid 10001). `docker_run.sh` bind-mount
+  dizinlerinin sahipliğini buna göre ayarlar; ayarlayamazsa host kullanıcınıza düşer
+  (her iki durumda da root değildir).
+* **Python:** `python:3.12-slim` — CI ve sunucu venv'i ile **aynı minor sürüm**
+  (`.github/workflows/ci.yml`: *"Sunucu venv'i Python 3.12 — CI aynı sürümü kullanır
+  (parite)"*). Parite
+  `tests/test_container.py::test_dockerfile_python_version_matches_ci_and_server` ile
+  kilitlidir; aksi hâlde "container'da testler geçti" bir deploy kapısı sayılmazdı.
+* **Erişim logu:** supervisord'da `logs/supervisor.log` (**secret içerir, dökme**).
+  Container'da böyle bir dosya YOKTUR; uvicorn erişim logu stdout'a → docker
+  `json-file` sürücüsüne gider. Sızıntı riski `src/main.py`'deki
+  `_SecretRedactionLogFilter` ile kapalıdır. **Ölçüldü:** container'a
+  `?secret=<değer>` içeren istek atıldı; `docker logs` çıktısında satır
+  `"GET /scalper/status?secret=*** HTTP/1.1" 200 OK` olarak göründü, ham değer
+  loglarda **bulunamadı**. Yine de `docker logs`u harici bir log toplayıcıya
+  yönlendirmeden önce bunu kendi kurulumunuzda doğrulayın.
+
+### Bu bölümdeki iddiaların kanıtı (2026-08-24, yerel docker 27.4.0 / aarch64)
+`scripts/docker_run.sh`in ve compose'un iddiaları **ölçülerek** yazıldı:
+görüntü derlendi (715 MB, ~2 dk), container `env.example` ile ayağa kalktı,
+`/health` **503 degraded** döndü (beklenen: sahte anahtarla
+`Binance [401] -2014 API-key format invalid`), `/dashboard` 200 (88 KB),
+defter mount edilen `data/` içinde oluştu, `docker stop -t 120` **1 sn**'de
+`exit=0` ile bitti ve kapanış zinciri loga düştü
+(`🛑 Uygulama kapatılıyor… → Scalper motoru durduruldu → Orchestrator kapatıldı
+→ Veritabanı bağlantıları kapatıldı → ✅ Uygulama kapatıldı`).
+Aynı akış `tests/test_container.py::test_smoke_build_and_health` ile
+tekrarlanabilir (docker varsa koşar, yoksa atlanır).
 
 ## REST ağırlık bütçesi (D22) — ölçüm AÇIK, geri çekilme **VARSAYILAN KAPALI**
 Binance USDⓈ-M IP ağırlık sınırı **2400/dk** ve sayaç **IP GENELİDİR** (aynı çıkış IP'sindeki

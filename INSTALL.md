@@ -25,22 +25,26 @@ TELEGRAM_CHAT_ID=your_chat_id
 OPENAI_API_KEY=your_openai_key
 ```
 
-### 3. Docker Container'ları Başlat
+### 3. Container'ı Başlat
 
 ```bash
-docker-compose up -d
+scripts/docker_run.sh
 ```
+
+> ⛔ Çıplak `docker compose up` KULLANMAYIN — entry-halt kilidini, 418 ban
+> penceresini ve supervisord ile çakışma kapısını atlar. Bkz.
+> `docs/RUNBOOK.md` → "Container ile çalıştırma / başka sunucuya taşıma".
 
 ### 4. Logları Kontrol Et
 
 ```bash
-docker-compose logs -f trading-bot
+scripts/docker_run.sh --logs   # secret REDAKSİYONLU
 ```
 
 ### 5. API'yi Test Et
 
 ```bash
-curl http://localhost:8000/health
+curl http://127.0.0.1:9091/health
 ```
 
 ## Manuel Kurulum (Docker Olmadan)
@@ -165,37 +169,45 @@ curl http://localhost:8000/stats
 curl -X POST "http://localhost:8000/signal?message=YOUR_SIGNAL_HERE"
 ```
 
-## Docker Komutları
+## Container Komutları
 
-### Logları İzle
+Servis adı `tradingbot`, port **9091** (halka tablosu: `docs/RUNBOOK.md`).
+Tümü `scripts/docker_run.sh` üzerinden yapılır — güvenlik kapıları oradadır.
+
+### Logları İzle (secret redaksiyonlu)
 
 ```bash
-docker-compose logs -f trading-bot
+scripts/docker_run.sh --logs
 ```
 
-### Container'ı Yeniden Başlat
+### Yeniden Başlat
 
 ```bash
-docker-compose restart trading-bot
+scripts/docker_run.sh --down && scripts/docker_run.sh --no-build
 ```
 
-### Container'ları Durdur
+### Durdur (graceful — bekleyen emirler iptal edilsin)
 
 ```bash
-docker-compose down
-```
-
-### Verileri Sil (Dikkat!)
-
-```bash
-docker-compose down -v
+scripts/docker_run.sh --down
 ```
 
 ### İmajı Yeniden Oluştur
 
 ```bash
-docker-compose up -d --build
+scripts/docker_run.sh          # build + up + sağlık
+scripts/docker_run.sh --build-only
 ```
+
+### Testleri container İÇİNDE koş (deploy kapısı)
+
+```bash
+docker compose -p tradingbot exec tradingbot python -m pytest tests -q -p no:cacheprovider
+```
+
+> ⚠️ `docker compose down -v` **KULLANMAYIN**: kalıcı veri (defter, state,
+> loglar) bind-mount'tadır ama `-v` alışkanlığı isimli volume kullanan bir
+> kurulumda **işlem defterini siler**.
 
 ## Sorun Giderme
 
