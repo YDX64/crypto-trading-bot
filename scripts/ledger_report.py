@@ -15,6 +15,7 @@ Veritabanına/`.env`'e/sunucuya ASLA yazmaz, sadece OKUR.
 Kullanım:
     python3 scripts/ledger_report.py --since "2026-08-21 12:35" --format md
     python3 scripts/ledger_report.py --since "2026-08-21" --forensics   # D21 etiket × sonuç
+    python3 scripts/ledger_report.py --since "2026-08-21" --ai          # D23 AI gölge raporu
     python3 scripts/ledger_report.py --since "2026-08-14" --until "2026-08-21" \
         --btc-klines-json data/btc_1d.json --format json --out report.json
 
@@ -436,6 +437,371 @@ def _group_stats(trades: List[ClosedTrade]) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# AI karar katmanı gölge raporu (D23)
+# --------------------------------------------------------------------------
+# Veri kaynağı: `scalp_trades.forensics` JSON belgesindeki `document["ai"]`
+# bloğu (`src/strategies/scalper/tracker.py::attach_ai` yazar; MIGRATION YOK).
+# Bu bölüm YALNIZ GÖZLEMDİR: gölge modda hiçbir karar UYGULANMAZ, dolayısıyla
+# "engellenen" küme aslında GİRİLMİŞ ve kapanmış işlemlerdir — "AI dinlenseydi
+# ne olurdu" sorusunun gerçekleşmiş (ama EKSİK, bkz. E8.6) cevabıdır.
+
+#: `src/strategies/scalper/ai_gate.py::AXES` ile AYNI adlar ve sıra.
+#: FORENSICS_TAG_LABELS ile aynı gerekçe: bu script bilinçli olarak yalnız
+#: stdlib kullanır (sunucuda `.venv` olmadan da koşabilmeli), bu yüzden liste
+#: TEKRARLANIR. Ayrışma `tests/test_ledger_report.py` ile yakalanır.
+AI_AXES: List[str] = [
+    "regime_fit",
+    "tv_confluence_depth",
+    "stop_sanity",
+    "crowding",
+    "structure_conflict",
+]
+
+#: `ai_gate.py`'deki kayıt durumları. Sıfır sayılı olanlar da tabloda görünür:
+#: "hiç ai_malformed yok" ile "bu alana hiç bakmadık" karıştırılmamalıdır.
+AI_STATUS_ORDER: List[str] = [
+    "ok",
+    "ai_unavailable",
+    "ai_malformed",
+    "ai_stale",
+    "ai_budget_exhausted",
+    "ai_skipped",
+    "ai_runaway",
+]
+
+#: "AI bloğu yok" = "AI izin verdi" DEĞİLDİR — raporun en kolay yanlış okunan
+#: yeri burasıdır, bu yüzden not ZORUNLUDUR.
+AI_NO_BLOCK_NOTE = (
+    "AI bloğu OLMAYAN kapanmış işlemler 'AI izin verdi' anlamına GELMEZ: "
+    "katman kapalıyken, bütçe bittiğinde ya da karar dolumdan sonra "
+    "yetişmediğinde blok hiç yazılmaz. Kapsama satırındaki 'yok' sayısı bir "
+    "örneklem eksiğidir, bir onay değil."
+)
+
+#: docs/EXPERIMENTS.md E8.6 — gölge ölçümünün yapısal alt sınırı.
+AI_CAPACITY_NOTE = (
+    "E8.6 UYARISI: Gölgede kapasite BOŞALMAZ — bir girişi engellemenin "
+    "faydasının büyük kısmı, boşalan işgal penceresine giren YENİ işlemlerden "
+    "gelir (docs/EXPERIMENTS.md E8.6: 11 işlem / +1217.4). Bu rapor faydanın "
+    "EN KÜÇÜK parçasını ölçer; 'engellenenlerin PnL'i' bir ALT SINIRDIR."
+)
+
+
+def _ai_float(value: Any) -> Optional[float]:
+    """Sayıya çevir; sayı değilse ya da NaN/sonsuzsa None (rapor uydurmaz)."""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(out) or math.isinf(out):
+        return None
+    return out
+
+
+def load_ai_rows(
+    db_path: str,
+    since: datetime,
+    until: datetime,
+    strategy: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Kapanmış işlemlerin (AI kaydı, pnl) çiftleri + uyarı notları.
+
+    `forensics` sütunu YOKSA (eski DB) ya da JSON bozuksa eksik/boş veriyle
+    döner — rapor ÇÖKMEZ, eksiklik nota yazılır (`load_forensics_rows` deseni).
+
+    `verdict` YALNIZ `status == "ok"` kayıtlarında anlamlıdır; fail-open
+    kayıtlarında (ai_unavailable/ai_malformed/...) alan yoktur ve OKUNMAZ.
+    """
+    wanted_strategy = (strategy or "").strip().upper() or None
+    notes: List[str] = [AI_CAPACITY_NOTE]
+    con = sqlite3.connect(db_path)
+    try:
+        con.row_factory = sqlite3.Row
+        try:
+            cur = con.execute(
+                "SELECT id, strategy, realized_pnl, closed_at, forensics "
+                "FROM scalp_trades WHERE status = 'CLOSED'"
+            )
+        except sqlite3.OperationalError as exc:
+            notes.append(
+                f"AI kararları okunamadı ({exc}); bu bölüm boş — "
+                f"scalp_trades.forensics sütunu yok (D21 öncesi DB)."
+            )
+            return [], notes
+        raw_rows = cur.fetchall()
+    finally:
+        con.close()
+
+    rows: List[Dict[str, Any]] = []
+    without = 0
+    broken_json = 0
+    broken_block = 0
+    for row in raw_rows:
+        if wanted_strategy is not None:
+            if str(row["strategy"] or "").strip().upper() != wanted_strategy:
+                continue
+        closed_dt = _parse_db_timestamp(row["closed_at"])
+        if closed_dt is None or not (since <= closed_dt <= until):
+            continue
+
+        document: Dict[str, Any] = {}
+        if row["forensics"]:
+            try:
+                parsed = json.loads(row["forensics"])
+                if isinstance(parsed, dict):
+                    document = parsed
+                else:
+                    broken_json += 1
+            except (TypeError, ValueError):
+                broken_json += 1
+
+        record = document.get("ai")
+        entry: Dict[str, Any] = {
+            "id": row["id"],
+            "pnl": float(row["realized_pnl"] or 0.0),
+            "has_ai": False,
+            "status": None,
+            "verdict": None,
+            "confidence": None,
+            "axes": {},
+            "pattern_ids": [],
+            "latency_ms": None,
+            "schema_version": None,
+        }
+        if record is not None and not isinstance(record, dict):
+            broken_block += 1
+            record = None
+        if isinstance(record, dict):
+            entry["has_ai"] = True
+            entry["status"] = str(record.get("status") or "").strip().lower() or "?"
+            entry["schema_version"] = record.get("schema_version")
+            entry["latency_ms"] = _ai_float(record.get("latency_ms"))
+            # Fail-open kayıtlarında verdict/axes/pattern_ids YOKTUR; olsa
+            # bile okunmaz — "ok olmayan bir karar" bir karar değildir.
+            if entry["status"] == "ok":
+                side = str(record.get("verdict") or "").strip().lower()
+                entry["verdict"] = side if side in ("allow", "deny") else None
+                entry["confidence"] = _ai_float(record.get("confidence"))
+                raw_axes = record.get("axes")
+                if isinstance(raw_axes, dict):
+                    axes: Dict[str, float] = {}
+                    for name, value in raw_axes.items():
+                        num = _ai_float(value)
+                        if num is not None:
+                            axes[str(name)] = num
+                    entry["axes"] = axes
+                raw_patterns = record.get("pattern_ids")
+                if isinstance(raw_patterns, list):
+                    seen: List[str] = []
+                    for name in raw_patterns:
+                        text = str(name or "").strip()
+                        if text and text not in seen:
+                            seen.append(text)
+                    entry["pattern_ids"] = seen
+        else:
+            without += 1
+        rows.append(entry)
+
+    if without:
+        notes.append(
+            f"{without} kapanmış işlemde AI kaydı YOK (katman kapalı, bütçe "
+            f"bitmiş ya da karar yetişmemiş). " + AI_NO_BLOCK_NOTE
+        )
+    else:
+        notes.append(AI_NO_BLOCK_NOTE)
+    if broken_json:
+        notes.append(
+            f"{broken_json} işlemin forensics JSON'u ayrıştırılamadı; o "
+            f"satırlar 'AI kaydı yok' sayıldı."
+        )
+    if broken_block:
+        notes.append(
+            f"{broken_block} işlemin 'ai' bloğu sözlük değil (bozuk kayıt); "
+            f"o satırlar 'AI kaydı yok' sayıldı."
+        )
+    return rows, notes
+
+
+def _mean_ci95(
+    values: List[float],
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """(ortalama, GA-alt, GA-üst). n<2 ise GA hesaplanamaz -> (ort, None, None).
+
+    Örneklem standart sapması (n-1) ile normal yaklaşım:
+    ort ± 1.96 * sd / sqrt(n). Kenar ince olduğu için GA'sız bir ortalama
+    karar dayanağı sayılmaz.
+    """
+    n = len(values)
+    if n == 0:
+        return None, None, None
+    mean = sum(values) / n
+    if n < 2:
+        return mean, None, None
+    variance = sum((v - mean) ** 2 for v in values) / (n - 1)
+    half = 1.96 * math.sqrt(variance) / math.sqrt(n)
+    return mean, mean - half, mean + half
+
+
+def _pearson(xs: List[float], ys: List[float]) -> Optional[float]:
+    """Pearson r — elle hesaplanır (numpy/scipy YOK; script saf stdlib kalmalı).
+
+    Sabit varyansta (payda 0) korelasyon TANIMSIZDIR -> None. 0.0 döndürmek
+    "ilişki yok" der; oysa doğru cevap "ölçülemez"dir.
+    """
+    n = len(xs)
+    if n != len(ys) or n < 2:
+        return None
+    if min(xs) == max(xs) or min(ys) == max(ys):
+        return None  # sabit eksen ya da sabit sonuç: tanımsız
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    sxx = sum((x - mx) ** 2 for x in xs)
+    syy = sum((y - my) ** 2 for y in ys)
+    # Kayan nokta artığı: hepsi aynı olan bir eksende bile kareler toplamı
+    # TAM 0 çıkmayabilir (altı tane 0.4'ün ortalaması 0.4 değildir) ve
+    # 1e-32/1e-32 bölmesi UYDURMA bir r üretir. Eşik ölçeğe GÖRELİdir;
+    # eksen değerleri 4 haneye yuvarlandığı için gerçek varyans bunun
+    # milyarlarca katıdır, meşru sinyal elenmez.
+    x_scale = max(abs(v) for v in xs) or 1.0
+    y_scale = max(abs(v) for v in ys) or 1.0
+    if sxx <= n * (x_scale * 1e-9) ** 2 or syy <= n * (y_scale * 1e-9) ** 2:
+        return None
+    r = sxy / math.sqrt(sxx * syy)
+    return max(-1.0, min(1.0, r))  # kayan nokta taşmasını kırp
+
+
+def _percentile(values: List[float], pct: float) -> Optional[float]:
+    """En yakın sıra (nearest-rank) yüzdelik. Boş listede None."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = int(math.ceil(pct / 100.0 * len(ordered)))
+    idx = min(len(ordered) - 1, max(0, rank - 1))
+    return float(ordered[idx])
+
+
+def _ai_set_stats(pnls: List[float]) -> Dict[str, Any]:
+    """Bir küme (deny/allow/taban) için GERÇEKLEŞMİŞ sonuç istatistikleri."""
+    n = len(pnls)
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+    mean, low, high = _mean_ci95(pnls)
+    return {
+        "trades": n,
+        "wins": len(wins),
+        "winrate": (len(wins) / n * 100.0) if n else 0.0,
+        "pnl": sum(pnls),
+        "avg_pnl": mean if mean is not None else 0.0,
+        "ci95_low": low,
+        "ci95_high": high,
+        "profit_factor": _profit_factor(sum(wins), abs(sum(losses))),
+    }
+
+
+def build_ai_report(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """D23 gölge raporu: kapsama + deny/allow kümeleri + eksen korelasyonu +
+    maliyet + kalıp × sonuç.
+
+    Taban (`baseline`) TÜM kapanmış işlemlerdir — AI kaydı olsun olmasın.
+    İzin verilen kümenin PF'i tabandan yüksek değilse "AI eliyor" iddiası
+    kendi verisiyle çürütülmüş demektir.
+    """
+    section_notes: List[str] = []
+
+    status_counts: Dict[str, int] = {name: 0 for name in AI_STATUS_ORDER}
+    with_ai = 0
+    for row in rows:
+        if not row.get("has_ai"):
+            continue
+        with_ai += 1
+        status = str(row.get("status") or "?")
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+    coverage = {
+        "closed_trades": len(rows),
+        "with_ai": with_ai,
+        "without_ai": len(rows) - with_ai,
+        "status_counts": status_counts,
+    }
+
+    deny = _ai_set_stats([r["pnl"] for r in rows if r.get("verdict") == "deny"])
+    allow = _ai_set_stats([r["pnl"] for r in rows if r.get("verdict") == "allow"])
+    baseline = _ai_set_stats([r["pnl"] for r in rows])
+
+    for name, stats in (("Engellenen (deny)", deny), ("İzin verilen (allow)", allow)):
+        if stats["trades"] < 2:
+            section_notes.append(
+                f"{name} kümesinde n={stats['trades']} — %95 güven aralığı "
+                f"hesaplanamaz ('—'); bu küme kanıt taşımaz."
+            )
+
+    # Eksen × PnL: her eksen AYRI ölçülür. Tek bir "AI skoru" hangi eksenin
+    # işe yaradığını gizler; D23'ün ölçüm tasarımı bunu yasaklar.
+    axis_names: List[str] = list(AI_AXES)
+    for row in rows:
+        for name in row.get("axes") or {}:
+            if name not in axis_names:
+                axis_names.append(name)
+
+    axes_table: List[Dict[str, Any]] = []
+    for name in axis_names:
+        xs: List[float] = []
+        ys: List[float] = []
+        for row in rows:
+            value = (row.get("axes") or {}).get(name)
+            if value is None:
+                continue
+            xs.append(float(value))
+            ys.append(float(row["pnl"]))
+        axes_table.append({"axis": name, "n": len(xs), "pearson_r": _pearson(xs, ys)})
+
+    latencies = [
+        float(r["latency_ms"]) for r in rows
+        if r.get("has_ai") and r.get("latency_ms") is not None
+    ]
+    cost = {
+        "decisions": len(latencies),
+        "latency_p50_ms": _percentile(latencies, 50.0),
+        "latency_p95_ms": _percentile(latencies, 95.0),
+        # Token/ücret DB'de TAŞINMIYOR. Tahmin etmek uydurmaktır; alan
+        # bilinçli olarak "ölçülemedi" der (CLAUDE.md yasak #6).
+        "tokens": None,
+        "cost_note": "ölçülemedi (DB token/ücret taşımıyor)",
+    }
+
+    buckets: Dict[str, List[float]] = {}
+    for row in rows:
+        for name in row.get("pattern_ids") or []:
+            buckets.setdefault(name, []).append(float(row["pnl"]))
+    patterns: List[Dict[str, Any]] = []
+    for name, pnls in buckets.items():
+        stats = _ai_set_stats(pnls)
+        patterns.append({
+            "pattern": name,
+            "trades": stats["trades"],
+            "winrate": stats["winrate"],
+            "pnl": stats["pnl"],
+            "avg_pnl": stats["avg_pnl"],
+            "profit_factor": stats["profit_factor"],
+        })
+    # En zararlıdan en kârlıya — bir kalıbın "işe yarar" olduğu iddiası
+    # tablonun üst satırlarında çürütülür.
+    patterns.sort(key=lambda item: (item["pnl"], -item["trades"]))
+
+    return {
+        "coverage": coverage,
+        "deny": deny,
+        "allow": allow,
+        "baseline": baseline,
+        "axes": axes_table,
+        "cost": cost,
+        "patterns": patterns,
+        "notes": section_notes,
+    }
+
+
+# --------------------------------------------------------------------------
 # Tablolar
 # --------------------------------------------------------------------------
 
@@ -652,9 +1018,10 @@ def build_report(
     days: List[str],
     notes: List[str],
     forensics: Optional[List[Dict[str, Any]]] = None,
+    ai: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    # `forensics` YOKSA anahtar hiç eklenmez (renderer'lar `is not None` ile
-    # bölümü açar). Tek gövde: iki ayrı sözlük tutmak, birine eklenen bir
+    # `forensics`/`ai` YOKSA anahtar hiç eklenmez (renderer'lar `is not None`
+    # ile bölümü açar). Tek gövde: iki ayrı sözlük tutmak, birine eklenen bir
     # alanın diğerinde unutulmasına davetiyedir (D21-R3, bulgu 5).
     headline = build_headline(trades, daily_changes, days)
     report: Dict[str, Any] = {
@@ -673,6 +1040,8 @@ def build_report(
     }
     if forensics is not None:
         report["forensics"] = forensics
+    if ai is not None:
+        report["ai"] = ai
     report["notes"] = notes
     return report
 
@@ -766,6 +1135,86 @@ _TABLE4_HEADERS = ["Gün", "Rejim", "BTC%", "İşlem", "GünPnL", "KümülatifPn
 _TABLE5_HEADERS = ["Etiket", "İşlem", "WR%", "PnL", "Ort.PnL", "PF", "Anlamı"]
 
 
+_TABLE6_HEADERS = ["Küme", "İşlem", "WR%", "PnL", "Ort.PnL", "%95 GA (ort.)", "PF"]
+_TABLE7_HEADERS = ["Eksen", "n", "Pearson r (eksen ~ PnL)"]
+_TABLE8_HEADERS = ["Kalıp", "İşlem", "WR%", "PnL", "Ort.PnL", "PF"]
+
+
+def _fmt_ci(low: Optional[float], high: Optional[float]) -> str:
+    """Güven aralığı metni; hesaplanamadıysa (n<2) '—' — sıfır DEĞİL."""
+    if low is None or high is None:
+        return "—"
+    return f"{low:.2f} .. {high:.2f}"
+
+
+def _fmt_r(value: Optional[float]) -> str:
+    """Pearson r; tanımsızsa (sabit eksen) '—' — 0.0 DEĞİL."""
+    return "—" if value is None else f"{value:+.3f}"
+
+
+def _fmt_ms(value: Optional[float]) -> str:
+    return "—" if value is None else f"{value:.0f}"
+
+
+def _ai_set_rows(report: Dict[str, Any]) -> List[List[str]]:
+    """Tablo 6: engellenen / izin verilen / taban kümelerinin karşılaştırması."""
+    ai = report.get("ai") or {}
+    rows: List[List[str]] = []
+    for label, key in (
+        ("ENGELLENEN (deny)", "deny"),
+        ("İZİN VERİLEN (allow)", "allow"),
+        ("TABAN (tüm işlemler)", "baseline"),
+    ):
+        stats = ai.get(key) or {}
+        if not stats:
+            continue
+        rows.append([
+            label,
+            str(stats["trades"]),
+            f"{stats['winrate']:.1f}",
+            f"{stats['pnl']:.2f}",
+            f"{stats['avg_pnl']:.2f}",
+            _fmt_ci(stats["ci95_low"], stats["ci95_high"]),
+            _fmt_pf(stats["profit_factor"]),
+        ])
+    return rows
+
+
+def _ai_axis_rows(report: Dict[str, Any]) -> List[List[str]]:
+    ai = report.get("ai") or {}
+    return [
+        [item["axis"], str(item["n"]), _fmt_r(item["pearson_r"])]
+        for item in ai.get("axes") or []
+    ]
+
+
+def _ai_pattern_rows(report: Dict[str, Any]) -> List[List[str]]:
+    ai = report.get("ai") or {}
+    return [
+        [item["pattern"], str(item["trades"]), f"{item['winrate']:.1f}",
+         f"{item['pnl']:.2f}", f"{item['avg_pnl']:.2f}", _fmt_pf(item["profit_factor"])]
+        for item in ai.get("patterns") or []
+    ]
+
+
+def _ai_coverage_lines(ai: Dict[str, Any]) -> List[str]:
+    """Kapsama + maliyet satırları (text ve md aynı sayıları yazsın diye tek yer)."""
+    cov = ai["coverage"]
+    cost = ai["cost"]
+    status_txt = ", ".join(
+        f"{name}={count}" for name, count in cov["status_counts"].items()
+    ) or "(kayıt yok)"
+    return [
+        f"Kapsama: {cov['closed_trades']} kapanmış işlem — AI kaydı OLAN "
+        f"{cov['with_ai']}, OLMAYAN {cov['without_ai']}.",
+        f"Durum kırılımı: {status_txt}",
+        f"Gecikme (ms): p50={_fmt_ms(cost['latency_p50_ms'])} "
+        f"p95={_fmt_ms(cost['latency_p95_ms'])} "
+        f"(ölçülen karar: {cost['decisions']})",
+        f"Token/ücret maliyeti: {cost['cost_note']}",
+    ]
+
+
 def _forensics_rows(report: Dict[str, Any]) -> List[List[str]]:
     rows: List[List[str]] = []
     for item in report.get("forensics") or []:
@@ -841,6 +1290,27 @@ def render_text(report: Dict[str, Any]) -> str:
             " sayısını aşabilir.)"
         )
 
+    ai = report.get("ai")
+    if ai is not None:
+        lines.append("")
+        lines.append("5c) AI KARAR KATMANI — GÖLGE RAPORU (D23)")
+        for line in _ai_coverage_lines(ai):
+            lines.append(f"   {line}")
+        lines.append("")
+        lines.append(_render_table(_TABLE6_HEADERS, _ai_set_rows(report)))
+        lines.append("")
+        lines.append("   Eksen x PnL korelasyonu:")
+        lines.append(_render_table(_TABLE7_HEADERS, _ai_axis_rows(report)))
+        lines.append("")
+        lines.append("   Kalıp x sonuç:")
+        lines.append(_render_table(_TABLE8_HEADERS, _ai_pattern_rows(report)))
+        lines.append(
+            "   (Bir işlem birden çok kalıp taşıyabilir — satır toplamı işlem"
+            " sayısını aşabilir.)"
+        )
+        for note in ai.get("notes") or []:
+            lines.append(f"   - {note}")
+
     lines.append("")
     lines.append("6) SOAK KONTROL LİSTESİ (docs/MAINNET_PLAN.md §2 madde 3)")
     for item in report["checklist"]:
@@ -909,6 +1379,28 @@ def render_md(report: Dict[str, Any]) -> str:
             "sayısını aşabilir._"
         )
 
+    ai = report.get("ai")
+    if ai is not None:
+        lines.append("")
+        lines.append("## 5c) AI karar katmanı — gölge raporu (D23)")
+        for line in _ai_coverage_lines(ai):
+            lines.append(f"- {line}")
+        lines.append("")
+        lines.append(_render_md_table(_TABLE6_HEADERS, _ai_set_rows(report)))
+        lines.append("")
+        lines.append("**Eksen × PnL korelasyonu**")
+        lines.append(_render_md_table(_TABLE7_HEADERS, _ai_axis_rows(report)))
+        lines.append("")
+        lines.append("**Kalıp × sonuç**")
+        lines.append(_render_md_table(_TABLE8_HEADERS, _ai_pattern_rows(report)))
+        lines.append("")
+        lines.append(
+            "_Bir işlem birden çok kalıp taşıyabilir — satır toplamı işlem "
+            "sayısını aşabilir._"
+        )
+        for note in ai.get("notes") or []:
+            lines.append(f"- {note}")
+
     lines.append("")
     lines.append("## 6) Soak kontrol listesi (`docs/MAINNET_PLAN.md` §2 madde 3)")
     for item in report["checklist"]:
@@ -971,6 +1463,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help=(
             "işlem adli kaydı (D21) etiket × sonuç bölümünü ekle "
             "(scalp_trades.forensics sütunu; yoksa bölüm boş kalır)"
+        ),
+    )
+    parser.add_argument(
+        "--ai", action="store_true",
+        help=(
+            "AI karar katmanının (D23, GÖLGE) kapsama/deny-allow/eksen/maliyet "
+            "bölümünü ekle (scalp_trades.forensics -> document['ai']; yoksa "
+            "bölüm boş kalır)"
         ),
     )
     parser.add_argument("--format", choices=["text", "md", "json"], default="text")
@@ -1041,9 +1541,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         notes.extend(forensics_notes)
         forensics_table = build_forensics_table(forensics_rows)
 
+    ai_section: Optional[Dict[str, Any]] = None
+    if args.ai:
+        ai_rows, ai_notes = load_ai_rows(
+            args.db, since, until, strategy=args.strategy
+        )
+        notes.extend(ai_notes)
+        ai_section = build_ai_report(ai_rows)
+
     report = build_report(
         trades, daily_changes, since, until, days, notes,
         forensics=forensics_table,
+        ai=ai_section,
     )
     output = RENDERERS[args.format](report)
 

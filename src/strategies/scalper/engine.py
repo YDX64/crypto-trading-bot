@@ -298,6 +298,12 @@ class ScalperEngine:
         self._market_gate_warn_at: Dict[str, float] = {}
         # D21 adli kayıt: kurulum hatası bir kez uyarılır, akış etkilenmez.
         self._forensics_error_logged: bool = False
+        # D23 AI karar katmanı (GÖLGE). TEMBEL kurulur: `SCALPER_AI_GATE_MODE`
+        # `off` (varsayılan) iken hiç örneklenmez → sıfır bellek, sıfır çağrı,
+        # bugünküyle birebir aynı davranış. Katman motor yolundan YALNIZ
+        # `_ai_gate_observe` ile çağrılır ve `_entry_lock` DIŞINDADIR.
+        self._ai_gate = None
+        self._ai_gate_error_logged: bool = False
         # Post-mortem turu (kapanıştan N dk sonra) için son çalıştırma anı.
         self._forensics_postmortem_at: float = 0.0
         # Post-mortem AYRI bir arka plan task'ında koşar: safety turu onu
@@ -481,6 +487,15 @@ class ScalperEngine:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+        # D23: bekleyen AI gözlem görevleri (ateşle-unut) askıda kalmasın.
+        # İptalleri hiçbir koruma işini etkilemez — yalnız kayıt düşer.
+        gate = getattr(self, "_ai_gate", None)
+        if gate is not None:
+            try:
+                await gate.aclose()
+            except Exception as e:  # pragma: no cover - savunma
+                self.logger.warning(f"⚠️ AI karar katmanı kapatılamadı: {e}")
 
         # Yeni WS fill olayı ile shutdown iptali yarışmasın; REST terminal
         # reconciliation aşağıda executor kilidi altında devam eder.
@@ -2111,6 +2126,18 @@ class ScalperEngine:
                     # pozisyon artık ownership'i taşıyor; başarısız normal
                     # denemede rezervasyon yukarıda zaten bırakıldı.
                     self._opening_symbols.discard(symbol)
+            # D23 (GÖLGE) AI karar katmanı — `_entry_lock` DIŞINDA ve karar
+            # yolu YUKARIDA BİTTİKTEN sonra. Senkron, O(1) bir çağrıdır:
+            # yalnız sözlük kopyalar ve `asyncio.create_task` ateşler; motor
+            # 0 ms bekler. Katman KAPALIYKEN (varsayılan) hiç örneklenmez.
+            self._ai_gate_observe(
+                symbol=symbol,
+                signal=sig,
+                ctx=ctx,
+                context=forensics_ctx,
+                position=sp,
+                signal_epoch=signal_epoch,
+            )
             # Sembol başına tek deneme: sinyal bulunduğu an (başarılı ya da
             # başarısız) bu sembol için tur biter.
             break
@@ -2121,6 +2148,105 @@ class ScalperEngine:
 
     def _forensics_enabled(self) -> bool:
         return bool(getattr(self.cfg, "scalper_forensics_enabled", True))
+
+    # ------------------------------------------------------------------
+    # AI karar katmanı (D23) — GÖLGE, motor yolunda 0 ms
+    # ------------------------------------------------------------------
+
+    def _ai_gate_mode(self) -> str:
+        mode = str(
+            getattr(self.cfg, "scalper_ai_gate_mode", "off") or "off"
+        ).strip().lower()
+        return mode if mode in ("off", "shadow", "active") else "off"
+
+    def _ai_gate_warn(self, message: str) -> None:
+        """Katman arızasını BİR KEZ duyur; hiçbir akışı kesme (fail-open)."""
+        if not getattr(self, "_ai_gate_error_logged", False):
+            self._ai_gate_error_logged = True
+            self.logger.warning(
+                f"⚠️ AI karar katmanı kurulamadı/çalışmadı ({message}) — bu "
+                f"uyarı bir kez loglanır, GİRİŞLER ETKİLENMEZ (D23 fail-open)"
+            )
+
+    def _ai_gate_layer(self):
+        """Katmanı TEMBEL kur. Kapalıyken (varsayılan) `None` döner."""
+        if self._ai_gate_mode() == "off":
+            return None
+        gate = getattr(self, "_ai_gate", None)
+        if gate is not None:
+            return gate
+        try:
+            from src.strategies.scalper.ai_gate import AiGate
+
+            gate = AiGate(self.cfg, logger=self.logger, tracker=self.tracker)
+        except Exception as e:
+            self._ai_gate_warn(f"{type(e).__name__}: {e}")
+            return None
+        self._ai_gate = gate
+        return gate
+
+    def _ai_gate_observe(
+        self,
+        *,
+        symbol: str,
+        signal: Any,
+        ctx: StrategyContext,
+        context: Optional[Dict[str, Any]],
+        position: Any,
+        signal_epoch: float,
+    ) -> None:
+        """Motor yolundaki TEK AI çağrısı — SENKRON, O(1), fail-open.
+
+        `_entry_lock` DIŞINDADIR ve karar yolu bittikten SONRA çağrılır:
+        gölgede motorun davranışı BAYT BAYT aynıdır. Girdiler zaten kurulmuş
+        `forensics_ctx` + dolum belgesidir; YENİ REST çağrısı YOKTUR.
+        """
+        gate = self._ai_gate_layer()
+        if gate is None:
+            return
+        if context is None:
+            # D23'ün TÜM girdileri D21 bağlamından gelir. Adli kayıt kapalıysa
+            # (ya da bağlam kurulamadıysa) modele sorulacak anlamlı bir şey
+            # yoktur: boş bir payload için para harcamak yerine sessizce
+            # atlanır. Operatör bunu bir kez logda görür.
+            self._ai_gate_warn(
+                "adli giriş bağlamı yok (SCALPER_FORENSICS_ENABLED kapalı mı?)"
+            )
+            return
+        try:
+            candles = list(getattr(ctx, "candles_5m", None) or [])
+            bar_close_time_ms = (
+                int(getattr(candles[-1], "close_time", 0)) if candles else None
+            )
+            trade_id = getattr(position, "trade_id", None)
+            gate.observe(
+                symbol=symbol,
+                direction=getattr(signal, "direction", None),
+                strategy=getattr(signal, "strategy", None),
+                context=context,
+                entry=getattr(position, "forensics_entry", None),
+                trade_id=trade_id,
+                bar_close_time_ms=bar_close_time_ms,
+                signal_epoch=signal_epoch,
+                opened=trade_id is not None,
+            )
+        except Exception as e:
+            self._ai_gate_warn(f"observe {type(e).__name__}: {e}")
+
+    def _ai_gate_snapshot(self) -> Dict[str, Any]:
+        """`/scalper/status` bloğu — motor yolundan BAĞIMSIZ, yalnız bellek."""
+        mode = self._ai_gate_mode()
+        gate = getattr(self, "_ai_gate", None)
+        if gate is None:
+            # Kapalı ya da henüz hiç aday görülmedi: pano "alan yok" ile
+            # "katman kapalı"yı karıştırmasın diye ŞEKİL hep aynıdır.
+            return {"mode": mode, "effective_mode": mode, "enabled": mode != "off"}
+        try:
+            snapshot = dict(gate.snapshot())
+        except Exception as e:  # pragma: no cover - teşhis alanı düşmemeli
+            return {"mode": mode, "error": f"{type(e).__name__}: {e}"}
+        snapshot["enabled"] = mode != "off"
+        return snapshot
 
     def _forensics_warn(self, message: str) -> None:
         """Adli kayıt arızasını BİR KEZ duyur; hiçbir akışı kesme."""
@@ -4623,6 +4749,9 @@ class ScalperEngine:
             "rest_weight": self._rest_weight_snapshot(),
             # D21/D22: adli kayıt yazıcı kuyruğu + post-mortem turu durumu.
             "forensics_queue": self._forensics_queue_snapshot(),
+            # D23: AI karar katmanı (gölge) — mod, kapsama, gecikme, bütçe,
+            # red oranı ve son kararlar. Motor davranışını ETKİLEMEZ.
+            "ai_gate": self._ai_gate_snapshot(),
             "entry_halted": self._entry_halted,
             "entry_halt_reason": self._entry_halt_reason,
             "entry_halted_at": self._entry_halted_at,

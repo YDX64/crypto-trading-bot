@@ -433,6 +433,41 @@
   .ap-note{font-size:11px; color:var(--text-dim); margin-top:8px;}
   .ap-warn{color:var(--loss); font-weight:700;}
 
+  /* --- AI karar katmanı kartı (D23) --- */
+  /* AlgoPro kartıyla aynı görünür ama AYRI sınıflar kullanır: iki kart
+     birbirinden bağımsız değişebilmeli — `ap-*` üzerinde yapılacak bir
+     düzenleme AI kartını sessizce bozmasın. */
+  .ai-grid{
+    display:grid;
+    grid-template-columns:repeat(auto-fit, minmax(150px, 1fr));
+    gap:10px;
+    margin-bottom:12px;
+  }
+  .ai-kv{
+    background:var(--panel-2);
+    border:1px solid var(--border);
+    border-radius:var(--radius);
+    padding:9px 11px;
+  }
+  .ai-kv .k{display:block; font-size:10px; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-faint);}
+  .ai-kv .v{display:block; font-family:var(--mono); font-size:15px; font-weight:700; margin-top:3px;}
+  .ai-kv-sub{display:block; font-family:var(--sans); font-size:10px; font-weight:600; color:var(--text-faint); margin-top:2px;}
+  .ai-note{font-size:11px; color:var(--text-dim); margin-top:8px;}
+  .ai-warn{color:var(--loss); font-weight:700;}
+  .ai-caution{color:var(--orange); font-weight:700;}
+  /* Modelin ürettiği serbest metin tabloyu şişirmesin diye tek satıra
+     kısaltılır; tamamı `title` ile okunur. */
+  .ai-reason{
+    display:inline-block;
+    max-width:320px;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    white-space:nowrap;
+    vertical-align:bottom;
+  }
+  .badge-ai-allow{color:var(--profit); background:var(--profit-bg); border-color:var(--profit-border);}
+  .badge-ai-deny{color:var(--loss); background:var(--loss-bg); border-color:var(--loss-border);}
+
   .badge-status{color:var(--text-dim); background:rgba(255,255,255,0.05); border-color:var(--border);}
   .badge-tp1{color:var(--profit); background:var(--profit-bg); border-color:var(--profit-border);}
   .badge-tp2{color:var(--purple); background:var(--purple-bg); border-color:rgba(163,133,218,0.35);}
@@ -778,6 +813,20 @@
       <div class="ap-grid" id="ap-grid"></div>
       <div class="table-wrap" id="ap-positions-wrap"></div>
       <div class="ap-note" id="ap-note"></div>
+    </div>
+  </div>
+
+  <!-- 2c. AI KARAR KATMANI (D23) — yalnız SCALPER_AI_GATE_MODE != off iken görünür -->
+  <div class="section" id="ai-section" style="display:none;">
+    <div class="section-head">
+      <div class="section-title">AI Karar Katmanı <span class="num" id="ai-state"></span></div>
+      <div class="section-sub" id="ai-sub"></div>
+    </div>
+    <div class="panel">
+      <div class="ai-grid" id="ai-grid"></div>
+      <div class="table-wrap" id="ai-recent-wrap"></div>
+      <div class="ai-note" id="ai-note"></div>
+      <div class="ai-note" id="ai-mode-note"></div>
     </div>
   </div>
 
@@ -1484,6 +1533,214 @@
         escapeHtml(String(f.entry_block_reason)) + '</span>';
     }
     qs("ap-note").innerHTML = (warn ? warn + (notes.length ? " · " : "") : "") + notes.join(" · ");
+  }
+
+  // ---------------------------------------------------------------
+  // AI karar katmanı kartı (D23)
+  // ---------------------------------------------------------------
+  // Verisi /api/status gövdesindeki `ai_gate` bloğundan gelir — pano AYRI
+  // bir yoklama AÇMAZ (2026-08-18 pano-açlığı dersi; nginx beyaz listesinde
+  // zaten yalnız /api/status var, yeni bir uç 404 alırdı). Blok yoksa
+  // (SCALPER_AI_GATE_MODE=off) bölüm gizli kalır ve pano bugünküyle
+  // birebir aynıdır.
+  var AI_MODE_LABELS = { off:"kapalı", shadow:"gölge", active:"aktif" };
+  // Karar dönmeyen durumlar. Kod OLDUĞU GİBİ gösterilir (logda bu isimle
+  // aranır); Türkçe karşılığı yalnız ipucu (`title`) olarak girer.
+  var AI_STATUS_HINTS = {
+    ai_unavailable: "sağlayıcıya ulaşılamadı",
+    ai_malformed: "yanıt biçimsiz / şemaya uymuyor",
+    ai_stale: "yanıt geç geldi (bayat)",
+    ai_budget_exhausted: "günlük çağrı tavanı doldu"
+  };
+
+  function aiKv(key, value, cls){
+    return '<div class="ai-kv"><span class="k">' + escapeHtml(key) + '</span>' +
+      '<span class="v ' + (cls || "") + '">' + value + '</span></div>';
+  }
+
+  function aiModeLabel(mode){
+    if (!mode) return "—";
+    return AI_MODE_LABELS[mode] || String(mode);
+  }
+
+  // Gecikmeler MİLİSANİYEDİR; `fmtDurationSeconds`den geçirilirse 2100 ms
+  // "35 dk" diye okunurdu.
+  function aiMs(n){
+    return isNum(n) ? fmtNum(n, 0) + " ms" : "—";
+  }
+
+  function aiVerdictCell(r){
+    // status "ok" değilse ORTADA karar yoktur: "izin verildi" sanılmasın
+    // diye gri durum kodu yazılır.
+    if (r.status && r.status !== "ok"){
+      var hint = AI_STATUS_HINTS[r.status] || "karar alınamadı";
+      return '<span class="badge badge-status" title="' + escapeHtml(hint) + '">' +
+        escapeHtml(String(r.status)) + '</span>';
+    }
+    if (r.verdict === "allow") return '<span class="badge badge-ai-allow">izin</span>';
+    if (r.verdict === "deny") return '<span class="badge badge-ai-deny">RED</span>';
+    return '<span class="badge badge-status">—</span>';
+  }
+
+  function renderAiGate(statusRes){
+    var section = qs("ai-section");
+    if (!section) return;
+    var g = (statusRes && statusRes.ok && statusRes.data) ? statusRes.data.ai_gate : null;
+    if (!g){
+      section.style.display = "none";
+      return;
+    }
+    section.style.display = "";
+
+    if (g.error){
+      qs("ai-state").textContent = "";
+      qs("ai-sub").textContent = "";
+      qs("ai-grid").innerHTML = "";
+      qs("ai-recent-wrap").innerHTML =
+        '<div class="placeholder">durum okunamadı: ' + escapeHtml(String(g.error)) + '</div>';
+      qs("ai-note").innerHTML = "";
+      qs("ai-mode-note").className = "ai-note";
+      qs("ai-mode-note").textContent = "";
+      return;
+    }
+
+    // Motor yokken / hiç aday görülmemişken blok YALNIZ mod alanlarını
+    // taşıyabilir; kart bu hâlde de çizilmeli (sayaçlar 0 ya da "—" olur).
+    var effMode = g.effective_mode || g.mode || null;
+    var latency = g.latency_ms || {};
+    var tokens = g.tokens || {};
+    var errors = g.errors || {};
+    var recent = Array.isArray(g.recent) ? g.recent : [];
+    var ready = Array.isArray(g.providers_ready) ? g.providers_ready : null;
+    // Motor yokken blok `applies_decisions` taşımayabilir; o hâlde etkin
+    // moddan türetilir — alan yok diye "gölge" yazıp KARARLARIN UYGULANDIĞINI
+    // gizlemek en tehlikeli yanlış okuma olurdu.
+    var applies = (g.applies_decisions === undefined || g.applies_decisions === null)
+      ? (effMode === "active")
+      : !!g.applies_decisions;
+
+    var errorTotal = 0;
+    var errorParts = [];
+    Object.keys(errors).forEach(function(k){
+      var v = errors[k] || 0;
+      if (!v) return;
+      errorTotal += v;
+      errorParts.push(k + " " + v);
+    });
+
+    qs("ai-state").textContent = "(" + aiModeLabel(effMode) + ")";
+    var subParts = [];
+    if (g.budget_day) subParts.push("gün " + g.budget_day);
+    if (g.schema_version) subParts.push("şema " + g.schema_version);
+    if (g.pattern_library_version) subParts.push("kalıp " + g.pattern_library_version);
+    qs("ai-sub").textContent = subParts.join(" · ");
+
+    // `mode` ile `effective_mode` ayrıştıysa (kaçak koruması / eksik anahtar)
+    // İSTENEN mod da yazılır; yoksa "neden aktif değil?" görünmez olurdu.
+    var modeTxt = aiModeLabel(effMode);
+    if (g.mode && effMode && g.mode !== effMode){
+      modeTxt += " (istenen: " + aiModeLabel(g.mode) + ")";
+    }
+
+    var p50 = isNum(latency.p50) ? fmtNum(latency.p50, 0) : "—";
+    var p95 = isNum(latency.p95) ? fmtNum(latency.p95, 0) : "—";
+
+    var grid = "";
+    grid += aiKv("Mod", '<span style="font-size:13px;">' + escapeHtml(modeTxt) + '</span>',
+      g.runaway ? "ai-warn" : "");
+    grid += aiKv("Sağlayıcı",
+      '<span style="font-size:13px;">' + escapeHtml(String(g.provider || "—")) + '</span>' +
+      (ready === null ? "" :
+        (ready.length
+          ? '<span class="ai-kv-sub">hazır: ' + escapeHtml(ready.join(", ")) + '</span>'
+          : '<span class="ai-kv-sub ai-warn">hazır sağlayıcı yok</span>')));
+    grid += aiKv("Model",
+      '<span style="font-size:12px;">' + escapeHtml(String(g.model_version || "—")) + '</span>');
+    grid += aiKv("Kapsama", isNum(g.coverage_pct) ? fmtNum(g.coverage_pct, 1) + "%" : "—");
+    grid += aiKv("JSON geçerliliği", isNum(g.json_valid_pct) ? fmtNum(g.json_valid_pct, 1) + "%" : "—");
+    grid += aiKv("Karar",
+      '<span style="font-size:13px;">izin ' + (g.allow || 0) + " / red " + (g.deny || 0) + '</span>');
+    grid += aiKv("Red oranı", isNum(g.deny_ratio_pct) ? fmtNum(g.deny_ratio_pct, 1) + "%" : "—");
+    grid += aiKv("Gecikme p50/p95",
+      '<span style="font-size:13px;">' + p50 + " / " + p95 + ' ms</span>' +
+      (isNum(latency.samples) ? '<span class="ai-kv-sub">' + latency.samples + ' örnek</span>' : ""));
+    grid += aiKv("Çağrı / tavan",
+      (g.calls || 0) + " / " + (isNum(g.max_calls_per_day) ? g.max_calls_per_day : "?"),
+      g.budget_exhausted ? "ai-caution" : "");
+    grid += aiKv("Günlük tahmini maliyet",
+      isNum(g.cost_estimate_usd_today) ? "$" + fmtNum(g.cost_estimate_usd_today, 4) : "—");
+    grid += aiKv("Aday / işleme dönmeyen", (g.candidates || 0) + " / " + (g.skipped_no_trade || 0));
+    grid += aiKv("Bekleyen", String(g.inflight || 0));
+    grid += aiKv("Hata",
+      String(errorTotal) +
+      (errorParts.length ? '<span class="ai-kv-sub">' + escapeHtml(errorParts.join(" · ")) + '</span>' : ""),
+      errorTotal > 0 ? "ai-caution" : "");
+    qs("ai-grid").innerHTML = grid;
+
+    var wrap = qs("ai-recent-wrap");
+    if (!recent.length){
+      wrap.innerHTML = '<div class="placeholder">henüz karar yok</div>';
+    } else {
+      var html = '<table><thead><tr>' +
+        '<th>Zaman</th><th>Sembol</th><th>Yön</th><th>Karar</th>' +
+        '<th class="num">Güven</th><th class="num">Gecikme</th>' +
+        '<th>Gerekçe</th><th>Kalıp</th>' +
+        '</tr></thead><tbody>';
+      recent.forEach(function(r){
+        var reason = r.reason ? String(r.reason) : "";
+        var patterns = Array.isArray(r.pattern_ids) ? r.pattern_ids.join(", ") : "";
+        // `reason` ve `pattern_ids` bir DİL MODELİNİN ürettiği metindir:
+        // HTML'e asla ham girmez (escapeHtml); `title` da kaçırılmış hâlini
+        // alır.
+        html += '<tr>' +
+          '<td class="cell-dim">' + fmtClock(r.at) + '</td>' +
+          '<td class="cell-symbol">' + escapeHtml(String(r.symbol || "—")) +
+            (r.trade_id ? '<div class="cell-dim">#' + escapeHtml(String(r.trade_id)) + '</div>' : "") +
+            '</td>' +
+          '<td>' + directionBadge(r.direction) + '</td>' +
+          '<td>' + aiVerdictCell(r) + '</td>' +
+          '<td class="num">' + (isNum(r.confidence) ? fmtNum(r.confidence, 2) : "—") + '</td>' +
+          '<td class="num cell-dim">' + aiMs(r.latency_ms) + '</td>' +
+          '<td>' + (reason
+            ? '<span class="ai-reason" title="' + escapeHtml(reason) + '">' + escapeHtml(reason) + '</span>'
+            : '<span class="cell-dim">—</span>') + '</td>' +
+          '<td class="cell-dim">' + (patterns ? escapeHtml(patterns) : "—") + '</td>' +
+          '</tr>';
+      });
+      wrap.innerHTML = html + '</tbody></table>';
+    }
+
+    var notes = [];
+    if (g.runaway){
+      notes.push('<span class="ai-warn">KAÇAK KORUMASI: katman shadow\'a düşürüldü</span>' +
+        (g.runaway_at ? " (" + fmtClock(g.runaway_at) + ")" : ""));
+    }
+    if (g.budget_exhausted){
+      notes.push('<span class="ai-caution">günlük çağrı tavanı doldu (ai_budget_exhausted)</span>');
+    }
+    if (errorTotal > 0){
+      notes.push('<span class="ai-caution">hata sayaçları: ' +
+        escapeHtml(errorParts.join(" · ")) + '</span>');
+    }
+    if (g.last_error){
+      notes.push('<span class="ai-caution">son hata: ' +
+        escapeHtml(String(g.last_error)) + '</span>' +
+        (g.last_error_at ? " (" + fmtClock(g.last_error_at) + ")" : ""));
+    }
+    if (isNum(tokens["in"]) || isNum(tokens.out)){
+      notes.push("jeton: " + fmtNum(tokens["in"] || 0, 0) + " giriş / " +
+        fmtNum(tokens.out || 0, 0) + " çıkış");
+    }
+    if (g.prompt_version) notes.push("istem " + escapeHtml(String(g.prompt_version)));
+    qs("ai-note").innerHTML = notes.join(" · ");
+
+    // SABİT açıklama. Kartın en tehlikeli yanlış okuması "AI işlem açıyor"
+    // sanısıdır: gölge modda motor davranışı DEĞİŞMEZ.
+    var modeNote = qs("ai-mode-note");
+    modeNote.className = applies ? "ai-note ai-warn" : "ai-note";
+    modeNote.textContent = applies
+      ? "AKTİF: `deny` kararları girişi ENGELLER."
+      : "GÖLGE: kararlar YALNIZ kaydedilir; hiçbir giriş engellenmez veya açılmaz. Motor davranışı DEĞİŞMEZ (D23).";
   }
 
   function renderPositions(positionsRes, scalperRes){
@@ -2260,6 +2517,7 @@
       renderTopbar(health, status, positions, scalperStatus);
       renderSysbar(scalperStatus);
       renderFollower(status);
+      renderAiGate(status);
       renderStrategyCards(scalperStats);
       renderPositions(positions, scalperStatus);
       renderRegimeMap(scalperStatus);

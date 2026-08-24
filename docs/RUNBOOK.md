@@ -222,6 +222,10 @@ bu tuzağa 2026-08-24'te düşüldü: D21 adli kayıt kartı proxy'de 404 alıyo
 `/scalper/stats`, `/scalper/trades` (query sabit `limit=30`),
 `/scalper/forensics/(summary|recent)`, `/scalper/trades/<id>/forensics`,
 `/follower/status`.
+ℹ️ **D23 (AI karar katmanı) kartı YENİ UÇ AÇMAZ** — verisini `/api/status`
+gövdesindeki `ai_gate` bloğundan okur, yani beyaz listeye EKLEME GEREKMEZ
+(nginx'e bakman gerekmiyor).
+
 **ASLA eklenmez:** `/tv-signal`, `/risk-event`, `/follower/event`,
 `/tv-events/reset` ve tüm POST/kontrol uçları (secret taşırlar / durum değiştirir).
 Değişiklikten sonra: `nginx -t` → `systemctl reload nginx` → kimliksiz `curl -k`
@@ -1138,6 +1142,99 @@ yeni olay gelene kadar sessizleşmesidir (fail-open, `docs/INTEGRATIONS.md` §7.
   (b) `gate_sources` o kaynağı içeriyor mu, (c) olayın `age_s` < `max_age_minutes`,
   (d) `structures` altında beklenen `src` var mı — yoksa adım (2) atlanmıştır ve kaynak
   `tv`/eski `?src=` değerine eşlenmiştir.
+
+## AI karar katmanını açma/kapama (`SCALPER_AI_GATE_MODE`, D23) — GÖLGE
+
+**Ne yapar:** motor pozisyonu AÇTIKTAN sonra, açılan işlemin bağlamını bir dil
+modeline sorar: *"bu giriş alınmalı mıydı?"*. Karar `logs/trades.jsonl`
+(`event="ai_verdict"`) ve `scalp_trades.forensics` içindeki `ai` bloğuna yazılır.
+**Motor davranışı DEĞİŞMEZ** (gölgede karar yolu bayt bayt aynıdır) ve kanca
+`_entry_lock` DIŞINDA, ateşle-unut çalışır — motor 0 ms bekler. Kod varsayılanı
+**`off`**: katman `.env` ile BİLİNÇLİ açılır. Sözleşme, go_live ölçütleri ve
+E8.6 uyarısı: `docs/DECISIONS.md` D23.
+
+**1) Sağlayıcı anahtarını doğrula** (zincir: DeepSeek → Gemini → OpenAI; sunucuda
+ANTHROPIC anahtarı YOKTUR). Anahtar yoksa ya da `your_...` yer tutucusuysa o
+sağlayıcı ATLANIR:
+```bash
+ssh awa 'cd /opt/tradingbot-v2 && for k in DEEPSEEK_API_KEY GEMINI_API_KEY OPENAI_API_KEY; do v=$(grep "^$k=" .env | cut -d= -f2-); case "$v" in ""|your_*) echo "$k: YOK/yer tutucu -> atlanir";; *) echo "$k: var";; esac; done'
+```
+
+**2) `.env` satırlarını ekle** (yedek + ekleme; `sed` yerine "varsa değiştir,
+yoksa ekle" kalıbı — `sed -i` eşleşme bulamazsa exit 0 verir ve `||` sağı hiç
+çalışmaz):
+```bash
+ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date -u +%Y%m%d-%H%M%S)-aigate && for line in "SCALPER_AI_GATE_MODE=shadow" "SCALPER_AI_GATE_PROVIDER=deepseek" "SCALPER_AI_GATE_DEEPSEEK_MODEL=deepseek-chat" "SCALPER_AI_GATE_MAX_CALLS_PER_DAY=200"; do k=${line%%=*}; grep -q "^$k=" .env && sed -i "s|^$k=.*|$line|" .env || echo "$line" >> .env; done && grep ^SCALPER_AI_GATE_ .env'
+```
+ℹ️ **`SCALPER_AI_GATE_DEEPSEEK_MODEL=deepseek-chat` gölge fazı için ÖNERİDİR**
+(ucuz ve katı JSON'u iyi üretir). Satırı BOŞ bırakırsan ya da hiç yazmazsan genel
+`DEEPSEEK_MODEL` kullanılır — o da `deepseek-reasoner`dır ve **pahalıdır**;
+günlük 200 çağrıda maliyet ölçütünü ($2/gün, D23 go_live #9) zorlar.
+
+**3) Yeniden başlat — ÇIPLAK `supervisorctl restart` YASAK** (D20a): `.env`
+değiştiyse doğru reçete güvenli yeniden başlatmadır (entry-halt/418/açık pozisyon
+kontrolleri + sağlık yoklaması + etiketli kayıt):
+```bash
+ssh awa 'cd /opt/tradingbot-v2 && RESTART_LABEL=d23-shadow-ac scripts/restart_safe.sh testnet'
+```
+Geçersiz bir değer startup'ta **ValueError** ile reddedilir
+(`config._validate_ai_gate_settings`) — yazım hatası sessizce `off`a DÜŞMEZ,
+süreç hiç kalkmaz. `supervisorctl status tradingbot_v2` FATAL gösteriyorsa
+`logs/bot.log`'un ilk satırlarına bak.
+
+**4) Doğrulama (restart'tan ~90 sn sonra):**
+```bash
+# (a) mod / kapsama / gecikme / bütçe / maliyet tahmini
+ssh awa 'curl -s http://127.0.0.1:9091/scalper/status | jq .ai_gate'
+# jq yoksa:
+ssh awa 'curl -sS http://127.0.0.1:9091/scalper/status' | python3 -c "import sys,json; d=json.load(sys.stdin)['ai_gate']; print({k:d.get(k) for k in ('mode','effective_mode','applies_decisions','provider','providers_ready','candidates','verdicts_ok','coverage_pct','json_valid_pct','allow','deny','deny_ratio_pct','latency_ms','calls','max_calls_per_day','runaway','cost_estimate_usd_today','last_error')})"
+# (b) tek tek kararlar (ai_skipped satırları = işleme dönüşmeyen adaylar)
+ssh awa 'jq -c "select(.event==\"ai_verdict\")" /opt/tradingbot-v2/logs/trades.jsonl | tail -20'
+# (c) gölge raporu (kapsama, deny kümesi ortalama PnL + %95 GA, allow kümesi PF,
+#     eksen x PnL korelasyonu, maliyet)
+ssh awa 'cd /opt/tradingbot-v2 && ./.venv/bin/python scripts/ledger_report.py --ai --since 2026-08-24'
+```
+Beklenen: `mode=shadow`, `effective_mode=shadow`, `applies_decisions=false`,
+`providers_ready` en az bir sağlayıcı içeriyor. Panoda **"AI Karar Katmanı
+(gölge)"** kartı görünür (kart `/api/status` gövdesinden beslenir, YENİ UÇ YOK).
+
+`candidates>0` ama `verdicts_ok=0` ise sağlayıcı tarafına bak: `last_error` ve
+`errors` sözlüğü (`ai_unavailable` / `ai_malformed` / `ai_stale` /
+`ai_budget_exhausted`) nedeni söyler. Hiçbiri girişleri ETKİLEMEZ (fail-open).
+
+**5) KAPATMA (tek satır geri alma):**
+```bash
+ssh awa 'cd /opt/tradingbot-v2 && cp .env backups/env.bak-$(date -u +%Y%m%d-%H%M%S)-aigate-off && sed -i "s/^SCALPER_AI_GATE_MODE=.*/SCALPER_AI_GATE_MODE=off/" .env && RESTART_LABEL=d23-shadow-kapat scripts/restart_safe.sh testnet'
+```
+Kod geri alma GEREKMEZ: `off` iken katman hiç örneklenmez, sıfır çağrı ve sıfır
+maliyet üretir.
+
+**Tuzaklar:**
+- Katman **kapalıyken `/api/status` gövdesinde `ai_gate` anahtarı HİÇ olmaz** ve
+  pano kartı gizlenir. Bu bir ARIZA DEĞİLDİR — "alan yok" ile "katman kapalı"yı
+  ayırmak için bilinçli seçilmiş şekildir.
+- **`SCALPER_AI_GATE_MODE=active` denenirse süreç AÇILMAZ** (config fail-fast:
+  *"D23 canlı kapı henüz onaylanmadı — go_live ölçütleri docs/DECISIONS.md
+  D23"*). Bu KASITLIDIR: kod yolu hazırdır ama ölçüm tamamlanmadan `.env`'de tek
+  kelimeyle canlı bir kapı açılamaz. Ayrıca `active` motora kablolanmamıştır ve
+  kablolanmadan önce harness/motor paritesi (DECISIONS #P1) gerekir.
+- **Sağlayıcı anahtarı yoksa ya da `your_...` yer tutucusuysa** o sağlayıcı
+  atlanır; zincirin hepsi atlanırsa karar `ai_unavailable` olur ve **giriş normal
+  sürer** (fail-open). Katman sessizce "çalışıyor görünüp" bir şeyi durdurmaz.
+- **`runaway` bayrağı yandıysa** (son 20 kararın %60'ından fazlası `deny`) katman
+  kendini `shadow`a düşürmüştür ve bayrak yanık kalır. Sıfırlanması için süreç
+  yeniden başlatılır (`restart_safe.sh`). `/scalper/status` → `ai_gate.runaway` /
+  `runaway_at`.
+- **Gölge sayılarını okurken E8.6 uyarısını hatırla:** engellenen bir girişin
+  faydasının %100'ü boşalan işgal penceresine giren YENİ işlemlerden geliyordu ve
+  **gölgede kapasite boşalmaz**. Gölge, faydanın muhtemelen en küçük parçasını
+  ölçer (iki yönlü uyarı, `docs/DECISIONS.md` D23).
+
+**Ne görürsün:**
+- Katman kurulamazsa TEK SEFER: `⚠️ AI karar katmanı kurulamadı/çalışmadı (…) —
+  bu uyarı bir kez loglanır, GİRİŞLER ETKİLENMEZ (D23 fail-open)`
+- Kaçak korumasında: `⚠️ AI kapısı KAÇAK koruması: son 20 kararın N'i deny
+  (> %60) — katman 'shadow'a düşürüldü, 'ai_runaway' bayrağı yandı (D23)`
 
 ## Güvenlik borçları
 1. Webhook düz HTTP + IP, secret sorgu dizesinde. Erişim logu kısmı ÇÖZÜLDÜ (D9,

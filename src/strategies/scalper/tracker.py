@@ -587,7 +587,51 @@ class ScalpTracker:
             "entry": document.get("entry"),
             "exit": document.get("exit"),
             "postmortem": document.get("postmortem"),
+            # D23: AI karar katmanının (gölge) bu işlem için ürettiği kayıt.
+            # `attach_ai` yazar; yoksa None (katman kapalı ya da karar
+            # yetişmedi) — "AI baktı, izin verdi" ile karıştırılmamalı.
+            "ai": document.get("ai"),
         }
+
+    async def attach_ai(
+        self, trade_id: int, record: Optional[Dict[str, Any]]
+    ) -> bool:
+        """D23: AI kararını işlemin adli belgesine `document['ai']` olarak ekle.
+
+        MIGRATION YOK: mevcut `scalp_trades.forensics` JSON sütununa yazılır.
+        `record_close` bu belgeyi OKUYUP yalnız `exit`/`verdict` anahtarlarını
+        eklediği için `ai` bloğu kapanışta KENDİLİĞİNDEN korunur (tracker.py
+        "BİRLEŞİM, üzerine yazma DEĞİL" kuralı).
+
+        Yalnız GÖZLEM: hata çağıranı ASLA etkilemez (arka plan görevinden
+        çağrılır) ve işlem satırı bulunamazsa sessizce False döner.
+        """
+        if not record:
+            return False
+        try:
+            async with AsyncSessionLocal() as session:
+                trade = await session.get(ScalpTradeModel, int(trade_id))
+                if trade is None:
+                    return False
+                document = self.parse_forensics(trade.forensics) or {}
+                document["ai"] = dict(record)
+                merged = self._dump_forensics(document)
+                if merged is None:
+                    return False
+                trade.forensics = merged
+                await session.commit()
+            return True
+        except Exception as e:
+            # D21 disiplini: adli kayıt bir gözlem katmanıdır; DB hatası
+            # işlem akışını ETKİLEMEZ ve bir kez uyarılır.
+            if not self._forensics_error_logged:
+                self._forensics_error_logged = True
+                self.logger.warning(
+                    f"⚠️ AI kararı adli belgeye yazılamadı (#{trade_id}: {e}) — "
+                    f"bu uyarı bir kez loglanır, işlem akışı ETKİLENMEZ "
+                    f"(kayıt logs/trades.jsonl'de durur)"
+                )
+            return False
 
     async def forensics_for(self, trade_id: int) -> Optional[Dict[str, Any]]:
         """Tek bir işlemin adli kaydı (yoksa None)."""

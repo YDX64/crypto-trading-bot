@@ -67,22 +67,33 @@ def _reset_rest_weight_state():
 #:
 #: `.env` DOSYASINDAN gelen sızıntıyı yalnız (2) durdurur; ortam değişkeni
 #: sızıntısını yalnız (1). Bu yüzden ikisi birlikte durur.
-_ISOLATED_ENV_PREFIXES = ("FOLLOWER_",)
+#: D23 (AI karar katmanı) AYNI GEREKÇEYLE izolasyona alınır ve dahası vardır:
+#: `SCALPER_AI_GATE_MODE=shadow` bir `.env`/ortam değişkeninden sızarsa
+#: testlerde kurulan motorlar arka planda GERÇEK bir sağlayıcıya (DeepSeek/
+#: Gemini/OpenAI) HTTP isteği açmaya çalışırdı. Test paketi ağ yapmaz: mod
+#: her testte sınıf varsayılanına (`off`) sabitlenir ve katmanın pozitif
+#: testleri kendi sahte sağlayıcılarıyla açıkça açar
+#: (tests/test_ai_gate.py).
+_ISOLATED_ENV_PREFIXES = ("FOLLOWER_", "SCALPER_AI_GATE_")
 _ISOLATED_ENV_NAMES = ("BOT_MODE",)
 
 
 def _isolated_settings_fields():
-    """`follower_*` alanlarının TAMAMI + `bot_mode` → sınıf varsayılanları.
+    """`follower_*` + `scalper_ai_gate_*` alanları + `bot_mode` → varsayılan.
 
     Tek tek listelemek yerine model alanlarından TÜRETİLİR: ileride eklenen
-    bir `FOLLOWER_*` ayarı otomatik olarak izolasyona dahil olur (doğrulayıcı
-    bulgusu Y4: "koruma tek assert uzaklıkta").
+    bir `FOLLOWER_*` / `SCALPER_AI_GATE_*` ayarı otomatik olarak izolasyona
+    dahil olur (doğrulayıcı bulgusu Y4: "koruma tek assert uzaklıkta").
     """
     from pydantic_core import PydanticUndefined
 
     pinned = {}
     for name, field in type(settings).model_fields.items():
-        if not (name.startswith("follower_") or name == "bot_mode"):
+        if not (
+            name.startswith("follower_")
+            or name.startswith("scalper_ai_gate_")
+            or name == "bot_mode"
+        ):
             continue
         default = field.default
         if default is PydanticUndefined:

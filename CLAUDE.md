@@ -60,10 +60,22 @@ Yeni sinyal kaynağı (haber botu vb.) eklemek: `docs/INTEGRATIONS.md`. Otomatik
   `/scalper/trades/{id}/forensics`, `/scalper/forensics/summary?since=7d`;
   rapor `scripts/ledger_report.py --forensics`. Reçete: `docs/RUNBOOK.md`
   "Bir işlemi nasıl incelerim".
+- **AI karar katmanı (D23, GÖLGE — kod varsayılanı `off`):** `SCALPER_AI_GATE_MODE`
+  `shadow` iken motor pozisyonu AÇTIKTAN sonra bağlam bir dil modeline sorulur
+  ("bu giriş alınmalı mıydı?") ve karar YALNIZ kaydedilir
+  (`logs/trades.jsonl` `ai_verdict` + `scalp_trades.forensics` → `document["ai"]`,
+  migration YOK). Kanca `_entry_lock` DIŞINDA, ateşle-unut: motor 0 ms bekler ve
+  karar yolu BAYT BAYT aynıdır. **Yalnız `deny` etkiler; `allow` hiçbir şey
+  AÇMAZ** — bu bir kalite filtresidir, güvenlik cihazı DEĞİLDİR ve her arıza
+  fail-OPEN'dır. `active` config validator ile REDDEDİLİR (go_live ölçütleri
+  D23'te; ayrıca #P1 harness paritesi gerekir). Sağlayıcı zinciri DeepSeek →
+  Gemini → OpenAI (yeni pip bağımlılığı yok). Rapor:
+  `scripts/ledger_report.py --ai`; açma/kapama: `docs/RUNBOOK.md` "AI karar
+  katmanını açma/kapama"; karar+kısıtlar: `docs/DECISIONS.md` D23.
 
 ## Nasıl çalıştırılır / test edilir / deploy edilir
 ```bash
-python3 -m pytest tests -q                      # 1960 test, ~55 sn — her değişiklikten önce
+python3 -m pytest tests -q                      # 2062 test, ~55 sn — her değişiklikten önce
 scripts/deploy.sh awa                           # push edilmiş main'i sunucuya uygula (test + restart + sağlık + otomatik geri alma)
 DEPLOY_NO_RESTART=1 scripts/deploy.sh awa       # yalnız kod/test; süreci yeniden başlatma
 scripts/deploy.sh awa <önceki-commit>           # geri alma (backups/commit.prev-*)
