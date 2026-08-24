@@ -276,6 +276,13 @@ class Settings(BaseSettings):
     scalper_entry_mode: str = "taker"            # "maker" = limit giriş simülasyonu (backtest)
     scalper_taker_fee_pct: float = 0.05          # nominal % / bacak
     scalper_maker_fee_pct: float = 0.02
+    # BACKTEST-ONLY (D24/A5): taker girişte aleyhte uygulanan kayma ORANI
+    # (0.0002 = %0,02). Daha önce backtest.py'de SABİT KODLUYDU; env'e
+    # taşınmasının tek amacı maliyet stres senaryosunu (`--fee-stress`)
+    # ölçülebilir kılmak. VARSAYILAN DEĞİŞMEDİ — altın backtest ve D#P1
+    # harness/motor paritesi korunur. Canlı motor bu alanı OKUMAZ (canlıda
+    # kayma gerçek dolum fiyatından gelir, modellenmez).
+    scalper_slippage_rate: float = 0.0002
     # Borsanın sembol bazlı komisyon sorgusu kullanılamazsa iki bacakta da
     # maker/taker config oranlarının YÜKSEĞİ kullanılır. Bu buffer ek kayma,
     # funding ve minimum net-kâr kilididir; komisyon yerine geçmez.
@@ -743,6 +750,31 @@ class Settings(BaseSettings):
                 "MARKET_DATA_ALLOWED_HOSTS demetine bilinçli olarak ekleyin)."
             )
         return value
+
+    @field_validator("scalper_slippage_rate")
+    @classmethod
+    def _validate_slippage_rate(cls, value: float) -> float:
+        """Kayma ORANDIR (0.0002 = %0,02), YÜZDE DEĞİL.
+
+        Fail-fast nedeni: birim karışıklığı sessizce felaket üretir —
+        `SCALPER_SLIPPAGE_RATE=0.02` yazan operatör %0,02 sanır ama motor
+        %2 kayma uygular ve her backtest sistematik olarak yanlış çıkar
+        (fark 100×). Üst sınır %1: bundan büyük bir kayma modeli bu
+        stratejide (stop mesafesi ≈%0,15–3) anlamsızdır.
+        """
+        rate = float(value)
+        if rate < 0.0:
+            raise ValueError(
+                f"SCALPER_SLIPPAGE_RATE negatif olamaz (verilen: {value}) — "
+                "kayma DAİMA aleyhtedir"
+            )
+        if rate > 0.01:
+            raise ValueError(
+                f"SCALPER_SLIPPAGE_RATE bir ORANDIR, yüzde değil "
+                f"(verilen: {value} = %{rate * 100:.2f}). Üst sınır 0.01 (%1). "
+                "%0,02 için 0.0002 yazın."
+            )
+        return rate
 
     @field_validator("binance_bind_ip")
     @classmethod

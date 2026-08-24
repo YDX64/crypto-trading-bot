@@ -640,3 +640,78 @@ class TestStrategyFilter:
     def test_cli_flag_exists(self):
         args = lr.parse_args(["--strategy", "AP"])
         assert args.strategy == "AP"
+
+
+# --------------------------------------------------------------------------
+# D24/A4 — konsantrasyon (canlı defter tarafı)
+# --------------------------------------------------------------------------
+
+class TestConcentration:
+    def _t(self, pnl: float, symbol: str, day: str, tid: int = 1) -> lr.ClosedTrade:
+        closed = datetime.strptime(day, "%Y-%m-%d")
+        return lr.ClosedTrade(
+            id=tid, strategy="C", symbol=symbol, direction="LONG",
+            realized_pnl=pnl, exit_reason="TRAIL", closed_at=closed, day=day,
+        )
+
+    def test_shares_match_manual_finding_shape(self):
+        """2026-08-21'de ELLE bulunan '+832'nin %68'i 4 günden' tespitinin
+        otomatik karşılığı: tek günün payı doğru hesaplanmalı."""
+        trades = [
+            self._t(600.0, "BTCUSDT", "2026-08-10", 1),
+            self._t(200.0, "ETHUSDT", "2026-08-10", 2),
+            self._t(200.0, "ETHUSDT", "2026-08-11", 3),
+        ]
+        out = lr.build_concentration(trades)
+        assert out["top_symbol"] == "BTCUSDT"
+        assert out["top_symbol_pnl"] == pytest.approx(600.0)
+        assert out["top_symbol_pnl_share"] == pytest.approx(60.0)
+        assert out["top_trade_pnl"] == pytest.approx(600.0)
+        assert out["top_trade_symbol"] == "BTCUSDT"
+        assert out["top_day"] == "2026-08-10"
+        assert out["top_day_pnl"] == pytest.approx(800.0)
+        assert out["top_day_pnl_share"] == pytest.approx(80.0)
+        assert out["distinct_symbols"] == 2
+        assert out["distinct_days"] == 2
+
+    def test_share_undefined_when_total_not_positive(self):
+        trades = [
+            self._t(10.0, "BTCUSDT", "2026-08-10", 1),
+            self._t(-40.0, "ETHUSDT", "2026-08-11", 2),
+        ]
+        out = lr.build_concentration(trades)
+        assert out["top_symbol_pnl_share"] is None
+        assert out["top_day_pnl_share"] is None
+        assert out["top_trade_pnl"] == pytest.approx(10.0)
+
+    def test_empty(self):
+        out = lr.build_concentration([])
+        assert out["top_symbol"] is None
+        assert out["distinct_days"] == 0
+
+    def test_wired_into_headline_and_renderers(self):
+        trades = [self._t(50.0, "SOLUSDT", "2026-08-10", 1)]
+        headline = lr.build_headline(trades, {}, ["2026-08-10"])
+        assert headline["concentration"]["top_symbol"] == "SOLUSDT"
+        report = lr.build_report(
+            trades, {}, datetime(2026, 8, 10), datetime(2026, 8, 11),
+            ["2026-08-10"], [],
+        )
+        text = lr.render_text(report)
+        md = lr.render_md(report)
+        assert "Yoğunluk/sembol" in text
+        assert "SOLUSDT" in text
+        assert "Yoğunluk — gün" in md
+        payload = json.loads(lr.render_json(report))
+        assert payload["headline"]["concentration"]["distinct_days"] == 1
+
+    def test_share_is_not_a_checklist_threshold(self):
+        """Konsantrasyon BİLGİ satırıdır: soak kontrol listesine EŞİK olarak
+        girmez (aksi halde D#P1 harness/motor paritesi tartışması açılır)."""
+        trades = [self._t(1000.0, "BTCUSDT", "2026-08-10", 1)]
+        headline = lr.build_headline(trades, {}, ["2026-08-10"])
+        names = " ".join(i["name"] for i in lr.build_checklist(
+            headline, datetime(2026, 8, 10), datetime(2026, 8, 11)
+        ))
+        assert "oğunluk" not in names
+        assert "onsantrasyon" not in names

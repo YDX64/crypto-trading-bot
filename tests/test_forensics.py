@@ -539,7 +539,130 @@ class TestSummarize:
         assert summary["tags"][0]["trades"] == 1
 
     def test_empty_input_is_safe(self):
-        assert fx.summarize([]) == {"trades": 0, "total_pnl": 0.0, "tags": []}
+        # D24/madde 6.3: `expectation` bloğu HER ZAMAN vardır (hiç beklenti
+        # kaydı olmasa bile) — raporun şekli sabit kalmalı.
+        assert fx.summarize([]) == {
+            "trades": 0,
+            "total_pnl": 0.0,
+            "tags": [],
+            "expectation": {
+                "with_expectation": 0,
+                "without_expectation": 0,
+                "by_model_version": {},
+            },
+        }
+
+
+# --------------------------------------------------------------------------
+# 6b) Beklenti alanları — "ne BEKLEDİK" (D24/madde 6)
+# --------------------------------------------------------------------------
+
+class TestExpectationFields:
+    def _signal(self):
+        return ScalpSignal(
+            strategy="C", symbol="TESTUSDT", direction=Direction.LONG,
+            entry_price=100.0, stop_price=99.0, reason="test",
+            regime=Regime.RANGE, atr_5m=1.0,
+        )
+
+    def _entry(self, **kwargs):
+        return fx.build_entry(
+            at="now", signal=self._signal(), ctx=None, cfg=SimpleNamespace(),
+            fill_price=100.0, quantity=1.0, leverage=10, margin_usdt=10.0,
+            stop_price=99.0, tp1_price=101.0, tp2_price=102.0, **kwargs
+        )
+
+    def test_keys_always_present_even_when_unfilled(self):
+        entry = self._entry()
+        for field in fx.EXPECTATION_FIELDS:
+            assert field in entry, field
+            assert entry[field] is None
+        # Doldurulmayan alan = ÖLÇÜLMEDİ; beklenti bloğu hiç kurulmaz.
+        assert fx.expectation_from_entry(entry) is None
+
+    def test_filled_fields_are_recorded(self):
+        entry = self._entry(
+            horizon_end_at="2026-08-24T12:00:00+00:00",
+            invalid_if="BTC 4h EMA200 altına kapanırsa",
+            confidence=0.6666,
+            model_version="d24-p1",
+        )
+        assert entry["horizon_end_at"] == "2026-08-24T12:00:00+00:00"
+        assert entry["invalid_if"] == "BTC 4h EMA200 altına kapanırsa"
+        assert entry["confidence"] == pytest.approx(0.667)   # 3 basamak
+        assert entry["model_version"] == "d24-p1"
+
+    def test_confidence_is_clamped_silently(self):
+        assert self._entry(confidence=2.5)["confidence"] == 1.0
+        assert self._entry(confidence=-3.0)["confidence"] == 0.0
+        assert self._entry(confidence=0.5)["confidence"] == 0.5
+        # Bozuk değer HATA değildir, ölçülmemiştir.
+        assert self._entry(confidence="çok")["confidence"] is None
+        assert self._entry(confidence=float("nan"))["confidence"] is None
+        # Kırpıldığı AYRICA kaydedilmez (yalnız kırpılır).
+        entry = self._entry(confidence=2.5)
+        assert not any("clamp" in str(k).lower() for k in entry)
+
+    def test_invalid_if_is_trimmed(self):
+        entry = self._entry(invalid_if="x" * 500)
+        assert len(entry["invalid_if"]) == fx.EXPECTATION_TEXT_MAX == 200
+
+    def test_forensics_version_is_not_bumped(self):
+        """Alanlar EKLEMELİDİR: eski satırlar okunur kalmalı."""
+        assert fx.FORENSICS_VERSION == 1
+
+    def test_expectation_from_entry_is_defensive(self):
+        assert fx.expectation_from_entry(None) is None
+        assert fx.expectation_from_entry({}) is None
+        assert fx.expectation_from_entry("sözlük değil") is None
+        assert fx.expectation_from_entry({"confidence": None}) is None
+        # Tek alan bile dolsa DÖRDÜ birden döner (kısmi beklenti de beklenti).
+        partial = fx.expectation_from_entry({"model_version": "v9"})
+        assert partial == {
+            "horizon_end_at": None, "invalid_if": None,
+            "confidence": None, "model_version": "v9",
+        }
+
+    def test_summary_expectation_block_counts_and_versions(self):
+        rows = [
+            {"tags": [], "pnl": 1.0,
+             "expectation": {"model_version": "v1", "confidence": 0.5}},
+            {"tags": [], "pnl": -1.0, "expectation": {"model_version": "v1"}},
+            {"tags": [], "pnl": 2.0, "expectation": {"model_version": "v2"}},
+            {"tags": [], "pnl": 3.0, "expectation": None},
+            {"tags": [], "pnl": 4.0},
+        ]
+        block = fx.summarize(rows)["expectation"]
+        assert block["with_expectation"] == 3
+        # null = ÖLÇÜLMEDİ (beklenti kurulmamıştı DEĞİL).
+        assert block["without_expectation"] == 2
+        assert block["by_model_version"] == {"v1": 2, "v2": 1}
+
+    def test_expectation_without_model_version_has_its_own_bucket(self):
+        block = fx.summarize(
+            [{"tags": [], "pnl": 0.0, "expectation": {"confidence": 0.9}}]
+        )["expectation"]
+        assert block["with_expectation"] == 1
+        assert block["by_model_version"] == {"_bilinmiyor_": 1}
+
+    def test_model_version_buckets_are_bounded(self):
+        rows = [
+            {"tags": [], "pnl": 0.0, "expectation": {"model_version": f"v{i}"}}
+            for i in range(fx.MODEL_VERSION_BUCKET_MAX + 7)
+        ]
+        block = fx.summarize(rows)["expectation"]
+        # En çok N GERÇEK sürüm + taşma kovası → N+1.
+        assert len(block["by_model_version"]) == fx.MODEL_VERSION_BUCKET_MAX + 1
+        assert block["by_model_version"][fx.OTHER_BUCKET] == 7
+        assert sum(block["by_model_version"].values()) == len(rows)
+
+    def test_broken_expectation_row_does_not_break_summary(self):
+        block = fx.summarize([
+            {"tags": [], "pnl": 0.0, "expectation": "sözlük değil"},
+            {"tags": [], "pnl": 0.0, "expectation": []},
+        ])["expectation"]
+        assert block["with_expectation"] == 0
+        assert block["without_expectation"] == 2
 
 
 # --------------------------------------------------------------------------
@@ -784,6 +907,40 @@ class TestTrackerForensicsRoundtrip:
         assert by_tag["counter_drift_long"]["label"]
         assert summary["with_forensics"] == 2
         assert summary["without_forensics"] == 0
+        # D24/madde 6.4: beklenti bloğu HER ZAMAN vardır; bu iki işlemde
+        # beklenti DOLDURULMADIĞI için ikisi de "ÖLÇÜLMEDİ" sayılır.
+        assert summary["expectation"] == {
+            "with_expectation": 0,
+            "without_expectation": 2,
+            "by_model_version": {},
+        }
+
+    async def test_summary_carries_the_expectation_block(self, real_tracker):
+        """D24/madde 6.4: `entry`'deki beklenti alanları özete taşınır."""
+        trade_id = await real_tracker.record_open(
+            signal=_tracker_signal(), entry_price=100.0, quantity=1.0,
+            leverage=10, margin_usdt=10.0, sl_algo_id=None,
+            tp1_algo_id=None, tp2_algo_id=None,
+            forensics={
+                "entry": {
+                    "direction": "LONG",
+                    "horizon_end_at": "2026-08-24T12:00:00+00:00",
+                    "invalid_if": "4h EMA200 altına kapanış",
+                    "confidence": 0.7,
+                    "model_version": "d24-p1",
+                },
+                "verdict": [],
+            },
+        )
+        await real_tracker.record_close(
+            trade_id, exit_price=101.0, realized_pnl=5.0, exit_reason="TRAIL",
+            forensics_exit={"reason": "TRAIL"}, verdict=[],
+        )
+
+        summary = await real_tracker.forensics_summary()
+        assert summary["expectation"]["with_expectation"] == 1
+        assert summary["expectation"]["without_expectation"] == 0
+        assert summary["expectation"]["by_model_version"] == {"d24-p1": 1}
 
     async def test_postmortem_candidates_respect_the_window(self, real_tracker):
         trade_id = await real_tracker.record_open(

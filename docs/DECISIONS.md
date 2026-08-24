@@ -2321,6 +2321,124 @@ Değişen: (i) kapanışın deftere yazılan ETİKETİ ve FİYAT KAYNAĞI, (ii) 
 seviyeleri, (iii) durum alanları ve pano önbelleği, (iv) varsayılan KAPALI bir
 ağırlık telemetrisi/geri çekilmesi.
 
+### D24 — Ölçüm/kanıt paketi (dört harici depodan ALINACAKLAR) · 2026-08-24 · **AKTİF (YALNIZ ÖLÇÜM — MOTOR DAVRANIŞI DEĞİŞMEDİ)**
+
+**Ne:** Dört harici deponun (investing-algorithm-framework · AI-Trader ·
+jane-street-secret-ai-trading-skills · OpenTrade) düşmanca incelemesinden çıkan yedi
+madde uygulandı. Hepsinin ortak özelliği: **kâr iddiası YOK**, katkı yalnız kanıt
+kalitesine. Dördü de "bağlanabilir servis" olarak REDDEDİLDİ (gerekçeler aşağıda).
+
+| # | Ne | Nereden | Nerede |
+|---|---|---|---|
+| A1 | Monte-Carlo permütasyon + yön-farkındalıklı p-değeri | IAF (Apache-2.0, vendor) | `src/strategies/scalper/permutation.py`, `backtest.py --permutations N` |
+| A2 | Benjamini-Hochberg FDR düzeltmesi | AI-Trader (lisans belirsiz, kod KOPYALANMADI) | `src/strategies/scalper/multitest.py` + CLI |
+| A3 | Bar-bazlı mark-to-market özkaynak eğrisi + gerçek çöküş | IAF (fikir) | `backtest._mark_equity` / `bar_equity_series` / `bar_drawdown` |
+| A4 | Konsantrasyon: tek sembol / tek işlem / tek gün kâr payı | jane-street (YALNIZ FİKİR) | `backtest.concentration_stats`, `scripts/ledger_report.build_concentration` |
+| A5 | Maliyet stresi + giriş gecikmesi çürütme koşusu | jane-street (YALNIZ FİKİR) | `--fee-stress`, `--entry-delay-candles`, `SCALPER_SLIPPAGE_RATE` |
+| A6 | Karar kaydı şema alanları (`horizon_end_at`/`invalid_if`/`confidence`/`model_version`) | AI-Trader (ŞEMA, kod değil) | `forensics.build_entry`, `forensics.expectation_from_entry` |
+| A7 | Üç-aşamalı niyet kaydı (niyet → karar → borsa sonucu) | OpenTrade (KALIP; ELv2, kod kopyalanmadı) | `src/strategies/scalper/intent.py`, `engine._record_intent` |
+| A8 | Metodoloji uyarısı: tekrarlı holdout + "saklı pencere" kuralı | jane-street (teşhis) | `docs/EXPERIMENTS.md` baş kutusu |
+
+**Neden:**
+1. `compute_stats` tek koşunun PF'sini veriyordu; "bu PF şanstan ayırt edilebilir mi"
+   sorusuna cevabımız YOKTU. D18 gibi ADAY/REDDEDİLDİ kararları göz kararı eşiklerle
+   veriliyordu (A1).
+2. "N varyant taradık, biri anlamlı çıktı" yanlış-pozitifini hiç düzeltmiyorduk (A2).
+3. `max_drawdown` yalnız **işlem kapanışlarında** örnekleniyordu → gerçek çukuru
+   olduğundan SIĞ gösteriyordu. Altın koşuda ölçüldü: kapanış-bazlı **0.00**,
+   bar-bazlı **11.46** (toplam kârın %42.8'i). 1000 USD sermaye ve %10/işlem sabit
+   boyutta bu doğrudan hayatta kalma sorusudur (A3).
+4. "+832'nin %68'i 4 yükseliş gününden" tespitini 2026-08-21'de ELLE bir kez
+   yapmıştık; sistematik değildi (A4).
+5. Başabaş WR ≈ %85 olan bir kenarda "kaymayı 2× yapmak sonucu tersine çevirir mi"
+   ve "giriş bir mum gecikirse ne olur" hiç ölçülmemişti (A5).
+6. D21 forensics "ne GÖRDÜK"ü kaydediyor, "ne BEKLEDİK"i kaydetmiyordu; bu alanlar
+   olmadan bir kararı sonradan KÖR puanlamak imkânsız (A6).
+7. Gerçekleşmeyen bir niyet (kapı reddi, TV sağlaması dolmadı, emir hatası) hiçbir
+   yerde iz bırakmıyordu — `scalp_trades` yalnız gerçekleşeni tutar (A7).
+8. E2…E9'un **36 varyantının TAMAMI aynı üç pencerede** ölçüldü; dokunulmamış bir
+   doğrulama penceremiz YOK ve canlıya giren D6 bu pencerelerde SEÇİLDİ (A8).
+
+**Kanıt:** `docs/EXPERIMENTS.md` "2026-08-24 — D24 ölçüm/kanıt paketi" bölümü.
+Öne çıkanlar (hepsi ölçülmüş sayı):
+- Altın koşu: kapanış-bazlı çöküş **0.00** vs bar-bazlı **11.46**.
+- Permütasyon kelepçesi 103.680 permüte barda ölçüldü: `High < max(O,C)` **%28.2**,
+  `Low > min(O,C)` **%29.4**, en az bir ihlal **%57.6**. Kelepçenin null'u kaydırması:
+  `winrate` null ortalaması **+7.61 puan**, `total_pnl` **+2.21**,
+  `bar_max_drawdown` **+2.84** → kelepçesiz null TP/trail aleyhine SİSTEMATİK bozuk.
+- Yön düzeltmesi: sentetik doğrulama vektöründe upstream'in sabit yönü p=0.05 yerine
+  **p=0.96** üretiyor (`tests/test_permutation.py`).
+- BH doğruluğu: Benjamini & Hochberg (1995) makalesinin 15 p-değerlik vektöründe
+  alpha=0.05 ile **ilk dört** hipotez reddediliyor (literatürle birebir).
+
+**Bağlayıcı kapsam sınırı:** hiçbir `SCALPER_*` strateji parametresi değişmedi;
+giriş kuralları, boyutlama, TP/stop seviyeleri, kapı sırası ve emir yolu BİREBİR aynı.
+- `tests/test_golden_backtest.py` altın sayıları **DEĞİŞMEDİ** (2 işlem, `total_pnl`
+  26.77, `{"regime_gate": 4}`) — motor kazara oynasaydı bu test kırılırdı.
+- D#P1 harness/motor paritesi korundu: `--fee-stress` ve `--entry-delay-candles`
+  varsayılanları (1.0× ve 0 mum) bugünkü davranışı bit düzeyinde korur;
+  `stressed_cfg(cfg, 1.0)` kopya bile üretmez, ORİJİNAL nesneyi döndürür.
+- `SCALPER_SLIPPAGE_RATE` varsayılanı **0.0002 = eski sabit** (`_SLIPPAGE_RATE`);
+  bekçi testi: `TestCostStress::test_settings_default_slippage_unchanged`.
+- `engine.py`'ye yalnız `_record_intent(...)` ÇAĞRILARI eklendi; tek silinen satır
+  `except Exception:` → `except Exception as e:` (`raise` çıplak kaldı). Hiçbir kapı
+  koşulu, sıra, `continue`/`return` ya da log metni değişmedi.
+- `FORENSICS_VERSION` **bump EDİLMEDİ**: dört yeni alan opsiyonel ve eklemelidir,
+  eski `scalp_trades.forensics` satırları okunur kalır. **Migration YOK.**
+
+**Bilinmezler / ölçülmeyenler (dürüstlük):**
+- **A5 koşulmadı.** Stres ve gecikme bayrakları hazır ama üç rejim penceresinde
+  koşulmadı; "kayma 2× kenarı tersine çeviriyor mu" hâlâ BİLİNMİYOR.
+- **A6 kapsaması SIFIR.** Beklenti alanlarını dolduran bir yol yok (D23 bağlayacak);
+  `/scalper/forensics/summary` bugün `with_expectation: 0` döner. Bu doğru sonuçtur:
+  null = "ÖLÇÜLMEDİ", "beklenti yoktu" değil.
+- **Niyet sayaçları süreç-içidir**, restart'ta sıfırlanır (`window: "process_start"`);
+  kalıcı tarihçe `logs/trades.jsonl` (`event="intent"`).
+- **Permütasyon null'u KOŞULLUDUR.** Yalnız giriş dilimi permüte edilir; bağlam/rejim
+  dilimleri ondan türetilir, kapsanmayan eski rejim barları GERÇEK kalır. p-değeri
+  "rejim arka planı aynıyken giriş sinyali şanstan ayırt edilebilir mi" sorusunu
+  yanıtlar — koşulsuz bir null DEĞİLDİR.
+- **Permütasyon PAHALIDIR:** N tur = N× simülasyon (kelepçe denetimiyle 2N).
+- `logs/trades.jsonl` hacmi ölçülmedi: her sinyal artık ≥2 satır (`proposed` +
+  `decided`), sağlaması dolmayan her TV oyu 1 satır. Motor yolunda IO YOK
+  (`append_soon` O(1), yazım ayrı iş parçacığında); günlük rotasyon + 30 gün
+  saklama zaten var.
+
+**Reddedilenler (kayıt için):**
+- **IAF'nin tamamına taşınma** — riskli değil, TEKNİK OLARAK MÜMKÜN DEĞİL: portföy
+  spot-only (short bile tam teminatlı/kaldıraçsız), marj muhasebesi yok, borsa-tarafı
+  reduce-only STOP_MARKET yok (stop istemci döngüsünde yoklanıyor → süreç ölürse
+  pozisyon korumasız), webhook tetikli giriş yok, asyncio yok, 418/429 ağırlık
+  bütçesi yok.
+- **IAF'yi pip ile kurmak** — `app/app.py` paket import ANINDA Flask'ı zorunlu kılıyor;
+  `finterion-charts` sabit pin; `ccxt>=4.2.48` bizim `ccxt==3.1.60` pinimizle çakışır.
+  → vendor et, kurma.
+- **AI-Trader'ın `bootstrap_ci`'ı ve istatistik hattı** — gerçek bootstrap DEĞİL
+  (rastgele örnekleme yerine sabit adımlı `values[(offset+i*7)%n]`; CI genişliği
+  n=5,10,13,50,100 için TAM 0.000000), DiD p-değeri sabit 1.0. Kopyalanırsa ZARAR verir.
+- **AI-Trader'ın regex sinyal ayrıştırması** — D19a'nın KATI biçim kuralının tam tersi;
+  kalıbı almak D19a ihlalidir.
+- **Sharpe/Sortino/Calmar** — 10-20 işlemlik pencerelerde günlük getiri serisi yok,
+  anlamsız.
+- **OpenTrade'in long-poll onay kalıbı** — park edilen istek uvicorn worker'ını tutar;
+  bu, bu repoda kanıtlanmış bir arıza sınıfıdır ("dashboard polling açlığı"). Kayıt
+  eşzamansız ve tek yönlü yapıldı.
+- **Konsantrasyon paylarını P2 karar kuralına EŞİK olarak koymak** — bilgi satırı
+  olarak kaldı; eşik yapmak D#P1 harness/motor paritesi tartışması açardı.
+
+**Lisans/atıf:** repo kökünde **`NOTICE`** dosyası (yeni). IAF Apache-2.0 (upstream
+commit `1db0df3a…`, değişiklikler §4(b) uyarınca listelendi). AI-Trader'da LICENSE
+DOSYASI YOK (README rozeti MIT diyor, metin yok) → kod kopyalanmadı, kamuya mal olmuş
+BH yordamı bağımsız yazıldı, atıf kayıt amaçlı (`d03ff6c0…`). jane-street deposunda
+lisans YOK ("No license is granted") → hiçbir metin kopyalanmadı, yalnız kavramlar
+kendi cümlelerimizle. OpenTrade ELv2 → hiçbir satır kopyalanmadı, yalnız aşama
+adlandırması fikri.
+
+**Geri alma:** paketin tamamı gözlemdir; geri almak için ya commit revert, ya da
+`SCALPER_FORENSICS_ENABLED=false` (niyet kaydını da kapatır — `_record_intent` aynı
+bayrağı okur) + CLI bayraklarını kullanmamak. Backtest tarafında `--permutations`,
+`--fee-stress`, `--entry-delay-candles` verilmezse kod yolu eskisiyle birebir aynıdır.
+
 ## Reddedilen kararlar (kanıtla)
 
 | Fikir | Tarih | Sonuç | Neden reddedildi |
