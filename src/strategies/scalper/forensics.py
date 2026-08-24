@@ -192,8 +192,15 @@ def _direction_value(direction: Any) -> str:
 # kapanışlardır — AYRI SAYILIR (sayıları stop kararının piyasa hızının
 # gerisinde kaldığını gösterir) ama TRAIL gibi raporlanır. "SL yedi"
 # DEĞİLDİRler: seviye kâr tarafındaki bir stoptu.
+# D27/A1: `REAPER` = 8 saatlik yaş kesmesi (D4, `SCALPER_MAX_HOLD_HOURS`).
+# KENDİ AİLESİ olarak durur — SL ailesine katmak, ölçüm borcunu kapatmak için
+# ayırdığımız etiketi rapor katmanında yeniden karıştırırdı. Yan etki (kasıtlı):
+# postmortem'in `losing` kuralı REAPER'ı artık yalnız NET PnL negatifse kayıplı
+# sayar; ARTIDA kesilen bir pozisyonda `noise_stop` ("stop sonrası fiyat girişe
+# döndü") sorusunun zaten anlamı yoktur.
 _EXIT_REASON_FAMILY = {
     "SL": "SL",
+    "REAPER": "REAPER",
     "TP_LADDER": "TP_LADDER",
     "TRAIL": "TRAIL",
     "TRAIL_MARKET": "TRAIL",
@@ -528,17 +535,63 @@ def build_exit(
     regime: Optional[str] = None,
     btc_price: Optional[float] = None,
     verification_notes: Optional[Sequence[str]] = None,
+    gross_source: Optional[str] = None,
+    mae_samples: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Kapanış ANINDA bilinen her şeyi tek sözlükte topla."""
+    """Kapanış ANINDA bilinen her şeyi tek sözlükte topla.
+
+    D27/A2 — `gross_source` ve `fee_estimate_source`. Komisyon tahmini
+    `brüt − net`tir; brüt YANLIŞSA tahmin de yanlıştır. Ölçüldü (2026-08-24):
+    22 işlemin 8'inde tahmin teorik komisyonun 2 katından fazla, **5'inde
+    NEGATİF** çıkmıştı — çünkü merdiven (TP1/TP2/runner) üç ayrı fiyattan
+    dolarken brüt TEK fiyatla hesaplanıyordu. Artık:
+
+      * brüt ölçülemediyse (`gross_pnl=None`) `fee_estimate` de `None`'dır ve
+        `fee_estimate_source="unmeasured"` der — **uydurma sayı YASAK**;
+      * brüt−net NEGATİF çıkarsa (fiziksel olarak imkânsız komisyon) değer
+        yine `None` bırakılır ve kaynak `"inconsistent"` olur. Sessizce
+        negatif bir "komisyon" yazmak, `fee_dominated` etiketini geçersiz
+        kılan asıl kusurdu.
+
+    ⚠️ ADLANDIRMA SINIRI: `fee_estimate` = brüt − net'tir ve `pnl_source`
+    `"binance_income_net"` iken net, `exits.NET_INCOME_TYPES` gereği
+    **FUNDING_FEE'yi de** içerir; `gross_pnl` ise Σ`realizedPnl`dir (funding
+    HARİÇ). Yani bu alan "komisyon" değil **"komisyon + funding"**dir. Uzun
+    tutulan pozisyonlarda `fee_dominated` eşiği bu yüzden hafifçe kayabilir.
+    Ayrıştırmak ayrı bir income kırılımı ister; D27 kapsamında YAPILMADI.
+
+    D27/A3 — MAE YOKLAMA KUSURU. `mae_roi_pct` safety turunda ÖRNEKLENİR
+    (≈2 sn); iki yoklama arasındaki fitil görülmez. Fiziksel kelepçe şudur:
+    **çıkış fiyatı fiilen DOKUNULMUŞ bir fiyattır**, dolayısıyla en kötü uç
+    en az çıkış kadar kötü olmalıdır — yani `mae_roi_pct <= çıkış ROI'si`
+    (fiyat tabanlı, komisyon HARİÇ: `price_move_pct × kaldıraç`). Komisyon
+    dahil net ROI ile kıyaslamak yanlış-pozitif üretirdi (başabaşa yakın bir
+    kapanış komisyon yüzünden eksi görünür ama fiyat hiç aleyhe gitmemiş
+    olabilir). İhlalde MAE çıkış ROI'siyle DÜZELTİLİR ve
+    `mae_source="corrected"` yazılır; ham örneklem `mae_roi_pct_sampled`
+    alanında AYNEN durur — **sessiz düzeltme YOKTUR**.
+    """
     lev = int(leverage or 0) or 1
     net = _f(realized_pnl)
     gross = _f(gross_pnl)
     fee_estimate = None
+    fee_estimate_source = "unmeasured"
     if net is not None and gross is not None:
-        fee_estimate = round(gross - net, 6)
+        raw_fee = round(gross - net, 6)
+        if raw_fee >= 0:
+            fee_estimate = raw_fee
+            fee_estimate_source = _s(gross_source) or "unknown"
+        else:
+            # Negatif komisyon fiziksel olarak imkânsız: brüt ya da net
+            # ölçümü tutarsız. Sayı YAZILMAZ.
+            fee_estimate_source = "inconsistent"
 
-    mae = _f(mae_roi_pct)
     mfe = _f(mfe_roi_pct)
+    move_pct = _pct_move(direction, entry_price, exit_price)
+    mae_sampled = _f(mae_roi_pct)
+    mae, mae_source = reconcile_mae(
+        mae_roi_pct=mae_sampled, price_move_pct=move_pct, leverage=lev
+    )
     return {
         "at": at,
         "reason": _s(reason),
@@ -549,13 +602,18 @@ def build_exit(
         "direction": _direction_value(direction),
         "realized_pnl": _round(net, 6),
         "gross_pnl": _round(gross, 6),
+        "gross_source": _s(gross_source),
         "fee_estimate": fee_estimate,
+        "fee_estimate_source": fee_estimate_source,
         "pnl_source": _s(pnl_source),
         "mae_roi_pct": _round(mae, 3),
+        "mae_roi_pct_sampled": _round(mae_sampled, 3),
+        "mae_source": mae_source,
+        "mae_samples": None if mae_samples is None else max(0, int(mae_samples)),
         "mfe_roi_pct": _round(mfe, 3),
         "mae_price_pct": None if mae is None else round(mae / lev, 4),
         "mfe_price_pct": None if mfe is None else round(mfe / lev, 4),
-        "price_move_pct": _pct_move(direction, entry_price, exit_price),
+        "price_move_pct": move_pct,
         "duration_sec": _round(duration_sec, 1),
         "path": dict(path or {}),
         "leader_day_drift_pct": _round(leader_day_drift_pct, 4),
@@ -563,6 +621,43 @@ def build_exit(
         "btc_price": _round(btc_price, 8),
         "verification_notes": list(verification_notes or []),
     }
+
+
+#: D27/A3 MAE kaynakları.
+MAE_SOURCE_SAMPLED = "sampled"        # yoklamanın gördüğü değer geçerli
+MAE_SOURCE_CORRECTED = "corrected"    # yoklama fiziksel kelepçeyi ihlal etti
+MAE_SOURCE_UNMEASURED = "unmeasured"  # hiç ölçülemedi (veri yok)
+
+
+def reconcile_mae(
+    *,
+    mae_roi_pct: Optional[float],
+    price_move_pct: Optional[float],
+    leverage: Optional[int],
+) -> tuple:
+    """MAE'yi fiziksel kelepçeyle uzlaştır — SAF. `(değer, kaynak)` döner.
+
+    Kelepçe: çıkış fiyatına FİİLEN dokunuldu, dolayısıyla en kötü uç
+    (`mae_roi_pct`) çıkış ROI'sinden (`price_move_pct × kaldıraç`) daha iyi
+    OLAMAZ. İhlal, örneklemenin (safety turu ≈2 sn) fitili kaçırdığını
+    gösterir — ölçüldü: 6 stop-out'ta MAE fiziksel olarak imkânsızdı.
+
+    Kıyas FİYAT tabanlıdır (komisyon HARİÇ): net PnL ile kıyaslamak,
+    komisyon yüzünden eksiye düşen başabaş kapanışlarda yanlış-pozitif
+    üretirdi.
+
+    Düzeltme sessiz DEĞİLDİR: çağıran ham örneklemi ayrı alanda saklar ve
+    kaynak `corrected` olur.
+    """
+    if mae_roi_pct is None:
+        return None, MAE_SOURCE_UNMEASURED
+    if price_move_pct is None:
+        return mae_roi_pct, MAE_SOURCE_SAMPLED
+    lev = int(leverage or 0) or 1
+    exit_roi = price_move_pct * lev
+    if mae_roi_pct > exit_roi:
+        return exit_roi, MAE_SOURCE_CORRECTED
+    return mae_roi_pct, MAE_SOURCE_SAMPLED
 
 
 def _pct_move(direction: Any, entry: Any, exit_price: Any) -> Optional[float]:
@@ -633,7 +728,13 @@ def classify_exit(
 
     net = _f(exit_.get("realized_pnl"))
     gross = _f(exit_.get("gross_pnl"))
-    if net is not None and gross is not None and gross > 0:
+    # D27/A2: brüt ÖLÇÜLEMEDİYSE (merdiven çıkışı + ledger yok) ya da
+    # brüt−net negatif çıktıysa `fee_estimate` `None`'dır — etiket ATILMAZ.
+    # Eskiden tek çıkış fiyatıyla hesaplanan yanlış brüt bu etiketi 22
+    # işlemin 8'inde geçersiz kılıyordu; "ölçemedik" demek yanlış etiketten
+    # iyidir.
+    fee_measured = exit_.get("fee_estimate") is not None
+    if fee_measured and net is not None and gross is not None and gross > 0:
         if net < th.fee_ratio * gross:
             tags.append(TAG_FEE_DOMINATED)
 
@@ -772,6 +873,11 @@ MODEL_VERSION_BUCKET_MAX = 20
 #: Üst sınırı aşan sürümlerin toplandığı kova.
 OTHER_BUCKET = "_diger_"
 
+#: D27/A1: `summarize` içindeki çıkış nedeni kova üst sınırı. Etiket koddan
+#: gelir (SL/REAPER/TP_LADDER/TRAIL/…) ama bir yazım hatası ya da ileride
+#: eklenecek bir etiket sınırsız kova büyütmemeli.
+EXIT_REASON_BUCKET_MAX = 20
+
 
 def summarize(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     """Etiket × sonuç tablosu — "neler etkiliyor" sorusunun cevabı.
@@ -793,6 +899,7 @@ def summarize(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     Bu ayrım korunmazsa ölçüm yokluğu sessizce bulguya dönüşür.
     """
     buckets: Dict[str, Dict[str, float]] = {}
+    exit_buckets: Dict[str, Dict[str, float]] = {}
     total_trades = 0
     total_pnl = 0.0
     with_expectation = 0
@@ -805,11 +912,38 @@ def summarize(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
              "gross_win": 0.0, "gross_loss": 0.0},
         )
 
+    def _exit_bucket(name: str) -> Dict[str, float]:
+        return exit_buckets.setdefault(
+            name,
+            {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0,
+             "gross_win": 0.0, "gross_loss": 0.0},
+        )
+
     for row in rows or []:
         pnl = _f(row.get("pnl")) or 0.0
         tags = [t for t in (row.get("tags") or []) if t]
         total_trades += 1
         total_pnl += pnl
+        # D27/A1: çıkış nedeni × sonuç. `REAPER` (8 saatlik yaş kesmesi) artık
+        # `SL`den AYRI görünür — eskiden ikisi tek kovadaydı ve brüt zararın
+        # %27'si yanlış etiketliydi. Kova sayısı SINIRLI: etiket koddan gelir
+        # ama bir yazım hatası sınırsız kova büyütmemeli.
+        reason = _s(row.get("exit_reason")) or "_bilinmiyor_"
+        reason = reason.upper() if reason != "_bilinmiyor_" else reason
+        if (
+            reason not in exit_buckets
+            and len(exit_buckets) >= EXIT_REASON_BUCKET_MAX
+        ):
+            reason = OTHER_BUCKET
+        exit_bucket = _exit_bucket(reason)
+        exit_bucket["trades"] += 1
+        exit_bucket["pnl"] += pnl
+        if pnl > 0:
+            exit_bucket["wins"] += 1
+            exit_bucket["gross_win"] += pnl
+        elif pnl < 0:
+            exit_bucket["losses"] += 1
+            exit_bucket["gross_loss"] += abs(pnl)
         expectation = row.get("expectation")
         if isinstance(expectation, dict) and any(
             expectation.get(field) is not None for field in EXPECTATION_FIELDS
@@ -858,10 +992,36 @@ def summarize(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
 
     # En zararlıdan en kârlıya: "neyi düzeltmeliyim" listesi tepede başlar.
     table.sort(key=lambda row: (row["pnl"], -row["trades"]))
+
+    exit_table: List[Dict[str, Any]] = []
+    for name, bucket in exit_buckets.items():
+        trades = int(bucket["trades"])
+        wins = int(bucket["wins"])
+        gross_loss = bucket["gross_loss"]
+        exit_table.append({
+            "reason": name,
+            "family": exit_reason_family(name) if name.isupper() else name,
+            "trades": trades,
+            "wins": wins,
+            "losses": int(bucket["losses"]),
+            "winrate": round(wins / trades * 100.0, 1) if trades else 0.0,
+            "pnl": round(bucket["pnl"], 4),
+            "avg_pnl": round(bucket["pnl"] / trades, 4) if trades else 0.0,
+            "profit_factor": (
+                round(bucket["gross_win"] / gross_loss, 3)
+                if gross_loss > 0 else None
+            ),
+        })
+    exit_table.sort(key=lambda row: (row["pnl"], -row["trades"]))
+
     return {
         "trades": total_trades,
         "total_pnl": round(total_pnl, 4),
         "tags": table,
+        # D27/A1: çıkış nedeni × sonuç. `REAPER` ayrı satırdır; ama
+        # **2026-08-24 ÖNCESİ** kapanan yaş kesmeleri defterde hâlâ "SL"dir
+        # (geriye dönük veri düzeltmesi YAPILMADI) — pencereyi buna göre böl.
+        "exit_reasons": exit_table,
         "expectation": {
             "with_expectation": with_expectation,
             # null = ÖLÇÜLMEDİ (beklenti kurulmamıştı DEĞİL).

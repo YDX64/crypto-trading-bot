@@ -474,6 +474,9 @@ class TestRenderers:
             # AP = gömülü AlgoPro takipçisi; ikisi AYNI tabloya yazar).
             "meta", "regime_direction", "exit_reason_direction",
             "symbol", "strategy", "daily", "headline", "checklist", "notes",
+            # D27/A1: "REAPER ayrımı 2026-08-24'ten itibaren" uyarısı JSON
+            # tüketicisine de görünmeli (renderer'a bağımlı uyarı, uyarı değil).
+            "exit_reason_note",
         }
         assert parsed["headline"]["total_trades"] == 5
 

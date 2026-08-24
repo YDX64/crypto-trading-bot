@@ -86,10 +86,23 @@ Yeni sinyal kaynağı (haber botu vb.) eklemek: `docs/INTEGRATIONS.md`. Otomatik
   artık `logs/trades.jsonl`'e `event="intent"` olarak yazılır (niyet→karar→borsa
   sonucu). Ret gerekçesi dağılımı `/scalper/forensics/summary` yanıtındaki `intents`
   bloğundadır — **süreç başlangıcından beri** sayar, restart'ta sıfırlanır.
+- **Ölçüm borcu + karşı-olgu defteri (D27, YALNIZ ÖLÇÜM):** (a) 8 saatlik yaş
+  kesmesi artık `SL` değil **`REAPER`** etiketlenir (geriye dönük düzeltme YOK;
+  kayıp-cooldown kapısı bilerek ESKİ etiket uzayını okur — parite); (b) merdiven
+  çıkışında brüt ölçülemezse `forensics.fee_estimate` **`null`**'dır
+  ("ölçülmedi", "ücret yok" DEĞİL); (c) fiziksel olarak imkânsız MAE
+  düzeltilir ve `mae_source="corrected"` yazılır (ham değer
+  `mae_roi_pct_sampled`'da); (d) TP1 emri konulamazsa `/scalper/status` ve
+  `/follower/status` → `order_health.tp1_missing` sayar ve pano kırmızı uyarı
+  gösterir — **girişe yeni kapı EKLENMEDİ**. **Karşı-olgu defteri:** reddedilen
+  her niyet için "girilseydi ne olurdu" H saat sonra ölçülür
+  (`/scalper/counterfactual?since=7d`, `ledger_report.py --counterfactual`,
+  `logs/trades.jsonl` `event="counterfactual"`); yeni REST ağırlığı SIFIR,
+  look-ahead yok, model yalnız TP1/ilk-stop'u kapsar. Ayrıntı: D27.
 
 ## Nasıl çalıştırılır / test edilir / deploy edilir
 ```bash
-python3 -m pytest tests -q                      # 2251 test, ~65 sn — her değişiklikten önce
+python3 -m pytest tests -q                      # 2483 test, ~60 sn — her değişiklikten önce
 scripts/deploy.sh awa                           # push edilmiş main'i sunucuya uygula (test + restart + sağlık + otomatik geri alma)
 DEPLOY_NO_RESTART=1 scripts/deploy.sh awa       # yalnız kod/test; süreci yeniden başlatma
 scripts/deploy.sh awa <önceki-commit>           # geri alma (backups/commit.prev-*)

@@ -181,6 +181,24 @@ def _direction(value: Any) -> Optional[str]:
     return None if text is None else text.upper()
 
 
+def _num(value: Any) -> Optional[float]:
+    """D27/B: sonlu bir sayı ya da `None` — bozuk girdi kaydı düşürmez."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed != parsed or parsed in (float("inf"), float("-inf")):
+        return None
+    return parsed
+
+
+def _int(value: Any) -> Optional[int]:
+    parsed = _num(value)
+    return None if parsed is None else int(parsed)
+
+
 def _trim(value: Any, limit: int = DETAIL_MAX) -> Optional[str]:
     text = _s(value)
     if text is None:
@@ -205,6 +223,10 @@ def build_intent(
     detail: Any = None,
     intent_id: Any = None,
     extra: Optional[Dict[str, Any]] = None,
+    price: Any = None,
+    stop_price: Any = None,
+    tp1_price: Any = None,
+    leverage: Any = None,
 ) -> Dict[str, Any]:
     """Tek bir niyet satırını kur — SAF (IO yok, saat okuma YOK).
 
@@ -212,6 +234,13 @@ def build_intent(
     ve motor yolundaki bir kayıt için ikinci bir saat okuması yapılmaz.
     Tüm okumalar savunmalıdır: bozuk/eksik girdi kayıt üretmeyi engellemez,
     yalnız o alan `None` kalır.
+
+    D27/B — `price`/`stop_price`/`tp1_price`/`leverage`: karşı-olgu defteri
+    "girilseydi ne olurdu"yu bu dört sayıyla kurar. Niyetin KALICI izi bu
+    satırdır: bekleyen karşı-olgu kuyruğu süreç-içidir ve restart'ta
+    kaybolur, ama bu satır `logs/trades.jsonl`'de durur — yani bir restart
+    ölçümü geciktirir, kaydı YOK ETMEZ. Dördü de `None` olabilir
+    ("ölçülmedi"); uydurma değer YAZILMAZ.
     """
     return {
         "at": _s(at),
@@ -224,6 +253,10 @@ def build_intent(
         "source": _s(source),
         "reason": _token(reason),
         "detail": _trim(detail),
+        "price": _num(price),
+        "stop_price": _num(stop_price),
+        "tp1_price": _num(tp1_price),
+        "leverage": _int(leverage),
         "extra": dict(extra) if isinstance(extra, dict) else {},
     }
 
@@ -269,6 +302,10 @@ def record(
     detail: Any = None,
     intent_id: Any = None,
     extra: Optional[Dict[str, Any]] = None,
+    price: Any = None,
+    stop_price: Any = None,
+    tp1_price: Any = None,
+    leverage: Any = None,
 ) -> Optional[Dict[str, Any]]:
     """Niyeti sayaçlara işle ve JSONL kuyruğuna bırak.
 
@@ -293,6 +330,10 @@ def record(
             detail=detail,
             intent_id=intent_id,
             extra=extra,
+            price=price,
+            stop_price=stop_price,
+            tp1_price=tp1_price,
+            leverage=leverage,
         )
     except Exception:  # pragma: no cover - saf kurucu, yine de akış kesilmesin
         return None

@@ -484,6 +484,22 @@ class Settings(BaseSettings):
     scalper_forensics_run_pct: float = 5.0             # geç-giriş etiketi
     scalper_forensics_stale_signal_sec: float = 30.0   # sinyal→dolum gecikmesi
     scalper_forensics_fee_ratio: float = 0.5           # net/brüt eşiği
+    # --- Karşı-olgu defteri (D27/B, 2026-08-24) — YALNIZ GÖZLEM ----------
+    # Reddedilen her giriş niyeti için "girilseydi mevcut TP/SL kurallarıyla
+    # ne olurdu" H saat sonra ölçülür. Kline'lar tarama turunun ZATEN
+    # çektiği serilerden gelir: **yeni REST ağırlığı SIFIR**. Ana bayrak
+    # `scalper_forensics_enabled`dır (kapalıysa bu blok da çalışmaz).
+    scalper_counterfactual_enabled: bool = True
+    # Ölçüm ufukları (saat, virgülle). En büyüğü simülasyon penceresidir.
+    scalper_counterfactual_horizons_h: str = "1,4,8"
+    # Bekleyen kayıt tavanı (dolarsa YENİ kayıt düşer, eskisi korunur).
+    scalper_counterfactual_max_pending: int = 500
+    # Aynı (sembol, yön, gerekçe) bu saniye içinde tekrarlanırsa yeni satır
+    # açılmaz; ağırlık `dup_count`ta birikir (JSONL hacim koruması).
+    scalper_counterfactual_dedup_sec: float = 300.0
+    # Bu yaştan sonra hâlâ çözülemeyen kayıt düşürülür (sembol tarama
+    # evreninden çıkmış olabilir).
+    scalper_counterfactual_max_age_h: float = 48.0
     scalper_c_allowed_regimes: str = "UP,DOWN,RANGE"  # deney: "RANGE" ile sınırla
     scalper_d_use_eqhl: bool = True              # D süpürmesi EQH/EQL kümelerine bağlı
     scalper_eqhl_tolerance_pct: float = 0.05     # pivot eşitlik eşiği (%)

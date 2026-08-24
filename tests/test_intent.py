@@ -59,6 +59,9 @@ class TestBuildIntent:
         assert set(row) == {
             "at", "intent_id", "symbol", "direction", "stage", "decision",
             "strategy", "source", "reason", "detail", "extra",
+            # D27/B: karşı-olgu defterinin KALICI girdisi (dördü de None
+            # olabilir = "ölçülmedi").
+            "price", "stop_price", "tp1_price", "leverage",
         }
 
     def test_detail_is_trimmed_to_limit(self):

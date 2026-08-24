@@ -2321,7 +2321,6 @@ Değişen: (i) kapanışın deftere yazılan ETİKETİ ve FİYAT KAYNAĞI, (ii) 
 seviyeleri, (iii) durum alanları ve pano önbelleği, (iv) varsayılan KAPALI bir
 ağırlık telemetrisi/geri çekilmesi.
 
-<<<<<<< HEAD
 ### D23 — AI karar katmanı (`SCALPER_AI_GATE_MODE`) · 2026-08-24 · **GÖLGE (aktif DEĞİL) — kod varsayılanı `off`, canlıda AÇILMADI**
 **Kanıt kaynağı:** YOK — bu madde bir strateji kanıtı değil, kanıt ÜRETME
 altyapısıdır (D21 ile aynı disiplin). Hüküm gölge ölçümünden sonra bu kayda
@@ -2639,7 +2638,6 @@ geçerli olduğuna karar ver (aynı `entry_order_id` iki kez girer).
 (kapanışta adli kayıt satırı kaybı; D21 gereği yalnız gözlem, işlem riski yok) —
 ayrı bir değişiklikte. `ccxt==3.1.60` hiç import edilmiyor; kaldırılırsa görüntü
 küçülür — ayrı bir commit'te.
-=======
 ### D24 — Ölçüm/kanıt paketi (dört harici depodan ALINACAKLAR) · 2026-08-24 · **AKTİF (YALNIZ ÖLÇÜM — MOTOR DAVRANIŞI DEĞİŞMEDİ)**
 
 **Ne:** Dört harici deponun (investing-algorithm-framework · AI-Trader ·
@@ -2757,7 +2755,6 @@ adlandırması fikri.
 `SCALPER_FORENSICS_ENABLED=false` (niyet kaydını da kapatır — `_record_intent` aynı
 bayrağı okur) + CLI bayraklarını kullanmamak. Backtest tarafında `--permutations`,
 `--fee-stress`, `--entry-delay-candles` verilmezse kod yolu eskisiyle birebir aynıdır.
->>>>>>> worktree-agent-af27869057747ff76
 
 ### D26 — Gölge halkası (`/opt/tradingbot-shadow`) + gölge modunun orchestrator kapısı · 2026-08-24 · **AKTİF (kod), halka ÖLÇÜM İÇİN**
 
@@ -2799,6 +2796,188 @@ kalıcı kaldırma: `rm /etc/supervisor/conf.d/tradingbot-shadow.conf && supervi
 yeniden başlatılır. Karşılaştırma: `scripts/ledger_report.py --db tradingbot_shadow.db`
 ile canlı defterin C satırları; soru "lider kapısı + mainnet kline açık/kapalı
 girişleri nasıl değiştiriyor".
+
+### D27 — Ölçüm borcu + karşı-olgu defteri · 2026-08-24 · **AKTİF (YALNIZ ÖLÇÜM — MOTOR KARAR YOLU BAYT BAYT AYNI)**
+
+**Bağlam.** 2026-08-24'te altı ajanlı bir kök-neden analizi bitti. Hüküm: sistem
+melt-up (19–21 Ağustos) dışında zararda ve **bugün yapılacak en değerli şey kod
+değil ÖLÇÜM** — çünkü raporun bütün filtre rakamları "üst sınır tahmini" olarak
+kalıyor: engellenen bir işlemin yerine kapasite/kayıp-cooldown serbestliğiyle
+BAŞKA bir işlem açılır ve bu, kapalı işlem defterinden çıkarılamaz. Bu karar
+raporun 4. ve 5. önerilerini uygular.
+
+#### A) Ölçüm borcu (etiket/hesap doğruluğu)
+
+| # | Ne | Ölçülen kusur | Nerede |
+|---|---|---|---|
+| A1 | **REAPER ayrı çıkış etiketi** | 8 saatlik yaş kesmesi (D4) deftere "SL" yazılıyordu: **43 kesme = −172.3 USDT = brüt zararın %27'si**, ve bunların **12'si ARTIDA** kesilmişti. Her SL analizi bozuktu. | `exits.EXIT_REASON_REAPER`, `exits._infer_exit_reason`, `engine._reap_aged_positions` (`sp.reaper_close_at`), `forensics._EXIT_REASON_FAMILY`, `ledger_report.EXIT_REASON_FAMILY` |
+| A2 | **`forensics.fee_estimate` merdiven düzeltmesi** | Brüt TEK çıkış fiyatıyla hesaplanıyordu; merdiven çıkışı 3 parçadır. **22 işlemin 8'inde** tahmini komisyon teorik değerin 2 katından fazla, **5'inde NEGATİF** → `fee_dominated` etiketi geçersizdi. | `exits._CloseLedger.gross_pnl/legs`, `exits._forensics_gross`, `forensics.build_exit` (`gross_source`, `fee_estimate_source`), `forensics.classify_exit` |
+| A3 | **MAE yoklama kusuru** | 6 stop-out'ta `mae_roi` fiziksel olarak İMKÂNSIZDI (#217: mae −7.16 iken çıkış −24.72). MAE safety turunda (≈2 sn) ÖRNEKLENİR; fitil kaçar. | `forensics.reconcile_mae`, `build_exit` (`mae_roi_pct_sampled`, `mae_source`, `mae_samples`), `ScalpPosition.mae_samples`, `exits._update_mae_mfe` |
+| A4 | **`tp1_missing` görünürlüğü** | 3 işlemde TP1 emri konulamadı → break-even HİÇ kurulamadı → tam risk stopuyla taşındı (**doğrudan −18.4 USDT**). Yalnız bir ERROR satırı vardı, sayaç yoktu. | `executor._order_health` + `order_health_snapshot`, `/scalper/status → order_health`, `/follower/status → order_health`, pano uyarı satırı |
+
+**A1 — parite şartı (ÖNEMLİ).** `exits._maybe_start_loss_cooldown` gövdesi
+`if exit_reason != "SL" and realized_pnl >= loss_threshold: return`'dur — yani
+"SL" etiketi PnL ARTIDA olsa bile cooldown BAŞLATIR. Etiketi doğrudan
+değiştirmek, ARTIDA kesilen 12 pozisyonda cooldown kararını sessizce
+değiştirirdi (ve TP1'e yakın kesilenlerde ters yönde). Bu yüzden:
+`_infer_exit_reason_legacy` D27 ÖNCESİ gövdeyi **bit düzeyinde** korur ve
+cooldown kapısı `_finalize_close`'daki AYRI `cooldown_reason` değişkeniyle ESKİ
+etiket uzayını okur. Deftere/adli kayda YENİ etiket yazılır. Parite testi:
+`tests/test_reaper_exit_label.py::TestCooldownParity`.
+
+**A1 — geriye dönük veri düzeltmesi YOKTUR.** 2026-08-24 öncesinde kapanan yaş
+kesmeleri defterde hâlâ "SL"dir. Rapor bunu `ledger_report.REAPER_SPLIT_NOTE`
+ile (metin/md tablo altında + JSON'da `exit_reason_note`) söyler.
+
+**A1 — nerede AYRI görünür.** (i) `scripts/ledger_report.py` 2. tablosu
+(`EXIT_REASON_ORDER`da SL'nin hemen ardında), (ii) `/scalper/forensics/summary`
+yanıtındaki YENİ `exit_reasons` bloğu (çıkış nedeni × işlem/WR/PnL/PF; adli
+kaydı olmayan satırlar `_bilinmiyor_` kovasında = "ölçülmedi"), (iii) panoda
+"Son İşlemler" rozetinde ayrı renk. `forensics.exit_reason_family("REAPER")`
+kendi ailesini döner — SL ailesine KARIŞMAZ.
+
+**A2/A3 — "uydurma sayı YASAK" kuralı.** Brüt ölçülemediğinde
+(`gross_source="unmeasured_ladder"`) `fee_estimate` `None`'dır ve
+`fee_dominated` etiketi ATILMAZ; brüt−net negatif çıkarsa (fiziksel olarak
+imkânsız komisyon) kaynak `"inconsistent"` olur ve yine sayı yazılmaz. MAE
+düzeltmesi SESSİZ DEĞİLDİR: ham örneklem `mae_roi_pct_sampled`ta durur,
+`mae_source="corrected"` yazılır ve `mae_samples` yoklama sıklığını verir.
+Kıyas FİYAT tabanlıdır (`price_move_pct × kaldıraç`), net PnL DEĞİL — komisyon
+yüzünden eksiye düşen başabaş kapanışlar yanlış-pozitif üretirdi.
+
+**A4 — girişe YENİ KAPI EKLENMEDİ.** Analiz "alarm-kotasyon sapma eşiği
+ÖLÇÜLEREK seçilmeli" diyor ve o eşik henüz ölçülmedi. Takipçideki "bir kez
+yeniden dene" adımı da scalper'a EKLENMEDİ (yeni REST ağırlığı sıfır).
+
+#### B) Karşı-olgu defteri
+
+**Ne.** Reddedilen (`deny`) ya da emir hatası alan (`error`) her giriş niyeti
+için niyet anındaki fiyat/stop/TP1/kaldıraç KALICI olarak kaydedilir
+(`event="intent"` satırına dört yeni alan), sonra H saat sonra "girilseydi
+mevcut TP/SL kurallarıyla ne olurdu" simüle edilip `event="counterfactual"`
+olarak yazılır. Ufuklar `SCALPER_COUNTERFACTUAL_HORIZONS_H` (varsayılan
+`1,4,8`).
+
+| Katman | Dosya |
+|---|---|
+| SAF çekirdek (simülasyon + özet) | `src/strategies/scalper/counterfactual.py` |
+| Durum katmanı (kuyruk, dedup, JSONL) | `src/strategies/scalper/counterfactual_store.py` |
+| Motor kancaları | `engine._counterfactual_plan` / `_counterfactual_resolve` / `_record_intent(signal=…)` |
+| TV sağlaması yolu | `main.py` `/tv-signal` — sağlama dolmadığında `register(...)` |
+| Uç | `GET /scalper/counterfactual?since=…&reason=…` |
+| Pano özeti | `/api/status → counterfactual` + `/scalper/status → counterfactual` (YENİ UÇ ÇAĞRISI YOK) |
+| Rapor | `scripts/ledger_report.py --counterfactual` (5d bölümü) |
+| Okuma yardımcısı | `forensics_log.read_events(...)` — arşivler dahil, YALNIZ istek üzerine |
+
+**Neden.** Raporun EN KRİTİK açık sorusu TV sağlamasıdır: kapının yön İÇİNDE
+seçicilik gücü ölçülebilir SIFIR (**LONG p=0.894, SHORT p=0.368**) ve en sık
+çift aynı satıcının iki script'i (`luxosc+luxso`, tetiklerin %54'ü, PF 0.858 —
+tek kaybeden çift). "Reddedilen 150+ sinyal gerçekten kötü müydü?" sorusunun
+bugün SAYISAL cevabı yok. Bu defter onu üretir.
+
+**Yeni REST ağırlığı SIFIR.** Çözüm `engine._evaluate_symbol` içinde, tarama
+turunun ZATEN çektiği `ctx.candles_5m` (150 mum ≈ 12.5 saat; 15m fallback 100
+mum ≈ 25 saat) ile yapılır. Mum yoksa hesap ERTELENİR (`pending`), ek kline
+isteği ASLA yapılmaz.
+
+**Look-ahead YOK.** `counterfactual.window` yalnız niyet anından SONRA AÇILMIŞ
+mumları alır (niyet anını İÇEREN yarım mum DIŞLANIR — onun high/low'u karar
+anından önceki fiyatları da taşır). Aynı mumda hem stop hem TP1 vurursa
+**STOP kazanır** (mum içi sıra bilinmez; yanlılık karamsar tarafta olmalı ki
+defter bir kapıyı haksız yere suçlamasın). Planı olmayan niyetlerde (TV
+sağlaması yolunda `ScalpSignal` YOKTUR) referans giriş, niyet anından SONRAKİ
+İLK mumun `open` fiyatıdır. Testler:
+`tests/test_counterfactual.py::test_window_look_ahead_yok` ve
+`tests/test_counterfactual_store.py`.
+
+**Modelin DÜRÜST sınırları.** Yalnız **TP1 ya da ilk stop** modellenir. TP2,
+chandelier trailing, break-even çekme, 8 saatlik reaper (D4), komisyon, kayma
+ve kısmi dolum MODELLENMEZ. `SCALPER_STOP_MODE=structural` iken planı olmayan
+niyetlerin stopu ROI politikasından yaklaşıklanır ve satır
+`extra.plan_source="roi_policy"` ile işaretlenir. Yani bu tablo motorun gerçek
+sonucu DEĞİL, aynı kurallarla kaba bir kıyas tabanıdır.
+
+**Hacim koruması.** `SCALPER_COUNTERFACTUAL_DEDUP_SEC` (varsayılan 300) aynı
+(sembol, yön, gerekçe) üçlüsünü tek satıra katlar; ağırlık `dup_count`ta
+birikir ve raporda `Katlanan` sütununda görünür. Bekleyen kuyruk
+`SCALPER_COUNTERFACTUAL_MAX_PENDING` (500) ile sınırlıdır (dolarsa YENİ kayıt
+düşer, eskisi korunur); `SCALPER_COUNTERFACTUAL_MAX_AGE_H` (48) çözülemeyen
+kaydı düşürür. `logs/trades.jsonl`'in günlük rotasyonu + 30 gün saklaması
+zaten vardır.
+
+**Bağlayıcı kapsam sınırı: MOTOR KARAR YOLU DEĞİŞMEDİ.**
+- Hiçbir `SCALPER_*` strateji parametresi değişmedi; giriş kuralları,
+  boyutlama, TP/stop seviyeleri, kapı sırası ve emir yolu BİREBİR aynı.
+- `engine.py`'ye eklenen tek karar-yolu-yakını satır, 15 `_record_intent`
+  çağrısına `signal=sig` kwarg'ı ve `_evaluate_symbol`'de tek bir
+  `self._counterfactual_resolve(symbol, ctx)` çağrısıdır. Hiçbir kapı koşulu,
+  sıra, `continue`/`return` ya da log metni değişmedi.
+- `apply_stop_policy` SAF'tır (`dataclasses.replace`), karşı-olgu planı için
+  çağrılması motorun kendi sinyalini DEĞİŞTİRMEZ.
+- `tests/test_golden_backtest.py` altın sayıları **DEĞİŞMEDİ**.
+- `FORENSICS_VERSION` **bump EDİLMEDİ**: yeni alanların hepsi opsiyonel ve
+  eklemelidir; eski `scalp_trades.forensics` satırları okunur kalır.
+  **Migration YOK.**
+
+**Test kanıtı (kırmızı-önce doğrulaması).** Beş yeni test dosyası (229 test)
+D27 ÖNCESİ ağaca (`git archive HEAD`) kopyalanıp koşuldu; sonuç:
+
+| Dosya | n | D27 ÖNCESİ |
+|---|---|---|
+| `tests/test_reaper_exit_label.py` | 38 | toplama HATASI (`EXIT_REASON_REAPER` yok) |
+| `tests/test_forensics_measurement.py` | 40 | 35 kırmızı / 5 yeşil |
+| `tests/test_order_health.py` | 35 | 33 kırmızı / 2 yeşil |
+| `tests/test_counterfactual.py` | 34 | toplama HATASI (modül yok) |
+| `tests/test_counterfactual_store.py` | 82 | toplama HATASI (modül yok) |
+
+Yani testler boş değildir: değişiklik olmadan gerçekten düşerler. Tam paket
+**2483 passed, 2 skipped** (temel: 2251) ve
+`FOLLOWER_EMBEDDED=true FOLLOWER_SYMBOLS=TUTUSDT` varyantı da AYNI.
+
+**Kanıt.** Bu paketin kendisi ölçümdür; "kâr" iddiası YOKTUR. Ölçülmüş girdi
+sayıları yukarıdaki A1–A4 tablosundadır (kaynak: 2026-08-24 kök-neden analizi,
+240 kapalı işlem). Karşı-olgu defterinin ürettiği kanıt **5–10 gün sonra**
+`scripts/ledger_report.py --counterfactual` ile okunacaktır; bugün defter BOŞ
+başlar ve bu doğru sonuçtur (`measured: 0` = "ölçülmedi", "etki yok" DEĞİL).
+
+**Bilinmezler / ölçülmeyenler (dürüstlük):**
+- **Karşı-olgu kuyruğu SÜREÇ-İÇİDİR**; restart'ta çözülmemiş niyetler kaybolur.
+  Kalıcı iz niyetin KENDİSİDİR (`event="intent"` + fiyat/stop/TP1 alanları) —
+  restart ölçümü GECİKTİRİR, kaydı yok etmez.
+- **İkinci-derece etki hâlâ ölçülmüyor.** Defter "o sinyal iyi miydi"yi
+  ölçer; "engellenmeseydi hangi BAŞKA işlem açılmazdı"yı ölçmez. Kapasite ve
+  kayıp-cooldown serbestliği bu satırlara GİRMEZ (bkz. E8.6 üç-mekanizma
+  ayrıştırması).
+- **A1 geriye dönük değil**: eski 43 yaş kesmesi hâlâ "SL" olarak durur.
+- **A1 restart'ta EKSİK SAYAR.** `sp.reaper_close_at` yalnız BELLEKTEDİR (DB
+  sütunu yok, `exits.recover()` geri yüklemez). Reduce-only MARKET emri
+  gittikten sonra, kapanış safety turunda finalize edilmeden önce süreç
+  yeniden başlarsa damga kaybolur ve kapanış eski yoldan "SL" etiketlenir.
+  Ayrım asla FAZLA saymaz, ama eksik sayabilir — "REAPER oranı" okunurken
+  restart sayısı düşülmelidir.
+- **`tp1_missing` sayaçları süreç-içidir**, restart'ta sıfırlanır; kalıcı iz
+  `logs/bot.log`'daki CRITICAL satırlarıdır.
+- **JSONL hacmi ölçülmedi.** Dedup varsayılanı 300 sn seçildi ama gerçek satır
+  hacmi bir günlük gözlemle doğrulanmalı (`/scalper/status → forensics_queue`
+  `dropped` sayacı taşmayı gösterir).
+- **`fee_estimate` aslında "komisyon + funding"dir.** `pnl_source` =
+  `binance_income_net` iken net, `exits.NET_INCOME_TYPES` gereği FUNDING_FEE'yi
+  de içerir; `gross_pnl` ise Σ`realizedPnl`dir (funding hariç). Ayrıştırmak
+  ayrı bir income kırılımı ister — D27 kapsamında YAPILMADI. Uzun tutulan
+  pozisyonlarda `fee_dominated` eşiği hafifçe kayabilir.
+- **`classify_exit`'in `gross > 0` ön koşulu D27 ÖNCESİNDEN gelir**: zararla
+  kapanan bir işlem `fee_dominated` etiketi ALAMAZ. A2 kapsamı dışında
+  bırakıldı (etiketin anlamı "ücret kârı yedi"dir).
+- **`ScalpPosition.mae_pct` varsayılanı hâlâ `0.0`**: "hiç yoklanmadı" ile
+  "hiç aleyhe gitmedi" aynı değere düşer; ayrımı yalnız `mae_samples` (0 =
+  yoklanmadı) dolaylı olarak verir.
+
+**Geri alma:** paketin tamamı gözlemdir. `SCALPER_FORENSICS_ENABLED=false`
+(niyet kaydını, adli kaydı ve karşı-olgu defterini birlikte kapatır) ya da
+yalnız defter için `SCALPER_COUNTERFACTUAL_ENABLED=false`. Etiket/hesap
+düzeltmeleri (A1–A3) kod yolundadır ve bayrakla kapanmaz — geri almak için
+commit revert. `--counterfactual` verilmezse rapor gövdesi eskisiyle birebir
+aynıdır.
 
 ## Reddedilen kararlar (kanıtla)
 

@@ -45,6 +45,7 @@ geri alma tek satir bulunur.
 | D24 | [[20-kararlar/D24-olcum-paketi\|Olcum/kanit paketi]] | AKTIF (yalniz olcum) |
 | D25 | [[20-kararlar/D25-container-yolu\|Tek container dagitim yolu]] | AKTIF (ek yol) |
 | D26 | [[20-kararlar/D26-golge-halkasi\|Golge halkasi + orchestrator kapisi]] | AKTIF |
+| D27 | [[20-kararlar/D27-olcum-borcu-karsi-olgu\|Olcum borcu + karsi-olgu defteri]] | AKTIF (yalniz olcum) |
 
 ## Aday / golge / arastirma
 

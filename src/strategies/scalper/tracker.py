@@ -706,12 +706,20 @@ class ScalpTracker:
             document = self.parse_forensics(raw_forensics) or {}
             if document:
                 tagged += 1
+            exit_block = document.get("exit")
             rows.append({
                 "tags": document.get("verdict") or [],
                 "pnl": float(realized_pnl or 0.0),
                 # D24/madde 6: "ne BEKLEDİK" bloğu. Doldurulmadıysa None =
                 # ÖLÇÜLMEDİ (beklenti kurulmamıştı DEĞİL).
                 "expectation": expectation_from_entry(document.get("entry")),
+                # D27/A1: çıkış nedeni × sonuç kırılımı için. Adli kaydı
+                # OLMAYAN satırlarda `None` → `_bilinmiyor_` kovası
+                # ("ölçülmedi", "nedensiz kapandı" DEĞİL).
+                "exit_reason": (
+                    exit_block.get("reason")
+                    if isinstance(exit_block, dict) else None
+                ),
             })
         summary = summarize(rows)
         summary["since"] = since.isoformat() if since else None

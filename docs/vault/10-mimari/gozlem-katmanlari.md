@@ -1,39 +1,44 @@
 ---
-tags: [mimari, forensics, gozlem, d21, d23, d24]
+tags: [mimari, forensics, gozlem, d21, d23, d24, d27]
 guncelleme: 2026-08-24
-kaynak: src/strategies/scalper/forensics.py, src/strategies/scalper/forensics_log.py, src/strategies/scalper/intent.py, src/strategies/scalper/ai_gate.py, docs/DECISIONS.md D21/D23/D24
+kaynak: src/strategies/scalper/forensics.py, src/strategies/scalper/forensics_log.py, src/strategies/scalper/intent.py, src/strategies/scalper/counterfactual.py, src/strategies/scalper/ai_gate.py, docs/DECISIONS.md D21/D23/D24/D27
 ---
 
-# Gozlem katmanlari — forensics (D21), niyet (D24), AI kapisi (D23)
+# Gozlem katmanlari — forensics (D21), niyet (D24), karsi-olgu (D27), AI kapisi (D23)
 
 ## NE
 
-Uc ayri kayit katmani. **UCU DE YALNIZ GOZLEMDIR**: hicbir kapi, boyutlama,
-stop/TP seviyesi ya da cikis karari bunlari OKUMAZ. Emir akisi bunlar
-olmadigindaki gibidir.
+Dort ayri kayit katmani. **DORDU DE YALNIZ GOZLEMDIR**: hicbir kapi,
+boyutlama, stop/TP seviyesi ya da cikis karari bunlari OKUMAZ. Emir akisi
+bunlar olmadigindaki gibidir.
 
 | Katman | Karar | Ne kaydeder | Varsayilan |
 |---|---|---|---|
 | **Forensics** | [[20-kararlar/D21-islem-adli-kaydi]] | gerceklesen islemin "neden girildi / nasil cikildi / ne ters gitti"si | ACIK |
 | **Niyet kaydi** | [[20-kararlar/D24-olcum-paketi]] | gerceklesMEyen niyet (kapi reddi, saglama dolmadi, emir hatasi) | ACIK, sayaclar surec-ici |
+| **Karsi-olgu defteri** | [[20-kararlar/D27-olcum-borcu-karsi-olgu]] | reddedilen niyet H saat sonra "girilseydi ne olurdu" | ACIK, kuyruk surec-ici |
 | **AI kapisi** | [[20-kararlar/D23-ai-kapisi]] | dil modelinin "bu giris alinmali miydi" hukmu | **`off`** |
 
 ## NEREDE
 
 | Ne | Yer |
 |---|---|
-| Forensics saf katman | `src/strategies/scalper/forensics.py:351` (giris) · `src/strategies/scalper/forensics.py:511` (cikis) |
-| Etiket kurallari | `src/strategies/scalper/forensics.py:584` · `src/strategies/scalper/forensics.py:624` |
-| Post-mortem | `src/strategies/scalper/forensics.py:676` |
-| Ozet | `src/strategies/scalper/forensics.py:776` |
-| Olay akisi (`logs/trades.jsonl`) | `src/strategies/scalper/forensics_log.py:66` · `:147` |
-| Giris baglami (motor) | `src/strategies/scalper/engine.py:2490` |
-| Post-mortem turu | `src/strategies/scalper/engine.py:2716` |
-| Niyet kaydi | `src/strategies/scalper/intent.py:195` · `src/strategies/scalper/intent.py:259` |
-| Niyet cagrisi (motor) | `src/strategies/scalper/engine.py:2442` |
+| Forensics saf katman | `src/strategies/scalper/forensics.py:358` (giris) · `src/strategies/scalper/forensics.py:518` (cikis) |
+| Etiket kurallari | `src/strategies/scalper/forensics.py:679` · `src/strategies/scalper/forensics.py:719` |
+| MAE fiziksel kelepcesi (D27/A3) | `src/strategies/scalper/forensics.py:632` |
+| Post-mortem | `src/strategies/scalper/forensics.py:777` |
+| Ozet | `src/strategies/scalper/forensics.py:877` |
+| Olay akisi (`logs/trades.jsonl`) | `src/strategies/scalper/forensics_log.py:171` · `src/strategies/scalper/forensics_log.py:208` |
+| JSONL okuma (yalniz istek uzerine) | `src/strategies/scalper/forensics_log.py:115` |
+| Giris baglami (motor) | `src/strategies/scalper/engine.py:2656` |
+| Niyet kaydi | `src/strategies/scalper/intent.py:213` · `src/strategies/scalper/intent.py:292` |
+| Niyet cagrisi (motor) | `src/strategies/scalper/engine.py:2513` |
+| Karsi-olgu saf cekirdek | `src/strategies/scalper/counterfactual.py:343` (simulasyon) · `src/strategies/scalper/counterfactual.py:621` (ozet) |
+| Karsi-olgu durum katmani | `src/strategies/scalper/counterfactual_store.py:186` · `src/strategies/scalper/counterfactual_store.py:329` |
+| Karsi-olgu motor kancalari | `src/strategies/scalper/engine.py:2591` · `src/strategies/scalper/engine.py:2638` |
 | AI kapisi | `src/strategies/scalper/ai_gate.py:857` (`should_block` `:943`, `observe` `:962`) |
-| AI gozlem cagrisi | `src/strategies/scalper/engine.py:2370` |
-| Okuma uclari | `src/main.py:2984` · `src/main.py:2997` · `src/main.py:3003` |
+| AI gozlem cagrisi | `src/strategies/scalper/engine.py:2441` |
+| Okuma uclari | `src/main.py:3041` · `src/main.py:3054` · `src/main.py:3060` · `src/main.py:3102` |
 
 ## NASIL CALISIR
 

@@ -37,7 +37,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.core.logger import app_logger
 
@@ -105,6 +105,67 @@ def _prune(directory: Path, now: float) -> None:
                 item.unlink()
             except OSError:
                 pass
+
+
+#: `read_events` bir çağrıda okuyacağı AZAMİ satır sayısı. Kalıcı tarihçe 30
+#: günlüktür; sınırsız okuma bir HTTP isteğini dakikalara uzatabilir.
+READ_MAX_LINES = 200_000
+
+
+def read_events(
+    event: str,
+    *,
+    since_iso: Optional[str] = None,
+    limit: int = READ_MAX_LINES,
+) -> List[Dict[str, Any]]:
+    """Arşivler dahil JSONL'den `event` türündeki satırları oku (ESKİ→YENİ).
+
+    **Yalnız İSTEK ÜZERİNE çağrılır** (rapor/uç), motor yolundan ASLA:
+    burada gerçek disk okuması vardır ve `append_soon`ın O(1) sözleşmesini
+    bozmamalıdır (bkz. modül başlığındaki D21-R3 notu).
+
+    `since_iso` verilirse satırın `ts` alanı (ya da yoksa `at`) bundan küçük
+    olanlar atlanır — ISO metinleri leksikografik olarak da doğru sıralanır
+    (hepsi UTC ve aynı biçimde yazılır).
+
+    Bozuk satır SESSİZCE atlanır: yarım yazılmış tek bir satır tüm raporu
+    düşürmemeli. Dosya yoksa boş liste döner.
+    """
+    wanted = str(event)
+    rows: List[Dict[str, Any]] = []
+    directory = log_dir()
+    try:
+        archives = sorted(directory.glob(f"{ARCHIVE_PREFIX}*.jsonl"))
+    except OSError:
+        archives = []
+    paths = list(archives) + [directory / FILE_NAME]
+    seen = 0
+    for path in paths:
+        if not path.exists():
+            continue
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    seen += 1
+                    if seen > max(0, int(limit)):
+                        return rows
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(row, dict) or row.get("event") != wanted:
+                        continue
+                    if since_iso:
+                        stamp = row.get("ts") or row.get("at")
+                        if isinstance(stamp, str) and stamp < since_iso:
+                            continue
+                    rows.append(row)
+        except OSError:
+            continue
+    return rows
 
 
 def append(event: str, payload: Dict[str, Any], *, now: Optional[float] = None) -> bool:

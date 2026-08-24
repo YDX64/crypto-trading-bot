@@ -1998,6 +1998,8 @@ class FollowerEngine:
             # Komisyon kapısı ret sayacı (D20a bulgu 3) panoda görünür.
             "fee_gate_rejects": int(rejects.get("fee_gate", 0) or 0),
             "reject_counters": dict(rejects),
+            # D27/A4: pano uyarı satırı bunu okur (AYRI yoklama YOK).
+            "order_health": full.get("order_health") or {},
         }
 
     @staticmethod
@@ -2179,5 +2181,38 @@ class FollowerEngine:
                 **self._reject_counters,
                 **self.executor.reject_snapshot(),
             },
+            # D27/A4: TP1 emri konulamadıysa break-even HİÇ kurulmaz ve işlem
+            # tam risk stopuyla taşınır. Takipçide sayaç ZATEN vardı
+            # (`reject_counters.tp1_missing`) ama ret kovasının içinde
+            # kayboluyordu; scalper ile AYNI ŞEKİLLİ bloğa taşınıyor ki pano
+            # tek bir uyarı satırıyla iki halkayı da gösterebilsin.
+            "order_health": self._order_health_snapshot(),
             "last_event_at": self._last_event_at,
+        }
+
+    def _order_health_snapshot(self) -> Dict[str, Any]:
+        """D27/A4: scalper `/scalper/status → order_health` ile AYNI şekil.
+
+        Takipçide `tp1_missing` sayacı `executor.count_reject` ile artar;
+        burada yalnız görünür yere taşınır — davranış değişmez.
+
+        İKİ AYRI `try`: executor anlık görüntüsü patlarsa motorun KENDİ
+        sayaçları YİNE OKUNUR. Tek bir `try` ile sarmak, bir teşhis arızasının
+        gerçek bir `tp1_missing`i **sıfır** (yani "sağlıklı") göstermesine yol
+        açardı — bu blok tam da sessiz kalmamak için var.
+        """
+        rejects: Dict[str, Any] = {}
+        try:
+            rejects.update(self._reject_counters or {})
+        except Exception:  # pragma: no cover - teşhis bloğu status'u düşürmez
+            pass
+        try:
+            rejects.update(self.executor.reject_snapshot() or {})
+        except Exception:  # pragma: no cover - teşhis bloğu status'u düşürmez
+            pass
+        return {
+            "tp1_missing": int(rejects.get("tp1_missing", 0) or 0),
+            "tp_wrong_side": int(rejects.get("tp_wrong_side", 0) or 0),
+            "partial_fill_split": int(rejects.get("partial_fill_split", 0) or 0),
+            "window": "process_start",
         }

@@ -71,6 +71,15 @@ TRAIL_EXIT_REASONS = frozenset({"TRAIL", EXIT_REASON_TRAIL_MARKET})
 # -2021 sonrası acil kapanışla sonlanan etiketler (defter/telemetri ortak).
 MARKET_EXIT_REASONS = frozenset({EXIT_REASON_TRAIL_MARKET, EXIT_REASON_BE_MARKET})
 
+# D27/A1 — YAŞ KESMESİ (reaper, D4) AYRI ETİKET. Bu bir DAVRANIŞ değişikliği
+# değil, zaten olan bir kapanışın dürüst adıdır: `engine._reap_aged_positions`
+# yaş limitini dolduran KORUMASIZ (TP1 görmemiş) pozisyonu reduce-only MARKET
+# ile kapatır ve bu kapanış bugüne kadar deftere "SL" yazılıyordu.
+# **GERİYE DÖNÜK VERİ DÜZELTMESİ YOKTUR**: eski satırlar "SL" olarak kalır,
+# yeni kapanışlar "REAPER" yazılır. Raporlar bunu "REAPER ayrımı
+# 2026-08-24'ten itibaren" notuyla söyler (scripts/ledger_report.py).
+EXIT_REASON_REAPER = "REAPER"
+
 # --- D17: ayrı market-data host'unda fiyat uzayı çevirisi ----------------
 # Chandelier seviyesi VERİ host'unun mumlarından çıkar ama emir İŞLEM host'una
 # gider. Baz (iki defter arasındaki anlık fark) her turda YENİDEN ölçülür ve
@@ -107,6 +116,16 @@ class _CloseLedger:
     net_pnl_estimate: float  # Σ(realizedPnl − commission) − tahmini giriş komisyonu
     close_fills: int
     flatten_kind: str        # "SL" | "TP1" | "TP2"
+    # --- D27/A2: merdiven-farkında BRÜT (yalnız ölçüm) --------------------
+    # `gross_pnl` = TÜM kapanış bacaklarının Σ(realizedPnl)'i — komisyon HARİÇ.
+    # `_estimate_gross_pnl` brütü TEK çıkış fiyatıyla hesaplar; TP1/TP2/runner
+    # üç ayrı fiyattan doldursa bile tek fiyat varsayar. Ölçüldü (2026-08-24):
+    # 22 işlemin 8'inde `forensics.fee_estimate` teorik komisyonun 2 katından
+    # fazla, 5'inde NEGATİF çıkmıştı → `fee_dominated` etiketi geçersizdi.
+    # Bu alan borsa satırlarından gelen GERÇEK brüttür; PnL/karar yollarına
+    # GİRMEZ (net hesabı `net_pnl_estimate` ile birebir aynı kaldı).
+    gross_pnl: Optional[float] = None
+    legs: int = 0            # kapanışı oluşturan TOPLAM fill satırı sayısı
 
 
 class ExitManager:
@@ -1358,6 +1377,12 @@ class ExitManager:
                 exit_price = sp.position.current_price or sp.position.entry_price
 
         estimated_gross = self._estimate_gross_pnl(direction, entry, exit_price, qty)
+        # D27/A2 — ADLİ KAYIT İÇİN merdiven-farkında brüt. `estimated_gross`
+        # PnL merdivenindeki rolünü (son çare `realized_pnl` kaynağı)
+        # DEĞİŞTİRMEDEN korur; yalnız forensics'e giden brüt ayrışır.
+        forensics_gross, gross_source = self._forensics_gross(
+            sp=sp, ledger=ledger, estimated_gross=estimated_gross
+        )
         income_net = await self._fetch_net_income(
             symbol=symbol,
             opened_at=sp.position.opened_at,
@@ -1393,6 +1418,22 @@ class ExitManager:
                 else self._infer_exit_reason(sp, exit_price, realized_pnl=realized_pnl)
             )
         )
+        # D27/A1 PARİTE: kayıp-cooldown kapısı etiketi OKUR. Yeni "REAPER"
+        # etiketi o kapıya SIZMAMALI — aksi hâlde yaş kesmesi cooldown
+        # kararını (her iki yönde de) sessizce değiştirirdi. Bu satır kapıya
+        # D27 ÖNCESİ etiket uzayını verir; deftere/adli kayda yazılan etiket
+        # `exit_reason`dır. Bkz. `_infer_exit_reason_legacy` docstring'i.
+        cooldown_reason = (
+            forced_exit_reason
+            if forced_exit_reason is not None
+            else (
+                ledger.exit_reason
+                if ledger is not None
+                else self._infer_exit_reason_legacy(
+                    sp, exit_price, realized_pnl=realized_pnl
+                )
+            )
+        )
         notes = ";".join(verification_notes) or None
 
         # D21 adli kayıt: "nasıl çıkıldı" + kural tabanlı etiketler. Hesap
@@ -1402,7 +1443,8 @@ class ExitManager:
             sp=sp,
             exit_price=exit_price,
             realized_pnl=realized_pnl,
-            gross_pnl=estimated_gross,
+            gross_pnl=forensics_gross,
+            gross_source=gross_source,
             pnl_source=pnl_source,
             exit_reason=exit_reason,
             verification_notes=verification_notes,
@@ -1438,7 +1480,7 @@ class ExitManager:
             else self._estimated_roundtrip_fee(entry, exit_price, qty)
         )
         self._maybe_start_loss_cooldown(
-            symbol, exit_reason, realized_pnl, loss_threshold
+            symbol, cooldown_reason, realized_pnl, loss_threshold
         )
 
         self.logger.info(
@@ -1514,6 +1556,50 @@ class ExitManager:
             except Exception:  # pragma: no cover - savunma
                 sp.opened_epoch = None
 
+    #: D27/A2 — adli kayıttaki brütün KAYNAĞI (rapor "ölçülmedi" diyebilsin).
+    GROSS_SOURCE_LEDGER = "ledger_legs"        # borsa fill'lerinden, merdiven dahil
+    GROSS_SOURCE_SINGLE = "single_leg_estimate"  # tek çıkış fiyatı — merdiven YOK
+    GROSS_SOURCE_UNMEASURED = "unmeasured_ladder"  # merdiven VAR ama ledger YOK
+
+    @staticmethod
+    def _forensics_gross(
+        *,
+        sp: ScalpPosition,
+        ledger: Optional[_CloseLedger],
+        estimated_gross: Optional[float],
+    ) -> Tuple[Optional[float], str]:
+        """Adli kayda yazılacak BRÜT PnL ve kaynağı — SAF, IO yok.
+
+        Üç durum vardır ve üçü de AYRI raporlanır:
+
+        1. **`ledger_legs`** — borsa `userTrades` satırları doğrulandı:
+           brüt = Σ(realizedPnl), merdivenin (TP1/TP2/runner) her bacağı
+           KENDİ fiyatından sayılır. Doğru olan budur.
+        2. **`single_leg_estimate`** — ledger yok AMA pozisyon hiç kısmi
+           dolum görmedi (`tp1_done`/`tp2_done` False, `trailing_active`
+           False): kapanış TEK bacaktır, tek fiyatla hesaplanan brüt
+           GEÇERLİDİR.
+        3. **`unmeasured_ladder`** — ledger yok ve merdiven kısmen dolmuş:
+           tek çıkış fiyatıyla hesaplanan brüt YANLIŞTIR (ölçüldü: 22
+           işlemin 8'inde tahmini komisyon teorik değerin 2 katından fazla,
+           5'inde NEGATİF). Bu hâlde brüt **`None`** bırakılır ve
+           `fee_estimate` de `None` olur: **uydurma sayı YASAK**, rapor
+           "ölçülemedi" der.
+
+        `realized_pnl` (defter) bu fonksiyondan ETKİLENMEZ; `_finalize_close`
+        PnL merdivenini (income → ledger net → brüt tahmin) aynen sürdürür.
+        """
+        if ledger is not None and ledger.gross_pnl is not None:
+            return float(ledger.gross_pnl), ExitManager.GROSS_SOURCE_LEDGER
+        laddered = bool(
+            getattr(sp, "tp1_done", False)
+            or getattr(sp, "tp2_done", False)
+            or getattr(sp, "trailing_active", False)
+        )
+        if laddered:
+            return None, ExitManager.GROSS_SOURCE_UNMEASURED
+        return estimated_gross, ExitManager.GROSS_SOURCE_SINGLE
+
     def _build_exit_forensics(
         self,
         *,
@@ -1525,6 +1611,7 @@ class ExitManager:
         pnl_source: Optional[str],
         exit_reason: Optional[str],
         verification_notes: List[str],
+        gross_source: Optional[str] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Optional[List[str]]]:
         """(çıkış sözlüğü, etiket listesi) — hata hâlinde (None, None)."""
         if not self._forensics_enabled():
@@ -1590,9 +1677,13 @@ class ExitManager:
                 direction=sp.signal.direction,
                 realized_pnl=realized_pnl,
                 gross_pnl=gross_pnl,
+                gross_source=gross_source,
                 pnl_source=pnl_source,
                 mae_roi_pct=getattr(sp, "mae_pct", None),
                 mfe_roi_pct=getattr(sp, "mfe_pct", None),
+                # D27/A3: MAE yoklama sıklığı — düzeltmenin ne kadar kaba bir
+                # örneklemeden geldiğini okuyan bilsin.
+                mae_samples=getattr(sp, "mae_samples", None),
                 duration_sec=duration,
                 path=path,
                 leader_day_drift_pct=context.get("leader_day_drift_pct"),
@@ -1889,6 +1980,11 @@ class ExitManager:
             net_pnl_estimate=net_pnl_estimate,
             close_fills=len(closing_fills),
             flatten_kind=closing_kind,
+            # D27/A2: merdivenin TÜM bacaklarının brütü (komisyon hariç).
+            # `net_pnl_estimate = gross - fees - entry_fee_est` ZATEN bu
+            # `gross`tan türüyordu; burada yalnız GÖRÜNÜR kılınıyor.
+            gross_pnl=gross,
+            legs=len(fills),
         )
 
     @staticmethod
@@ -2111,6 +2207,49 @@ class ExitManager:
         mesafe kıyası fiyat sıçraması/kayma nedeniyle yanılabilir, ama kayıplı
         bir kapanışın "kâr merdiveni" olarak görünmesi asıl bulguyu (2026-08-13
         ADAUSDT vakası) tekrarlar.
+
+        D27/A1 — REAPER AYRIMI. Yaş limitini (D4, `SCALPER_MAX_HOLD_HOURS`)
+        dolduran pozisyonu `engine._reap_aged_positions` düz bir reduce-only
+        MARKET emriyle kapatır. `_verified_close_ledger` YALNIZ algo adaylarına
+        (SL/TP1/TP2/TP3) bakar, o emri GÖREMEZ ve buraya düşülür; buradaki
+        mesafe kıyası da kesmeyi çoğunlukla "SL" diye etiketliyordu. Ölçüldü
+        (2026-08-24 kök-neden analizi): 43 yaş-kesmesi = **-172.3 USDT** =
+        brüt zararın **%27'si**, ve bunların **12'si ARTIDA** kesilmişti. Bu
+        etiket kirliliği her SL analizini bozuyordu.
+
+        Sıra ÖNEMLİ: reaper damgası `trailing_active`ten ÖNCE bakılır. Reaper
+        `trailing_active` pozisyonları zaten MUAF tutar (D4), yani ikisi
+        normalde bir arada olamaz; olduysa (TP1 emirle aynı turda dolduysa)
+        pozisyonu FİİLEN kapatan reaper'ın MARKET emridir. Borsa kanıtı
+        (gerçek bir SL/TP fill) varsa buraya HİÇ düşülmez — ledger kazanır.
+        """
+        if getattr(sp, "reaper_close_at", None):
+            return EXIT_REASON_REAPER
+        return ExitManager._infer_exit_reason_legacy(sp, exit_price, realized_pnl)
+
+    @staticmethod
+    def _infer_exit_reason_legacy(
+        sp: ScalpPosition, exit_price: float, realized_pnl: float
+    ) -> str:
+        """D27 ÖNCESİ kaba çıkarım — DEĞİŞMEDİ, bit düzeyinde aynı gövde.
+
+        NEDEN AYRI DURUYOR: `_maybe_start_loss_cooldown` kapısı etiketi OKUR
+        (`exit_reason != "SL" and realized_pnl >= threshold` → çık). Sapma TEK
+        yönlüdür ve tam olarak şu köşededir: **eski etiket "SL" + PnL eşiğin
+        ÜSTÜNDE**. Bugün böyle bir kapanış cooldown BAŞLATIR; "REAPER" etiketi
+        kapıya sızsaydı BAŞLATMAZDI — ve ölçüldüğü üzere yaş kesmelerinin
+        12'si tam da ARTIDA kapanmıştı. (Eski etiket "TP_LADDER" olan artıda
+        kapanışlarda fark YOKTUR: ikisi de erken döner.) D27 sözleşmesi
+        "motor karar yolu bayt bayt aynı" der; bu yüzden cooldown kapısı ESKİ
+        etiket uzayını okumaya devam eder ve deftere/adli kayda YENİ etiket
+        yazılır. Parite testi:
+        `tests/test_reaper_exit_label.py::TestCooldownParity`.
+
+        SINIR (dürüstlük): `sp.reaper_close_at` yalnız BELLEKTEDİR — DB'de
+        sütunu yoktur ve `recover()` onu geri yüklemez. Emir gönderildikten
+        sonra, kapanış finalize edilmeden ÖNCE süreç yeniden başlarsa damga
+        kaybolur ve kapanış eski yoldan "SL" etiketlenir. Yani REAPER ayrımı
+        restart'lar boyunca EKSİK SAYAR (asla fazla saymaz).
         """
         if sp.trailing_active:
             # TP1 sonrası trailing aktifken kapanmışsa TRAIL veya son SL — TRAIL say
@@ -2135,6 +2274,14 @@ class ExitManager:
         roi_pct = price_delta_pct * leverage
         sp.mfe_pct = max(sp.mfe_pct, roi_pct)
         sp.mae_pct = min(sp.mae_pct, roi_pct)
+        # D27/A3 — yoklama sayacı (YALNIZ ÖLÇÜM). MAE/MFE bir ÖRNEKLEMEDİR;
+        # kaç kez örneklendiği bilinmeden "MAE −7.16" ifadesinin çözünürlüğü
+        # bilinemez. Hata akışı kesmemeli: alan yoksa (eski test çiftleri)
+        # sessizce atlanır.
+        try:
+            sp.mae_samples = int(getattr(sp, "mae_samples", 0) or 0) + 1
+        except Exception:  # pragma: no cover - SimpleNamespace fixture'ları
+            pass
 
     @staticmethod
     def _live_stop_order(
