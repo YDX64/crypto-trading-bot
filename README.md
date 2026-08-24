@@ -3,6 +3,8 @@
 > [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/DECISIONS.md`](docs/DECISIONS.md),
 > [`docs/RUNBOOK.md`](docs/RUNBOOK.md), [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md) okunur.
 > Eski araştırma/n8n dosyaları `archive/2025-10-legacy/` altındadır.
+>
+> **Yeni başlayan AI/mühendis:** [`docs/vault/00-BASLA-BURADAN.md`](docs/vault/00-BASLA-BURADAN.md) (Obsidian kasası — sistemin bileşen/karar/deney/işletme haritası).
 
 # 🤖 AI-Powered Crypto Trading Bot
 

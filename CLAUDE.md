@@ -3,6 +3,8 @@
 Bu dosya, bu repoya bakan her yapay zekâ/mühendis için **zorunlu** giriş kapısıdır.
 Amaç: 10 dakikada sistemi doğru anlamak, uydurmamak, bozmamak.
 
+> **Yeni başlayan AI/mühendis:** `docs/vault/00-BASLA-BURADAN.md` (Obsidian kasası — bileşen/karar/deney/işletme notları, çapraz bağlı).
+
 ## Ne bu?
 Binance USDⓈ-M Futures için Python (FastAPI + asyncio) scalping botu. Aktif strateji
 **C** (RSI ucu + Bollinger taşması + RSI diverjansı, ters yön giriş) — `src/strategies/scalper/`.
