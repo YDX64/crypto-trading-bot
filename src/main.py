@@ -823,6 +823,21 @@ async def api_status(request: Request = None):
         except Exception as e:  # teşhis alanı asla status'u düşürmemeli
             payload["follower"] = {"error": f"{type(e).__name__}: {e}"}
 
+    # D23: pano "AI Karar Katmanı (gölge)" kartını BU gövdeden okur — YENİ bir
+    # uç AÇILMAZ (nginx beyaz listesi: `/api/status` zaten izinli, bkz.
+    # docs/RUNBOOK.md "Pano erişimi"). `_ai_gate_snapshot()` yalnız BELLEK
+    # okur (REST/DB YOK) → 2026-08-18 pano-açlığı riski doğurmaz. Katman
+    # KAPALIYKEN anahtar hiç EKLENMEZ → yanıt bugünküyle birebir aynıdır.
+    if str(getattr(settings, "scalper_ai_gate_mode", "off") or "off") != "off":
+        try:
+            payload["ai_gate"] = (
+                scalper_engine._ai_gate_snapshot()
+                if scalper_engine
+                else {"mode": settings.scalper_ai_gate_mode, "enabled": True}
+            )
+        except Exception as e:  # teşhis alanı asla status'u düşürmemeli
+            payload["ai_gate"] = {"error": f"{type(e).__name__}: {e}"}
+
     return _store_status(_api_status_cache, cache_key, payload)
 
 
@@ -2646,6 +2661,17 @@ _EMPTY_SCALPER_STATUS = {
     "rest_weight": {},
     # D21/D22: adli kayıt kuyruğu (istek anında tazelenir).
     "forensics_queue": {},
+    # D23: AI karar katmanı (gölge). Motor yokken de ŞEKİL aynı olmalı —
+    # pano "alan yok" ile "katman kapalı"yı karıştırmasın.
+    "ai_gate": {
+        "mode": str(getattr(settings, "scalper_ai_gate_mode", "off") or "off"),
+        "effective_mode": str(
+            getattr(settings, "scalper_ai_gate_mode", "off") or "off"
+        ),
+        "enabled": str(
+            getattr(settings, "scalper_ai_gate_mode", "off") or "off"
+        ) != "off",
+    },
     "entry_halted": False,
     "entry_halt_reason": None,
     "entry_halted_at": None,

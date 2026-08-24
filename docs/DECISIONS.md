@@ -2321,6 +2321,241 @@ Değişen: (i) kapanışın deftere yazılan ETİKETİ ve FİYAT KAYNAĞI, (ii) 
 seviyeleri, (iii) durum alanları ve pano önbelleği, (iv) varsayılan KAPALI bir
 ağırlık telemetrisi/geri çekilmesi.
 
+### D23 — AI karar katmanı (`SCALPER_AI_GATE_MODE`) · 2026-08-24 · **GÖLGE (aktif DEĞİL) — kod varsayılanı `off`, canlıda AÇILMADI**
+**Kanıt kaynağı:** YOK — bu madde bir strateji kanıtı değil, kanıt ÜRETME
+altyapısıdır (D21 ile aynı disiplin). Hüküm gölge ölçümünden sonra bu kayda
+eklenecektir.
+
+**Ne:** motor TÜM kapılarını (rejim, lider piyasa, TV sağlaması, kapasite,
+cooldown) geçirip pozisyonu AÇTIKTAN sonra, açılan işlemin bağlamı bir dil
+modeline tek bir soruyla sorulur: *"bu giriş alınmalı mıydı?"*. Yanıt KATI bir
+JSON şemasıdır (`schema_version=d23.1`) ve iki yere yazılır: `logs/trades.jsonl`
+(`event="ai_verdict"`, `forensics_log.append_soon` ile — disk yazımı olay
+döngüsü DIŞINDA, D21-R3) ve `scalp_trades.forensics` JSON'unun `document["ai"]`
+bloğu (`tracker.attach_ai`, **MIGRATION YOK**; `record_close` birleştirmesi
+bloğu korur). Gölgede motorun davranışı BAYT BAYT aynıdır.
+
+**Neden bu iş yapıldı:** sinyal-öncelik kuralı (kullanıcı kararı, 2026-08-23)
+boyut/TP1/stop ayarıyla kayıp küçültmeyi YASAKLAR; geriye kalan tek yol sinyal
+kalitesini ÖLÇMEKTİR. D21 kaydı bu ölçüm için gereken VERİYİ üretti; bu madde
+o veriye bir HÜKÜM adayı ekler. Kural tabanlı etiketlerin (D21) göremediği şey
+bağlamın BİRLEŞİMİDİR: "TV SHORT + lider yukarı + stop ATR'ye göre dar +
+sağlama tek aile" gibi bir çakışma tek eşikli hiçbir kuralda görünmez, ama
+defterde ödeme asimetrisi olarak durur (E8.7).
+
+**Neden GÖLGE ve neden varsayılan `off`:**
+1. Bir dil modelinin hükmü de bir PARAMETRE değişikliğidir; CLAUDE.md yasak #1
+   kanıtsız parametre değişikliğini yasaklar. Gölge, kanıt üretmenin tek dürüst
+   yoludur: karar üretilir, kaydedilir, HİÇBİR ŞEYE dokunmaz.
+2. Varsayılan `off` D18/D20b konvansiyonudur — yeni katman `.env` ile BİLİNÇLİ
+   açılır. `off` iken `AiGate` **hiç örneklenmez** (`engine._ai_gate_layer`
+   tembel kurar): sıfır çağrı, sıfır maliyet, sıfır sağlayıcı bağımlılığı.
+3. `active` **config validator tarafından REDDEDİLİR**
+   (`Settings._validate_ai_gate_settings` → startup ValueError: *"D23 canlı kapı
+   henüz onaylanmadı — go_live ölçütleri docs/DECISIONS.md D23"*). Kod yolu
+   (`AiGate.should_block`) hazırdır ama **motora KABLOLANMAMIŞTIR**: `active`e
+   geçmek yalnız validator satırını kaldırmak değil, kancayı karar yoluna
+   taşımak VE **harness/motor paritesini (#P1) kurmaktır**. Canlıda engelleyip
+   backtest'te engellemeyen bir kapı iki defteri kıyaslanamaz hâle getirir.
+
+**Sözleşme (pazarlık edilemez):**
+- **YALNIZ ENGELLEYEN.** Yalnız `verdict="deny"` bir etki üretebilir; `allow`
+  hiçbir şey AÇMAZ, hiçbir kapıyı gevşetmez, boyutu artırmaz.
+- **Bu bir KALİTE FİLTRESİDİR, güvenlik cihazı DEĞİLDİR.** Gerçek güvenlik
+  cihazları (entry-halt latch'i, risk-olayı halt'ı, borsa pozisyon doğrulaması)
+  **fail-CLOSED**'dur; bu katman onlara DOKUNMAZ ve onların yerine GEÇMEZ.
+- **Her arıza FAIL-OPEN'dır.** Sağlayıcı hatası, zaman aşımı, bozuk JSON, bütçe
+  bitmesi, bayat karar — hepsi kaydedilir ve giriş normal sürer. Bozuk bir
+  kalite filtresi trading halt'a dönüşmemelidir. Katman kurulamazsa
+  `engine._ai_gate_warn` TEK SEFER WARNING yazar ve girişler ETKİLENMEZ.
+
+**Nerede:**
+- `src/strategies/scalper/ai_gate.py` — katmanın tamamı (sanitizasyon, kalıp
+  kütüphanesi, prompt, şema doğrulaması, sağlayıcı zinciri, sayaçlar).
+- `src/core/config.py` — `scalper_ai_gate_*` ayarları +
+  `_validate_ai_gate_settings` (yazım hatası startup'ta patlar; `active` red).
+- `src/strategies/scalper/engine.py` — `_ai_gate_layer` (tembel kurulum),
+  `_ai_gate_observe` (TEK kanca), `_ai_gate_snapshot` (`/scalper/status`).
+- `src/strategies/scalper/tracker.py` — `attach_ai` (adli belgeye `ai` bloğu).
+- `src/main.py` — `/api/status` gövdesindeki `ai_gate` bloğu (pano kartı).
+- `scripts/ledger_report.py --ai` — gölge raporu.
+
+**Motor yolunda 0 ms — neden `_entry_lock` DIŞINDA:** kanca giriş denemesi
+BİTTİKTEN sonra, kilidin DIŞINDA çağrılır ve yaptığı iş mod kontrolü + sözlük
+kopyası + `asyncio.create_task`tır (ateşle-unut). Gerekçe D21-R3'ün devamıdır:
+`engine._entry_lock` **TEK ve GLOBAL**'dir — içindeki her `await` TÜM
+sembollerin girişini sıraya sokar. D21-R3 bu yüzden JSONL **disk yazımını** bile
+olay döngüsünden çıkardı; bir **ağ çağrısı** (25 sn'ye kadar) disk yazımından
+kat kat kötüdür ve safety turunu bloklayarak 2026-08-14 yolunu (TP1→BE,
+trailing, reaper gecikmesi → `/health` 503 → watchdog restart) açardı.
+
+**Kimin sorulduğu (bütçe kuralı):** katman YALNIZ pozisyona dönüşen adayları
+sağlayıcıya sorar. Gerekçe iki taraflıdır: (a) girdilerin bir parçası dolum
+belgesidir (`executor.build_entry` çıktısı), (b) gölge ölçümü GERÇEKLEŞMİŞ PnL
+gerektirir — açılmamış bir adayın sonucu yoktur. İşleme dönüşmeyen aday yine de
+iz bırakır: `logs/trades.jsonl`'e `ai_verdict` olayı + `outcome:"no_trade"` +
+`status:"ai_skipped"` satırı yazılır ve sağlayıcıya SORULMAZ. "AI hiç bakmadı"
+ile "AI baktı, izin verdi" ayrı şeylerdir ve raporda ayrı sayılır.
+
+**Sağlayıcı zinciri:** `SCALPER_AI_GATE_PROVIDER` birincildir, kalanlar sırayla
+denenir: **DeepSeek → Gemini → OpenAI**. Sunucuda ANTHROPIC anahtarı YOKTUR.
+Zincir `src/analyzers/ai_analyzer.py` ile AYNI istemci altyapısını kullanır
+(mevcut `openai` SDK + `google-generativeai`) — **YENİ pip bağımlılığı YOK**.
+Anahtar yoksa ya da `your_...` yer tutucusuysa o sağlayıcı ATLANIR; hepsi
+atlanır/başarısız olursa `ai_unavailable` + fail-open. Model adları
+`SCALPER_AI_GATE_{DEEPSEEK,GEMINI,OPENAI}_MODEL` ile ayarlanır; boş bırakılırsa
+sağlayıcının genel ayarı (`DEEPSEEK_MODEL` / `GEMINI_MODEL` / `OPENAI_MODEL`)
+kullanılır. Kodda model adı SABİTLENMEZ.
+
+**Prompt injection savunması:** `/tv-signal` HERKESE AÇIK bir uçtur, dolayısıyla
+alarm gövdesi DÜŞMAN girdisidir. TV alarmının **HAM METNİ prompt'a ASLA
+girmez**: `build_payload` yalnız sayı/bool ve KAPALI listeden gelen belirteçleri
+geçirir — bilinmeyen anahtar DÜŞER, biçimsiz değer `invalid` olur, listede
+olmayan bir TV kaynağı `other`a eşlenir. Prompt'ta serbest metin alanı YOKTUR.
+
+**Katı JSON şeması (`validate_verdict`):** `schema_version` (`d23.1`), `verdict`
+(`allow|deny`), `confidence` (0..1), `axes` (5 eksen, her biri 0..1:
+`regime_fit`, `tv_confluence_depth`, `stop_sanity`, `crowding`,
+`structure_conflict`), `pattern_ids` (**KAPALI ve SÜRÜMLÜ liste**,
+`PATTERN_LIBRARY_VERSION=d23.1`), `reason` (≤200 karakter, **KARAR TAŞIMAZ** —
+yalnız insan okuru içindir), `horizon_end_at`, `invalid_if`,
+`expected_outcome`, `model_version`, `input_digest` = sha256(sembol, bar
+`close_time`, payload), `latency_ms`. Şema dışı HER yanıt → `ai_malformed` +
+fail-open. Eksenler KARAR VERMEZ: her biri AYRI AYRI PnL ile ilişkilendirilir,
+böylece "AI katkısı var mı" sorusu tek bir skor yerine HANGİ eksenin işe
+yaradığı biçiminde ölçülür.
+
+**Kalıp kütüphanesi — `deny` kanıt İSTER:** her kalıp `docs/EXPERIMENTS.md`'deki
+ÖLÇÜLMÜŞ bir bulgudan türer ve üç duruştan birini taşır: `deny_evidence`
+(defterde negatif → bir REDDİ destekleyebilir), `refuted` (ölçüldü ve
+REDDEDİLDİ → **REDDE GEREKÇE OLAMAZ**), `context` (ne destek ne ret). Kural şema
+doğrulamasında ÇİVİLİDİR: **`deny` yalnız en az bir `deny_evidence` kalıbıyla
+desteklenirse geçerlidir**, aksi hâlde yanıt `ai_malformed` sayılır ve karar
+DÜŞER. Çürütülmüş hipotezler (D18 CHoCH kapısı, lider koşu kapısı, ATR
+persentili, uzama kapısı, TV sağlama SÜRESİ) kütüphanede KASITLI olarak durur:
+bir dil modeli aksi hâlde bunları makul göründükleri için yeniden icat eder —
+orada olmaları onları modele "ölçüldü ve reddedildi" olarak tanıtır.
+
+**Kaçak/bütçe/tazelik korumaları:**
+- **Kaçak:** son `SCALPER_AI_GATE_DENY_WINDOW=20` kararda `deny` oranı
+  `SCALPER_AI_GATE_DENY_RATIO_LIMIT=0.60`ı (%60) aşarsa `runaway` bayrağı yanar
+  ve katman kendini **`shadow`a düşürür** (`effective_mode`). Bayrak süreç
+  yeniden başlatılana kadar yanık kalır.
+- **Tazelik:** karar `SCALPER_AI_GATE_TTL_SEC=120` saniyeden geç gelirse
+  `ai_stale` işaretlenir ve `active` fazda **ASLA uygulanmaz**.
+- **Bütçe:** `SCALPER_AI_GATE_MAX_CALLS_PER_DAY=200` aşılırsa
+  `ai_budget_exhausted`; sayaç **UTC gün başında** sıfırlanır.
+- **Zaman aşımı:** `SCALPER_AI_GATE_TIMEOUT_SEC=25` yalnız arka plan görevini
+  sınırlar; motor zaten beklemiyordur.
+
+**REST ağırlığı artışı SIFIR:** orderbook/funding ALINMAZ, yeni Binance isteği
+YOKTUR. Girdiler motorun zaten kurduğu `forensics_ctx` + dolum belgesi + DB
+defter özetidir (son `SCALPER_AI_GATE_RECENT_TRADES=20` işlem). 418 ban
+döngüsünün kökü REST ağırlığıydı; bu katman o bütçeye DOKUNMAZ.
+
+**Görünürlük:** `/scalper/status` → `ai_gate` bloğu (mod, `effective_mode`,
+sağlayıcı zinciri, hazır sağlayıcılar, kapsama %, JSON geçerliliği %,
+allow/deny, `deny_ratio_pct`, `latency_ms` p50/p95, hatalar, `runaway`, günlük
+çağrı/bütçe, `cost_estimate_usd_today`). Pano kartı ("AI Karar Katmanı")
+**YENİ UÇ AÇMAZ** — `/api/status` gövdesindeki aynı `ai_gate` bloğundan
+beslenir; katman `off` iken anahtar gövdede HİÇ bulunmaz ve kart gizlenir.
+Gölge raporu: `scripts/ledger_report.py --ai` (kapsama, deny kümesinin ortalama
+PnL'i + %95 GA, allow kümesinin PF'i, eksen×PnL korelasyonu, maliyet).
+
+#### D23 go_live ölçütleri — `active`e geçmenin ÖN KOŞULLARI
+**HEPSİ VE'lidir. Ağırlıklı skor YOKTUR; bir madde kırmızıysa terfi yoktur.**
+
+1. Kapsama ≥ **%98** (verdict üretilen aday / toplam aday).
+   *İşletme tanımı (`ai_gate.coverage_pct`):* payda **SORULAN** adaydır
+   (`asked` = `candidates` − `skipped_no_trade`). İşleme dönüşmeyen niyetler
+   sağlayıcıya bilinçli olarak SORULMAZ (bütçe); onları paydaya koymak bu
+   ölçütü tanım gereği ULAŞILAMAZ yapardı. İki sayı da `/scalper/status`ta
+   AYRI görünür — fark operatörden gizlenmez.
+2. JSON şema geçerliliği ≥ **%99**.
+3. Engellenen kümenin ortalama PnL'i **< 0** VE **%95 GA'nın ÜST sınırı da < 0**.
+4. İzin verilen kümenin PF'i taban PF'ten **DÜŞÜK DEĞİL**.
+5. Red oranı **%10–40** aralığında.
+6. **n_deny ≥ 50**.
+7. Yeniden üretilebilirlik: aynı `input_digest` + `model_version` → aynı
+   `verdict` ≥ **%90** (iki koşu).
+8. Gölgede **MOTOR SAPMASI = 0** ve **#P1 harness/motor parite testi yeşil**.
+9. Maliyet ≤ **$2/gün**.
+10. **A5 gecikme koşusu geçilmiş**: `--entry-delay-candles 1` backtest'te 3
+    rejimde bozulma kabul edilebilir VE canlı `slippage_pct` dağılımı 2,5 sn
+    gecikmeyi kaldırıyor.
+11. İlk canlı sürüm **DAR KAPSAMLI**: yalnız E8.7 TV-SHORT (15 işlem, PF 0,15)
+    hücresi — her yere birden açılmaz.
+
+ℹ️ (10) için gereken `--entry-delay-candles` harness bayrağı **bugün YOKTUR**;
+eklenmesi go_live işinin parçasıdır (ve eklendiğinde #P1 gereği motor tarafıyla
+BİRLİKTE düşünülür).
+
+#### D23 — E8.6 UYARISI (yazılı kabul; ölçütlerden ÖNCE okunmalı)
+`docs/EXPERIMENTS.md` E8.6: bir girişi engellemenin faydasının **%100'ü**
+engellenen işlemin PnL'inden DEĞİL, **boşalan işgal penceresine giren YENİ
+işlemlerden** geldi (11 işlem / **+1217.4**). **GÖLGEDE KAPASİTE BOŞALMAZ** —
+"engellenen" aday gölgede zaten açılmıştır ve slotu tutar. Dolayısıyla gölge
+ölçümü, faydanın büyük olasılıkla **EN KÜÇÜK parçasını** ölçer.
+
+Bu **İKİ YÖNLÜ** bir uyarıdır ve iki yönü de bağlayıcıdır:
+- Gölgede etki görünmezse bu "AI işe yaramaz" demek DEĞİLDİR — ölçüm mekanizması
+  faydanın ikinci-derece bileşenini göremez.
+- Gölgede etki görünürse bu canlıda AYNI büyüklükte olacağı anlamına da GELMEZ —
+  ikinci-derece etki rejime ve o anki işgal doluluğuna bağlıdır.
+
+Her iki hâlde de hüküm **canlı defterle** verilir (P3: canlı defter nihai
+hakemdir).
+
+#### D23 — Bilinen ölçüm kısıtları (dürüstlük bölümü)
+a. **Gölge payload'ı dolum SONRASI bilinen alanları içerir** (`slippage_pct`,
+   `fill_latency_sec`). `active` fazda bu alanlar giriş anında TAHMİN olurdu;
+   dolayısıyla gölgede öğrenilen ayrım canlıya BİRE BİR taşınmayabilir. Terfi
+   kararında bu madde ayrıca ele alınmalıdır.
+b. **Katman yalnız AÇILAN işlemleri görür.** Kapılarda (rejim, lider piyasa,
+   sağlama, kapasite, cooldown) düşen adaylar sağlayıcıya sorulmaz; "AI bu
+   kapıların yerine geçebilir miydi" sorusu bu veriyle CEVAPLANAMAZ.
+c. **Maliyet alanı bir TAHMİNDİR** (`SCALPER_AI_GATE_PRICE_IN/OUT_PER_MTOK` ×
+   token sayısı). Fatura sağlayıcının kendi panosudur; $2/gün ölçütü oradan
+   doğrulanır.
+d. **`active` motora KABLOLANMAMIŞTIR.** `should_block` TEK yerde tanımlıdır
+   (canlıya alma günü "engelleme koşulu" tartışmaya açılmasın diye) ama hiçbir
+   karar yolu onu çağırmaz; kablolama ÖNCESİNDE harness paritesi (#P1) gerekir.
+e. **`forensics` sütununda teorik bir kayıp-güncelleme penceresi vardır.**
+   `attach_ai` ile `record_close` aynı JSON sütununu OKU-DEĞİŞTİR-YAZ yapar;
+   ikisi milisaniyelik pencerede çakışırsa `ai` bloğu ya da çıkış bloğu
+   kaybolabilir. Pratikte kararlar girişten SANİYELER sonra, kapanış ise
+   DAKİKALAR sonra yazılır. Kaybolsa bile **kayıt kaybolmaz**: her karar
+   ayrıca `logs/trades.jsonl`'e (`ai_verdict`) yazılır ve orası append-only'dur.
+   Kilit EKLENMEDİ çünkü bir gözlem alanı için giriş/kapanış yolunu
+   senkronlamak bu katmanın en temel kuralını (motor yolunda 0 ms) çiğnerdi.
+f. **Adli kayıt kapalıysa katman da sessizdir.** `SCALPER_FORENSICS_ENABLED`
+   kapalıyken (ya da bağlam kurulamazken) `_ai_gate_observe` sağlayıcıya HİÇ
+   sormaz — D23'ün tüm girdileri D21 bağlamındandır; boş bir payload için para
+   harcanmaz. Durum TEK SEFER WARNING olarak loglanır.
+
+**Geri alma (tek satır):** `.env`'de `SCALPER_AI_GATE_MODE=off` +
+`RESTART_LABEL=<etiket> scripts/restart_safe.sh testnet`. **Kod geri alma
+GEREKMEZ**: katman `off` iken hiç örneklenmez ve hiçbir kod yolu ona dokunmaz.
+`scalp_trades.forensics` içinde kalan `ai` blokları zararsızdır (hiçbir karar
+yolu okumaz).
+
+**Kanıt:** STRATEJİ kanıtı YOK — ve bu KASITLIDIR. Bu madde bir strateji kanıtı
+değil, kanıt ÜRETME altyapısıdır (D21 ile aynı disiplin). Katmanın kendi
+sözleşmesi testlerle ÇİVİLENMİŞTİR: `tests/test_ai_gate.py` (70 test — mod
+matrisi, fail-open, katı şema, prompt injection, TTL/bayatlık, bütçe, kaçak,
+idempotanslık, sağlayıcı zinciri, adli belge birleşimi, durum yüzeyleri) ve
+`tests/test_ledger_report.py`'ye eklenen `--ai` testleri. Bunların içinde
+**MOTOR SAPMASI = 0** paritesi ayrıca durur
+(`TestEngineZeroDrift::test_shadow_run_is_byte_for_byte_identical_to_off_run`:
+`off` ve `shadow` turlarında `executor.try_open` çağrısı, sinyal alanları, log
+satırları ve sayaçlar BİREBİR aynı) ve motorun AI'yı BEKLEMEDİĞİ
+(`test_engine_never_waits_for_the_ai_and_holds_no_lock`: `_evaluate_symbol`
+dönerken karar hâlâ uçuşta ve `_entry_lock` SERBEST) kanıtlanır. Sağlayıcı
+çağrıları testlerde SAHTEDİR — bu pakette gerçek ağ yoktur.
+
+Strateji hükmü ancak gölge ölçümü + `--ai` raporu + yukarıdaki 11 ölçütle
+verilir ve bu kayda EKLENİR.
+
 ### D25 — Tek container dağıtım yolu (taşınabilirlik) · 2026-08-24 · **AKTİF (EK YOL — canlı supervisord DEĞİŞMEDİ)**
 
 **Ne.** Bot tek bir `python:3.12-slim` görüntüsüne paketlendi: `Dockerfile`,

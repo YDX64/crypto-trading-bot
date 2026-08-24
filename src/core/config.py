@@ -532,6 +532,53 @@ class Settings(BaseSettings):
     tv_events_state_path: str = "state/tv_events.json"
 
     # ------------------------------------------------------------------
+    # AI karar katmanı (D23, 2026-08-24) — GÖLGE, "yalnız engelleyen"
+    # ------------------------------------------------------------------
+    # Motorun TÜM kapıları geçtikten sonra bir dil modeline "bu giriş
+    # alınmalı mıydı?" diye sorar. SÖZLEŞME: bir KALİTE FİLTRESİDİR, güvenlik
+    # cihazı DEĞİLDİR — girişi yalnız ENGELLEYEBİLİR, ASLA açamaz.
+    #   off    = katman hiç çalışmaz (VARSAYILAN; sıfır çağrı, sıfır maliyet).
+    #   shadow = karar üretilir ve KAYDEDİLİR, motor davranışı DEĞİŞMEZ.
+    #   active = kararın uygulanacağı faz — `_validate_ai_gate_settings`
+    #            tarafından ŞİMDİLİK REDDEDİLİR (D23 go_live ölçütleri
+    #            karşılanmadan kazara canlıya alınamasın diye).
+    # Varsayılan `off`: D18/D20b konvansiyonu — yeni katman `.env` ile
+    # BİLİNÇLİ açılır (docs/DECISIONS.md D23, docs/RUNBOOK.md).
+    scalper_ai_gate_mode: str = "off"
+    # Sağlayıcı zinciri: birincil BU, ardından kalanlar sırayla denenir
+    # (deepseek → gemini → openai). Hepsi başarısızsa `ai_unavailable` +
+    # FAIL-OPEN (giriş normal sürer). Sunucuda ANTHROPIC anahtarı YOKTUR;
+    # bu üçü `src/analyzers/ai_analyzer.py` ile AYNI istemci altyapısını
+    # kullanır — yeni pip bağımlılığı eklenmez.
+    scalper_ai_gate_provider: str = "deepseek"
+    # Model adları: boş = ilgili sağlayıcının genel ayarı (DEEPSEEK_MODEL /
+    # GEMINI_MODEL / OPENAI_MODEL). Kodda MODEL ADI SABİTLENMEZ.
+    scalper_ai_gate_deepseek_model: str = ""
+    scalper_ai_gate_gemini_model: str = ""
+    scalper_ai_gate_openai_model: str = ""
+    # Günlük çağrı tavanı (maliyet kaçağı koruması). Aşılırsa katman kendini
+    # kapatır (`ai_budget_exhausted`) ve UTC gün başında sıfırlanır.
+    scalper_ai_gate_max_calls_per_day: int = 200
+    # Tek çağrının üst sınırı (saniye). Gölgede motor BEKLEMEZ (ateşle-unut),
+    # bu süre yalnız arka plan görevini sınırlar.
+    scalper_ai_gate_timeout_sec: float = 25.0
+    # Kararın TAZELİK penceresi. Bundan geç gelen karar `ai_stale` işaretlenir
+    # ve `active` fazda ASLA uygulanmaz (gölgede zaten hiçbir şey uygulanmaz).
+    scalper_ai_gate_ttl_sec: float = 120.0
+    # Kaçak koruması: son `deny_window` kararın `deny` oranı bu eşiği aşarsa
+    # katman kendini `shadow`a düşürür ve `runaway` bayrağı yanar.
+    scalper_ai_gate_deny_ratio_limit: float = 0.60
+    scalper_ai_gate_deny_window: int = 20
+    # Prompt'a giren "son N işlem" defter özeti (HAM FİYAT SERİSİ DEĞİL).
+    scalper_ai_gate_recent_trades: int = 20
+    # Yanıt üst sınırı (token). Şema küçük; büyük değer yalnız maliyet demek.
+    scalper_ai_gate_max_tokens: int = 700
+    # Maliyet TAHMİNİ için $/MTok (birincil sağlayıcıya göre ayarla). Yalnız
+    # TAHMİNDİR: fatura sağlayıcının kendi panosudur.
+    scalper_ai_gate_price_in_per_mtok: float = 0.28
+    scalper_ai_gate_price_out_per_mtok: float = 0.42
+
+    # ------------------------------------------------------------------
     # Çalışma modu (D20) — AlgoPro takipçi halkası
     # ------------------------------------------------------------------
     # "scalper" (varsayılan) = BUGÜNKÜ davranış: scanner + strateji C + TV
@@ -1118,6 +1165,77 @@ class Settings(BaseSettings):
                 f"karar vermez), EXIT={self.scalper_tv_events_exit!r}. "
                 "`active` bilinçli bir karardır; sessizce ölü bir kanal "
                 "operatörü yanıltır (docs/INTEGRATIONS.md §7.4)"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_ai_gate_settings(self) -> "Settings":
+        """AI karar katmanı (D23) ayarları — yazım hatası startup'ta patlasın.
+
+        `active` BİLİNÇLİ olarak REDDEDİLİR: kod yolu hazırdır ama D23'ün
+        go_live ölçütleri (kapsama ≥%98, JSON geçerliliği ≥%99, engellenen
+        kümenin ortalama PnL'i ve %95 GA üst sınırı <0, n_deny ≥ 50, ...)
+        kanıtlanmadan kimse `.env`'de tek kelime değiştirerek canlı bir kapı
+        açamamalıdır. Ölçütler karşılandığında bu blok TEK SATIRLIK bir
+        değişiklikle kaldırılır (ve D23'e karar kaydı düşülür).
+        """
+        mode = str(self.scalper_ai_gate_mode or "").strip().lower()
+        if mode not in ("off", "shadow", "active"):
+            raise ValueError(
+                f"SCALPER_AI_GATE_MODE geçersiz: {self.scalper_ai_gate_mode!r} — "
+                "off | shadow | active olmalı (docs/DECISIONS.md D23)"
+            )
+        if mode == "active":
+            raise ValueError(
+                "D23 canlı kapı henüz onaylanmadı — go_live ölçütleri "
+                "docs/DECISIONS.md D23. SCALPER_AI_GATE_MODE=active kod "
+                "seviyesinde hazırdır ama ölçüm tamamlanmadan açılamaz; "
+                "gölge ölçümü için SCALPER_AI_GATE_MODE=shadow kullanın."
+            )
+        provider = str(self.scalper_ai_gate_provider or "").strip().lower()
+        if provider not in ("deepseek", "gemini", "openai"):
+            raise ValueError(
+                f"SCALPER_AI_GATE_PROVIDER geçersiz: "
+                f"{self.scalper_ai_gate_provider!r} — deepseek | gemini | "
+                "openai olmalı (sunucuda ANTHROPIC anahtarı YOKTUR)"
+            )
+        if int(self.scalper_ai_gate_max_calls_per_day or 0) < 0:
+            raise ValueError(
+                "SCALPER_AI_GATE_MAX_CALLS_PER_DAY negatif olamaz "
+                f"({self.scalper_ai_gate_max_calls_per_day}); 0 = katman hiç "
+                "çağrı yapmaz"
+            )
+        if float(self.scalper_ai_gate_timeout_sec or 0.0) <= 0:
+            raise ValueError(
+                "SCALPER_AI_GATE_TIMEOUT_SEC pozitif olmalı "
+                f"({self.scalper_ai_gate_timeout_sec})"
+            )
+        if float(self.scalper_ai_gate_ttl_sec or 0.0) <= 0:
+            raise ValueError(
+                "SCALPER_AI_GATE_TTL_SEC pozitif olmalı "
+                f"({self.scalper_ai_gate_ttl_sec})"
+            )
+        ratio = float(self.scalper_ai_gate_deny_ratio_limit or 0.0)
+        if not (0.0 < ratio <= 1.0):
+            raise ValueError(
+                "SCALPER_AI_GATE_DENY_RATIO_LIMIT 0 ile 1 arasında olmalı "
+                f"({self.scalper_ai_gate_deny_ratio_limit}) — 0.60 = %60"
+            )
+        if int(self.scalper_ai_gate_deny_window or 0) < 1:
+            raise ValueError(
+                "SCALPER_AI_GATE_DENY_WINDOW en az 1 olmalı "
+                f"({self.scalper_ai_gate_deny_window})"
+            )
+        if int(self.scalper_ai_gate_recent_trades or 0) < 0:
+            raise ValueError(
+                "SCALPER_AI_GATE_RECENT_TRADES negatif olamaz "
+                f"({self.scalper_ai_gate_recent_trades})"
+            )
+        if int(self.scalper_ai_gate_max_tokens or 0) < 64:
+            raise ValueError(
+                "SCALPER_AI_GATE_MAX_TOKENS en az 64 olmalı "
+                f"({self.scalper_ai_gate_max_tokens}) — katı JSON şeması "
+                "kısa yanıtlarda kesilir ve her karar ai_malformed olurdu"
             )
         return self
 
