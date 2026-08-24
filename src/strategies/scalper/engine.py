@@ -44,6 +44,7 @@ from src.services.tv_events import tv_events as _tv_events_singleton
 from src.strategies.scalper.executor import ScalpExecutor
 from src.strategies.scalper.exits import ExitManager
 from src.strategies.scalper.indicators import atr as compute_atr
+from src.strategies.scalper import intent
 from urllib.parse import urlsplit
 
 from src.strategies.scalper.market_gate import (
@@ -1900,6 +1901,27 @@ class ScalperEngine:
             # D21 adli kayıt: sinyalin doğduğu an. Kapılar + emir gecikmesi
             # (`stale_signal`) buradan ölçülür. Karar yoluna GİRMEZ.
             signal_epoch = time.time()
+            # D24/madde 7: niyet kaydının kaynak ayrımı — KARAR YOLUNA GİRMEZ.
+            # (`is_external` birkaç satır aşağıda AYNI sınıf adından türetilir;
+            # o satıra DOKUNULMADI.)
+            intent_source = (
+                "tv"
+                if strat.__class__.__name__ == "_ExternalSignalStrategy"
+                else "scan"
+            )
+            # (a) Niyet DOĞDU. `_evaluate_symbol`'ün EN BAŞINDAKİ erken
+            # dönüşler (owner rezervasyonu, cooldown, `_scan_open_symbols`)
+            # için kayıt YAPILMAZ: orada henüz SİNYAL yoktur, dolayısıyla bir
+            # "niyet" de doğmamıştır — onları saymak reddedilenleri
+            # sembol × tarama turu kadar şişirirdi.
+            self._record_intent(
+                symbol=symbol,
+                direction=sig.direction,
+                stage=intent.STAGE_PROPOSED,
+                decision=intent.DECISION_ALLOW,
+                strategy=getattr(sig, "strategy", None),
+                source=intent_source,
+            )
             # 2026-08-16 rejim kapisi: C, DOWN rejimde LONG / UP rejimde SHORT
             # acamaz (30 saatlik RANGE/DOWN penceresinde rejime ters girisler
             # -35 USDT kanatti). 2026-08-18: TV muafiyeti KALDIRILDI (ayrı
@@ -1921,6 +1943,16 @@ class ScalperEngine:
                         f"⛔ {symbol}: rejim kapısı — {rejim} rejiminde {yon} "
                         f"{kaynak} engellendi (SCALPER_REGIME_FILTER)"
                     )
+                    self._record_intent(  # (b) D24/madde 7 — yalnız kayıt
+                        symbol=symbol,
+                        direction=sig.direction,
+                        stage=intent.STAGE_DECIDED,
+                        decision=intent.DECISION_DENY,
+                        reason=intent.REASON_REGIME_GATE,
+                        strategy=getattr(sig, "strategy", None),
+                        source=intent_source,
+                        extra={"regime": rejim},
+                    )
                     continue
             # 2026-08-23 (D15) lider piyasa kapısı: rejim kapısının HEMEN
             # yanında, AYNI tek giriş noktasında — bu döngüden hem C taraması
@@ -1940,6 +1972,18 @@ class ScalperEngine:
                     f"koşu {_fmt_pct(gate_status.get('run_pct'))}) nedeniyle {yon} "
                     f"{kaynak} engellendi (SCALPER_MARKET_GATE)"
                 )
+                self._record_intent(  # (c) D24/madde 7 — yalnız kayıt
+                    symbol=symbol,
+                    direction=sig.direction,
+                    stage=intent.STAGE_DECIDED,
+                    decision=intent.DECISION_DENY,
+                    # `market_reason` ZATEN "market_gate_day"/"market_gate_run"
+                    # değerlerini üretir (bkz. _market_gate_reason).
+                    reason=market_reason,
+                    strategy=getattr(sig, "strategy", None),
+                    source=intent_source,
+                    extra={"leader": gate_status.get("leader")},
+                )
                 continue
             # 2026-08-23 yapı kapısı (E9/D18 adayı, varsayılan KAPALI): rejim
             # kapısı 15m EMA50/200 ile dönüşleri saatler geç görüyor; yapı
@@ -1956,6 +2000,18 @@ class ScalperEngine:
                     f"engellendi (son olay {structure_state.last_event}, "
                     f"{structure_state.age_bars} mum önce; SCALPER_STRUCTURE_GATE)"
                 )
+                self._record_intent(  # (d) D24/madde 7 — yalnız kayıt
+                    symbol=symbol,
+                    direction=sig.direction,
+                    stage=intent.STAGE_DECIDED,
+                    decision=intent.DECISION_DENY,
+                    reason=intent.REASON_STRUCTURE_GATE,
+                    strategy=getattr(sig, "strategy", None),
+                    source=intent_source,
+                    extra={
+                        "last_event": getattr(structure_state, "last_event", None)
+                    },
+                )
                 continue
             # TV yapı kapısı (D19): rejim kapısının HEMEN yanında, AYNI tek
             # giriş noktasında — C stratejisi de TV dış sinyali de buradan
@@ -1963,6 +2019,15 @@ class ScalperEngine:
             # sinyali düşürmez; `active` modda BEAR yapıda LONG / BULL yapıda
             # SHORT girişini engeller (bkz. _tv_structure_gate_blocks).
             if self._tv_structure_gate_blocks(symbol, sig.direction):
+                self._record_intent(  # (e) D24/madde 7 — yalnız kayıt
+                    symbol=symbol,
+                    direction=sig.direction,
+                    stage=intent.STAGE_DECIDED,
+                    decision=intent.DECISION_DENY,
+                    reason=intent.REASON_TV_STRUCTURE_GATE,
+                    strategy=getattr(sig, "strategy", None),
+                    source=intent_source,
+                )
                 continue
             # Ortak stop politikası: structural modda ATR tabanı, fixed_roi
             # modda marj-yüzdesi stopu. Backtest'te simulate_symbol aynı
@@ -1986,6 +2051,26 @@ class ScalperEngine:
                     else:
                         reason = "exchange/recovery readiness"
                     self.logger.info(f"⏭️ {symbol}: {reason} aktif, hazır sinyal açılmadı")
+                    self._record_intent(  # (f) D24/madde 7 — yalnız kayıt
+                        symbol=symbol,
+                        direction=sig.direction,
+                        stage=intent.STAGE_DECIDED,
+                        decision=intent.DECISION_DENY,
+                        # Yukarıdaki `reason` insan metnidir; sayaç için AYNI
+                        # ayrımın makine karşılığı kurulur (koşullar birebir).
+                        reason=(
+                            intent.REASON_ENTRY_HALT
+                            if self._entry_halted
+                            else intent.REASON_KILL_SWITCH
+                            if self._kill_switch
+                            else intent.REASON_RISK_EVENT
+                            if risk_event_snap.get("active")
+                            else intent.REASON_EXCHANGE_UNVERIFIED
+                        ),
+                        detail=reason,
+                        strategy=getattr(sig, "strategy", None),
+                        source=intent_source,
+                    )
                     return
                 # Mumlar indirilirken veya strateji hesaplanırken bir koruma
                 # hatası cooldown başlatmış olabilir. POST'tan hemen önceki
@@ -1994,8 +2079,26 @@ class ScalperEngine:
                     self.logger.info(
                         f"⏭️ {symbol}: giriş cooldown aktif, hazır sinyal açılmadı"
                     )
+                    self._record_intent(  # (g) D24/madde 7 — yalnız kayıt
+                        symbol=symbol,
+                        direction=sig.direction,
+                        stage=intent.STAGE_DECIDED,
+                        decision=intent.DECISION_DENY,
+                        reason=intent.REASON_LOSS_COOLDOWN,
+                        strategy=getattr(sig, "strategy", None),
+                        source=intent_source,
+                    )
                     return
                 if symbol in tracked or symbol in pending:
+                    self._record_intent(  # (h) D24/madde 7 — yalnız kayıt
+                        symbol=symbol,
+                        direction=sig.direction,
+                        stage=intent.STAGE_DECIDED,
+                        decision=intent.DECISION_DENY,
+                        reason=intent.REASON_ALREADY_TRACKED,
+                        strategy=getattr(sig, "strategy", None),
+                        source=intent_source,
+                    )
                     return
                 open_count = len(tracked | pending)
                 if bool(getattr(self.cfg, "scalper_shadow_mode", False)):
@@ -2008,9 +2111,33 @@ class ScalperEngine:
                     shadow_active = self.executor.shadow_active_count()
                     if open_count + shadow_active >= self.cfg.scalper_max_positions:
                         self.logger.info(f"👻 {symbol}: GÖLGE kapasite dolu, sinyal açılmadı")
+                        self._record_intent(  # (i) D24/madde 7 — yalnız kayıt
+                            symbol=symbol,
+                            direction=sig.direction,
+                            stage=intent.STAGE_DECIDED,
+                            decision=intent.DECISION_DENY,
+                            reason=intent.REASON_CAPACITY,
+                            detail="shadow",
+                            strategy=getattr(sig, "strategy", None),
+                            source=intent_source,
+                            extra={
+                                "open_positions": open_count,
+                                "shadow_active": shadow_active,
+                            },
+                        )
                         return
                 elif open_count >= self.cfg.scalper_max_positions:
                     self.logger.info(f"⏭️ {symbol}: scalper pozisyon kapasitesi dolu, sinyal açılmadı")
+                    self._record_intent(  # (i) D24/madde 7 — yalnız kayıt
+                        symbol=symbol,
+                        direction=sig.direction,
+                        stage=intent.STAGE_DECIDED,
+                        decision=intent.DECISION_DENY,
+                        reason=intent.REASON_CAPACITY,
+                        strategy=getattr(sig, "strategy", None),
+                        source=intent_source,
+                        extra={"open_positions": open_count},
+                    )
                     return
                 try:
                     exchange_positions = await self.client.get_all_positions()
@@ -2021,6 +2148,16 @@ class ScalperEngine:
                     self.logger.error(
                         f"⛔ {symbol}: hesap pozisyonları doğrulanamadı; giriş fail-closed reddedildi ({e})"
                     )
+                    self._record_intent(  # (j) D24/madde 7 — yalnız kayıt
+                        symbol=symbol,
+                        direction=sig.direction,
+                        stage=intent.STAGE_DECIDED,
+                        decision=intent.DECISION_DENY,
+                        reason=intent.REASON_EXCHANGE_UNVERIFIED,
+                        detail=f"{type(e).__name__}: {e}",
+                        strategy=getattr(sig, "strategy", None),
+                        source=intent_source,
+                    )
                     return
 
                 live_symbols = {
@@ -2029,6 +2166,15 @@ class ScalperEngine:
                     if float(raw.get("positionAmt", 0) or 0) != 0
                 }
                 if symbol in live_symbols:
+                    self._record_intent(  # (k) D24/madde 7 — yalnız kayıt
+                        symbol=symbol,
+                        direction=sig.direction,
+                        stage=intent.STAGE_DECIDED,
+                        decision=intent.DECISION_DENY,
+                        reason=intent.REASON_EXCHANGE_POSITION_EXISTS,
+                        strategy=getattr(sig, "strategy", None),
+                        source=intent_source,
+                    )
                     return
                 # D20b (düşmanca inceleme): hesap-geneli tavan takipçiyi
                 # SAYMAZ. Takipçinin kendi tavanı (FOLLOWER_MAX_POSITIONS)
@@ -2059,6 +2205,15 @@ class ScalperEngine:
                 ):
                     self.logger.info(
                         f"⏭️ {symbol}: sembol başka motorun yönetiminde veya hesap kapasitesi dolu"
+                    )
+                    self._record_intent(  # (l) D24/madde 7 — yalnız kayıt
+                        symbol=symbol,
+                        direction=sig.direction,
+                        stage=intent.STAGE_DECIDED,
+                        decision=intent.DECISION_DENY,
+                        reason=intent.REASON_SYMBOL_RESERVED_BY_OTHER,
+                        strategy=getattr(sig, "strategy", None),
+                        source=intent_source,
                     )
                     return
 
@@ -2095,12 +2250,25 @@ class ScalperEngine:
                     # sync fail-open biçimde ownership'i bırakamaz.
                     unsafe_failure = True
                     raise
-                except Exception:
+                except Exception as e:
                     # Normal bir emir reddi/istemci hatasında try_open ya
                     # journal+pending durumunu kurmuştur ya da aşağıdaki
                     # finally rezervasyonu bırakacaktır. In-flight işareti
                     # bu sembolü sonsuza dek kapasitede tutmamalı.
                     self._opening_symbols.discard(symbol)
+                    # (n) D24/madde 7: emir hatası da bir SONUÇTUR; bugün
+                    # yalnız `raise` ile yukarı gidiyor ve sayısal izi yok.
+                    # `raise` ÇIPLAK kalır → davranış birebir aynıdır.
+                    self._record_intent(
+                        symbol=symbol,
+                        direction=sig.direction,
+                        stage=intent.STAGE_EXECUTED,
+                        decision=intent.DECISION_ERROR,
+                        reason=intent.REASON_ORDER_ERROR,
+                        detail=f"{type(e).__name__}: {e}",
+                        strategy=getattr(sig, "strategy", None),
+                        source=intent_source,
+                    )
                     raise
                 finally:
                     if (
@@ -2119,6 +2287,20 @@ class ScalperEngine:
                         f"🎯 {symbol}: strateji {sig.strategy} sinyali işlendi -> pozisyon açıldı "
                         f"({sig.direction.value} @ {sp.position.entry_price})",
                         extra={"trade": True},
+                    )
+                    self._record_intent(  # (m) D24/madde 7 — yalnız kayıt
+                        symbol=symbol,
+                        direction=sig.direction,
+                        stage=intent.STAGE_EXECUTED,
+                        decision=intent.DECISION_ALLOW,
+                        reason=intent.REASON_OPENED,
+                        strategy=getattr(sig, "strategy", None),
+                        source=intent_source,
+                        extra={
+                            "entry_price": getattr(
+                                getattr(sp, "position", None), "entry_price", None
+                            )
+                        },
                     )
             finally:
                 if not unsafe_failure:
@@ -2256,6 +2438,54 @@ class ScalperEngine:
                 f"⚠️ Adli kayıt bağlamı kurulamadı ({message}) — bu uyarı bir "
                 f"kez loglanır, giriş/çıkış akışı ETKİLENMEZ"
             )
+
+    def _record_intent(
+        self,
+        *,
+        symbol: str,
+        direction: Any,
+        stage: str,
+        decision: str,
+        reason: Optional[str] = None,
+        detail: Optional[str] = None,
+        strategy: Any = None,
+        source: Any = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Üç-aşamalı niyet kaydı (D24/madde 7) — YALNIZ GÖZLEM.
+
+        Gerçekleşmeyen bir niyet (kapı reddi, kapasite, emir hatası) bugün
+        `scalp_trades`'te iz bırakmaz; bu kanca o izi bırakır. Sözleşme:
+
+          * Adli kayıt KAPALIYSA hiç çalışmaz (tek bayrak, tek anahtar).
+          * `await` YOKTUR: `intent.record` sayaç artırır ve JSONL kuyruğuna
+            O(1) satır bırakır; disk yazımı ayrı iş parçacığındadır.
+          * İSTİSNA SIZDIRMAZ. Bir teşhis kaydı bir girişi ya da bir reddi
+            ASLA değiştirmemeli — hata hâlinde sessizce düşer.
+        """
+        try:
+            # Bayrak okuması da TRY İÇİNDE: `cfg`'si hiç kurulmamış bir test
+            # çifti ya da yarım kurulmuş bir motor, bir TEŞHİS kaydı yüzünden
+            # tarama turunu düşürmemeli.
+            if not self._forensics_enabled():
+                return
+            intent.record(
+                at=_utcnow_iso(),
+                symbol=symbol,
+                direction=direction,
+                stage=stage,
+                decision=decision,
+                strategy=strategy,
+                source=source,
+                reason=reason,
+                detail=detail,
+                extra=extra,
+            )
+        except Exception:
+            # Sessiz: `intent.record` zaten kendi içinde yutar; buraya yalnız
+            # bir test çifti/monkeypatch patlarsa düşülür ve o da akışı
+            # kesmemeli (gözlem ≠ güvenlik kilidi).
+            return
 
     def _forensics_entry_context(
         self,

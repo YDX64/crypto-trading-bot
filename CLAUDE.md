@@ -67,6 +67,7 @@ Yeni sinyal kaynağı (haber botu vb.) eklemek: `docs/INTEGRATIONS.md`. Otomatik
   `/scalper/trades/{id}/forensics`, `/scalper/forensics/summary?since=7d`;
   rapor `scripts/ledger_report.py --forensics`. Reçete: `docs/RUNBOOK.md`
   "Bir işlemi nasıl incelerim".
+<<<<<<< HEAD
 - **AI karar katmanı (D23, GÖLGE — kod varsayılanı `off`):** `SCALPER_AI_GATE_MODE`
   `shadow` iken motor pozisyonu AÇTIKTAN sonra bağlam bir dil modeline sorulur
   ("bu giriş alınmalı mıydı?") ve karar YALNIZ kaydedilir
@@ -83,6 +84,16 @@ Yeni sinyal kaynağı (haber botu vb.) eklemek: `docs/INTEGRATIONS.md`. Otomatik
 ## Nasıl çalıştırılır / test edilir / deploy edilir
 ```bash
 python3 -m pytest tests -q                      # 2123 test, ~60 sn — her değişiklikten önce
+=======
+- **GerçekleşMEyen niyetler (D24):** kapı reddi / TV sağlaması dolmadı / emir hatası
+  artık `logs/trades.jsonl`'e `event="intent"` olarak yazılır (niyet→karar→borsa
+  sonucu). Ret gerekçesi dağılımı `/scalper/forensics/summary` yanıtındaki `intents`
+  bloğundadır — **süreç başlangıcından beri** sayar, restart'ta sıfırlanır.
+
+## Nasıl çalıştırılır / test edilir / deploy edilir
+```bash
+python3 -m pytest tests -q                      # 2072 test, ~50 sn — her değişiklikten önce
+>>>>>>> worktree-agent-af27869057747ff76
 scripts/deploy.sh awa                           # push edilmiş main'i sunucuya uygula (test + restart + sağlık + otomatik geri alma)
 DEPLOY_NO_RESTART=1 scripts/deploy.sh awa       # yalnız kod/test; süreci yeniden başlatma
 scripts/deploy.sh awa <önceki-commit>           # geri alma (backups/commit.prev-*)
@@ -96,6 +107,17 @@ env $(ssh awa grep ^SCALPER_ /opt/tradingbot-v2/.env | xargs) python3 -m src.str
   --start 2026-01-23 --end 2026-02-13        # ayı | yatay: 2026-07-01→07-21 | boğa: 2026-08-07→08-21
 ```
 Koşuları sıralı yap (paralel = Binance 429). Sonuç `docs/EXPERIMENTS.md`'ye log yoluyla girer.
+
+**Ölçüm/kanıt bayrakları (D24, hepsi VARSAYILAN KAPALI — motor davranışını değiştirmez):**
+`--permutations N` (+`--permutation-clamp-audit`) Monte-Carlo permütasyon p-değeri;
+`--fee-stress` komisyon+kayma 2×; `--entry-delay-candles N` giriş gecikmesi çürütme
+koşusu. Çok-varyant taramasında yanlış-pozitif düzeltmesi:
+`python3 -m src.strategies.scalper.multitest --json <tarama.json>` (Benjamini-Hochberg).
+Rapor artık `bar_max_drawdown` (bar-bazlı mark-to-market çöküş — kapanış-bazlı
+`max_drawdown` gerçek çukuru SIĞ gösterir) ve konsantrasyon (tek sembol/işlem/gün kâr
+payı) satırlarını da içerir. Ayrıntı ve ölçülmüş etkiler: `docs/DECISIONS.md` D24.
+**`docs/EXPERIMENTS.md`'nin BAŞINDAKİ uyarı kutusunu oku:** E2…E9'un 36 varyantının
+tamamı aynı üç pencerede ölçüldü — dokunulmamış bir doğrulama penceremiz YOK.
 
 ## Yasaklar (ihlal = sistemi bozma)
 1. Kanıtsız parametre değişikliği yok: her `SCALPER_*` değişikliği önce 3 rejim

@@ -1,0 +1,67 @@
+TRADINGBOT — üçüncü taraf kaynak bildirimi (NOTICE)
+====================================================
+
+Bu depo MIT lisanslıdır (bkz. LICENSE). Aşağıdaki dosyalar üçüncü taraf
+projelerden UYARLANMIŞ kod içerir; ilgili lisans ve atıflar burada ve her
+dosyanın başlığında kayıtlıdır. Hiçbir üçüncü taraf paketi pip ile
+KURULMAZ — yalnız ilgili fikir/algoritma uyarlanmıştır (vendor).
+
+
+1) src/strategies/scalper/permutation.py
+--------------------------------------------------------------------
+Kaynak : investing-algorithm-framework (coding-kitties)
+         https://github.com/coding-kitties/investing-algorithm-framework
+Commit : 1db0df3a8c04ccf9b61b565ae2830a3fd4b77e73
+Dosya  : investing_algorithm_framework/infrastructure/services/backtesting/
+             backtest_service.py  (create_ohlcv_permutation, satır 3333-3453)
+         investing_algorithm_framework/domain/backtesting/
+             backtest_monte_carlo_test.py  (compute_p_values, satır 114-152)
+Lisans : Apache License 2.0
+
+   Copyright (c) coding-kitties / investing-algorithm-framework katkıcıları
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+
+Değişiklikler (Apache-2.0 §4(b) uyarınca bildirilir):
+  * Permüte barlara High = max(H,O,C) / Low = min(L,O,C) KELEPÇESİ eklendi.
+    Upstream dört göreli bileşeni bağımsız karıştırdığı için permüte
+    barların yaklaşık beşte birinde High < max(Open,Close) çıkıyor; bizim
+    harness'ımız stop/hedef değmesini high/low ile belirlediğinden bu, null
+    dağılımı sistematik olarak bozar. Kelepçenin null'u ne kadar kaydırdığı
+    ayrıca ölçülebilir (`clamp_audit`).
+  * p-değerinde metrik BAŞINA yön tanımlandı (upstream `mean(dist >= real)`
+    ile yönü sabit varsayıyordu; max_drawdown gibi "küçük iyi" metriklerde
+    bu yön TERSTİR).
+  * p-değeri (b+1)/(m+1) ile hesaplanır (Phipson & Smyth 2010); ham oran
+    `p_raw` alanında ayrıca verilir.
+  * pandas/polars DataFrame yerine bu deponun `Candle` dataclass'ı kullanılır.
+
+
+2) src/strategies/scalper/multitest.py
+--------------------------------------------------------------------
+Kaynak : AI-Trader (HKUDS)
+         https://github.com/HKUDS/AI-Trader
+Commit : d03ff6c056b32ced735adf7c19ed8175adb1c8df
+Dosya  : research/scripts/research_common.py  (benjamini_hochberg, satır 150)
+Lisans : BELİRSİZ. README rozeti MIT diyor, ancak depoda LICENSE DOSYASI
+         YOKTUR (`ls LICENSE*` boş döner). Lisans metni olmadan MIT iddiası
+         hukuken zayıftır. Bu nedenle kod KOPYALANMAMIŞ, yalnız kamuya mal
+         olmuş Benjamini-Hochberg (1995) adım-aşağı yordamı bu depoda
+         BAĞIMSIZ olarak yeniden yazılmıştır; atıf ilk kez nerede görüldüğü
+         kaydı içindir.
+
+Aynı dosyanın GERİSİ BİLİNÇLİ OLARAK ALINMAMIŞTIR: `bootstrap_ci` gerçek
+bir bootstrap değildir (rastgele örnekleme yerine sabit adımlı
+`values[(offset + i*7) % n]` — gcd(7,n)=1 iken dizinin permütasyonu olduğu
+için güven aralığı genişliği n=5,10,13,50,100 için TAM 0.000000 çıkar) ve
+`analyze_experiments.py`'de DiD p-değeri sabit 1.0'dır.

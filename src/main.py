@@ -43,6 +43,7 @@ from src.services.tv_events import (
 )
 from src.strategies.scalper.data import MarketDataGuard
 from src.strategies.scalper.engine import ScalperEngine
+from src.strategies.scalper import intent as scalp_intent
 from src.strategies.scalper.tracker import ScalpTracker
 from src.strategies.scalper.types import FOLLOWER_LEDGER_STRATEGY
 from src.trading.symbol_reservations import symbol_reservations
@@ -1944,6 +1945,26 @@ async def tradingview_webhook(request: Request):
     if required > 1:
         verdict = _tv_confluence().vote(symbol, direction.value, source)
         if not verdict["triggered"]:
+            # D24/madde 7: sağlaması DOLMAYAN TV oyu bugün hiçbir yerde iz
+            # bırakmıyor (motor hiç çağrılmıyor → adli kayıt da yok). Yalnız
+            # KAYIT: yanıt gövdesi ve oy defteri DEĞİŞMEZ, hata yutulur.
+            try:
+                scalp_intent.record(
+                    at=datetime.now(timezone.utc).isoformat(),
+                    symbol=symbol,
+                    direction=direction,
+                    stage=scalp_intent.STAGE_DECIDED,
+                    decision=scalp_intent.DECISION_DENY,
+                    reason=scalp_intent.REASON_TV_CONFLUENCE,
+                    source=source,
+                    extra={
+                        "votes": verdict.get("votes"),
+                        "required": verdict.get("required"),
+                        "sources": list(verdict.get("sources") or []),
+                    },
+                )
+            except Exception:  # pragma: no cover - kayıt akışı ASLA kesmez
+                pass
             return {
                 "symbol": symbol,
                 "direction": direction.value,
@@ -2982,14 +3003,27 @@ async def scalper_forensics_summary(
     dışlanır — takipçide strateji göstergesi/rejim/lider kapısı YOKTUR ve
     onun etiketleri scalper'ın "neler etkiliyor" tablosunu kirletirdi.
     `?strategy=AP` ile takipçinin kendi tablosu çekilir.
+
+    `intents` (D24/madde 7): gerçekleşMEyen niyetlerin (kapı reddi, kapasite,
+    emir hatası) sayaçları. **SÜREÇ BAŞLANGICINDAN BERİDİR ve restart'ta
+    SIFIRLANIR** (`window="process_start"`) — `since`/`until` bu bloğa
+    UYGULANMAZ. Kalıcı tarihçe `logs/trades.jsonl` (`event="intent"`).
+    Sayaç anlık görüntüsü O(1)'dir: bu uç panodan düzenli yoklanır, ek DB ya
+    da disk işi YAPILMAZ (bkz. "dashboard polling açlığı" dersi).
     """
     wanted = (strategy or "").strip().upper() or None
-    return await ScalpTracker().forensics_summary(
+    summary = await ScalpTracker().forensics_summary(
         since=_parse_since(since or FORENSICS_DEFAULT_SINCE),
         until=_parse_since(until),
         strategies=(wanted,) if wanted else None,
         exclude_strategies=None if wanted else (FOLLOWER_LEDGER_STRATEGY,),
     )
+    try:
+        intents = scalp_intent.counters_snapshot()
+    except Exception:  # pragma: no cover - sayaç arızası ucu düşürmemeli
+        intents = None
+    summary["intents"] = intents
+    return summary
 
 
 async def main():

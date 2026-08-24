@@ -669,7 +669,10 @@ class ScalpTracker:
         nokta AP'yi VARSAYILAN olarak dışlar; `?strategy=AP` ile takipçinin
         kendi tablosu ayrıca çekilebilir.
         """
-        from src.strategies.scalper.forensics import summarize
+        from src.strategies.scalper.forensics import (
+            expectation_from_entry,
+            summarize,
+        )
 
         filters = [ScalpTradeModel.status == "CLOSED"]
         wanted = {str(x).strip().upper() for x in (strategies or ()) if str(x).strip()}
@@ -706,6 +709,9 @@ class ScalpTracker:
             rows.append({
                 "tags": document.get("verdict") or [],
                 "pnl": float(realized_pnl or 0.0),
+                # D24/madde 6: "ne BEKLEDİK" bloğu. Doldurulmadıysa None =
+                # ÖLÇÜLMEDİ (beklenti kurulmamıştı DEĞİL).
+                "expectation": expectation_from_entry(document.get("entry")),
             })
         summary = summarize(rows)
         summary["since"] = since.isoformat() if since else None

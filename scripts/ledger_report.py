@@ -962,6 +962,59 @@ def build_headline(
         "regime_pnls": regime_pnls,
         "regime_trade_counts": regime_trade_counts,
         "soak_days": len(days),
+        "concentration": build_concentration(trades),
+    }
+
+
+def build_concentration(trades: List[ClosedTrade]) -> Dict[str, Any]:
+    """D24/A4 — konsantrasyon: kâr tek sembolden/işlemden/günden mi geldi?
+
+    "+832'nin %68'i 4 yükseliş gününden" tespitini 2026-08-21'de ELLE bir kez
+    yapmıştık; bu blok onu her raporda otomatik üretir. `backtest.py`'deki
+    `concentration_stats` ile AYNI tanımı kullanır (iki taraf ayrışmasın):
+    pay YALNIZ toplam PnL POZİTİFKEN tanımlıdır — toplam sıfır/negatifken
+    "kârın payı" sorusu anlamsızdır, o durumda pay None döner ama MUTLAK
+    katkı yine raporlanır.
+
+    Bu bir EŞİK değil BİLGİ satırıdır: `build_checklist` bunu okumaz.
+    """
+    empty: Dict[str, Any] = {
+        "top_symbol": None, "top_symbol_pnl": 0.0, "top_symbol_pnl_share": None,
+        "top_trade_pnl": 0.0, "top_trade_pnl_share": None, "top_trade_symbol": None,
+        "top_day": None, "top_day_pnl": 0.0, "top_day_pnl_share": None,
+        "distinct_symbols": 0, "distinct_days": 0,
+    }
+    if not trades:
+        return empty
+
+    total_pnl = sum(t.realized_pnl for t in trades)
+    by_symbol: Dict[str, float] = {}
+    by_day: Dict[str, float] = {}
+    for t in trades:
+        by_symbol[t.symbol] = by_symbol.get(t.symbol, 0.0) + t.realized_pnl
+        by_day[t.day] = by_day.get(t.day, 0.0) + t.realized_pnl
+
+    def _share(value: float) -> Optional[float]:
+        if total_pnl <= 0.0 or value <= 0.0:
+            return None
+        return value / total_pnl * 100.0
+
+    top_symbol, top_symbol_pnl = max(by_symbol.items(), key=lambda kv: kv[1])
+    top_day, top_day_pnl = max(by_day.items(), key=lambda kv: kv[1])
+    best_trade = max(trades, key=lambda t: t.realized_pnl)
+
+    return {
+        "top_symbol": top_symbol,
+        "top_symbol_pnl": top_symbol_pnl,
+        "top_symbol_pnl_share": _share(top_symbol_pnl),
+        "top_trade_pnl": best_trade.realized_pnl,
+        "top_trade_symbol": best_trade.symbol,
+        "top_trade_pnl_share": _share(best_trade.realized_pnl),
+        "top_day": top_day,
+        "top_day_pnl": top_day_pnl,
+        "top_day_pnl_share": _share(top_day_pnl),
+        "distinct_symbols": len(by_symbol),
+        "distinct_days": len(by_day),
     }
 
 
@@ -1230,6 +1283,31 @@ def _forensics_rows(report: Dict[str, Any]) -> List[List[str]]:
     return rows
 
 
+def _fmt_share(value: Optional[float]) -> str:
+    """Konsantrasyon payı: None = TANIMSIZ (kâr yok), 'ölçülmedi' DEĞİL."""
+    return f"%{value:.1f}" if value is not None else "— (toplam PnL pozitif değil)"
+
+
+def _concentration_lines(conc: Dict[str, Any]) -> List[str]:
+    """D24/A4 — özet bloğunun konsantrasyon satırları (bilgi, eşik değil)."""
+    if not conc:
+        return []
+    return [
+        f"  Yoğunluk/sembol    : {conc.get('top_symbol') or '—'} "
+        f"{float(conc.get('top_symbol_pnl') or 0.0):+.2f} "
+        f"({_fmt_share(conc.get('top_symbol_pnl_share'))} kârın), "
+        f"{conc.get('distinct_symbols', 0)} sembol",
+        f"  Yoğunluk/işlem     : en iyi tek işlem "
+        f"{float(conc.get('top_trade_pnl') or 0.0):+.2f} "
+        f"({conc.get('top_trade_symbol') or '—'}, "
+        f"{_fmt_share(conc.get('top_trade_pnl_share'))} kârın)",
+        f"  Yoğunluk/gün       : {conc.get('top_day') or '—'} "
+        f"{float(conc.get('top_day_pnl') or 0.0):+.2f} "
+        f"({_fmt_share(conc.get('top_day_pnl_share'))} kârın), "
+        f"{conc.get('distinct_days', 0)} işlem günü",
+    ]
+
+
 def render_text(report: Dict[str, Any]) -> str:
     meta = report["meta"]
     h = report["headline"]
@@ -1280,6 +1358,7 @@ def render_text(report: Dict[str, Any]) -> str:
     lines.append(
         f"  Rejim gün sayısı   : UP={rdc['UP']} FLAT={rdc['FLAT']} DOWN={rdc['DOWN']} ?={rdc['?']}"
     )
+    lines.extend(_concentration_lines(h.get("concentration") or {}))
 
     if report.get("forensics") is not None:
         lines.append("")
@@ -1368,6 +1447,25 @@ def render_md(report: Dict[str, Any]) -> str:
     lines.append(f"- UP günlerden PnL payı: **{up_share_txt}**")
     lines.append(f"- exit_reason=UNKNOWN oranı: **%{h['unknown_exit_share_pct']:.1f}**")
     lines.append(f"- Rejim gün sayısı: UP={rdc['UP']} FLAT={rdc['FLAT']} DOWN={rdc['DOWN']} ?={rdc['?']}")
+    conc = h.get("concentration") or {}
+    if conc:
+        lines.append(
+            f"- Yoğunluk — sembol: **{conc.get('top_symbol') or '—'}** "
+            f"{float(conc.get('top_symbol_pnl') or 0.0):+.2f} "
+            f"({_fmt_share(conc.get('top_symbol_pnl_share'))} kârın, "
+            f"{conc.get('distinct_symbols', 0)} sembol)"
+        )
+        lines.append(
+            f"- Yoğunluk — tek işlem: **{float(conc.get('top_trade_pnl') or 0.0):+.2f}** "
+            f"({conc.get('top_trade_symbol') or '—'}, "
+            f"{_fmt_share(conc.get('top_trade_pnl_share'))} kârın)"
+        )
+        lines.append(
+            f"- Yoğunluk — gün: **{conc.get('top_day') or '—'}** "
+            f"{float(conc.get('top_day_pnl') or 0.0):+.2f} "
+            f"({_fmt_share(conc.get('top_day_pnl_share'))} kârın, "
+            f"{conc.get('distinct_days', 0)} işlem günü)"
+        )
 
     if report.get("forensics") is not None:
         lines.append("")

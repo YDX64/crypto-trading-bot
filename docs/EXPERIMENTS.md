@@ -1,5 +1,66 @@
 # Deney defteri — backtest ve ölçüm kayıtları
 
+> ## ⚠️ ÖNCE BUNU OKU — bu defterdeki sayılar OOS DEĞİLDİR (D24, 2026-08-24)
+>
+> **Olgu.** Bu dosyadaki E2…E9 varyantlarının **TAMAMI** aynı üç pencerede ölçüldü:
+> AYI `2026-01-23→02-13`, YATAY `2026-07-01→07-21`, BOĞA `2026-08-07→08-21`.
+> Sayılabilir: 29 harf etiketli varyant (`E2a`…`E6e`) + E9'un 7 yapı varyantı
+> (S1, S2, S3, S4, S1p3, S1p8, S2p8) = **36 varyant, 3 pencere**. Bu üç pencere
+> dışında ölçülmüş **hiçbir** varyantımız yok.
+>
+> **Bu neden bir sorun?** Aynı pencerede arka arkaya varyant denemek
+> *tekrarlı holdout*'tur: her yeni deneme o pencereyi biraz daha bir EĞİTİM
+> kümesine çevirir. Canlıya giren D6/`E2a` bu pencerelerde **seçildi** —
+> dolayısıyla onun ölçülen kenarı, gerçek beklenen kenarın tarafsız bir
+> tahmini değil, bir **ÜST SINIRIDIR**. Elimizde hiç dokunulmamış bir
+> doğrulama penceresi **YOKTUR**.
+>
+> **Bu ne DEMEK DEĞİL.** "Sonuçlar yanlış" ya da "D6 kötü" demek değildir.
+> Yalnızca şu demektir: bu tablolardaki hiçbir sayı örneklem-dışı (OOS) bir
+> tahmin olarak okunamaz; göreli karşılaştırma için hâlâ geçerlidirler
+> (CLAUDE.md "Karar verirken" maddesi zaten göreli farkları şart koşar).
+>
+> ### Bundan sonrası için önerilen kural: **SAKLI PENCERE**
+> (Öneri — bu bölüm bir ÖLÇÜM DEĞİL, bir yöntem kuralıdır. Henüz hiçbir saklı
+> pencere koşulmadı ve bu kural henüz bir karara uygulanmadı.)
+>
+> 1. **Bir kere, önceden, kör seçilir.** Saklı pencere tarihleri BURAYA yazılır
+>    ve sonuçlara BAKILMADAN belirlenir. Aday alan: `2026-02-15 → 2026-06-25`
+>    — bu aralıkta bugüne kadar hiçbir deney koşulmadı ve `data/klines_cache`
+>    ile `data/klines*` altına indirilmedi bile (dosya adları defterde: `klines/`
+>    2026-06-25→08-23, `klines_bear/` 2025-12-15→2026-02-15). Rejim eşleşmesi
+>    gerekiyorsa üç saklı pencere, YALNIZ BTC günlük getirisinden türeyen
+>    önceden yazılmış bir eşikle seçilir — strateji sonucuna asla bakılmaz.
+> 2. **Arama sırasında AÇILMAZ.** Parametre araması (`scripts/autoresearch.py`
+>    dahil) yalnız üç açık pencerede koşar. Saklı pencerede koşu yapan bir
+>    komut, bu dosyada gerekçesiyle kayıtlıysa geçerlidir; kayıtsızsa pencere
+>    yakılmış sayılır.
+> 3. **Aday başına EN FAZLA BİR kez açılır.** Açık pencerelerdeki karar
+>    kuralını (ayıda PF ≥ 1.1 **ve** boğada PnL kaybı ≤ %20) zaten geçmiş bir
+>    aday için, tek seferlik doğrulama olarak.
+> 4. **Sonuç NE ÇIKARSA ÇIKSIN buraya yazılır** — özellikle başarısızlıklar.
+>    Sessizce atlanan bir saklı pencere koşusu, pencereyi ikinci bir eğitim
+>    kümesine çevirir; kuralın tek yaptırımı bu kayıttır.
+> 5. **Saklı pencere yalnız VETO eder, terfi ETTİRMEZ.** Reddedebilir; tek
+>    başına "canlıya al" diyemez. (Fail-closed ilkemizle aynı yön.)
+> 6. **Açıldıktan sonra o parametre ailesi için YANIK sayılır**; yeni bir saklı
+>    pencere ilan edilmeden aynı aile yeniden doğrulanamaz. Açılma sayacı bu
+>    kutuda tutulur — **bugüne kadar: 0**.
+> 7. **Çok-varyant taramasında p/q raporlanır.** Tek bir varyantın "kazanması"
+>    N denemede beklenen bir olaydır; `--permutations` (D24/A1) p-değerini,
+>    `python3 -m src.strategies.scalper.multitest` (D24/A2, Benjamini-Hochberg)
+>    q-değerini verir. Bunlar saklı pencerenin yerini TUTMAZ, yalnız şişkinliği
+>    görünür kılar.
+>
+> **Kuralın kendi sınırları (dürüstlük).** (a) Pencerelerimiz 3 hafta; saklı
+> pencere de kısa olacağından tek başına istatistiksel güç vermez. (b) Kripto
+> rejimi hızlı değişir: farklı bir dönemden seçilen saklı pencere, yalnız
+> "aşırı uyum" değil aynı zamanda "rejim genellemesi" de sınar — iki etki
+> ayrışmaz ve başarısızlık ikisinden hangisinden geldiğini söylemez.
+> (c) Bu kural, dış bir inceleme sırasında bu ölçüm boşluğunun teşhis
+> edilmesiyle yazıldı; ilgili depoda lisans YOKTUR, hiçbir metin kopyalanmadı
+> — buradaki formülasyon bize aittir.
+
 Kural: bir satırın kanıt sayılması için **komut + pencere + env kaynağı + log yolu** gerekir.
 Harness ≥ 7640c0a (kapı-pariteli). Pencereler: AYI 2026-01-23→02-13 · YATAY 07-01→07-21 · BOĞA 08-07→08-21.
 Komut kalıbı:
@@ -1078,3 +1139,103 @@ koşularla **bit düzeyinde AYNI** (V1c AYI 158 işlem / WR 88.0 / +3812.25 / PF
 2.39 / 734.59, 3 tetik). Mainnet verisinde değişim inert — E7 tablosu her iki tanım altında da
 geçerli — ama testnet soak'undaki belirsizlik artık YOK.
 Eski (vekil) koşu logları `logs/market_gate_prevclose/` altında saklandı.
+
+## 2026-08-24 — D24 ölçüm/kanıt paketi (motor davranışı DEĞİŞMEDİ)
+
+Dört harici deponun (IAF · AI-Trader · jane-street-skills · OpenTrade) incelemesinden
+çıkan, **kâr değil kanıt kalitesi** getiren yedi madde. Hiçbiri motorun karar yoluna
+girmez; hepsi ya salt-rapor ya varsayılan-kapalı bayraktır. `tests/test_golden_backtest.py`
+altın sayıları **DEĞİŞMEDİ** (2 işlem / `total_pnl` 26.77 / `{"regime_gate": 4}`).
+
+### D24.1 — Bar-bazlı çöküş, kapanış-bazlının GÖRMEDİĞİ çukuru gösteriyor
+Altın koşuda (BTCUSDT+ETHUSDT, 2026-08-07→08-10, `SCALPER_TF_REGIME=15m`):
+
+| Metrik | Değer |
+|---|---|
+| `max_drawdown` (bugünkü, yalnız işlem KAPANIŞLARINDA örneklenir) | **0.00** |
+| `bar_max_drawdown` (yeni, her 5m barında mark-to-market) | **11.46** |
+| Toplam PnL | 26.77 |
+| Bar-bazlı çukurun toplam kâra oranı | **%42.8** |
+| Bar işareti sayısı / çukur zamanı | 80 / `2026-08-07T09:34:59Z` |
+| İşlem başına en derin bar-içi çukur | −4.92 (işlem #1) · −7.82 (işlem #2) |
+
+Okuma: bu pencerede iki işlem de kazandı, bu yüzden kümülatif PnL hiç düşmedi ve
+bugünkü metrik **sıfır risk** raporluyordu; oysa portföy bar-içinde kârın %43'ü kadar
+su altındaydı. 1000 USD sermaye ve %10/işlem sabit boyutta bu doğrudan hayatta kalma
+sorusudur. Değişmez (test edildi): aynı taban + daha sık örnekleme → `bar_max_drawdown`
+`max_drawdown`'dan **küçük olamaz**.
+Kod: `backtest.bar_equity_series` / `bar_drawdown` / `_mark_equity`.
+Test: `tests/test_backtest_measurement.py::TestBarDrawdownIsDeeperThanCloseBased`.
+
+### D24.2 — Monte-Carlo permütasyon: kelepçe ZORUNLU, ölçüldü
+Altın fixture'ı üzerinde 60 tur × 2 sembol, tohum 12345, `--permutation-clamp-audit`
+(AĞ YOK — veri `series_out` ile ilk koşudan devralınır):
+
+| Metrik | Yön | Gerçek | Null ort | Null p05 | Null p95 | p |
+|---|---|---|---|---|---|---|
+| `total_pnl` | büyük | 26.77 | −4.72 | −78.66 | 45.06 | 0.180 |
+| `profit_factor` | büyük | ∞ (hiç kayıp yok) | 1.45 | 0.00 | 3.68 | **üretilmedi** |
+| `winrate` | büyük | 100.0 | 69.94 | 0.00 | 100.0 | 0.295 |
+| `max_drawdown` | **küçük** | 0.00 | 32.08 | 0.00 | 87.82 | 0.295 |
+| `bar_max_drawdown` | **küçük** | 11.46 | 58.24 | 12.49 | 107.24 | **0.066** |
+
+**Kelepçe ölçümü (planın 1. zorunlu düzeltmesi).** Upstream dört göreli bileşeni
+bağımsız karıştırdığı için permüte barlarda OHLC tanımı bozuluyor. Ölçtük
+(103.680 permüte bar): **High < max(O,C) → %28.2** · **Low > min(O,C) → %29.4** ·
+en az bir ihlal taşıyan bar **%57.6**. Kelepçenin düzeltme büyüklüğü: ortalama
+%0.0416, en büyük %0.5953 (fiyat cinsinden).
+**Kelepçenin null'u kaydırması** (kelepçeli − kelepçesiz, AYNI tohumlar):
+`winrate` null ortalaması **+7.61 puan** · `bar_max_drawdown` **+2.84** ·
+`total_pnl` **+2.21** · `max_drawdown` **+0.58** · `profit_factor` **+0.66**.
+Yani kelepçesiz null, permüte dünyayı sistematik olarak TP/trail aleyhine bozuyor ve
+gerçek sonucu olduğundan anlamlı gösteriyordu — kelepçe kozmetik değil.
+(p-değeri farkları N=60'ta ±0.05 mertebesinde, yani 3 permütasyon; bu ölçekte
+gürültüdür — güvenilir sinyal null ORTALAMASINDAKİ kaymadır.)
+
+**Yön ölçümü (2. zorunlu düzeltme).** `max_drawdown`/`bar_max_drawdown`'da küçük olan
+iyidir. Upstream'in sabit `mean(dist >= real)` yönü, sentetik doğrulama vektöründe
+p=0.05 yerine **p=0.96** üretiyor (`tests/test_permutation.py::
+test_lower_is_better_direction_is_inverted`). Yönü tanımlı olmayan metrik için
+p-değeri hiç üretilmez; `profit_factor=∞` gibi sonlu olmayan gerçek değerde de
+üretilmez (yukarıdaki tabloda "üretilmedi").
+
+**Null'un kapsamı (dürüstlük).** Permütasyon YALNIZ giriş dilimine uygulanır; bağlam
+ve rejim dilimleri permüte seriden `aggregate_from` ile TÜRETİLİR, permüte serinin
+kapsamadığı daha eski rejim barları GERÇEK kalır. Yani p-değeri şu DAR soruyu
+yanıtlar: *"rejim arka planı aynıyken, giriş sinyalinin kendisi şanstan ayırt
+edilebilir mi?"* Koşulsuz bir null DEĞİLDİR.
+
+Komut:
+```bash
+env $(ssh awa grep ^SCALPER_ /opt/tradingbot-v2/.env | xargs) python3 -m src.strategies.scalper.backtest \
+  --strategies C --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,BNBUSDT,ADAUSDT,LTCUSDT \
+  --start 2026-01-23 --end 2026-02-13 --cache-dir data/klines_cache \
+  --permutations 200 --permutation-clamp-audit
+```
+Maliyet uyarısı: permütasyon **N× simülasyon** demektir (audit ile 2N). Altın
+fixture'da 60×2 tur 23 sn sürdü; 8 sembol × 3 hafta ölçeğinde tur başına dakikalar
+beklenir — sıralı koşun.
+
+### D24.3 — Konsantrasyon (altın koşu)
+`top_symbol` BTCUSDT %100 (bu pencerede ETHUSDT hiç işlem üretmiyor — bilinen ve
+belgeli) · `top_trade_pnl_share` **%60.5** · `top_day` 2026-08-07 **%60.5** ·
+2 gün / 1 sembol. Canlı defter tarafında aynı tanım `scripts/ledger_report.py`
+"5) ÖZET" bloğunda ("Yoğunluk/sembol · /işlem · /gün"). Pay YALNIZ toplam PnL
+POZİTİFKEN tanımlıdır; değilse `—` (tanımsız) — "ölçülmedi" değil.
+**Eşik DEĞİL, bilgi satırı**: soak kontrol listesine girmez (D#P1 paritesi).
+
+### D24.4 — Maliyet stresi / giriş gecikmesi: ölçülmedi (yalnız araç hazır)
+`--fee-stress` (komisyon+kayma 2×) ve `--entry-delay-candles N` bayrakları eklendi;
+`SCALPER_SLIPPAGE_RATE` env'e taşındı (varsayılan **0.0002 = DEĞİŞMEDİ**, config
+fail-fast: oran, yüzde değil; üst sınır 0.01). Üç rejim penceresinde stres koşusu
+**bu commit'te KOŞULMADI** — koşulduğunda sonucu buraya, kendi başlığı altında yazın.
+Beklenen okuma: başabaş WR ≈ %85 olan bir kenarda kaymayı 2× yapmak sonucu tersine
+çeviriyorsa, canlı kenarın kaymaya duyarlılığı belgelenmiş olur.
+
+### D24.5 — Niyet kaydı ve beklenti alanları: kapsama bugün SIFIR
+`logs/trades.jsonl`'e `event="intent"` satırı (proposed → decided → executed) ve
+`/scalper/forensics/summary` yanıtına `intents` bloğu eklendi. Sayaçlar **süreç
+başlangıcından beridir** ve restart'ta sıfırlanır (`window: "process_start"`).
+`horizon_end_at`/`invalid_if`/`confidence`/`model_version` alanları şemaya girdi ama
+onları DOLDURAN bir yol henüz yok (D23 ajanı bağlayacak) → rapor bugün
+`with_expectation: 0` döner. Bu **doğru** sonuçtur: null = "ölçülmedi".

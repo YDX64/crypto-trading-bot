@@ -27,6 +27,19 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 FORENSICS_VERSION = 1
 
+#: D24/madde 6: "beklenti" (expectation) alanlarının serbest metin sınırı.
+#: Kayıt bir teşhis satırıdır, deneme değil: 200 karakter bir insanın tek
+#: bakışta okuyabileceği en uzun gerekçedir ve JSONL satırını şişirmez.
+EXPECTATION_TEXT_MAX = 200
+
+#: `build_entry`'nin döndürdüğü beklenti anahtarları — sıra RAPOR sırasıdır.
+EXPECTATION_FIELDS: tuple = (
+    "horizon_end_at",
+    "invalid_if",
+    "confidence",
+    "model_version",
+)
+
 # --------------------------------------------------------------------------
 # Etiketler (verdict) — kural tabanlı, basit ve dürüst.
 # --------------------------------------------------------------------------
@@ -140,6 +153,34 @@ def _s(value: Any) -> Optional[str]:
 def _cfg_float(cfg: Any, name: str, default: float) -> float:
     value = _f(getattr(cfg, name, None))
     return default if value is None else value
+
+
+def _trim(value: Any, limit: int = EXPECTATION_TEXT_MAX) -> Optional[str]:
+    """Serbest metni `limit` karaktere kırp (kırpıldığını İŞARETLEME).
+
+    Kırpma sessizdir: bir teşhis alanında "…(kırpıldı)" gibi bir ek, metnin
+    kendisi kadar yer kaplar ve `jq` ile eşleştirmeyi bozar.
+    """
+    text = _s(value)
+    if text is None:
+        return None
+    return text[: max(0, int(limit))] or None
+
+
+def _unit(value: Any) -> Optional[float]:
+    """0.0–1.0 aralığına KIRP (clamp); aralık dışı değer hata DEĞİLDİR.
+
+    Kırpıldığı AYRICA kaydedilmez (madde 6.1): kaydın tüketicisi eşik
+    karşılaştırması yapar, kırpma tarihçesi değil.
+    """
+    out = _f(value)
+    if out is None:
+        return None
+    if out < 0.0:
+        out = 0.0
+    elif out > 1.0:
+        out = 1.0
+    return round(out, 3)
 
 
 def _direction_value(direction: Any) -> str:
@@ -337,8 +378,30 @@ def build_entry(
     daily_pnl: Optional[float] = None,
     btc_price: Optional[float] = None,
     rr: Optional[float] = None,
+    # ---- D24/madde 6: "ne BEKLEDİK" (expectation) -----------------------
+    # Şema fikri AI-Trader'ın sinyal-kalitesi kaydından alınmıştır (YALNIZ
+    # ALAN ADLARI; hiçbir satır kopyalanmadı — o repoda LİSANS METNİ YOKTUR,
+    # README rozeti MIT der ama dosya yoktur, bu yüzden kod alınmaz).
+    # Bugün bu alanları DOLDURAN bir çağıran YOKTUR: giriş yolundaki kanca
+    # AYRI bir kararın konusudur. Doldurulmayan alan raporda "ÖLÇÜLMEDİ"
+    # olarak görünür — bu DOĞRU ve beklenen sonuçtur.
+    horizon_end_at: Optional[str] = None,
+    invalid_if: Optional[str] = None,
+    confidence: Optional[float] = None,
+    model_version: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Giriş ANINDA bilinen her şeyi tek sözlükte topla (look-ahead yok)."""
+    """Giriş ANINDA bilinen her şeyi tek sözlükte topla (look-ahead yok).
+
+    Beklenti alanları (`horizon_end_at`, `invalid_if`, `confidence`,
+    `model_version`) OPSİYONELDİR ve dönen sözlükte HER ZAMAN bulunur
+    (doldurulmadıysa `None`).
+
+    `FORENSICS_VERSION` BUMP EDİLMEZ: alanlar yalnız EKLEMELİDİR, hiçbir
+    mevcut alanın adı/anlamı değişmedi. Eski satırlar (v1) yeni okuyucuyla
+    okunabilir — okuyucu eksik anahtarı `None` sayar — ve yeni satırlar eski
+    okuyucuyla okunabilir (fazla anahtarı yok sayar). Sürümü artırmak,
+    aslında uyumlu olan bir şemayı "kırıldı" diye işaretlerdi.
+    """
     signal_price = _f(getattr(signal, "entry_price", None))
     fill = _f(fill_price)
     stop = _f(stop_price)
@@ -401,7 +464,44 @@ def build_entry(
         "open_positions": None if open_positions is None else int(open_positions),
         "daily_pnl": _round(daily_pnl, 4),
         "btc_price": _round(btc_price, 8),
+        # Beklenti alanları: anahtarlar HER ZAMAN vardır ki tüketici
+        # (`expectation_from_entry`, pano, rapor) "alan yok" ile "beklenti
+        # yoktu"yu karıştırmasın.
+        "horizon_end_at": _s(horizon_end_at),
+        "invalid_if": _trim(invalid_if),
+        "confidence": _unit(confidence),
+        "model_version": _s(model_version),
     }
+
+
+# --------------------------------------------------------------------------
+# Beklenti (expectation) — "ne BEKLEDİK" kaydı (D24/madde 6)
+# --------------------------------------------------------------------------
+
+def expectation_from_entry(
+    entry: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Giriş kaydından beklenti bloğunu çıkar; hiç doldurulmadıysa `None`.
+
+    Sözleşme:
+      * DÖRT alandan EN AZ BİRİ dolu ise dördü de (eksikler `None`) döner —
+        kısmen doldurulmuş bir beklenti de bir beklentidir.
+      * Hepsi boş/eksikse `None` döner. `None` = **ÖLÇÜLMEDİ**; "beklenti
+        yoktu" DEĞİL. Ayrım önemlidir: kaydın kapalı olduğu bir dönemi
+        "beklentisiz işlem" diye raporlamak ölçüm yokluğunu bulguya çevirir.
+      * `entry` None/bozuk/sözlük-değil olabilir — ASLA patlamaz.
+    """
+    if not isinstance(entry, dict):
+        return None
+    out = {
+        "horizon_end_at": _s(entry.get("horizon_end_at")),
+        "invalid_if": _trim(entry.get("invalid_if")),
+        "confidence": _unit(entry.get("confidence")),
+        "model_version": _s(entry.get("model_version")),
+    }
+    if all(value is None for value in out.values()):
+        return None
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -663,6 +763,16 @@ def postmortem_from_candles(
 # Özet (etiket × sonuç)
 # --------------------------------------------------------------------------
 
+#: `summarize` içindeki `by_model_version` kova üst sınırı — en çok bu kadar
+#: GERÇEK sürüm kovası tutulur, fazlası `OTHER_BUCKET`ta toplanır (yani sözlük
+#: en çok N+1 anahtar taşır). Sürüm etiketi serbest metindir; sınırsız kova
+#: sınırsız RAM/JSON demektir.
+MODEL_VERSION_BUCKET_MAX = 20
+
+#: Üst sınırı aşan sürümlerin toplandığı kova.
+OTHER_BUCKET = "_diger_"
+
+
 def summarize(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     """Etiket × sonuç tablosu — "neler etkiliyor" sorusunun cevabı.
 
@@ -671,10 +781,22 @@ def summarize(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     işlem sayısını AŞABİLİR — bu bir hata değil, kasıtlıdır).
     `_etiketsiz_` satırı hiç etiket almamış işlemleri gösterir: kıyas tabanı
     olmadan "şu etiket kötü" demek anlamsızdır.
+
+    D24/madde 6.3: satırlar OPSİYONEL bir `"expectation"` anahtarı taşıyabilir
+    (bkz. `expectation_from_entry`). Dönen sözlükteki `"expectation"` bloğu
+    HER ZAMAN bulunur — hiç beklenti kaydı yoksa bile — ki raporun şekli
+    sabit kalsın ve pano "alan yok" hâlini ayrıca ele almak zorunda kalmasın.
+
+    `without_expectation` sayacının anlamı **ÖLÇÜLMEDİ**'dir: o işlemde bir
+    beklenti kaydı YOKTU demek, "o işleme girerken beklenti kurulmamıştı"
+    demek DEĞİLDİR (kanal kapalı olabilir, kayıt sonradan eklenmiş olabilir).
+    Bu ayrım korunmazsa ölçüm yokluğu sessizce bulguya dönüşür.
     """
     buckets: Dict[str, Dict[str, float]] = {}
     total_trades = 0
     total_pnl = 0.0
+    with_expectation = 0
+    by_model_version: Dict[str, int] = {}
 
     def _bucket(name: str) -> Dict[str, float]:
         return buckets.setdefault(
@@ -688,6 +810,18 @@ def summarize(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         tags = [t for t in (row.get("tags") or []) if t]
         total_trades += 1
         total_pnl += pnl
+        expectation = row.get("expectation")
+        if isinstance(expectation, dict) and any(
+            expectation.get(field) is not None for field in EXPECTATION_FIELDS
+        ):
+            with_expectation += 1
+            version = _s(expectation.get("model_version")) or "_bilinmiyor_"
+            if (
+                version not in by_model_version
+                and len(by_model_version) >= MODEL_VERSION_BUCKET_MAX
+            ):
+                version = OTHER_BUCKET
+            by_model_version[version] = by_model_version.get(version, 0) + 1
         for name in _dedup(tags) or ["_etiketsiz_"]:
             bucket = _bucket(name)
             bucket["trades"] += 1
@@ -728,4 +862,15 @@ def summarize(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         "trades": total_trades,
         "total_pnl": round(total_pnl, 4),
         "tags": table,
+        "expectation": {
+            "with_expectation": with_expectation,
+            # null = ÖLÇÜLMEDİ (beklenti kurulmamıştı DEĞİL).
+            "without_expectation": total_trades - with_expectation,
+            "by_model_version": dict(
+                sorted(
+                    by_model_version.items(),
+                    key=lambda item: (-item[1], item[0]),
+                )
+            ),
+        },
     }
