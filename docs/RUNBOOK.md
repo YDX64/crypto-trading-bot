@@ -97,6 +97,71 @@ ssh awa 'cd /opt/tradingbot-v2 && .venv/bin/python scripts/ledger_report.py --si
 - **Kapatmak güvenlidir:** `SCALPER_FORENSICS_ENABLED=false` yalnız kaydı
   durdurur; motor davranışı her iki durumda da aynıdır.
 
+### Yeni (D27, 2026-08-24): REAPER etiketi, ücret/MAE dürüstlüğü, karşı-olgu
+
+**REAPER ayrı çıkış etiketidir.** 8 saatlik yaş kesmesi (D4) artık deftere
+"SL" değil `REAPER` yazılır (panoda mor rozet). **Geriye dönük düzeltme
+YOKTUR**: 2026-08-24 ÖNCESİ kapanan yaş kesmeleri hâlâ "SL"dir — bir "SL
+oranı" kıyaslaması yaparken pencereyi buna göre böl.
+`scripts/ledger_report.py` bunu tablo altında not olarak yazar. Ayrımı
+görmenin üç yolu:
+```bash
+ssh awa 'curl -s "localhost:9091/scalper/forensics/summary?since=7d" | python3 -c "import sys,json;[print(r) for r in json.load(sys.stdin)[\"exit_reasons\"]]"'
+ssh awa 'cd /opt/tradingbot-v2 && .venv/bin/python scripts/ledger_report.py --since "2026-08-24" --format md'   # 2. tablo
+# ...ve panodaki "Son İşlemler" rozeti (REAPER = mor).
+```
+⚠️ Damga yalnız BELLEKTEDİR (`sp.reaper_close_at`): reduce-only emir gittikten
+sonra kapanış finalize edilmeden ÖNCE süreç yeniden başlarsa etiket "SL"ye
+düşer. Ayrım asla FAZLA saymaz, ama restart'larda EKSİK sayabilir.
+
+**`forensics.fee_estimate` artık `null` olabilir.** Merdiven (TP1/TP2/runner)
+çıkışında borsa fill'leri doğrulanamadıysa brüt ÖLÇÜLEMEZ ve komisyon tahmini
+YAZILMAZ (`gross_source="unmeasured_ladder"`, `fee_estimate_source="unmeasured"`).
+Brüt−net negatif çıkarsa kaynak `"inconsistent"`tır. **`null` = "ölçülmedi",
+"ücret yok" DEĞİL.** `fee_dominated` etiketi yalnız ölçülmüş komisyonla atılır.
+
+**MAE düzeltilmiş olabilir.** `mae_source="corrected"` ise yoklama (safety
+turu ≈2 sn) fitili kaçırmıştır ve değer çıkış ROI'siyle değiştirilmiştir; ham
+örneklem `mae_roi_pct_sampled`ta durur, `mae_samples` kaç kez yoklandığını
+söyler. DB'deki `scalp_trades.mae_pct` HAM örneklemdir (düzeltilmez).
+
+**TP1 emri konulamadıysa pano kırmızı uyarı satırı gösterir.** Sayaç:
+`/scalper/status → order_health.tp1_missing` ve
+`/follower/status → order_health.tp1_missing`. Bu, o pozisyonda break-even'ın
+HİÇ kurulamadığı ve işlemin tam risk stopuyla taşındığı anlamına gelir
+(ölçüldü: 3 işlem, −18.4 USDT). Sayaçlar süreç-içidir; kalıcı iz
+`logs/bot.log`'daki CRITICAL satırlarıdır.
+
+**Karşı-olgu defteri: "reddettiğimiz sinyal iyi miydi?"**
+```bash
+# Pano özeti (yeni uç YOK): /api/status ve /scalper/status içindeki
+# `counterfactual` bloğu — bekleyen/çözülen/ölçülen sayaçları.
+ssh awa 'curl -s localhost:9091/scalper/counterfactual?since=7d | python3 -m json.tool | head -60'
+ssh awa 'curl -s "localhost:9091/scalper/counterfactual?since=7d&reason=tv_confluence"'
+ssh awa 'cd /opt/tradingbot-v2 && .venv/bin/python scripts/ledger_report.py --since "2026-08-24" --counterfactual --format md'
+ssh awa 'cd /opt/tradingbot-v2 && jq -c "select(.event==\"counterfactual\")" logs/trades.jsonl | tail -5'
+```
+Tablo: ret gerekçesi × (n, ölçülen, tp1/stop/açık/veriyok, ort. ROI%, PF,
+%95 GA, katlanan).
+
+**Karşı-olgu tuzakları:**
+- **Model yalnız TP1 ya da İLK STOP'u modeller.** TP2, chandelier trailing,
+  break-even, 8 saatlik reaper, komisyon ve kayma MODELLENMEZ. Aynı mumda
+  ikisi de vurursa STOP kazanır (karamsar). Yani bu tablo motorun gerçek
+  sonucu DEĞİL, aynı kurallarla kaba bir kıyas tabanıdır.
+- **"Veriyok" satırları ortalama/PF hesabına GİRMEZ.** `measured: 0` =
+  "ölçülmedi", "etki yok" DEĞİL.
+- **İkinci-derece etki ölçülmüyor.** Defter "o sinyal iyi miydi"yi söyler;
+  "engellenmeseydi hangi BAŞKA işlem açılmazdı"yı söylemez (kapasite ve
+  kayıp-cooldown serbestliği).
+- **Bekleyen kuyruk süreç-içidir**: restart çözülmemiş niyetleri düşürür.
+  Kalıcı iz niyetin kendisidir (`event="intent"` satırı, artık
+  `price`/`stop_price`/`tp1_price`/`leverage` alanlarıyla).
+- **Kapatma:** `SCALPER_COUNTERFACTUAL_ENABLED=false` (yalnız defter) ya da
+  `SCALPER_FORENSICS_ENABLED=false` (adli kayıt + niyet + defter birlikte).
+- **Hacim taşarsa** `/scalper/status → forensics_queue.dropped` artar;
+  `SCALPER_COUNTERFACTUAL_DEDUP_SEC`i büyüt (varsayılan 300).
+
 ## Deploy ve geri alma
 
 **Üç halka vardır** ve her biri AYRI dizin/süreç/port/`.env` taşır. `--ring`
@@ -231,6 +296,14 @@ bu tuzağa 2026-08-24'te düşüldü: D21 adli kayıt kartı proxy'de 404 alıyo
 ℹ️ **D23 (AI karar katmanı) kartı YENİ UÇ AÇMAZ** — verisini `/api/status`
 gövdesindeki `ai_gate` bloğundan okur, yani beyaz listeye EKLEME GEREKMEZ
 (nginx'e bakman gerekmiyor).
+ℹ️ **D27/B (karşı-olgu defteri) de pano tarafında YENİ UÇ AÇMAZ** — pano özeti
+`/scalper/status → counterfactual` ve `/api/status → counterfactual`
+bloklarındadır (ikisi de zaten izinli). Ayrıntılı tablo ucu
+**`/scalper/counterfactual` BEYAZ LİSTEYE EKLENMEDİ ve EKLENMEMELİDİR**:
+gerçek disk okuması yapar (JSONL + arşivler) ve panodan 5 sn'de bir
+yoklanırsa 2026-08-18 pano-açlığı sınıfını geri getirir. Elle kullanım:
+`ssh awa 'curl -s localhost:9091/scalper/counterfactual?since=7d' | jq`
+ya da `scripts/ledger_report.py --counterfactual`.
 
 **ASLA eklenmez:** `/tv-signal`, `/risk-event`, `/follower/event`,
 `/tv-events/reset` ve tüm POST/kontrol uçları (secret taşırlar / durum değiştirir).

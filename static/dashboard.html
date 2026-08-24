@@ -502,6 +502,8 @@
   .exit-sl{color:var(--loss); background:var(--loss-bg); border-color:var(--loss-border);}
   .exit-tp{color:var(--profit); background:var(--profit-bg); border-color:var(--profit-border);}
   .exit-trail{color:var(--gold); background:var(--gold-bg); border-color:var(--gold-border);}
+  /* D27/A1: yaş kesmesi (REAPER) — SL değildir, TP de değildir; nötr/mor. */
+  .exit-reaper{color:#c084fc; background:rgba(192,132,252,.10); border-color:rgba(192,132,252,.35);}
 
   /* ---------- adli kart (işlem forensics, D21) ---------- */
   /* Tasarım kuralı: BÜYÜK sayı + AZ renk. Tek bakışta "ne oldu"; ayrıntı
@@ -623,6 +625,24 @@
     margin-bottom:12px;
   }
   .cooldown-banner strong{font-size:12px; margin-right:2px;}
+  /* D27/A4: TP emri konulamadı uyarısı (kırmızı — kill-switch'ten farklı). */
+  .order-health-banner{
+    display:flex;
+    flex-wrap:wrap;
+    align-items:center;
+    gap:10px;
+    background:linear-gradient(90deg, rgba(224,78,78,0.18), rgba(224,78,78,0.06));
+    border:1px solid rgba(224,78,78,0.5);
+    color:#f2a1a1;
+    padding:10px 12px;
+    border-radius:var(--radius);
+    font-size:12px;
+    margin-bottom:12px;
+  }
+  .order-health-banner strong{font-size:12px;}
+  .order-health-note{color:var(--text-faint); font-size:11px;}
+  /* D27/B: karşı-olgu defteri sayaç satırı (bilgi — uyarı DEĞİL). */
+  .cf-note{color:var(--text-faint); font-size:11px; margin-bottom:10px;}
   .cooldown-chip{
     display:inline-flex;
     align-items:center;
@@ -1532,6 +1552,15 @@
       warn = '<span class="ap-warn">giriş kapalı: ' +
         escapeHtml(String(f.entry_block_reason)) + '</span>';
     }
+    // D27/A4: TP1 emri konulamamışsa break-even HİÇ kurulamaz — bu, giriş
+    // kilidi kadar sessiz ama daha pahalı bir arızadır ve diğer uyarılarla
+    // else-if zincirine GİRMEZ (ikisi aynı anda olabilir).
+    var apOh = f.order_health || {};
+    var apTp1Missing = isNum(apOh.tp1_missing) ? apOh.tp1_missing : 0;
+    if (apTp1Missing > 0){
+      warn = '<span class="ap-warn">TP1 EMRİ KONULAMADI ×' + apTp1Missing +
+        ' — break-even yok, tam risk stopu</span>' + (warn ? " · " + warn : "");
+    }
     qs("ap-note").innerHTML = (warn ? warn + (notes.length ? " · " : "") : "") + notes.join(" · ");
   }
 
@@ -1913,6 +1942,29 @@
       panel.appendChild(el("div", "kill-switch-banner", "⛔ Günlük zarar limiti aşıldı — yeni giriş durduruldu"));
     }
 
+    // D27/A4: TP1 emri konulamamışsa o pozisyonda break-even HİÇ kurulmaz ve
+    // işlem TAM RİSK stopuyla taşınır (ölçüldü: 3 işlem, −18.4 USDT). Sayaç
+    // SÜREÇ-İÇİDİR (restart'ta sıfırlanır); satır yalnız sayı > 0 iken çıkar.
+    // Veri `/scalper/status → order_health`tan gelir — AYRI yoklama YOK.
+    var oh = d.order_health || {};
+    var tp1Missing = isNum(oh.tp1_missing) ? oh.tp1_missing : 0;
+    var tp2Missing = isNum(oh.tp2_missing) ? oh.tp2_missing : 0;
+    if (tp1Missing > 0 || tp2Missing > 0){
+      var ohParts = [];
+      if (tp1Missing > 0) ohParts.push("TP1 ×" + tp1Missing);
+      if (tp2Missing > 0) ohParts.push("TP2 ×" + tp2Missing);
+      var ohRow = el("div", "order-health-banner");
+      ohRow.innerHTML =
+        '<strong>🚨 TP emri konulamadı (' + ohParts.join(" · ") + ')</strong>' +
+        '<span>TP1 yoksa break-even kurulamaz; işlem TAM RİSK stopuyla taşınır.</span>' +
+        (oh.last_symbol
+          ? '<span>son: <b>' + escapeHtml(String(oh.last_symbol)) + '</b> ' +
+            fmtClock(oh.last_at) + '</span>'
+          : "") +
+        '<span class="order-health-note">süreç başlangıcından beri — restart\'ta sıfırlanır</span>';
+      panel.appendChild(ohRow);
+    }
+
     if (cooldowns.length){
       var cooldownBanner = el("div", "cooldown-banner");
       var cooldownHtml = '<strong>⏳ Giriş cooldown — yeni giriş geçici olarak kapalı:</strong>';
@@ -1923,6 +1975,23 @@
       });
       cooldownBanner.innerHTML = cooldownHtml;
       panel.appendChild(cooldownBanner);
+    }
+
+    // D27/B karşı-olgu defteri: reddedilen niyetlerin "girilseydi ne olurdu"
+    // sayaçları. Veri `/scalper/status → counterfactual` bloğundadır — pano
+    // AYRI bir uç ÇAĞIRMAZ (2026-08-18 pano-açlığı dersi + nginx beyaz
+    // listesi). Sayaçlar SÜREÇ-İÇİDİR; ayrıntılı tablo rapor yolundadır
+    // (`scripts/ledger_report.py --counterfactual`).
+    var cfx = d.counterfactual || {};
+    if (cfx.enabled){
+      var cfxRow = el("div", "cf-note");
+      cfxRow.textContent =
+        "karşı-olgu defteri: " + (isNum(cfx.pending) ? cfx.pending : 0) + " bekleyen · " +
+        (isNum(cfx.resolved) ? cfx.resolved : 0) + " çözüldü (" +
+        (isNum(cfx.measured) ? cfx.measured : 0) + " ölçüldü) · " +
+        (isNum(cfx.dedup_hits) ? cfx.dedup_hits : 0) + " katlandı · ufuk " +
+        ((cfx.horizons_h || []).join("/") || "—") + " sa";
+      panel.appendChild(cfxRow);
     }
 
     if (universe.length === 0){
@@ -1949,6 +2018,10 @@
   function exitReasonChip(reason){
     var cls = "exit-other";
     if (reason === "SL") cls = "exit-sl";
+    // D27/A1: REAPER = 8 saatlik yaş kesmesi (D4). Eskiden "SL" yazılıyordu;
+    // AYRI renk/etiket — "stop yedi" ile "süre doldu" aynı şey DEĞİLDİR.
+    // 2026-08-24 ÖNCESİ kapanışlar defterde hâlâ "SL" görünür.
+    else if (reason === "REAPER") cls = "exit-reaper";
     else if (reason === "TP_LADDER") cls = "exit-tp";
     // D22: TRAIL_MARKET / BE_MARKET, TRAIL ailesindendir (stop kararının
     // -2021 sonrası piyasa emriyle uygulanmış hâli) — aynı renk, farklı etiket.

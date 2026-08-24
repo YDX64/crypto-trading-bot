@@ -72,6 +72,17 @@ def _exit(**overrides):
         "direction": "LONG",
     }
     base.update(overrides)
+    # D27/A2: `classify_exit` artık `fee_estimate`i ÖLÇÜM olarak okur —
+    # `None`/eksik = "ölçülemedi" ve `fee_dominated` etiketi ATILMAZ. Bu
+    # yardımcı `build_exit`in çıktısını taklit eder ki etiket kuralları
+    # gerçek belgeyle AYNI girdiyle sınansın. Testler `fee_estimate`i
+    # açıkça geçirerek "ölçülemedi" hâlini de kurabilir.
+    if "fee_estimate" not in base:
+        net, gross = base.get("realized_pnl"), base.get("gross_pnl")
+        if net is not None and gross is not None and gross - net >= 0:
+            base["fee_estimate"] = round(gross - net, 6)
+        else:
+            base["fee_estimate"] = None
     return base
 
 
@@ -538,6 +549,47 @@ class TestSummarize:
         summary = fx.summarize([{"tags": ["noise_stop", "noise_stop"], "pnl": -1.0}])
         assert summary["tags"][0]["trades"] == 1
 
+    # --- D27/A1: çıkış nedeni × sonuç kırılımı ---------------------------
+
+    def test_reaper_sl_den_AYRI_satirda_sayilir(self):
+        """Yaş kesmesi ile gerçek stop tek kovada TOPLANMAZ.
+
+        Ölçüldü (2026-08-24): 43 yaş kesmesi "SL" diye etiketliydi ve brüt
+        zararın %27'sini taşıyordu; ayrım olmadan her SL analizi bozuktu.
+        """
+        summary = fx.summarize([
+            {"tags": [], "pnl": -10.0, "exit_reason": "SL"},
+            {"tags": [], "pnl": -20.0, "exit_reason": "SL"},
+            {"tags": [], "pnl": -3.0, "exit_reason": "REAPER"},
+            {"tags": [], "pnl": +2.0, "exit_reason": "REAPER"},
+            {"tags": [], "pnl": +30.0, "exit_reason": "TP_LADDER"},
+        ])
+        by_reason = {row["reason"]: row for row in summary["exit_reasons"]}
+        assert by_reason["SL"]["trades"] == 2
+        assert by_reason["SL"]["pnl"] == -30.0
+        assert by_reason["REAPER"]["trades"] == 2
+        assert by_reason["REAPER"]["pnl"] == -1.0
+        # REAPER kendi AİLESİNDE durur; SL ailesine karışmaz.
+        assert by_reason["REAPER"]["family"] == "REAPER"
+        assert by_reason["SL"]["family"] == "SL"
+        # ARTIDA kesilen yaş kesmesi "kazanan" olarak sayılır (12 vaka).
+        assert by_reason["REAPER"]["wins"] == 1
+
+    def test_adli_kaydi_olmayan_satir_bilinmiyor_kovasina_duser(self):
+        """`None` = ÖLÇÜLMEDİ; "nedensiz kapandı" DEĞİL."""
+        summary = fx.summarize([{"tags": [], "pnl": -1.0}])
+        assert summary["exit_reasons"][0]["reason"] == "_bilinmiyor_"
+
+    def test_cikis_nedeni_kovalari_SINIRLIDIR(self):
+        rows = [
+            {"tags": [], "pnl": 1.0, "exit_reason": f"X{i}"}
+            for i in range(fx.EXIT_REASON_BUCKET_MAX + 5)
+        ]
+        summary = fx.summarize(rows)
+        names = {row["reason"] for row in summary["exit_reasons"]}
+        assert fx.OTHER_BUCKET in names
+        assert len(names) <= fx.EXIT_REASON_BUCKET_MAX + 1
+
     def test_empty_input_is_safe(self):
         # D24/madde 6.3: `expectation` bloğu HER ZAMAN vardır (hiç beklenti
         # kaydı olmasa bile) — raporun şekli sabit kalmalı.
@@ -545,6 +597,9 @@ class TestSummarize:
             "trades": 0,
             "total_pnl": 0.0,
             "tags": [],
+            # D27/A1: çıkış nedeni × sonuç bloğu da HER ZAMAN vardır (boş
+            # liste = "hiç kapanış yok", "alan yok" DEĞİL).
+            "exit_reasons": [],
             "expectation": {
                 "with_expectation": 0,
                 "without_expectation": 0,

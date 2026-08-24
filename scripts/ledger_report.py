@@ -16,6 +16,7 @@ Kullanım:
     python3 scripts/ledger_report.py --since "2026-08-21 12:35" --format md
     python3 scripts/ledger_report.py --since "2026-08-21" --forensics   # D21 etiket × sonuç
     python3 scripts/ledger_report.py --since "2026-08-21" --ai          # D23 AI gölge raporu
+    python3 scripts/ledger_report.py --since "2026-08-24" --counterfactual  # D27/B karşı-olgu
     python3 scripts/ledger_report.py --since "2026-08-14" --until "2026-08-21" \
         --btc-klines-json data/btc_1d.json --format json --out report.json
 
@@ -38,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sqlite3
 import sys
 import urllib.error
@@ -62,11 +64,24 @@ REGIME_ORDER = ["UP", "FLAT", "DOWN", "?"]
 # ve `position_manager._emergency_close` pozisyonu reduce-only MARKET ile
 # kapattı. TRAIL AİLESİNDENDİRLER ama AYRI SAYILIRLAR — sayıları artıyorsa
 # stop kararı piyasa hızının gerisinde kalıyordur.
+# "REAPER" (D27/A1): 8 saatlik yaş kesmesi (D4, `SCALPER_MAX_HOLD_HOURS`).
+# Bugüne kadar "SL" diye etiketleniyordu; 2026-08-24 kök-neden analizinde
+# ölçüldü: 43 kesme = −172.3 USDT = brüt zararın %27'si ve 12'si ARTIDA
+# kesilmişti. **GERİYE DÖNÜK VERİ DÜZELTMESİ YOKTUR** — 2026-08-24 öncesinde
+# kapanan yaş kesmeleri defterde hâlâ "SL"dir; rapor bunu REAPER_SPLIT_NOTE
+# ile söyler.
 EXIT_REASON_ORDER = [
-    "SL", "TP_LADDER", "TRAIL", "TRAIL_MARKET", "BE_MARKET", "MANUAL", "UNKNOWN",
+    "SL", "REAPER", "TP_LADDER", "TRAIL", "TRAIL_MARKET", "BE_MARKET",
+    "MANUAL", "UNKNOWN",
 ]
+REAPER_SPLIT_NOTE = (
+    "REAPER ayrımı 2026-08-24'ten itibaren geçerlidir (D27/A1): daha eski yaş "
+    "kesmeleri (D4) defterde hâlâ 'SL' olarak durur — geriye dönük veri "
+    "düzeltmesi YAPILMADI."
+)
 EXIT_REASON_FAMILY = {
     "SL": "SL",
+    "REAPER": "REAPER",
     "TP_LADDER": "TP_LADDER",
     "TRAIL": "TRAIL",
     "TRAIL_MARKET": "TRAIL",
@@ -1072,6 +1087,7 @@ def build_report(
     notes: List[str],
     forensics: Optional[List[Dict[str, Any]]] = None,
     ai: Optional[Dict[str, Any]] = None,
+    counterfactual: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     # `forensics`/`ai` YOKSA anahtar hiç eklenmez (renderer'lar `is not None`
     # ile bölümü açar). Tek gövde: iki ayrı sözlük tutmak, birine eklenen bir
@@ -1095,7 +1111,13 @@ def build_report(
         report["forensics"] = forensics
     if ai is not None:
         report["ai"] = ai
+    if counterfactual is not None:
+        report["counterfactual"] = counterfactual
     report["notes"] = notes
+    # D27/A1: "REAPER ayrımı ... tarihinden itibaren" uyarısı JSON tüketicisine
+    # de görünmeli — metin/md renderer'ları bunu tablo altına yazar, JSON'da
+    # ayrı bir anahtar taşır (renderer'a bağımlı bir uyarı, uyarı değildir).
+    report["exit_reason_note"] = REAPER_SPLIT_NOTE
     return report
 
 
@@ -1268,6 +1290,107 @@ def _ai_coverage_lines(ai: Dict[str, Any]) -> List[str]:
     ]
 
 
+#: D27/B karşı-olgu tablosu. Ad DİKKATLE seçildi: `_TABLE8_HEADERS` ZATEN
+#: AI kalıp tablosuna aitti (satır ~1215) ve üzerine yazmak `_ai_pattern_rows`
+#: 6 sütunluk satırlarını 11 sütunluk başlıkla eşleştirip `IndexError` verir.
+_TABLE9_HEADERS = [
+    "RetGerekçesi", "n", "Ölçülen", "TP1", "STOP", "Açık", "Veriyok",
+    "Ort.ROI%", "PF", "%95 GA", "Katlanan",
+]
+
+_COUNTERFACTUAL_NOTE = (
+    "KARŞI-OLGU MODELİ: yalnız TP1 ya da İLK STOP modellenir; TP2, chandelier "
+    "trailing, break-even çekme, 8 saatlik reaper (D4), komisyon ve kayma "
+    "MODELLENMEZ. Aynı mumda ikisi de vurursa STOP kazanır (karamsar). "
+    "'Veriyok' satırları ortalama/PF hesabına GİRMEZ. 'Katlanan', dedup "
+    "penceresinde tek satıra indirgenmiş özdeş retlerin toplam ağırlığıdır."
+)
+
+
+def load_counterfactual_rows(
+    since: datetime,
+    until: datetime,
+    *,
+    log_dir: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """`logs/trades.jsonl`'den karşı-olgu satırlarını oku (D27/B).
+
+    Kaynak DB DEĞİLDİR: reddedilen niyetlerin defterde satırı yoktur, izleri
+    JSONL'dedir. Dosya yoksa boş liste + açıklayıcı not döner — rapor ÇÖKMEZ
+    (`load_forensics_rows` deseni).
+    """
+    notes: List[str] = []
+    if log_dir:
+        os.environ["TRADINGBOT_LOG_DIR"] = str(log_dir)
+    try:
+        from src.strategies.scalper import forensics_log
+    except Exception as exc:  # pragma: no cover - import yolu bozuksa
+        return [], [f"Karşı-olgu satırları okunamadı (import): {exc}"]
+
+    since_iso = since.replace(tzinfo=timezone.utc).isoformat()
+    until_iso = until.replace(tzinfo=timezone.utc).isoformat()
+    try:
+        rows = forensics_log.read_events("counterfactual", since_iso=since_iso)
+    except Exception as exc:
+        return [], [f"Karşı-olgu satırları okunamadı: {exc}"]
+
+    windowed = [
+        row for row in rows
+        if not isinstance(row.get("ts"), str) or row["ts"] <= until_iso
+    ]
+    if not windowed:
+        notes.append(
+            "Karşı-olgu defterinde bu pencerede satır yok "
+            f"({forensics_log.log_path()}). Defter 2026-08-24'te (D27/B) "
+            "açıldı ve yalnız REDDEDİLEN niyetleri kaydeder."
+        )
+    return windowed, notes
+
+
+def build_counterfactual_report(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Ret gerekçesi × karşı-olgu sonucu — SAF çekirdek `counterfactual.summarize`."""
+    try:
+        from src.strategies.scalper import counterfactual as cf
+    except Exception as exc:  # pragma: no cover - import yolu bozuksa
+        return {"error": f"{type(exc).__name__}: {exc}", "by_reason": [], "overall": {}}
+    summary = cf.summarize(rows)
+    summary["note"] = _COUNTERFACTUAL_NOTE
+    return summary
+
+
+def _counterfactual_rows(report: Dict[str, Any]) -> List[List[str]]:
+    section = report.get("counterfactual") or {}
+    out: List[List[str]] = []
+    entries = list(section.get("by_reason") or [])
+    overall = section.get("overall")
+    if overall:
+        entries = entries + [overall]
+    for item in entries:
+        ci = item.get("ci95_roi_pct")
+        out.append([
+            str(item.get("reason") or "?"),
+            str(item.get("n", 0)),
+            str(item.get("measured", 0)),
+            str(item.get("tp1", 0)),
+            str(item.get("stop", 0)),
+            str(item.get("open", 0)),
+            str(item.get("no_data", 0)),
+            _fmt_opt(item.get("avg_roi_pct")),
+            # `profit_factor` None olabilir ("kayıp yok" ya da "hiç ölçüm
+            # yok"): `_fmt_pf` yalnız sayı/inf bekler, burada ayrı okunur.
+            _fmt_pf(item["profit_factor"])
+            if item.get("profit_factor") is not None else "—",
+            f"[{ci[0]:+.1f}, {ci[1]:+.1f}]" if ci else "—",
+            str(item.get("collapsed", 0)),
+        ])
+    return out
+
+
+def _fmt_opt(value: Optional[float]) -> str:
+    """None = ÖLÇÜLMEDİ (0.0 DEĞİL) — rapor bunu ayırt edebilmeli."""
+    return f"{value:+.2f}" if value is not None else "—"
+
+
 def _forensics_rows(report: Dict[str, Any]) -> List[List[str]]:
     rows: List[List[str]] = []
     for item in report.get("forensics") or []:
@@ -1330,6 +1453,7 @@ def render_text(report: Dict[str, Any]) -> str:
     lines.append("")
     lines.append("2) ÇIKIŞ NEDENİ x YÖN")
     lines.append(_render_table(_TABLE2_HEADERS, _exit_reason_rows(report)))
+    lines.append(f"   NOT: {REAPER_SPLIT_NOTE}")
 
     lines.append("")
     lines.append("3) SEMBOL BAZINDA")
@@ -1368,6 +1492,13 @@ def render_text(report: Dict[str, Any]) -> str:
             "   (Bir işlem birden çok etiket taşıyabilir — satır toplamı işlem"
             " sayısını aşabilir.)"
         )
+
+    cfx = report.get("counterfactual")
+    if cfx is not None:
+        lines.append("")
+        lines.append("5d) KARŞI-OLGU DEFTERİ — REDDEDİLEN NİYETLER (D27/B)")
+        lines.append(_render_table(_TABLE9_HEADERS, _counterfactual_rows(report)))
+        lines.append(f"   {cfx.get('note') or _COUNTERFACTUAL_NOTE}")
 
     ai = report.get("ai")
     if ai is not None:
@@ -1421,6 +1552,8 @@ def render_md(report: Dict[str, Any]) -> str:
     lines.append("")
     lines.append("## 2) Çıkış nedeni × yön")
     lines.append(_render_md_table(_TABLE2_HEADERS, _exit_reason_rows(report)))
+    lines.append("")
+    lines.append(f"> {REAPER_SPLIT_NOTE}")
 
     lines.append("")
     lines.append("## 3) Sembol bazında")
@@ -1476,6 +1609,14 @@ def render_md(report: Dict[str, Any]) -> str:
             "_Bir işlem birden çok etiket taşıyabilir — satır toplamı işlem "
             "sayısını aşabilir._"
         )
+
+    cfx = report.get("counterfactual")
+    if cfx is not None:
+        lines.append("")
+        lines.append("## 5d) Karşı-olgu defteri — reddedilen niyetler (D27/B)")
+        lines.append(_render_md_table(_TABLE9_HEADERS, _counterfactual_rows(report)))
+        lines.append("")
+        lines.append(f"_{cfx.get('note') or _COUNTERFACTUAL_NOTE}_")
 
     ai = report.get("ai")
     if ai is not None:
@@ -1571,6 +1712,21 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "bölüm boş kalır)"
         ),
     )
+    parser.add_argument(
+        "--counterfactual", action="store_true",
+        help=(
+            "karşı-olgu defteri (D27/B): REDDEDİLEN niyetlerin 'girilseydi ne "
+            "olurdu' tablosu. Kaynak DB DEĞİL, logs/trades.jsonl "
+            "(event=counterfactual); yoksa bölüm boş kalır"
+        ),
+    )
+    parser.add_argument(
+        "--jsonl-dir", default=None,
+        help=(
+            "karşı-olgu satırlarının okunacağı log dizini (varsayılan: "
+            "TRADINGBOT_LOG_DIR ya da ./logs)"
+        ),
+    )
     parser.add_argument("--format", choices=["text", "md", "json"], default="text")
     parser.add_argument("--out", default=None, help="çıktı dosyası (varsayılan: stdout)")
     return parser.parse_args(argv)
@@ -1647,10 +1803,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         notes.extend(ai_notes)
         ai_section = build_ai_report(ai_rows)
 
+    counterfactual_section: Optional[Dict[str, Any]] = None
+    if args.counterfactual:
+        cf_rows, cf_notes = load_counterfactual_rows(
+            since, until, log_dir=args.jsonl_dir
+        )
+        notes.extend(cf_notes)
+        counterfactual_section = build_counterfactual_report(cf_rows)
+
     report = build_report(
         trades, daily_changes, since, until, days, notes,
         forensics=forensics_table,
         ai=ai_section,
+        counterfactual=counterfactual_section,
     )
     output = RENDERERS[args.format](report)
 

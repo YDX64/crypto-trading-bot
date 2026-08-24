@@ -132,6 +132,25 @@ class ScalpPosition:
     # KAPSAMAZ. Kapanış belgesi bunu `path.restart_gap=true` ile bildirir ve
     # bilinmeyen damgaları `null` bırakır — uydurma değer yazılmaz (D21-R3).
     forensics_restart_gap: bool = False
+    # --- D27/A1: REAPER çıkış etiketi — YALNIZ ÖLÇÜM -----------------------
+    # `engine._reap_aged_positions` reduce-only MARKET kapanışı BORSAYA
+    # GÖNDERDİKTEN SONRA doldurulur (ISO UTC damgası). Reaper'ın kapanışı
+    # düz bir MARKET emridir; `_verified_close_ledger` YALNIZ algo adaylarına
+    # (SL/TP1/TP2/TP3) baktığı için onu GÖREMEZ ve kaba çıkarım
+    # (`exits._infer_exit_reason`) yaş-kesmesini "SL" diye etiketliyordu
+    # (ölçüldü: 43 kesme = -172.3 USDT = brüt zararın %27'si; 12'si ARTIDA).
+    # Bu damga yalnız ETİKETİ ayırır: hiçbir kapı, boyutlama ya da çıkış
+    # kararı okumaz. `pending_exit_reason` KULLANILMADI — o alan ledger'ın
+    # borsa kanıtını da EZER; reaper'da borsa kanıtı (gerçek bir SL/TP fill)
+    # varsa doğru etiket ODUR.
+    reaper_close_at: Optional[str] = None
+    # --- D27/A3: MAE yoklama sıklığı — YALNIZ ÖLÇÜM ------------------------
+    # `mae_pct`/`mfe_pct` safety turunda (≈2 sn) ÖRNEKLENİR: iki yoklama
+    # arasındaki fitil GÖRÜLMEZ. Ölçüldü (2026-08-24): 6 stop-out'ta `mae_roi`
+    # fiziksel olarak imkânsızdı (ör. #217: mae −7.16 iken çıkış −24.72).
+    # Bu sayaç, adli kayıttaki MAE düzeltmesinin ne kadar kaba bir
+    # örneklemeden geldiğini okunabilir kılar. Hiçbir karar yolunda okunmaz.
+    mae_samples: int = 0
 
 
 @dataclass
@@ -231,6 +250,21 @@ class ScalpExecutor:
         self._reject_counters: Dict[str, int] = {}
         # Adli kayıt kurulumu bir kez uyarır (gözlem asla girişi engellemez).
         self._forensics_error_logged: bool = False
+        # --- D27/A4: EMİR SAĞLIĞI — YALNIZ SAYAÇ, YENİ KAPI YOK ------------
+        # TP1 emri konulamazsa (`_place_tp_safely` None döner) break-even
+        # HİÇ kurulamaz (`exits._check_tp1_breakeven` TP1'in GERÇEK fill'ini
+        # arar) ve pozisyon TAM RİSK stopuna kadar taşınır. Ölçüldü
+        # (2026-08-24): 3 işlemde bu oldu, doğrudan −18.4 USDT. Bugüne kadar
+        # yalnız bir ERROR satırı vardı; kimse saymıyordu.
+        # ⚠️ Girişe YENİ KAPI EKLENMEDİ: analiz "alarm-kotasyon sapma eşiği
+        # ÖLÇÜLEREK seçilmeli" diyor ve o eşik henüz ölçülmedi. Burada yalnız
+        # görünürlük var — motor davranışı BİREBİR aynı.
+        self._order_health: Dict[str, Any] = {
+            "tp1_missing": 0,
+            "tp2_missing": 0,
+            "last_symbol": None,
+            "last_at": None,
+        }
         self._last_sizing_snapshot: Dict[str, Any] = {
             "mode": "uninitialized",
             "exchange_available": None,
@@ -546,6 +580,39 @@ class ScalpExecutor:
         HANGİ kapının reddettiği okunabilmeli (2026-08-12 inceleme bulgusu).
         """
         self._reject_counters[reason] = self._reject_counters.get(reason, 0) + 1
+
+    def _count_order_health(self, key: str, symbol: str) -> None:
+        """D27/A4: TP emri konulamadı — SAY ve SÖYLE (davranış değişmez).
+
+        `_place_tp_safely` başarısızlığı pozisyonu iptal ETTİRMEZ (SL zaten
+        var) ve bu doğru davranıştır. Ama TP1'siz bir pozisyonda break-even
+        HİÇ kurulamaz: `exits._check_tp1_breakeven` TP1'in GERÇEK fill'ini
+        arar, emir yoksa fill de olmaz. Sonuç: tam risk stopuyla taşınan bir
+        pozisyon. Sayaç `/scalper/status → order_health`ta, pano bunu uyarı
+        satırı olarak gösterir.
+        """
+        try:
+            self._order_health[key] = int(self._order_health.get(key, 0) or 0) + 1
+            self._order_health["last_symbol"] = str(symbol)
+            self._order_health["last_at"] = datetime.now(timezone.utc).isoformat()
+        except Exception:  # pragma: no cover - teşhis sayacı akışı kesmez
+            pass
+
+    def order_health_snapshot(self) -> Dict[str, Any]:
+        """API/pano için emir sağlığı sayaçları (süreç başlangıcından beri).
+
+        DÜRÜSTLÜK: süreç-içidir, restart'ta SIFIRLANIR. Kalıcı iz
+        `logs/bot.log`'daki CRITICAL satırlarıdır.
+
+        `_count_order_health` gibi savunmalıdır: bozuk/eksik bir teşhis alanı
+        `/scalper/status`'u ASLA düşürmemeli.
+        """
+        try:
+            snapshot = dict(self._order_health or {})
+        except Exception:  # pragma: no cover - bozuk teşhis alanı
+            snapshot = {}
+        snapshot["window"] = "process_start"
+        return snapshot
 
     def reject_snapshot(self) -> Dict[str, int]:
         """API/dashboard için kapı ret sayaçları (süreç başlangıcından beri)."""
@@ -1528,6 +1595,21 @@ class ScalpExecutor:
 
         tp1_algo_id = await self._place_tp_safely(symbol, sl_side, tp1_price, tp1_qty, "TP1")
         tp2_algo_id = await self._place_tp_safely(symbol, sl_side, tp2_price, tp2_qty, "TP2")
+        # D27/A4 — SESSİZ KALMA. TP1 emri yoksa break-even hiç kurulamaz ve
+        # pozisyon tam risk stopuyla taşınır (ölçüldü: 3 işlem, −18.4 USDT).
+        # YENİ DENEME YOK (yeni REST ağırlığı sıfır sözleşmesi) ve YENİ KAPI
+        # YOK: yalnız sayaç + CRITICAL. `tp1_qty <= 0` hâli AYRI bir olaydır
+        # (miktar bölünemedi) ve `_place_tp_safely` onu zaten uyarır.
+        if tp1_algo_id is None and tp1_qty > 0:
+            self._count_order_health("tp1_missing", symbol)
+            self.logger.critical(
+                f"🚨 {symbol}: TP1 emri KONULAMADI — break-even bu pozisyonda "
+                f"HİÇ kurulamayacak, işlem tam risk stopuyla taşınıyor. "
+                f"/scalper/status → order_health.tp1_missing",
+                extra={"trade": True},
+            )
+        if tp2_algo_id is None and tp2_qty > 0:
+            self._count_order_health("tp2_missing", symbol)
 
         entry_fee_rate, exit_fee_rate, fee_rate_source = await self._resolve_commission_rates(
             symbol

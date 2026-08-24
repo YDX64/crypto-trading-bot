@@ -45,6 +45,7 @@ from src.strategies.scalper.executor import ScalpExecutor
 from src.strategies.scalper.exits import ExitManager
 from src.strategies.scalper.indicators import atr as compute_atr
 from src.strategies.scalper import intent
+from src.strategies.scalper import counterfactual_store
 from urllib.parse import urlsplit
 
 from src.strategies.scalper.market_gate import (
@@ -78,6 +79,7 @@ from src.strategies.scalper.types import (
     Regime,
     ScalpSignal,
     StrategyContext,
+    price_at_roi,
 )
 from src.trading.binance_client_improved import (
     ImprovedBinanceClient,
@@ -249,6 +251,44 @@ class ScalperEngine:
             # çağrısı YOKTUR; yalnız adli kayda yazılır.
             forensics_context_cb=self._forensics_close_context,
         )
+
+        # D27/B karşı-olgu defteri (YALNIZ GÖZLEM). Modül varsayılanı KAPALI
+        # olduğu için `object.__new__` ile kurulan test çiftlerinde hiç
+        # çalışmaz; gerçek motor burada açar. Ana anahtar adli kayıttır:
+        # `SCALPER_FORENSICS_ENABLED=false` bu defteri de kapatır (D24 ile
+        # aynı tek-bayrak disiplini).
+        try:
+            counterfactual_store.configure(
+                enabled=(
+                    bool(getattr(self.cfg, "scalper_forensics_enabled", True))
+                    and bool(
+                        getattr(self.cfg, "scalper_counterfactual_enabled", True)
+                    )
+                ),
+                horizons_h=counterfactual_store.parse_horizons(
+                    getattr(self.cfg, "scalper_counterfactual_horizons_h", None)
+                ),
+                max_pending=getattr(
+                    self.cfg, "scalper_counterfactual_max_pending",
+                    counterfactual_store.DEFAULT_MAX_PENDING,
+                ),
+                dedup_sec=getattr(
+                    self.cfg, "scalper_counterfactual_dedup_sec",
+                    counterfactual_store.DEFAULT_DEDUP_SEC,
+                ),
+                max_age_h=getattr(
+                    self.cfg, "scalper_counterfactual_max_age_h",
+                    counterfactual_store.DEFAULT_MAX_AGE_H,
+                ),
+                # Planı OLMAYAN niyetler (TV sağlaması `/tv-signal`'da
+                # reddeder; orada ScalpSignal YOKTUR) için yedek ROI
+                # politikası — motorun kendi TP1/stop yüzdeleri.
+                tp1_roi_pct=getattr(self.cfg, "scalper_tp1_roi", 0.0),
+                stop_roi_pct=getattr(self.cfg, "scalper_fixed_stop_roi_pct", 0.0),
+                policy_leverage=getattr(self.cfg, "scalper_leverage", 0),
+            )
+        except Exception as e:  # pragma: no cover - teşhis kurulumu motoru düşürmez
+            self.logger.warning(f"⚠️ Karşı-olgu defteri kurulamadı ({e}); kapalı kalıyor")
 
         # _task eski iç kullanımlar için scan task alias'ı olarak korunur.
         self._task: Optional[asyncio.Task] = None
@@ -1476,6 +1516,15 @@ class ScalperEngine:
             try:
                 qty = await self.client.quantize_quantity(symbol, qty)
                 await self._submit_reduce_only_market_close(symbol, close_side, qty)
+                # D27/A1 — YALNIZ ETİKET: emir BORSAYA GİTTİKTEN sonra damgala.
+                # Emir hata verirse (except dalı) damga KONULMAZ: kapanmayan bir
+                # pozisyon "REAPER" diye etiketlenmemelidir. Damga hiçbir kapıya
+                # ya da çıkış kararına girmez; yalnız `_infer_exit_reason` kaba
+                # çıkarımının yaş-kesmesini "SL" ile karıştırmasını engeller.
+                try:
+                    sp.reaper_close_at = _utcnow_iso()
+                except Exception:  # pragma: no cover - test çiftleri (SimpleNamespace)
+                    pass
                 self.logger.info(
                     f"⏳ Reaper: {symbol} {age_h:.1f}sa yaşında (limit {limit_h:.0f}sa) — "
                     f"reduce-only kapanış gönderildi; ledger doğrulaması safety turunda",
@@ -1870,6 +1919,13 @@ class ScalperEngine:
             leverage=self.cfg.scalper_leverage,
         )
 
+        # D27/B karşı-olgu defteri: olgunlaşmış "reddedilen niyet" kayıtları
+        # BU turun ZATEN çektiği mumlarla çözülür — yeni REST çağrısı YOK.
+        # Karar yolundan ÖNCE ya da SONRA olması fark etmez (hiçbir şeye
+        # dokunmaz); burada, ctx kurulur kurulmaz duruyor ki her tur her
+        # sembol için tam bir çözüm şansı olsun.
+        self._counterfactual_resolve(symbol, ctx)
+
         # Piyasa yapısı (BOS/CHoCH) — ctx'te ZATEN çekilmiş serilerden türetilir,
         # yeni REST çağrısı YOKTUR (bkz. structure.structure_series). Hesap saf ve
         # ucuzdur (~100 mum); yine de bir hata tüm taramayı düşürmemeli.
@@ -1917,6 +1973,7 @@ class ScalperEngine:
             self._record_intent(
                 symbol=symbol,
                 direction=sig.direction,
+                signal=sig,
                 stage=intent.STAGE_PROPOSED,
                 decision=intent.DECISION_ALLOW,
                 strategy=getattr(sig, "strategy", None),
@@ -1946,6 +2003,7 @@ class ScalperEngine:
                     self._record_intent(  # (b) D24/madde 7 — yalnız kayıt
                         symbol=symbol,
                         direction=sig.direction,
+                        signal=sig,
                         stage=intent.STAGE_DECIDED,
                         decision=intent.DECISION_DENY,
                         reason=intent.REASON_REGIME_GATE,
@@ -1975,6 +2033,7 @@ class ScalperEngine:
                 self._record_intent(  # (c) D24/madde 7 — yalnız kayıt
                     symbol=symbol,
                     direction=sig.direction,
+                    signal=sig,
                     stage=intent.STAGE_DECIDED,
                     decision=intent.DECISION_DENY,
                     # `market_reason` ZATEN "market_gate_day"/"market_gate_run"
@@ -2003,6 +2062,7 @@ class ScalperEngine:
                 self._record_intent(  # (d) D24/madde 7 — yalnız kayıt
                     symbol=symbol,
                     direction=sig.direction,
+                    signal=sig,
                     stage=intent.STAGE_DECIDED,
                     decision=intent.DECISION_DENY,
                     reason=intent.REASON_STRUCTURE_GATE,
@@ -2022,6 +2082,7 @@ class ScalperEngine:
                 self._record_intent(  # (e) D24/madde 7 — yalnız kayıt
                     symbol=symbol,
                     direction=sig.direction,
+                    signal=sig,
                     stage=intent.STAGE_DECIDED,
                     decision=intent.DECISION_DENY,
                     reason=intent.REASON_TV_STRUCTURE_GATE,
@@ -2054,6 +2115,7 @@ class ScalperEngine:
                     self._record_intent(  # (f) D24/madde 7 — yalnız kayıt
                         symbol=symbol,
                         direction=sig.direction,
+                        signal=sig,
                         stage=intent.STAGE_DECIDED,
                         decision=intent.DECISION_DENY,
                         # Yukarıdaki `reason` insan metnidir; sayaç için AYNI
@@ -2082,6 +2144,7 @@ class ScalperEngine:
                     self._record_intent(  # (g) D24/madde 7 — yalnız kayıt
                         symbol=symbol,
                         direction=sig.direction,
+                        signal=sig,
                         stage=intent.STAGE_DECIDED,
                         decision=intent.DECISION_DENY,
                         reason=intent.REASON_LOSS_COOLDOWN,
@@ -2093,6 +2156,7 @@ class ScalperEngine:
                     self._record_intent(  # (h) D24/madde 7 — yalnız kayıt
                         symbol=symbol,
                         direction=sig.direction,
+                        signal=sig,
                         stage=intent.STAGE_DECIDED,
                         decision=intent.DECISION_DENY,
                         reason=intent.REASON_ALREADY_TRACKED,
@@ -2114,6 +2178,7 @@ class ScalperEngine:
                         self._record_intent(  # (i) D24/madde 7 — yalnız kayıt
                             symbol=symbol,
                             direction=sig.direction,
+                            signal=sig,
                             stage=intent.STAGE_DECIDED,
                             decision=intent.DECISION_DENY,
                             reason=intent.REASON_CAPACITY,
@@ -2131,6 +2196,7 @@ class ScalperEngine:
                     self._record_intent(  # (i) D24/madde 7 — yalnız kayıt
                         symbol=symbol,
                         direction=sig.direction,
+                        signal=sig,
                         stage=intent.STAGE_DECIDED,
                         decision=intent.DECISION_DENY,
                         reason=intent.REASON_CAPACITY,
@@ -2151,6 +2217,7 @@ class ScalperEngine:
                     self._record_intent(  # (j) D24/madde 7 — yalnız kayıt
                         symbol=symbol,
                         direction=sig.direction,
+                        signal=sig,
                         stage=intent.STAGE_DECIDED,
                         decision=intent.DECISION_DENY,
                         reason=intent.REASON_EXCHANGE_UNVERIFIED,
@@ -2169,6 +2236,7 @@ class ScalperEngine:
                     self._record_intent(  # (k) D24/madde 7 — yalnız kayıt
                         symbol=symbol,
                         direction=sig.direction,
+                        signal=sig,
                         stage=intent.STAGE_DECIDED,
                         decision=intent.DECISION_DENY,
                         reason=intent.REASON_EXCHANGE_POSITION_EXISTS,
@@ -2209,6 +2277,7 @@ class ScalperEngine:
                     self._record_intent(  # (l) D24/madde 7 — yalnız kayıt
                         symbol=symbol,
                         direction=sig.direction,
+                        signal=sig,
                         stage=intent.STAGE_DECIDED,
                         decision=intent.DECISION_DENY,
                         reason=intent.REASON_SYMBOL_RESERVED_BY_OTHER,
@@ -2262,6 +2331,7 @@ class ScalperEngine:
                     self._record_intent(
                         symbol=symbol,
                         direction=sig.direction,
+                        signal=sig,
                         stage=intent.STAGE_EXECUTED,
                         decision=intent.DECISION_ERROR,
                         reason=intent.REASON_ORDER_ERROR,
@@ -2291,6 +2361,7 @@ class ScalperEngine:
                     self._record_intent(  # (m) D24/madde 7 — yalnız kayıt
                         symbol=symbol,
                         direction=sig.direction,
+                        signal=sig,
                         stage=intent.STAGE_EXECUTED,
                         decision=intent.DECISION_ALLOW,
                         reason=intent.REASON_OPENED,
@@ -2451,6 +2522,7 @@ class ScalperEngine:
         strategy: Any = None,
         source: Any = None,
         extra: Optional[Dict[str, Any]] = None,
+        signal: Any = None,
     ) -> None:
         """Üç-aşamalı niyet kaydı (D24/madde 7) — YALNIZ GÖZLEM.
 
@@ -2462,6 +2534,14 @@ class ScalperEngine:
             O(1) satır bırakır; disk yazımı ayrı iş parçacığındadır.
           * İSTİSNA SIZDIRMAZ. Bir teşhis kaydı bir girişi ya da bir reddi
             ASLA değiştirmemeli — hata hâlinde sessizce düşer.
+
+        D27/B — `signal`: karşı-olgu defteri için giriş/stop/TP1 planı.
+        `apply_stop_policy` SAF bir fonksiyondur (`dataclasses.replace` ile
+        YENİ bir sinyal döndürür); burada çağrılması motorun kendi sinyalini
+        DEĞİŞTİRMEZ. REDDEDİLEN (ya da emir hatası alan) niyetler ayrıca
+        karşı-olgu kuyruğuna alınır; ÇÖZÜM `_evaluate_symbol`'de, tarama
+        turunun ZATEN çektiği mumlarla yapılır — **yeni REST ağırlığı
+        SIFIR**.
         """
         try:
             # Bayrak okuması da TRY İÇİNDE: `cfg`'si hiç kurulmamış bir test
@@ -2469,8 +2549,10 @@ class ScalperEngine:
             # tarama turunu düşürmemeli.
             if not self._forensics_enabled():
                 return
+            at = _utcnow_iso()
+            price, stop_price, tp1_price, leverage = self._counterfactual_plan(signal)
             intent.record(
-                at=_utcnow_iso(),
+                at=at,
                 symbol=symbol,
                 direction=direction,
                 stage=stage,
@@ -2480,11 +2562,95 @@ class ScalperEngine:
                 reason=reason,
                 detail=detail,
                 extra=extra,
+                price=price,
+                stop_price=stop_price,
+                tp1_price=tp1_price,
+                leverage=leverage,
             )
+            if decision in (intent.DECISION_DENY, intent.DECISION_ERROR):
+                counterfactual_store.register(
+                    at=at,
+                    at_epoch=time.time(),
+                    symbol=symbol,
+                    direction=direction,
+                    reason=reason,
+                    price=price,
+                    stop_price=stop_price,
+                    tp1_price=tp1_price,
+                    leverage=leverage,
+                    strategy=strategy,
+                    source=source,
+                    plan_source="signal" if price is not None else None,
+                )
         except Exception:
             # Sessiz: `intent.record` zaten kendi içinde yutar; buraya yalnız
             # bir test çifti/monkeypatch patlarsa düşülür ve o da akışı
             # kesmemeli (gözlem ≠ güvenlik kilidi).
+            return
+
+    def _counterfactual_plan(self, signal: Any) -> Tuple[
+        Optional[float], Optional[float], Optional[float], Optional[int]
+    ]:
+        """(giriş, stop, TP1, kaldıraç) — SİNYALDEN türetilir, IO yok.
+
+        Motorun gerçekte kuracağı planla AYNI iki saf dönüşümü kullanır:
+        `apply_stop_policy` (canlı + harness ortak stop politikası, bkz.
+        DECISIONS #P1) ve `price_at_roi` (executor'ın TP1 formülü). Böylece
+        karşı-olgu, "başka bir kurala göre ne olurdu"yu değil, **bu botun
+        kendi kurallarına göre ne olurdu**yu ölçer.
+
+        Sinyal yoksa ya da hesap patlarsa dört değer de `None` döner
+        ("ölçülmedi"); karşı-olgu satırı yine açılır ama simülasyon
+        `no_data` der — uydurma plan YAZILMAZ.
+        """
+        if signal is None:
+            return None, None, None, None
+        try:
+            planned = apply_stop_policy(signal, self.cfg)
+            entry = float(getattr(planned, "entry_price", 0.0) or 0.0)
+            if entry <= 0:
+                return None, None, None, None
+            leverage = int(
+                getattr(planned, "leverage", None)
+                or getattr(self.cfg, "scalper_leverage", 0)
+                or 0
+            )
+            if leverage <= 0:
+                return entry, None, None, None
+            stop = float(getattr(planned, "stop_price", 0.0) or 0.0) or None
+            tp1 = price_at_roi(
+                entry,
+                float(getattr(self.cfg, "scalper_tp1_roi", 0.0) or 0.0),
+                leverage,
+                planned.direction,
+            )
+            return entry, stop, tp1, leverage
+        except Exception:
+            return None, None, None, None
+
+    def _counterfactual_snapshot(self) -> Dict[str, Any]:
+        """D27/B sayaçları — O(1), disk/DB işi YOK (pano bunu 5 sn'de yoklar)."""
+        try:
+            return counterfactual_store.counters_snapshot()
+        except Exception as e:  # pragma: no cover - teşhis alanı status'u düşürmez
+            return {"error": f"{type(e).__name__}: {e}"}
+
+    def _counterfactual_resolve(self, symbol: str, ctx: StrategyContext) -> None:
+        """Olgunlaşmış karşı-olgu kayıtlarını ZATEN ÇEKİLMİŞ mumlarla çöz.
+
+        **Yeni REST çağrısı YOKTUR**: `ctx.candles_5m` bu tarama turunda
+        zaten çekildi (giriş dilimi, ~150 mum ≈ 12.5 saat — en büyük
+        varsayılan ufuk 8 saati kapsar). Hata hâlinde sessizce döner: bir
+        ölçüm kaydı bir tarama turunu ASLA düşürmemeli.
+        """
+        try:
+            candles = getattr(ctx, "candles_5m", None) or getattr(
+                ctx, "candles_15m", None
+            )
+            if not candles:
+                return
+            counterfactual_store.resolve_symbol(symbol, candles, time.time())
+        except Exception:
             return
 
     def _forensics_entry_context(
@@ -3784,6 +3950,21 @@ class ScalperEngine:
             self.logger.error(f"Scalper reject snapshot okunamadı: {e}")
             return {}
 
+    def _executor_order_health_snapshot(self) -> Dict[str, Any]:
+        """D27/A4: TP emri konulamama sayaçları (geriye uyumlu okuma).
+
+        Eski/çıplak executor çiftlerinde alan olmayabilir; teşhis bloğu
+        `/scalper/status`'u ASLA düşürmemeli.
+        """
+        snapshotter = getattr(self.executor, "order_health_snapshot", None)
+        if not callable(snapshotter):
+            return {}
+        try:
+            return dict(snapshotter())
+        except Exception as e:
+            self.logger.error(f"Scalper order_health snapshot okunamadı: {e}")
+            return {}
+
     def _executor_cooldown_snapshot(self) -> List[Dict[str, Any]]:
         """Dashboard için secret içermeyen cooldown telemetrisi."""
         snapshotter = getattr(self.executor, "cooldown_snapshot", None)
@@ -4979,6 +5160,9 @@ class ScalperEngine:
             "rest_weight": self._rest_weight_snapshot(),
             # D21/D22: adli kayıt yazıcı kuyruğu + post-mortem turu durumu.
             "forensics_queue": self._forensics_queue_snapshot(),
+            # D27/B: karşı-olgu defteri sayaçları (SÜREÇ-İÇİ, restart'ta
+            # sıfırlanır). Kalıcı tablo: `/scalper/counterfactual`.
+            "counterfactual": self._counterfactual_snapshot(),
             # D23: AI karar katmanı (gölge) — mod, kapsama, gecikme, bütçe,
             # red oranı ve son kararlar. Motor davranışını ETKİLEMEZ.
             "ai_gate": self._ai_gate_snapshot(),
@@ -5000,6 +5184,9 @@ class ScalperEngine:
             "pending_entries": self.executor.pending_snapshot(),
             "cooldowns": cooldowns,
             "entry_rejects": self._executor_reject_snapshot(),
+            # D27/A4: TP1/TP2 emri konulamadı mı? TP1'siz pozisyonda
+            # break-even HİÇ kurulmaz ve işlem tam risk stopuyla taşınır.
+            "order_health": self._executor_order_health_snapshot(),
             "stop_mode": str(getattr(self.cfg, "scalper_stop_mode", "structural")),
             "sizing": sizing,
             "sizing_equity_usdt": sizing_equity,

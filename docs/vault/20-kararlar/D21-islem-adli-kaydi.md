@@ -36,8 +36,23 @@ motor davranisi her iki durumda da aynidir.
 - Disk yazimi olay dongusunun DISINDA (`append_soon`).
 - Post-mortem turu AYRI task'ta, 5 sn timeout.
 
-**Nerede.** `src/strategies/scalper/forensics.py:351` / `:511` / `:584`,
-`src/strategies/scalper/forensics_log.py:147`,
-`src/strategies/scalper/engine.py:2490`, uclar `src/main.py:2984`.
+**Nerede.** `src/strategies/scalper/forensics.py:358` / `:518` / `:679`,
+`src/strategies/scalper/forensics_log.py:208`,
+`src/strategies/scalper/engine.py:2656`, uclar `src/main.py:3041`.
 
-ILGILI: [[10-mimari/gozlem-katmanlari]] · [[50-veri/loglar]] · [[40-isletme/gunluk-kontrol]]
+## D27 duzeltmeleri (2026-08-24) — belge alanlari DEGISTI
+
+Cikis belgesine dort yeni alan girdi ve ikisi artik **`None` olabilir**:
+
+| Alan | Anlami |
+|---|---|
+| `gross_source` | `ledger_legs` (borsa fill'leri, merdiven dahil) · `single_leg_estimate` · `unmeasured_ladder` |
+| `fee_estimate_source` | `unmeasured` / `inconsistent` ise `fee_estimate` **`None`**'dir |
+| `mae_roi_pct_sampled` + `mae_source` | `corrected` ise yoklama fiziksel kelepceyi ihlal etmisti; ham deger burada durur |
+| `mae_samples` | MAE kac kez yoklandi (cozunurluk) |
+
+`fee_dominated` etiketi artik yalniz OLCULMUS komisyonla atilir. `FORENSICS_VERSION`
+**bump EDILMEDI** (alanlar eklemeli, migration YOK). Ayrinti:
+[[20-kararlar/D27-olcum-borcu-karsi-olgu]].
+
+ILGILI: [[10-mimari/gozlem-katmanlari]] · [[50-veri/loglar]] · [[40-isletme/gunluk-kontrol]] · [[20-kararlar/D27-olcum-borcu-karsi-olgu]]

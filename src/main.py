@@ -44,6 +44,7 @@ from src.services.tv_events import (
 from src.strategies.scalper.data import MarketDataGuard
 from src.strategies.scalper.engine import ScalperEngine
 from src.strategies.scalper import intent as scalp_intent
+from src.strategies.scalper import counterfactual_store
 from src.strategies.scalper.tracker import ScalpTracker
 from src.strategies.scalper.types import FOLLOWER_LEDGER_STRATEGY
 from src.trading.symbol_reservations import symbol_reservations
@@ -854,6 +855,17 @@ async def api_status(request: Request = None):
             )
         except Exception as e:  # teşhis alanı asla status'u düşürmemeli
             payload["ai_gate"] = {"error": f"{type(e).__name__}: {e}"}
+
+    # D27/B: pano "Karşı-olgu defteri" özetini BU gövdeden okur — YENİ bir uç
+    # ÇAĞIRMAZ (nginx beyaz listesi: `/api/status` zaten izinli, bkz.
+    # docs/RUNBOOK.md "Pano erişimi"). `counters_snapshot()` yalnız BELLEK
+    # okur (REST/DB/disk YOK) → 2026-08-18 pano-açlığı riski doğurmaz.
+    # Defter KAPALIYKEN blok yine eklenir ama `enabled=false` der: "alan yok"
+    # ile "ölçüm kapalı" karışmamalı.
+    try:
+        payload["counterfactual"] = counterfactual_store.counters_snapshot()
+    except Exception as e:  # teşhis alanı asla status'u düşürmemeli
+        payload["counterfactual"] = {"error": f"{type(e).__name__}: {e}"}
 
     return _store_status(_api_status_cache, cache_key, payload)
 
@@ -1965,8 +1977,9 @@ async def tradingview_webhook(request: Request):
             # bırakmıyor (motor hiç çağrılmıyor → adli kayıt da yok). Yalnız
             # KAYIT: yanıt gövdesi ve oy defteri DEĞİŞMEZ, hata yutulur.
             try:
+                intent_at = datetime.now(timezone.utc).isoformat()
                 scalp_intent.record(
-                    at=datetime.now(timezone.utc).isoformat(),
+                    at=intent_at,
                     symbol=symbol,
                     direction=direction,
                     stage=scalp_intent.STAGE_DECIDED,
@@ -1978,6 +1991,22 @@ async def tradingview_webhook(request: Request):
                         "required": verdict.get("required"),
                         "sources": list(verdict.get("sources") or []),
                     },
+                )
+                # D27/B karşı-olgu defteri: raporun EN KRİTİK açık sorusu
+                # tam da bu kapıdır ("sağlamanın reddettiği 150+ sinyal
+                # gerçekten kötü müydü?" — seçicilik gücü LONG p=0.894,
+                # SHORT p=0.368 = ölçülebilir SIFIR). Burada bir
+                # `ScalpSignal` YOKTUR: plan (giriş/stop/TP1) ÇÖZÜM anında,
+                # niyet anından SONRAKİ ilk mumdan ROI politikasıyla
+                # tamamlanır (`counterfactual_store._fill_plan`) — bu
+                # istekte HİÇBİR REST çağrısı yapılmaz.
+                counterfactual_store.register(
+                    at=intent_at,
+                    at_epoch=time.time(),
+                    symbol=symbol,
+                    direction=direction,
+                    reason=scalp_intent.REASON_TV_CONFLUENCE,
+                    source=source,
                 )
             except Exception:  # pragma: no cover - kayıt akışı ASLA kesmez
                 pass
@@ -2424,6 +2453,14 @@ _EMPTY_FOLLOWER_STATUS = {
     "entries_ready": False,
     "positions": [],
     "events": [],
+    # D27/A4: motor yokken de ŞEKİL aynı olmalı (pano "alan yok" ile "hiç
+    # olmadı"yı karıştırmasın).
+    "order_health": {
+        "tp1_missing": 0,
+        "tp_wrong_side": 0,
+        "partial_fill_split": 0,
+        "window": "process_start",
+    },
 }
 
 
@@ -2698,6 +2735,13 @@ _EMPTY_SCALPER_STATUS = {
     "rest_weight": {},
     # D21/D22: adli kayıt kuyruğu (istek anında tazelenir).
     "forensics_queue": {},
+    # D27/B: karşı-olgu defteri sayaçları. Motor yokken de ŞEKİL aynı olmalı
+    # — defter SÜREÇ-İÇİDİR ve motor kurulmadan hiçbir niyet kaydedilmez.
+    # ANAHTAR KÜMESİ `counterfactual_store.counters_snapshot()` ile BİREBİR
+    # aynıdır (inceleme bulgusu): eksik bir alt alan, panoda "ölçüm yok" ile
+    # "alan yok"u karıştırırdı. Bekçi testi:
+    # tests/test_counterfactual_store.py::TestApiSurface.
+    "counterfactual": dict(counterfactual_store.counters_snapshot()),
     # D23: AI karar katmanı (gölge). Motor yokken de ŞEKİL aynı olmalı —
     # pano "alan yok" ile "katman kapalı"yı karıştırmasın.
     "ai_gate": {
@@ -2737,6 +2781,15 @@ _EMPTY_SCALPER_STATUS = {
     "pending_entries": [],
     "cooldowns": [],
     "entry_rejects": {},
+    # D27/A4: TP1/TP2 emri konulamama sayaçları. Motor yokken de ŞEKİL aynı
+    # olmalı — pano "alan yok" ile "hiç olmadı"yı karıştırmasın.
+    "order_health": {
+        "tp1_missing": 0,
+        "tp2_missing": 0,
+        "last_symbol": None,
+        "last_at": None,
+        "window": "process_start",
+    },
     "stop_mode": str(getattr(settings, "scalper_stop_mode", "structural")),
     "sizing": {},
     "sizing_equity_usdt": None,
@@ -3040,6 +3093,68 @@ async def scalper_forensics_summary(
         intents = None
     summary["intents"] = intents
     return summary
+
+
+@app.get("/scalper/counterfactual")
+async def scalper_counterfactual(
+    since: Optional[str] = None,
+    reason: Optional[str] = None,
+    limit: int = 50,
+):
+    """D27/B — ret gerekçesi × KARŞI-OLGU sonucu: "girilseydi ne olurdu".
+
+    Reddedilen her giriş niyeti için, o niyet anından SONRAKİ mumlarla
+    "mevcut TP/SL kurallarıyla girilseydi ne olurdu" simüle edilir ve
+    sonuç `logs/trades.jsonl`'e (`event="counterfactual"`) yazılır. Bu uç
+    o kalıcı satırları okur ve gerekçe bazında tablo döner (n, ölçülen,
+    tp1/stop/açık dağılımı, ortalama ROI, PF, %95 güven aralığı).
+
+    NEDEN VAR: 2026-08-24 kök-neden analizinin BÜTÜN filtre rakamları
+    "üst sınır tahmini"ydi — engellenen bir işlemin yerine kapasite ve
+    kayıp-cooldown serbestliğiyle başka bir işlem açılır ve bu, kapalı
+    işlem defterinden çıkarılamaz. Bu tablo o tahminleri kanıta çevirir.
+
+    DÜRÜSTLÜK:
+    * `measured=False` satırlar ("mum yoktu", "plan kurulamadı") ortalama/PF
+      hesabına GİRMEZ ve `no_data` olarak ayrı sayılır — uydurma sayı YOK.
+    * Simülasyon yalnız **TP1 ya da ilk stop**u modeller. TP2, chandelier
+      trailing, break-even çekme, 8 saatlik reaper (D4), komisyon ve kayma
+      MODELLENMEZ; aynı mumda ikisi de vurursa STOP kazanır (karamsar).
+    * `collapsed`, dedup penceresi içinde tek satıra indirgenmiş özdeş
+      retlerin toplam ağırlığıdır (`dup_count`).
+
+    **Pano bu ucu ÇAĞIRMAZ** (nginx beyaz listesi yalnız `/api/status`);
+    pano özeti `/api/status → counterfactual` bloğundadır. Burada GERÇEK
+    disk okuması vardır — elle/rapor yolundan çağrılır.
+    """
+    from src.strategies.scalper import forensics_log
+
+    since_iso: Optional[str] = None
+    if since:
+        parsed = _parse_since(since)
+        if parsed is not None:
+            since_iso = parsed.replace(tzinfo=timezone.utc).isoformat()
+    try:
+        rows = forensics_log.read_events("counterfactual", since_iso=since_iso)
+    except Exception as e:  # pragma: no cover - okuma hatası uç düşürmemeli
+        raise HTTPException(status_code=500, detail=f"JSONL okunamadı: {e}")
+
+    wanted = (reason or "").strip().lower() or None
+    if wanted:
+        rows = [r for r in rows if str(r.get("reason") or "") == wanted]
+
+    try:
+        n = max(0, min(int(limit), 500))
+    except (TypeError, ValueError):
+        n = 50
+    return {
+        "since": since_iso,
+        "reason": wanted,
+        "summary": counterfactual_store.summary(rows),
+        "counters": counterfactual_store.counters_snapshot(),
+        # En yeni önce; `limit` ile sınırlı ham satırlar (teşhis için).
+        "rows": list(reversed(rows))[:n],
+    }
 
 
 async def main():
