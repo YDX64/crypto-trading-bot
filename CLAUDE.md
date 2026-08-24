@@ -69,7 +69,6 @@ Yeni sinyal kaynağı (haber botu vb.) eklemek: `docs/INTEGRATIONS.md`. Otomatik
   `/scalper/trades/{id}/forensics`, `/scalper/forensics/summary?since=7d`;
   rapor `scripts/ledger_report.py --forensics`. Reçete: `docs/RUNBOOK.md`
   "Bir işlemi nasıl incelerim".
-<<<<<<< HEAD
 - **AI karar katmanı (D23, GÖLGE — kod varsayılanı `off`):** `SCALPER_AI_GATE_MODE`
   `shadow` iken motor pozisyonu AÇTIKTAN sonra bağlam bir dil modeline sorulur
   ("bu giriş alınmalı mıydı?") ve karar YALNIZ kaydedilir
@@ -83,10 +82,6 @@ Yeni sinyal kaynağı (haber botu vb.) eklemek: `docs/INTEGRATIONS.md`. Otomatik
   `scripts/ledger_report.py --ai`; açma/kapama: `docs/RUNBOOK.md` "AI karar
   katmanını açma/kapama"; karar+kısıtlar: `docs/DECISIONS.md` D23.
 
-## Nasıl çalıştırılır / test edilir / deploy edilir
-```bash
-python3 -m pytest tests -q                      # 2251 test, ~65 sn — her değişiklikten önce
-=======
 - **GerçekleşMEyen niyetler (D24):** kapı reddi / TV sağlaması dolmadı / emir hatası
   artık `logs/trades.jsonl`'e `event="intent"` olarak yazılır (niyet→karar→borsa
   sonucu). Ret gerekçesi dağılımı `/scalper/forensics/summary` yanıtındaki `intents`
@@ -94,8 +89,7 @@ python3 -m pytest tests -q                      # 2251 test, ~65 sn — her değ
 
 ## Nasıl çalıştırılır / test edilir / deploy edilir
 ```bash
-python3 -m pytest tests -q                      # 2072 test, ~50 sn — her değişiklikten önce
->>>>>>> worktree-agent-af27869057747ff76
+python3 -m pytest tests -q                      # 2251 test, ~65 sn — her değişiklikten önce
 scripts/deploy.sh awa                           # push edilmiş main'i sunucuya uygula (test + restart + sağlık + otomatik geri alma)
 DEPLOY_NO_RESTART=1 scripts/deploy.sh awa       # yalnız kod/test; süreci yeniden başlatma
 scripts/deploy.sh awa <önceki-commit>           # geri alma (backups/commit.prev-*)
