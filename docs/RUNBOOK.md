@@ -706,7 +706,16 @@ ssh awa 'supervisorctl stop tradingbot_v2 && supervisorctl status tradingbot_v2'
 > `restart: unless-stopped` ile zaten ayaktadır. Sonuç: **İKİ MOTOR, AYNI HESAP**,
 > kimse fark etmeden. Bu, bu bölümün en başındaki felaketin sessiz hâlidir.
 > ```bash
-> ssh awa 'grep -n autostart /etc/supervisor/conf.d/tradingbot_v2.conf'   # önce oku
+> ssh awa 'grep -n autostart /etc/supervisor/conf.d/tradingbot-v2.conf'   # önce oku
+>
+> **ÖLÇÜLDÜ (2026-08-24, awa):** dosya adı `tradingbot-v2.conf` (tire, alt çizgi
+> DEĞİL) ve içinde `autostart=true` + `autorestart=true` var — yani bu adım
+> teorik değil, GERÇEKTEN gerekli. Sunucu saat dilimi **Europe/Stockholm
+> (CEST, UTC+2)**; container `TZ=UTC` sabitler → aynı `logs/bot.log` içinde iki
+> farklı damga ölçeği oluşur. Geçişte log dosyasını DÖNDÜR (rotate) ya da
+> karışık damgalı pencereyi elle yorumla; `docker_run.sh`'nin 418 kapısı UTC,
+> `server_deploy.sh`/`restart_safe.sh` yerel saat kullanır (ikisi de doğru,
+> gerekçeleri script başlıklarında).
 > ssh awa 'sed -i "s/^autostart=.*/autostart=false/" /etc/supervisor/conf.d/tradingbot_v2.conf \
 >          && supervisorctl reread && supervisorctl update && supervisorctl status'
 > ```
