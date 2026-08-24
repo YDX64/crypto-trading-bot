@@ -1002,6 +1002,14 @@ GİDERİLDİ:** gerçek yetim artık "hiçbir motorun izlemediği pozisyon"dur �
 > mevcut 1dk any-alert() AlgoPro alarmı (eski BTCUSDT testi) TUTUSDT.P'ye yeniden bağlandı
 > (URL'ye dokunulmadı); alarm serisi **Heikin Ashi** grafikten (kullanıcının grafiği HA —
 > panel ölçümleriyle tutarlı; seviyeler mesajdan geldiği için motor tarafı etkilenmez, not).
+> **Güncelleme 2026-08-24 00:45 UTC:** işlem akışını artırmak için evren
+> `TUTUSDT,ZECUSDT` yapıldı (`FOLLOWER_MAX_POSITIONS=1` değişmedi → aynı anda
+> hâlâ tek pozisyon, işlem başı risk aynı; yalnız boş bekleme süresi doluyor).
+> ZEC testnet dilimi 50x/50k$ mmr %1.5; ücret kapısını geçer (SL ~%0.6).
+> TV: ZECUSDT.P 1dk AlgoPro any-alert() alarmı gösterge menüsünden oluşturuldu,
+> webhook donör alarmdan kopyalandı (URL hiç görüntülenmedi). İlk AP işlemi
+> (#211 TUTUSDT SHORT) **+2.07 USDT** net kapandı — Binance income ile birebir
+> doğrulandı (brüt +3.75, komisyon −1.68); sanal defter 1002.07.
 
 **Bağlayıcılık:** D20/D20a ile çelişen her noktada **D20b geçerlidir**; takipçi
 artık ayrı hesap/süreç/panel GEREKTİRMEZ. D20a'nın kapılarından şunlar

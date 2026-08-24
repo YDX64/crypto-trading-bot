@@ -206,6 +206,28 @@ redirect_stderr=true
 Uygulamanın kendi log dosyası (`logs/bot.log`, testnet'teki gibi) çalışma dizini `/opt/tradingbot-main`
 olduğu için otomatik olarak ayrı olur — testnet'in `logs/`'ıyla KARIŞMAZ.
 
+### Pano erişimi (nginx monitor proxy) — yeni uç eklerken DİKKAT
+Kullanıcı panoyu `https://<sunucu-ip>:9443/dashboard` üzerinden görür
+(nginx `sites-available/tradingbot-monitor-ip`, HTTP Basic auth
+`/etc/nginx/.htpasswd-tradingbot-ip`, kullanıcı `efe`). Bot yalnız
+`127.0.0.1:9091`'e bağlıdır — proxy dışında dışarı AÇIK DEĞİLDİR.
+
+**Beyaz liste kuralı:** proxy YALNIZ sayılan salt-okuma GET uçlarını geçirir;
+listelenmeyen her yol `404` döner (catch-all). Yeni bir pano kartı yeni bir uç
+çağırıyorsa proxy'ye EKLENMEDEN kullanıcıda ÇALIŞMAZ (localhost'ta çalışır —
+bu tuzağa 2026-08-24'te düşüldü: D21 adli kayıt kartı proxy'de 404 alıyordu).
+
+İzinli (2026-08-24 itibarıyla): `/dashboard`, `/health`, `/api/status`,
+`/positions`, `/config`, `/waiting-mode/active`, `/scalper/status`,
+`/scalper/stats`, `/scalper/trades` (query sabit `limit=30`),
+`/scalper/forensics/(summary|recent)`, `/scalper/trades/<id>/forensics`,
+`/follower/status`.
+**ASLA eklenmez:** `/tv-signal`, `/risk-event`, `/follower/event`,
+`/tv-events/reset` ve tüm POST/kontrol uçları (secret taşırlar / durum değiştirir).
+Değişiklikten sonra: `nginx -t` → `systemctl reload nginx` → kimliksiz `curl -k`
+ile 401 (izinli uç) ve 404 (kontrol ucu) doğrulaması. Yedek:
+`sites-available/tradingbot-monitor-ip.bak-<tarih>`.
+
 ### Gömülü takipçiyi açma (D20b — **TERCİH EDİLEN** kurulum)
 Kullanıcı kararı (2026-08-23): *"Yeni hesap yok, yeni panel yok."* AlgoPro takipçisi
 scalper ile **AYNI süreçte** (`tradingbot_v2`, :9091), **AYNI testnet hesabında** ve
