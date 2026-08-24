@@ -100,9 +100,14 @@ MAX_POSITIONS=5
 # Development modda
 python -m src.main
 
-# Production modda (Docker)
-docker-compose up -d
+# Container ile (EK dağıtım yolu — taşınabilir tek container)
+scripts/docker_run.sh
 ```
+
+> ⛔ Çıplak `docker compose up` KULLANMAYIN: entry-halt kilidini, Binance 418 ban
+> penceresini ve "supervisord ile aynı anda çalışma" kapısını ATLAR.
+> `scripts/docker_run.sh` bunların hepsini uygular.
+> Ayrıntı: `docs/RUNBOOK.md` → "Container ile çalıştırma / başka sunucuya taşıma".
 
 ### API Endpoints
 

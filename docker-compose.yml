@@ -1,96 +1,205 @@
-version: '3.8'
+# TRADINGBOT — tek container dağıtımı (EK yol; sunucudaki supervisord AYNEN durur)
+# =============================================================================
+# ⛔⛔ AYNI BINANCE HESABINA AYNI ANDA İKİ MOTOR BAĞLANAMAZ ⛔⛔
+#   Sunucudaki supervisord programı (`tradingbot_v2`, :9091) çalışırken bu
+#   container'ı AYNI `.env` ile başlatmak, AYNI pozisyonları İKİ motorun
+#   yönetmesi demektir: çift SL/TP yerleştirme, çift kapanış, yarışan pozisyon
+#   devralma, state/*.json dosyalarında son-yazan-kazanır. Bu, D20b
+#   incelemesindeki "ayrı halka + gömülü takipçi aynı anda" kritik sınıfının
+#   birebir aynısıdır.
+#   Kapı: `scripts/docker_run.sh` başlamadan önce supervisord'u yoklar.
+#   Reçete: docs/RUNBOOK.md "Container ile çalıştırma / başka sunucuya taşıma".
+#
+# Başlatma: scripts/docker_run.sh   (çıplak `docker compose up` güvenlik
+#           kapılarını —entry-halt, 418 ban penceresi, supervisord— ATLAR)
+# =============================================================================
 
 services:
-  # Trading Bot
-  trading-bot:
+  tradingbot:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: vip-trading-bot
+    image: tradingbot:local
+    container_name: tradingbot
+
+    # PID 1 olarak tini: SIGTERM'i uvicorn'a iletir ve zombi süreç bırakmaz.
+    init: true
+
+    # Non-root. Varsayılan UID görüntüdeki `bot` kullanıcısıdır (10001);
+    # bind-mount dizinlerinin sahipliğini docker_run.sh bu UID'ye ayarlar.
+    # Host'ta chown mümkün değilse TRADINGBOT_UID/GID ile host kullanıcısına
+    # çevrilebilir — her iki durumda da root DEĞİLDİR.
+    user: "${TRADINGBOT_UID:-10001}:${TRADINGBOT_GID:-10001}"
+
+    # ⚠️ `unless-stopped` ile 418/entry-halt kuralı arasındaki GERİLİM
+    # (bilinçli seçim, docs/RUNBOOK.md tuzak tablosunda da yazılı):
+    # CLAUDE.md yasak #3 "ban aktifken restart YASAK" der; docker ise süreç
+    # ÇÖKERSE otomatik yeniden başlatır ve `docker_run.sh` kapılarını atlar.
+    # Yine de `unless-stopped` seçildi çünkü:
+    #   a) alternatifi (`no`) AÇIK POZİSYONLU bir botu süresiz KAPALI bırakır —
+    #      pozisyonlar yönetilmeden kalır, bu daha büyük bir zarardır;
+    #   b) uygulamanın KENDİ kapıları fail-closed'dur: ScalperEngine açılışta
+    #      `state/scalper_entry_halt.json`i okur ve dosya BOZUKSA/okunamazsa da
+    #      girişleri kapatır (src/strategies/scalper/engine.py `_load_entry_halt`),
+    #      dosya da kalıcı volume'dedir → restart kilidi SİLMEZ;
+    #   c) sağlık yoklaması otomatik restart TETİKLEMEZ (docker "unhealthy"
+    #      container'ı yeniden başlatmaz) ve autoheal KULLANILMAZ.
+    # Tekrarlayan çökme görülüyorsa doğru tepki `docker_run.sh --down` ile
+    # DURDURUP nedeni incelemektir; restart politikasını gevşetmek değil.
     restart: unless-stopped
-    env_file:
-      - .env
+
+    # Kapanış: uvicorn SIGTERM'de graceful kapanır → FastAPI lifespan `finally`
+    # bloğu çalışır → scalper motoru bekleyen MAKER girişlerini İPTAL EDER
+    # (executor.cancel_all_pending), user-stream'i kapatır, Binance/Telegram
+    # istemcilerini ve DB'yi kapatır. Bunların hepsi AĞ çağrısıdır. Süre
+    # yetmezse docker SIGKILL atar ve iptal edilmemiş LIMIT emirleri borsada
+    # ASILI KALIR.
+    # NOT: kapanış AÇIK POZİSYONU KAPATMAZ — pozisyonlar bilinçli olarak
+    # borsada bırakılır ve yeniden başlarken devralınır.
+    #
+    # ⏱️ NEDEN 300s (120 DEĞİL): düşmanca inceleme, TEK bir REST çağrısının
+    # 120 sn sürebileceğini ölçtü — `binance_client_improved.py` 429 (rate
+    # limit) gördüğünde `asyncio.sleep(60)` yapar ve `max_retries=3`tür
+    # (2×60 = 120 sn). `cancel_all_pending` bekleyen HER emir için ayrı çağrı
+    # yapar; 120 sn tavanı tek bir 429'da bile dolardı → SIGKILL → iptal
+    # EDİLMEMİŞ LIMIT emirleri borsada ASILI kalırdı.
+    stop_grace_period: 300s
+    stop_signal: SIGTERM
+
     ports:
-      - "${API_PORT:-8000}:8000"
-      - "${METRICS_PORT:-9090}:9090"
+      # Varsayılan olarak YALNIZ localhost'a yayınlanır. Panoyu dışarı açmak
+      # bilinçli bir karardır (TRADINGBOT_BIND=0.0.0.0) — uçlar secret ile
+      # korunuyor olsa da erişim logu secret içerir (CLAUDE.md kural 5).
+      - "${TRADINGBOT_BIND:-127.0.0.1}:${TRADINGBOT_PORT:-9091}:9091"
+
     volumes:
+      # `.env` GÖRÜNTÜYE GÖMÜLMEZ — mount edilir (.dockerignore onu dışarıda
+      # bırakır). Salt okunur: container ayarlarını kendi değiştiremez;
+      # değişiklik host'ta yapılır + container yeniden başlatılır (sunucudaki
+      # `restart_safe.sh` reçetesinin aynısı).
+      # ⚠️ İZİN: `chmod 600` + root sahipliği, container uid 10001'in dosyayı
+      # OKUYAMAMASINA ve import'ta ValidationError ile sonsuz çökme döngüsüne
+      # yol açar. `docker_run.sh` sahipliği container uid'sine verip 640 yapar.
+      #
+      # ⚠️ NEDEN `env_file:` DEĞİL: `env_file:` satırları SÜREÇ ORTAMINA koyar
+      # ve `docker inspect <container>` ile `docker compose config` çıktısı
+      # TÜM değerleri DÜZ METİN gösterir (Binance anahtarı, Telegram token'ı,
+      # webhook secret'ları). Mount edilen dosya bu yüzeyde GÖRÜNMEZ ve
+      # pydantic-settings zaten `.env`i CWD'den (=/app, WORKDIR) okur —
+      # sunucudaki davranışın birebir aynısı.
+      - ./.env:/app/.env:ro
+
+      # ── Kalıcı veri (container silinse de yaşar) ──────────────────────────
+      # Bind mount seçildi (named volume değil): başka sunucuya taşıma
+      # `tar czf tradingbot-data.tgz state logs backups data` kadar basit olsun.
+      - ./state:/app/state
       - ./logs:/app/logs
+      - ./backups:/app/backups
+      # data/ hem sqlite defterini hem backtest kline önbelleğini taşır.
       - ./data:/app/data
-    depends_on:
-      - postgres
-      - redis
-    networks:
-      - trading-network
+
+    environment:
+      TZ: UTC
+      # ⚠️ sqlite DEFTERİNİN YERİ BİLİNÇLİ OLARAK DEĞİŞTİRİLİR.
+      # Sunucuda defter repo kökündedir (`sqlite:///./tradingbot.db`). Container'da
+      # repo kökü GÖRÜNTÜNÜN İÇİDİR ve kalıcı değildir. Tek bir DOSYAYI
+      # bind-mount etmek de çözüm DEĞİLDİR: src/core/database.py
+      # `PRAGMA journal_mode=WAL` uygular ve sqlite `tradingbot.db-wal` /
+      # `tradingbot.db-shm` kardeş dosyalarını AYNI DİZİNDE oluşturur; yalnız
+      # .db dosyası mount edilseydi WAL container katmanında kalır ve container
+      # silindiğinde HENÜZ CHECKPOINT EDİLMEMİŞ İŞLEM KAYITLARI KAYBOLURDU.
+      # Bu yüzden defter, dizin olarak mount edilen data/ içine alınır.
+      # Süreç ortamı `.env`i EZER (pydantic-settings önceliği: env > dotenv),
+      # yani taşınan `.env` düzenlenmeden çalışır.
+      DATABASE_URL: "sqlite:///./data/tradingbot.db"
+
     healthcheck:
-      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health')"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9091/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
+      # Açılış ~90 sn (Binance init + pozisyon devralma) sürebilir.
+      start_period: 180s
+
     logging:
       driver: "json-file"
       options:
-        max-size: "10m"
-        max-file: "3"
+        # Uygulama logları zaten logs/ altına dönüyor (loguru rotation);
+        # buradaki tavan container stdout'unun diski doldurmasını engeller.
+        max-size: "50m"
+        max-file: "5"
 
-  # PostgreSQL Database
-  postgres:
-    image: postgres:15-alpine
-    container_name: trading-bot-db
+    # ⚠️ BINANCE_BIND_IP UYARISI (sunucuya özel, taşımada tuzak):
+    # `.env`de BINANCE_BIND_IP doluysa (NordVPN policy routing çözümü, bkz.
+    # src/core/config.py) soket O YEREL IP'ye bind edilir. Bridge ağında
+    # container'ın ağ ad alanı AYRIDIR ve host'un IP'si orada YOKTUR → bind
+    # EADDRNOTAVAIL ile düşer. İki seçenek:
+    #   a) `.env`de BINANCE_BIND_IP'i BOŞALT (weight bütçesi tünelle paylaşılır
+    #      → 418 riski geri gelir), ya da
+    #   b) AŞAĞIDAKİ satırı aç (YALNIZ Linux; macOS/colima'da çalışmaz) ve
+    #      `ports:` bölümünü kaldır — container host ağını kullanır:
+    # network_mode: host
+    #
+    #      ⛔ HOST AĞINDA `--host 0.0.0.0` PANOYU TÜM ARAYÜZLERE AÇAR.
+    #      `ports:` kalkınca `127.0.0.1` kısıtı da kalkar ve erişim logu
+    #      secret içerir (CLAUDE.md kural 5). `network_mode: host` açıyorsan
+    #      `command:`i de MUTLAKA daralt:
+    # command: ["uvicorn", "src.main:app", "--host", "127.0.0.1", "--port", "9091", "--workers", "1"]
+    #
+    # docker_run.sh BINANCE_BIND_IP + bridge durumunu başlamadan önce UYARIR.
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # İKİNCİ HALKA (D20: BOT_MODE=follower, AYRI Binance hesabı, :9093)
+  # VARSAYILAN KAPALI — `profiles` sayesinde `docker compose up` bunu BAŞLATMAZ.
+  # Açmak için (SERVİS ADI ŞART): 
+  #     docker compose --profile follower up -d tradingbot-follower
+  # ⚠️ Servis adı verilmezse profilsiz `tradingbot` servisi DE başlar ve
+  #    `scripts/docker_run.sh` güvenlik kapıları (entry-halt / 418 /
+  #    supervisord) TAMAMEN atlanır.
+  #
+  # ⚠️ TERCİH EDİLEN KURULUM BU DEĞİLDİR. D20b (kullanıcı kararı 2026-08-23:
+  # "Yeni hesap yok, yeni panel yok") takipçiyi scalper ile AYNI süreçte
+  # çalıştırır (`FOLLOWER_EMBEDDED=true`, yukarıdaki `tradingbot` servisi).
+  # Gömülü mod açıkken AlgoPro gövdeleri SÜREÇ İÇİNDE tüketilir ve bu servise
+  # HİÇBİR olay ULAŞMAZ (docs/RUNBOOK.md "Gömülü takipçiyi açma" adım 0).
+  # Bu servis yalnız D20 kurulumunu container'a taşımak gerekirse vardır.
+  # ───────────────────────────────────────────────────────────────────────────
+  tradingbot-follower:
+    profiles: ["follower"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tradingbot:local
+    container_name: tradingbot-follower
+    init: true
+    user: "${TRADINGBOT_UID:-10001}:${TRADINGBOT_GID:-10001}"
     restart: unless-stopped
+    stop_grace_period: 300s
+    stop_signal: SIGTERM
+    # Tek süreç kuralı burada da geçerlidir; yalnız port değişir.
+    command: ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "9093", "--workers", "1"]
+    ports:
+      - "${TRADINGBOT_FOLLOWER_BIND:-127.0.0.1}:${TRADINGBOT_FOLLOWER_PORT:-9093}:9093"
+    volumes:
+      # AYRI `.env` (AYRI Binance testnet hesabı + BOT_MODE=follower) ve AYRI
+      # veri dizinleri: takipçi halkası scalper'ın defterini/state'ini ASLA
+      # paylaşmaz.
+      - ./.env.follower:/app/.env:ro
+      - ./follower-data/state:/app/state
+      - ./follower-data/logs:/app/logs
+      - ./follower-data/backups:/app/backups
+      - ./follower-data/data:/app/data
     environment:
-      POSTGRES_DB: tradingbot
-      POSTGRES_USER: trading
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    networks:
-      - trading-network
+      TZ: UTC
+      DATABASE_URL: "sqlite:///./data/tradingbot.db"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U trading"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  # Redis Cache (Optional)
-  redis:
-    image: redis:7-alpine
-    container_name: trading-bot-redis
-    restart: unless-stopped
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis-data:/data
-    networks:
-      - trading-network
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-    command: redis-server --appendonly yes
-
-  # Adminer (Database GUI - Optional)
-  adminer:
-    image: adminer:latest
-    container_name: trading-bot-adminer
-    restart: unless-stopped
-    ports:
-      - "8080:8080"
-    networks:
-      - trading-network
-    depends_on:
-      - postgres
-
-volumes:
-  postgres-data:
-    driver: local
-  redis-data:
-    driver: local
-
-networks:
-  trading-network:
-    driver: bridge
-
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9093/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"

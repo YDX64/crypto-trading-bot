@@ -1,74 +1,96 @@
-# Python
+# TRADINGBOT görüntü bağlamı filtresi
+# =============================================================================
+# İKİ KURAL:
+#  1) SIR ve CANLI VERİ görüntüye GİRMEZ (görüntü kopyalanabilir/ihraç edilebilir).
+#  2) TESTLER ve SÖZLEŞME DOSYALARI görüntüde KALIR — container içinde
+#     `python -m pytest tests -q` çalıştırmak bir deploy kapısıdır ve
+#     tests/test_container.py Dockerfile/docker-compose.yml/.dockerignore/
+#     scripts/docker_run.sh dosyalarını OKUR. Bu dosyalar dışlanırsa tam paket
+#     container içinde ÇÖKER.
+# =============================================================================
+
+# ── SIRLAR (asla görüntüye girmez; .env MOUNT edilir) ────────────────────────
+.env
+.env.*
+**/.env
+**/.env.*
+env.bak*
+*.bak
+**/*.bak
+
+# ── ESKİ/ARŞİV İÇERİK ───────────────────────────────────────────────────────
+# archive/ eski dokümanlar taşır ve içinde API-anahtarı BİÇİMİNDE dizeler
+# vardır (archive/2025-10-legacy/docs/TESTNET_KEYS_QUICKSTART.md). Görüntü
+# `docker save` ile ihraç edilebildiği için çalışma zamanında gereksiz olan
+# hiçbir şey içeri girmemeli.
+archive/
+
+# ── CANLI/ÜRETİLMİŞ VERİ (kalıcı volume'lerden gelir) ────────────────────────
+logs/
+state/
+backups/
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.log
+follower-data/
+# autoresearch/backtest operatör artefaktı (.gitignore'da da var)
+scripts/.scalper_env_snapshot.txt
+
+# ── Sürüm kontrolü ve yerel araç artıkları ──────────────────────────────────
+.git
+.git/
+.gitignore
+.gitattributes
+.github/
+# ⚠️ İSTİSNA: tests/test_container.py, Dockerfile'ın Python sürümünü CI'nınkiyle
+# (= sunucu venv'i) karşılaştırmak için BU dosyayı okur. Dışlanırsa container
+# İÇİNDE `pytest tests` KIRMIZI döner ve "container içi test = deploy kapısı"
+# iddiası çöker (ölçüldü: 1 failed).
+!.github/workflows/ci.yml
+.claude/
+
+# ── Python yerel ortamı / önbellekler ───────────────────────────────────────
+.venv/
+venv/
+ENV/
+env/
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-.Python
-env/
-venv/
-ENV/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*.swn
-.DS_Store
-
-# Environment
-.env
-.env.local
-.env.*.local
-
-# Logs
-logs/
-*.log
-
-# Database
-*.db
-*.sqlite
-*.sqlite3
-data/
-
-# Testing
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
 htmlcov/
 .tox/
 .hypothesis/
+.test-logs/
+*.egg-info/
+build/
+dist/
+.ipynb_checkpoints/
 
-# Documentation
-docs/_build/
-site/
+# ── IDE / OS ────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
 
-# Git
-.git/
-.gitignore
-.gitattributes
-
-# Docker
-.dockerignore
-docker-compose*.yml
-Dockerfile*
-
-# Other
-*.md
-LICENSE
-.pre-commit-config.yaml
-
+# ── Kasıtlı olarak DIŞLANMAYANLAR (silme!) ──────────────────────────────────
+#   tests/          → container içinde pytest (deploy kapısı)
+#   conftest.py     → test log yönlendirmesi
+#   pytest.ini      → asyncio_mode=auto, marker'lar
+#   examples/       → tests/test_news_bot_client.py bu modülü import eder
+#   scripts/        → docker_run.sh, ledger_report.py, backtest yardımcıları
+#   static/         → pano (/dashboard, /static)
+#   docs/           → operatör container içinde RUNBOOK reçetesine bakabilsin
+#   env.example     → örnek ayarlar (SIR İÇERMEZ; .env'in şablonu)
+#   Dockerfile, docker-compose.yml, .dockerignore
+#                   → tests/test_container.py sözleşme testleri bunları okur

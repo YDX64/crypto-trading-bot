@@ -43,3 +43,46 @@ jobs:
 
       - name: Deploy script sözdizimi
         run: bash -n scripts/deploy.sh && bash -n scripts/server_deploy.sh && bash -n scripts/ring_env_diff.sh
+        # docker_run.sh container yolunun kapısıdır (entry-halt / 418 / supervisord).
+        # Sözdizimi kırılırsa taşıma reçetesi çalışmaz.
+
+      - name: "Container script sözdizimi"
+        run: bash -n scripts/docker_run.sh
+
+  # Container görüntüsü GERÇEKTEN derleniyor mu? YALNIZ BUILD — push YOK, çalıştırma YOK.
+  # Sözleşme testleri (tests/test_container.py) statiktir ve `test` işinde koşar;
+  # bu iş, statik testin göremeyeceği tek şeyi kanıtlar: bağımlılıklar taban
+  # görüntüde gerçekten kuruluyor ve kod katmanı kopyalanıyor.
+  docker-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: "Görüntüyü derle (build-only, push YOK)"
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: tradingbot:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: "Görüntü sözleşmesi: non-root + tek süreç + testler içeride"
+        run: |
+          set -euo pipefail
+          # Non-root
+          uid="$(docker run --rm --entrypoint id tradingbot:ci -u)"
+          test "$uid" != "0" || { echo "HATA: container root olarak koşuyor"; exit 1; }
+          echo "container uid=$uid (root değil)"
+          # Testler ve sözleşme dosyaları görüntüde mi? (container içi pytest = deploy kapısı)
+          docker run --rm --entrypoint sh tradingbot:ci -c \
+            'test -d tests && test -f conftest.py && test -f pytest.ini && test -f Dockerfile && test -f docker-compose.yml'
+          # .env görüntüye GÖMÜLMEMİŞ olmalı (mount edilir)
+          if docker run --rm --entrypoint sh tradingbot:ci -c 'test -f /app/.env'; then
+            echo "HATA: .env görüntüye gömülmüş"; exit 1
+          fi
+          echo "görüntü sözleşmesi TAMAM"

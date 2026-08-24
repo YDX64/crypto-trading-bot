@@ -2313,6 +2313,89 @@ Değişen: (i) kapanışın deftere yazılan ETİKETİ ve FİYAT KAYNAĞI, (ii) 
 seviyeleri, (iii) durum alanları ve pano önbelleği, (iv) varsayılan KAPALI bir
 ağırlık telemetrisi/geri çekilmesi.
 
+### D23 — Tek container dağıtım yolu (taşınabilirlik) · 2026-08-24 · **AKTİF (EK YOL — canlı supervisord DEĞİŞMEDİ)**
+
+**Ne.** Bot tek bir `python:3.12-slim` görüntüsüne paketlendi: `Dockerfile`,
+`docker-compose.yml`, `.dockerignore`, `scripts/docker_run.sh`,
+`tests/test_container.py` (61 sözleşme testi + opt-in duman testi),
+`docs/RUNBOOK.md` → "Container ile çalıştırma / başka sunucuya taşıma",
+CI'da `docker-build` işi (build-only, push YOK).
+
+**Neden.** Kullanıcı isteği: *"hepsi aynı container'da olsun, sonra başka
+sunucuya taşıyacağım."* Bugünkü canlı yol (supervisord `tradingbot_v2`,
+`/opt/tradingbot-v2`, `.venv`, uvicorn :9091) **hiç değişmedi** —
+`scripts/deploy.sh` / `server_deploy.sh` / `restart_safe.sh` dosyalarına
+DOKUNULMADI (`git diff --stat -- scripts/deploy.sh scripts/server_deploy.sh
+scripts/restart_safe.sh` boş).
+
+**En kritik kural.** ⛔ **supervisord ile container AYNI ANDA ÇALIŞAMAZ** —
+aynı Binance hesabı, aynı pozisyonlar → çift SL/TP, yarışan devralma,
+`state/*.json`'da son-yazan-kazanır. Bu, D20b'deki "ayrı halka + gömülü
+takipçi aynı anda" kritik sınıfının aynısıdır. `docker_run.sh` bunu İKİ
+bağımsız sinyalle yoklar (supervisorctl + `pgrep -af 'uvicorn.*src\.main:app'`);
+bilinçli istisna `DOCKER_ALLOW_ALONGSIDE=1`.
+
+**Kanıt (ölçüldü, yerel docker 27.4.0 / linux-aarch64, 2026-08-24).**
+| İddia | Ölçüm |
+|---|---|
+| Görüntü derleniyor | 715 MB, ~2 dk; `user=bot` (uid 10001), Python 3.12.14, `TZ=UTC` |
+| Uygulama ayağa kalkıyor | `env.example` ile `/health` **503 degraded** (beklenen: `Binance [401] -2014 API-key format invalid`), `/dashboard` 200 (88 KB) |
+| Defter kalıcı | sqlite `data/` mount'unda oluştu (WAL kardeşleri aynı dizinde) |
+| Zarif kapanış | `docker stop -t 120` → **1 sn, exit 0**; lifespan `finally` zinciri loga düştü |
+| entry-halt kalıcı + fail-closed | host'a yazılan halt dosyası container'da görüldü; **bozuk** dosyada da `🚨 entry halt state okunamadı … fail-closed kapalı` → `entry_halted=true` |
+| Secret sızıntısı yok | `?secret=<değer>` isteği `docker logs`'ta `secret=***`; ham değer bulunamadı |
+| Container içi tam paket | **2021 passed, 2 skipped** |
+| Host tam paket | **2021 passed, 2 skipped** (2 skip = mevcut 1 + opt-in duman testi) |
+
+**Bilinçli sapmalar (gerekçeleriyle).**
+* **Python 3.12** (3.11 değil): CI ve sunucu venv'i 3.12'dir
+  (`.github/workflows/ci.yml`). Aksi hâlde "container'da testler geçti" ile
+  "sunucuda testler geçti" aynı şey olmaz ve container bir deploy kapısı sayılmazdı.
+  Parite `test_dockerfile_python_version_matches_ci_and_server` ile kilitli.
+* **Defter `data/` altına alındı** (`DATABASE_URL=sqlite:///./data/tradingbot.db`):
+  `journal_mode=WAL` `-wal`/`-shm` kardeşlerini AYNI dizinde üretir; tek DOSYA
+  bind-mount'u onları container katmanında bırakır ve container silinince
+  **checkpoint edilmemiş kayıtlar kaybolurdu**. Süreç ortamı `.env`i ezdiği için
+  taşınan `.env` düzenlenmeden çalışır.
+* **418 ban penceresi UTC hesaplanır** (`restart_safe.sh` YEREL kullanır):
+  container `TZ=UTC` yazar, host UTC+2 olabilir; yerel kesim noktasıyla pencere
+  "15 dk − 2 saat" olur ve AKTİF ban SESSİZCE görülmezdi (ölçüldü: CEST host'ta
+  taze `HTTP 418` satırı filtreden 0 satır geçti).
+* **`stop_grace_period: 300s`**: tek bir REST çağrısı 429'da 2×60 sn sürebilir
+  (`binance_client_improved.py`), `cancel_all_pending` emir başına çağrı yapar;
+  120 sn tavanı tek 429'da dolar → SIGKILL → iptal edilmemiş LIMIT emirleri
+  borsada asılı kalırdı.
+* **`restart: unless-stopped`** (418 kuralıyla gerilim, bilinçli): alternatifi
+  açık pozisyonlu botu süresiz kapalı bırakır. Emniyet, uygulamanın KENDİ
+  fail-closed kapılarıdır (yukarıda ölçüldü) + sağlık yoklaması otomatik restart
+  TETİKLEMEZ + autoheal kullanılmaz.
+* **İkinci halka (`BOT_MODE=follower`, :9093) `profiles: [follower]` ile
+  VARSAYILAN KAPALI** — D20b gömülü mod tercih edilendir.
+
+**Düşmanca inceleme (2 ajan, 39 bulgu).** Düzeltilen kritikler: (a) `.dockerignore`
+`.github/`i dışlıyordu ama `tests/test_container.py` `ci.yml`i okuyor → container içi
+tam paket KIRMIZI dönüyordu (`!.github/workflows/ci.yml` istisnası eklendi, sonra
+2021 passed ölçüldü); (b) supervisord kapısı fail-open'dı (pgrep ikinci sinyali);
+(c) 418 penceresi TZ uyumsuzluğu; (d) duman testi host bind-mount'a bağlıydı ve
+yayınlanan portta duran BAŞKA bir container'ın cevabıyla YANLIŞ GEÇMİŞTİ →
+`docker create` + `docker cp` + isimli volume + `docker exec` ile yeniden yazıldı;
+(e) redaksiyon 8 sızıntı sınıfını kaçırıyordu (hepsi maskelendi, testle kilitli);
+(f) `archive/` görüntüye giriyordu (API-anahtarı biçimli dizeler); (g) README/INSTALL
+çıplak `docker-compose up -d` öğretiyordu (kapısız); (h) reboot sonrası supervisord
+`autostart=true` + container `unless-stopped` = iki motor (taşıma reçetesine
+`autostart=false` adımı ZORUNLU olarak eklendi); (i) `.env` `chmod 600` + root
+sahipliği → container uid okuyamaz → sonsuz çökme döngüsü.
+
+**Geri alma.** Container yolu tamamen ek'tir: `scripts/docker_run.sh --down` yeter;
+dosyalar silinse bile canlı supervisord yolu etkilenmez. Karşı yön (container'dan
+supervisord'a dönüş) RUNBOOK adım 6'dadır — **iki defteri BİRLEŞTİRME**, hangisinin
+geçerli olduğuna karar ver (aynı `entry_order_id` iki kez girer).
+
+**Açık kalanlar.** `forensics_log.drain()` üretim kapanış yolunda çağrılmıyor
+(kapanışta adli kayıt satırı kaybı; D21 gereği yalnız gözlem, işlem riski yok) —
+ayrı bir değişiklikte. `ccxt==3.1.60` hiç import edilmiyor; kaldırılırsa görüntü
+küçülür — ayrı bir commit'te.
+
 ## Reddedilen kararlar (kanıtla)
 
 | Fikir | Tarih | Sonuç | Neden reddedildi |
