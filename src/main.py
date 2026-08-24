@@ -856,12 +856,15 @@ async def api_status(request: Request = None):
         except Exception as e:  # teşhis alanı asla status'u düşürmemeli
             payload["ai_gate"] = {"error": f"{type(e).__name__}: {e}"}
 
-    # D27/B: pano "Karşı-olgu defteri" özetini BU gövdeden okur — YENİ bir uç
-    # ÇAĞIRMAZ (nginx beyaz listesi: `/api/status` zaten izinli, bkz.
-    # docs/RUNBOOK.md "Pano erişimi"). `counters_snapshot()` yalnız BELLEK
-    # okur (REST/DB/disk YOK) → 2026-08-18 pano-açlığı riski doğurmaz.
-    # Defter KAPALIYKEN blok yine eklenir ama `enabled=false` der: "alan yok"
-    # ile "ölçüm kapalı" karışmamalı.
+    # D27/B: karşı-olgu defteri sayaçları.
+    # ⚠️ D27 incelemesi (D7): pano bu bloğu `/scalper/status`tan okur
+    # (`static/dashboard.html`, `renderScalper` → `d.counterfactual`), BURADAN
+    # DEĞİL. Bu blok bugün TÜKETİCİSİZDİR ve simetri/teşhis için durur;
+    # yanlış yorum ileride yanlış tarafı sildirebilirdi.
+    # `counters_snapshot()` yalnız BELLEK okur (REST/DB/disk YOK) →
+    # 2026-08-18 pano-açlığı riski doğurmaz. Defter KAPALIYKEN blok yine
+    # eklenir ama `enabled=false` der: "alan yok" ile "ölçüm kapalı"
+    # karışmamalı.
     try:
         payload["counterfactual"] = counterfactual_store.counters_snapshot()
     except Exception as e:  # teşhis alanı asla status'u düşürmemeli
@@ -2454,7 +2457,9 @@ _EMPTY_FOLLOWER_STATUS = {
     "positions": [],
     "events": [],
     # D27/A4: motor yokken de ŞEKİL aynı olmalı (pano "alan yok" ile "hiç
-    # olmadı"yı karıştırmasın).
+    # olmadı"yı karıştırmasın). D27 incelemesi (D8): ortak alan kümesi
+    # scalper halkasıyla AYNIDIR (`tp1_missing`, `tp_wrong_side`,
+    # `partial_fill_split`, `window`).
     "order_health": {
         "tp1_missing": 0,
         "tp_wrong_side": 0,
@@ -2738,10 +2743,31 @@ _EMPTY_SCALPER_STATUS = {
     # D27/B: karşı-olgu defteri sayaçları. Motor yokken de ŞEKİL aynı olmalı
     # — defter SÜREÇ-İÇİDİR ve motor kurulmadan hiçbir niyet kaydedilmez.
     # ANAHTAR KÜMESİ `counterfactual_store.counters_snapshot()` ile BİREBİR
-    # aynıdır (inceleme bulgusu): eksik bir alt alan, panoda "ölçüm yok" ile
-    # "alan yok"u karıştırırdı. Bekçi testi:
+    # aynıdır: eksik bir alt alan, panoda "ölçüm yok" ile "alan yok"u
+    # karıştırırdı. Bekçi testi:
     # tests/test_counterfactual_store.py::TestApiSurface.
-    "counterfactual": dict(counterfactual_store.counters_snapshot()),
+    #
+    # ⚠️ D27 incelemesi-2 (bulgu 6): DEĞERLER LİTERALDİR, `counters_snapshot()`
+    # ÇAĞRILMAZ. Eskiden çağrılıyordu ve sözlük IMPORT ANINDA donuyordu: aynı
+    # süreçte defter daha önce kullanıldıysa MOTORSUZ gövde `enabled=true,
+    # registered=7` diyebiliyordu — yani kendi yorumunun tam tersi. Sıfırlar
+    # burada "motor yok, hiçbir şey kaydedilmedi" demektir.
+    "counterfactual": {
+        "enabled": False,
+        "window": "process_start",
+        "horizons_h": list(counterfactual_store.DEFAULT_HORIZONS),
+        "dedup_sec": counterfactual_store.DEFAULT_DEDUP_SEC,
+        "max_pending": counterfactual_store.DEFAULT_MAX_PENDING,
+        "pending": 0,
+        "registered": 0,
+        "dedup_hits": 0,
+        "dropped_full": 0,
+        "expired": 0,
+        "resolved": 0,
+        "measured": 0,
+        "logged": 0,
+        "log_dropped": 0,
+    },
     # D23: AI karar katmanı (gölge). Motor yokken de ŞEKİL aynı olmalı —
     # pano "alan yok" ile "katman kapalı"yı karıştırmasın.
     "ai_gate": {
@@ -2783,9 +2809,16 @@ _EMPTY_SCALPER_STATUS = {
     "entry_rejects": {},
     # D27/A4: TP1/TP2 emri konulamama sayaçları. Motor yokken de ŞEKİL aynı
     # olmalı — pano "alan yok" ile "hiç olmadı"yı karıştırmasın.
+    # D27 incelemesi (D8): `tp1_missing` + `tp_wrong_side` +
+    # `partial_fill_split` + `window` İKİ HALKADA DA vardır (ortak küme);
+    # yalnız bu sayede pano tek bir uyarı satırıyla ikisini de gösterebilir.
     "order_health": {
         "tp1_missing": 0,
+        "tp1_unidentified": 0,
         "tp2_missing": 0,
+        "tp2_unidentified": 0,
+        "tp_wrong_side": 0,
+        "partial_fill_split": 0,
         "last_symbol": None,
         "last_at": None,
         "window": "process_start",
@@ -3123,34 +3156,64 @@ async def scalper_counterfactual(
     * `collapsed`, dedup penceresi içinde tek satıra indirgenmiş özdeş
       retlerin toplam ağırlığıdır (`dup_count`).
 
-    **Pano bu ucu ÇAĞIRMAZ** (nginx beyaz listesi yalnız `/api/status`);
-    pano özeti `/api/status → counterfactual` bloğundadır. Burada GERÇEK
-    disk okuması vardır — elle/rapor yolundan çağrılır.
+    **Pano bu ucu ÇAĞIRMAZ**; pano özeti `/scalper/status → counterfactual`
+    bloğundadır. Burada GERÇEK disk okuması vardır — elle/rapor yolundan
+    çağrılır ve okuma AYRI BİR İŞ PARÇACIĞINDA yapılır (Y4).
+
+    `truncated=True` dönerse satır tavanı (`forensics_log.READ_MAX_LINES`)
+    dolmuştur ve DAHA ESKİ veri okunmamıştır — tablo o pencerenin TAMAMI
+    değildir. Pencereyi daraltın (`?since=`).
     """
     from src.strategies.scalper import forensics_log
 
+    # D27 incelemesi (Y5): `since` VARSAYILANI VARDIR. Filtresiz çağrı 30
+    # günün tamamını okurdu ve bu, en pahalı uçta en kötü hâli tetikleyen
+    # varsayılandı; kardeş uç (`/scalper/forensics/summary`) zaten
+    # `FORENSICS_DEFAULT_SINCE` kullanıyor.
     since_iso: Optional[str] = None
-    if since:
-        parsed = _parse_since(since)
-        if parsed is not None:
-            since_iso = parsed.replace(tzinfo=timezone.utc).isoformat()
-    try:
-        rows = forensics_log.read_events("counterfactual", since_iso=since_iso)
-    except Exception as e:  # pragma: no cover - okuma hatası uç düşürmemeli
-        raise HTTPException(status_code=500, detail=f"JSONL okunamadı: {e}")
+    parsed = _parse_since(since or FORENSICS_DEFAULT_SINCE)
+    if parsed is not None:
+        since_iso = parsed.replace(tzinfo=timezone.utc).isoformat()
+
+    def _read_and_summarize() -> Dict[str, Any]:
+        """Disk okuması + özet — AYRI İŞ PARÇACIĞINDA (bkz. aşağıdaki not)."""
+        result = forensics_log.read_events_detailed(
+            "counterfactual", since_iso=since_iso
+        )
+        rows = result.rows
+        if wanted:
+            rows = [r for r in rows if str(r.get("reason") or "") == wanted]
+        return {
+            "rows": rows,
+            "truncated": result.truncated,
+            "scanned": result.scanned,
+            "summary": counterfactual_store.summary(rows),
+        }
 
     wanted = (reason or "").strip().lower() or None
-    if wanted:
-        rows = [r for r in rows if str(r.get("reason") or "") == wanted]
+    try:
+        # D27 incelemesi (Y4): `read_events` + `summarize` SENKRONDUR ve
+        # `async def` gövdesinde OLAY DÖNGÜSÜNÜ BLOKLAR (ölçüldü: 200k
+        # satırda ≈1.43 sn blokaj, +225 MB RSS). Blokaj süresince tarama
+        # turu, safety turu ve TÜM HTTP donar — 2026-08-18 "pano açlığı"
+        # dersinin okuma tarafındaki eşleniği. `to_thread` bunu ayırır.
+        payload = await asyncio.to_thread(_read_and_summarize)
+    except Exception as e:  # pragma: no cover - okuma hatası uç düşürmemeli
+        raise HTTPException(status_code=500, detail=f"JSONL okunamadı: {e}")
 
     try:
         n = max(0, min(int(limit), 500))
     except (TypeError, ValueError):
         n = 50
+    rows = payload["rows"]
     return {
         "since": since_iso,
         "reason": wanted,
-        "summary": counterfactual_store.summary(rows),
+        # `truncated=True`: satır tavanı doldu, DAHA ESKİ veri OKUNMADI.
+        # "kayıt yok" ile "hepsini okuyamadık" aynı şey değildir (K1).
+        "truncated": payload["truncated"],
+        "scanned_lines": payload["scanned"],
+        "summary": payload["summary"],
         "counters": counterfactual_store.counters_snapshot(),
         # En yeni önce; `limit` ile sınırlı ham satırlar (teşhis için).
         "rows": list(reversed(rows))[:n],

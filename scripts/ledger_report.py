@@ -1294,7 +1294,16 @@ def _ai_coverage_lines(ai: Dict[str, Any]) -> List[str]:
 #: AI kalıp tablosuna aitti (satır ~1215) ve üzerine yazmak `_ai_pattern_rows`
 #: 6 sütunluk satırlarını 11 sütunluk başlıkla eşleştirip `IndexError` verir.
 _TABLE9_HEADERS = [
-    "RetGerekçesi", "n", "Ölçülen", "TP1", "STOP", "Açık", "Veriyok",
+    "RetGerekçesi", "n", "Ölçülen", "ROIn", "TP1", "STOP", "Açık", "Veriyok",
+    "Ort.ROI%", "PF", "%95 GA", "Katlanan",
+]
+
+#: D27 incelemesi (Y6): plan kaynağı kırılımı. TV kapısı yolunda stop/TP1
+#: ROI POLİTİKASINDAN yaklaşıklanır; tarama-içi retler gerçek yapısal stopu
+#: kullanır. İki kova aynı tabloda okunursa TV kovası sistematik olarak
+#: "girseydik kazanırdık" tarafına kayar ve bu ayırt EDİLEMEZ.
+_TABLE10_HEADERS = [
+    "PlanKaynağı", "n", "Ölçülen", "ROIn", "TP1", "STOP", "Açık", "Veriyok",
     "Ort.ROI%", "PF", "%95 GA", "Katlanan",
 ]
 
@@ -1302,8 +1311,18 @@ _COUNTERFACTUAL_NOTE = (
     "KARŞI-OLGU MODELİ: yalnız TP1 ya da İLK STOP modellenir; TP2, chandelier "
     "trailing, break-even çekme, 8 saatlik reaper (D4), komisyon ve kayma "
     "MODELLENMEZ. Aynı mumda ikisi de vurursa STOP kazanır (karamsar). "
-    "'Veriyok' satırları ortalama/PF hesabına GİRMEZ. 'Katlanan', dedup "
-    "penceresinde tek satıra indirgenmiş özdeş retlerin toplam ağırlığıdır."
+    "'Veriyok' satırları ortalama/PF hesabına GİRMEZ ('ROIn' = ortalamaya "
+    "GİREN satır sayısı). 'Katlanan', dedup penceresinde tek satıra "
+    "indirgenmiş özdeş retlerin toplam ağırlığıdır."
+)
+
+_PLAN_SOURCE_NOTE = (
+    "PLAN KAYNAĞI UYARISI: `roi_policy` satırlarının stop/TP1'i ROI "
+    "politikasından YAKLAŞIKLANMIŞTIR (TV sağlaması `/tv-signal`'da reddeder; "
+    "orada ScalpSignal ve dolayısıyla yapısal stop YOKTUR). Varsayılan "
+    "configle stop ≈%2.5 / TP1 ≈%1.0 fiyat mesafesi (2.5:1) eder — yani bu "
+    "kova diğerlerine göre SİSTEMATİK olarak 'girseydik kazanırdık' tarafına "
+    "kayar. `signal` satırlarıyla AYNI ortalamaya karıştırmayın."
 )
 
 
@@ -1312,16 +1331,26 @@ def load_counterfactual_rows(
     until: datetime,
     *,
     log_dir: Optional[str] = None,
+    stamp_field: str = "ts",
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     """`logs/trades.jsonl`'den karşı-olgu satırlarını oku (D27/B).
 
     Kaynak DB DEĞİLDİR: reddedilen niyetlerin defterde satırı yoktur, izleri
     JSONL'dedir. Dosya yoksa boş liste + açıklayıcı not döner — rapor ÇÖKMEZ
     (`load_forensics_rows` deseni).
+
+    `stamp_field` (D27 incelemesi O10) pencere süzgecinin HANGİ ana
+    uygulanacağını seçer:
+
+    * `"ts"` (varsayılan) — satırın YAZILDIĞI (çözüm) anı;
+    * `"at"` — NİYET anı. Başlık "REDDEDİLEN NİYETLER" dediği için gün/rejim
+      kıyaslarında doğru olan budur: 8 saatlik ufukla gece 23:00'teki bir ret
+      `ts` süzgecinde ERTESİ GÜNE düşer.
+
+    `log_dir` (D27 incelemesi D10) artık `TRADINGBOT_LOG_DIR` ortam
+    değişkenini KALICI OLARAK DEĞİŞTİRMEZ; doğrudan okuyucuya geçirilir.
     """
     notes: List[str] = []
-    if log_dir:
-        os.environ["TRADINGBOT_LOG_DIR"] = str(log_dir)
     try:
         from src.strategies.scalper import forensics_log
     except Exception as exc:  # pragma: no cover - import yolu bozuksa
@@ -1329,15 +1358,31 @@ def load_counterfactual_rows(
 
     since_iso = since.replace(tzinfo=timezone.utc).isoformat()
     until_iso = until.replace(tzinfo=timezone.utc).isoformat()
+    field = "at" if str(stamp_field) == "at" else "ts"
     try:
-        rows = forensics_log.read_events("counterfactual", since_iso=since_iso)
+        # `since_iso` süzgeci `ts` alanına bakar (okuyucunun sözleşmesi);
+        # `at` seçildiğinde alt sınırı BURADA yeniden uygularız, çünkü niyet
+        # anı çözüm anından DAİMA daha eskidir (ufuk kadar).
+        result = forensics_log.read_events_detailed(
+            "counterfactual",
+            since_iso=None if field == "at" else since_iso,
+            directory=log_dir,
+        )
     except Exception as exc:
         return [], [f"Karşı-olgu satırları okunamadı: {exc}"]
 
-    windowed = [
-        row for row in rows
-        if not isinstance(row.get("ts"), str) or row["ts"] <= until_iso
-    ]
+    windowed = []
+    for row in result.rows:
+        stamp = row.get(field)
+        if isinstance(stamp, str) and not (since_iso <= stamp <= until_iso):
+            continue
+        windowed.append(row)
+
+    if result.truncated:
+        notes.append(
+            "⚠️ Karşı-olgu okuma tavanı doldu: DAHA ESKİ satırlar OKUNMADI, "
+            "tablo bu pencerenin TAMAMI DEĞİLDİR (--since ile daraltın)."
+        )
     if not windowed:
         notes.append(
             "Karşı-olgu defterinde bu pencerede satır yok "
@@ -1347,15 +1392,57 @@ def load_counterfactual_rows(
     return windowed, notes
 
 
-def build_counterfactual_report(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+def build_counterfactual_report(
+    rows: List[Dict[str, Any]], *, truncated: bool = False
+) -> Dict[str, Any]:
     """Ret gerekçesi × karşı-olgu sonucu — SAF çekirdek `counterfactual.summarize`."""
     try:
         from src.strategies.scalper import counterfactual as cf
     except Exception as exc:  # pragma: no cover - import yolu bozuksa
-        return {"error": f"{type(exc).__name__}: {exc}", "by_reason": [], "overall": {}}
+        return {
+            "error": f"{type(exc).__name__}: {exc}",
+            "by_reason": [],
+            "by_plan_source": [],
+            "overall": {},
+        }
     summary = cf.summarize(rows)
     summary["note"] = _COUNTERFACTUAL_NOTE
+    summary["plan_source_note"] = _PLAN_SOURCE_NOTE
+    summary["truncated"] = bool(truncated)
     return summary
+
+
+def _counterfactual_cells(item: Dict[str, Any], label: str) -> List[str]:
+    ci = item.get("ci95_roi_pct")
+    # `profit_factor` None iki ZIT anlama gelebiliyordu; `profit_factor_note`
+    # ayrımı taşır (D27 incelemesi D4): `no_loss` = kayıp yok (PF "sonsuz"),
+    # `no_sample` = hiç ölçüm yok.
+    note = item.get("profit_factor_note")
+    if item.get("profit_factor") is not None:
+        pf = _fmt_pf(item["profit_factor"])
+    elif note == "no_loss":
+        pf = "∞(kayıpsız)"
+    else:
+        pf = "—"
+    return [
+        label,
+        str(item.get("n", 0)),
+        str(item.get("measured", 0)),
+        str(item.get("roi_n", 0)),
+        str(item.get("tp1", 0)),
+        str(item.get("stop", 0)),
+        str(item.get("open", 0)),
+        str(item.get("no_data", 0)),
+        _fmt_opt(item.get("avg_roi_pct")),
+        pf,
+        f"[{ci[0]:+.1f}, {ci[1]:+.1f}]" if ci else "—",
+        # Katlanan ağırlık sonuç bazında da ayrışır (D5): "toplam(tp1/stop)".
+        "{}({}/{})".format(
+            item.get("collapsed", 0),
+            item.get("collapsed_tp1", 0),
+            item.get("collapsed_stop", 0),
+        ),
+    ]
 
 
 def _counterfactual_rows(report: Dict[str, Any]) -> List[List[str]]:
@@ -1366,24 +1453,38 @@ def _counterfactual_rows(report: Dict[str, Any]) -> List[List[str]]:
     if overall:
         entries = entries + [overall]
     for item in entries:
-        ci = item.get("ci95_roi_pct")
-        out.append([
-            str(item.get("reason") or "?"),
-            str(item.get("n", 0)),
-            str(item.get("measured", 0)),
-            str(item.get("tp1", 0)),
-            str(item.get("stop", 0)),
-            str(item.get("open", 0)),
-            str(item.get("no_data", 0)),
-            _fmt_opt(item.get("avg_roi_pct")),
-            # `profit_factor` None olabilir ("kayıp yok" ya da "hiç ölçüm
-            # yok"): `_fmt_pf` yalnız sayı/inf bekler, burada ayrı okunur.
-            _fmt_pf(item["profit_factor"])
-            if item.get("profit_factor") is not None else "—",
-            f"[{ci[0]:+.1f}, {ci[1]:+.1f}]" if ci else "—",
-            str(item.get("collapsed", 0)),
-        ])
+        out.append(_counterfactual_cells(item, str(item.get("reason") or "?")))
     return out
+
+
+def _counterfactual_plan_source_rows(report: Dict[str, Any]) -> List[List[str]]:
+    """Plan kaynağı × sonuç (D27 incelemesi Y6) — `roi_policy` AYRI okunur."""
+    section = report.get("counterfactual") or {}
+    return [
+        _counterfactual_cells(item, str(item.get("plan_source") or "?"))
+        for item in (section.get("by_plan_source") or [])
+    ]
+
+
+def _counterfactual_error_lines(section: Optional[Dict[str, Any]]) -> List[str]:
+    """Karşı-olgu bölümünün HATA satırları — D27 incelemesi (O9).
+
+    `build_counterfactual_report` `{"error": ...}` döndürebiliyordu ama
+    `render_text`/`render_md` yalnız `note` basıyordu: hata GÖRÜNMÜYOR, boş
+    tablo görünüyordu. "Ölçüm yok" ile "ölçüm bozuldu" aynı şey değildir.
+    """
+    lines: List[str] = []
+    if not isinstance(section, dict):
+        return lines
+    error = section.get("error")
+    if error:
+        lines.append(f"⚠️ KARŞI-OLGU RAPORU KURULAMADI: {error}")
+    if section.get("truncated"):
+        lines.append(
+            "⚠️ SATIR TAVANI DOLDU: daha eski karşı-olgu satırları OKUNMADI — "
+            "tablo bu pencerenin TAMAMI DEĞİLDİR. Pencereyi daraltın (--since)."
+        )
+    return lines
 
 
 def _fmt_opt(value: Optional[float]) -> str:
@@ -1492,13 +1593,25 @@ def render_text(report: Dict[str, Any]) -> str:
             "   (Bir işlem birden çok etiket taşıyabilir — satır toplamı işlem"
             " sayısını aşabilir.)"
         )
+        # D27 incelemesi (B2): REAPER kendi ailesi olunca ARTIDA kesilen yaş
+        # kesmelerinde `noise_stop` artık atılmıyor — yani ETİKET dağılımı da
+        # 08-24 öncesi/sonrası kıyaslanamaz. Not bu tablonun altına da girer.
+        lines.append(f"   NOT: {REAPER_SPLIT_NOTE}")
 
     cfx = report.get("counterfactual")
     if cfx is not None:
         lines.append("")
         lines.append("5d) KARŞI-OLGU DEFTERİ — REDDEDİLEN NİYETLER (D27/B)")
+        for line in _counterfactual_error_lines(cfx):
+            lines.append(f"   {line}")
         lines.append(_render_table(_TABLE9_HEADERS, _counterfactual_rows(report)))
         lines.append(f"   {cfx.get('note') or _COUNTERFACTUAL_NOTE}")
+        plan_rows = _counterfactual_plan_source_rows(report)
+        if plan_rows:
+            lines.append("")
+            lines.append("5e) KARŞI-OLGU — PLAN KAYNAĞI KIRILIMI (D27/B)")
+            lines.append(_render_table(_TABLE10_HEADERS, plan_rows))
+            lines.append(f"   {cfx.get('plan_source_note') or _PLAN_SOURCE_NOTE}")
 
     ai = report.get("ai")
     if ai is not None:
@@ -1609,14 +1722,28 @@ def render_md(report: Dict[str, Any]) -> str:
             "_Bir işlem birden çok etiket taşıyabilir — satır toplamı işlem "
             "sayısını aşabilir._"
         )
+        lines.append("")
+        # D27 incelemesi (B2): etiket dağılımı da 08-24 öncesi/sonrası
+        # kıyaslanamaz (REAPER kendi ailesi olunca `noise_stop` değişti).
+        lines.append(f"> {REAPER_SPLIT_NOTE}")
 
     cfx = report.get("counterfactual")
     if cfx is not None:
         lines.append("")
         lines.append("## 5d) Karşı-olgu defteri — reddedilen niyetler (D27/B)")
+        for line in _counterfactual_error_lines(cfx):
+            lines.append(f"> {line}")
+            lines.append("")
         lines.append(_render_md_table(_TABLE9_HEADERS, _counterfactual_rows(report)))
         lines.append("")
         lines.append(f"_{cfx.get('note') or _COUNTERFACTUAL_NOTE}_")
+        plan_rows = _counterfactual_plan_source_rows(report)
+        if plan_rows:
+            lines.append("")
+            lines.append("## 5e) Karşı-olgu — plan kaynağı kırılımı (D27/B)")
+            lines.append(_render_md_table(_TABLE10_HEADERS, plan_rows))
+            lines.append("")
+            lines.append(f"_{cfx.get('plan_source_note') or _PLAN_SOURCE_NOTE}_")
 
     ai = report.get("ai")
     if ai is not None:
@@ -1727,6 +1854,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "TRADINGBOT_LOG_DIR ya da ./logs)"
         ),
     )
+    parser.add_argument(
+        "--counterfactual-stamp", choices=["ts", "at"], default="ts",
+        help=(
+            "karşı-olgu pencere süzgecinin uygulanacağı an: 'ts' = ÇÖZÜM anı "
+            "(varsayılan, satırın yazıldığı an), 'at' = NİYET anı. 8 saatlik "
+            "ufukla gece 23:00'teki bir ret 'ts' ile ERTESİ GÜNE düşer — "
+            "gün/rejim kıyaslarında 'at' doğrudur (D27 incelemesi O10)"
+        ),
+    )
     parser.add_argument("--format", choices=["text", "md", "json"], default="text")
     parser.add_argument("--out", default=None, help="çıktı dosyası (varsayılan: stdout)")
     return parser.parse_args(argv)
@@ -1806,10 +1942,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     counterfactual_section: Optional[Dict[str, Any]] = None
     if args.counterfactual:
         cf_rows, cf_notes = load_counterfactual_rows(
-            since, until, log_dir=args.jsonl_dir
+            since, until,
+            log_dir=args.jsonl_dir,
+            stamp_field=args.counterfactual_stamp,
         )
         notes.extend(cf_notes)
-        counterfactual_section = build_counterfactual_report(cf_rows)
+        counterfactual_section = build_counterfactual_report(
+            cf_rows,
+            truncated=any("tavanı doldu" in note for note in cf_notes),
+        )
 
     report = build_report(
         trades, daily_changes, since, until, days, notes,

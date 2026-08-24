@@ -241,13 +241,23 @@ class TestTp1MissingIsCountedOnPlacementFailure:
     """
 
     @staticmethod
-    def _prepare(executor, *, tp_results):
-        """`_place_tp_safely`yi sahtele; çağrı etiketlerini ve miktarları kaydet."""
+    def _prepare(executor, *, tp_results, tp_fail=None):
+        """`_place_tp_safely`yi sahtele; çağrı etiketlerini ve miktarları kaydet.
+
+        D27 incelemesi (O7): gerçek imza artık `(algo_id, fail_reason)`
+        döndürür — sahte de aynı sözleşmeyi taşır.
+        """
         calls: list = []
+        fails = tp_fail or {}
 
         async def fake_place_tp(symbol, side, price, quantity, label):
             calls.append({"symbol": symbol, "label": label, "quantity": quantity})
-            return tp_results.get(label)
+            algo_id = tp_results.get(label)
+            if algo_id is not None:
+                return algo_id, None
+            if quantity <= 0:
+                return None, ScalpExecutor.TP_FAIL_ZERO_QTY
+            return None, fails.get(label, ScalpExecutor.TP_FAIL_REJECTED)
 
         executor._place_tp_safely = fake_place_tp
         return calls
@@ -421,26 +431,33 @@ class TestEngineSnapshotOrderHealth:
 
         assert payload["tp1_missing"] == 1
 
-    def test_metot_yoksa_bos_sozluk_doner(self):
-        """Eski/çıplak executor çiftleri: alan yok → `{}` (istisna DEĞİL)."""
+    def test_metot_yoksa_ERROR_alani_doner(self):
+        """D27 incelemesi (O8): alan yok → `{"error": ...}` (istisna DEĞİL).
+
+        Eskiden `{}` dönüyordu ve pano onu **0** okuyordu, yani "TP sorunu
+        yok" — oysa bu blok tam da sessiz kalmamak için yazıldı.
+        """
         engine = self._engine(SimpleNamespace())
 
-        assert engine._executor_order_health_snapshot() == {}
+        snapshot = engine._executor_order_health_snapshot()
+        assert snapshot.get("error")
+        assert snapshot["window"] == "process_start"
         assert engine.logger.error_messages == []
 
-    def test_metot_cagrilabilir_degilse_bos_sozluk_doner(self):
+    def test_metot_cagrilabilir_degilse_ERROR_alani_doner(self):
         engine = self._engine(SimpleNamespace(order_health_snapshot="metot değil"))
 
-        assert engine._executor_order_health_snapshot() == {}
+        assert engine._executor_order_health_snapshot().get("error")
 
-    def test_metot_istisna_firlatirsa_bos_doner_ve_motor_patlamaz(self):
+    def test_metot_istisna_firlatirsa_ERROR_doner_ve_motor_patlamaz(self):
         engine = self._engine(
             SimpleNamespace(
                 order_health_snapshot=MagicMock(side_effect=RuntimeError("kilit"))
             )
         )
 
-        assert engine._executor_order_health_snapshot() == {}
+        snapshot = engine._executor_order_health_snapshot()
+        assert "RuntimeError" in snapshot["error"]
         assert len(engine.logger.error_messages) == 1
         assert "order_health" in engine.logger.error_messages[0]
 
@@ -465,16 +482,33 @@ class TestStatusShapes:
 
         assert set(block) == {
             "tp1_missing",
+            # D27 incelemesi (O7): "emir kabul edildi, kimliği okunamadı"
+            # AYRI sayılır — `tp1_missing` durumu yanlış tarif ediyordu.
+            "tp1_unidentified",
             "tp2_missing",
+            "tp2_unidentified",
+            # D27 incelemesi (D8): iki halkanın ORTAK alan kümesi.
+            "tp_wrong_side",
+            "partial_fill_split",
             "last_symbol",
             "last_at",
             "window",
         }
-        assert block["tp1_missing"] == 0
-        assert block["tp2_missing"] == 0
+        assert all(block[key] == 0 for key in (
+            "tp1_missing", "tp1_unidentified", "tp2_missing",
+            "tp2_unidentified", "tp_wrong_side", "partial_fill_split",
+        ))
         assert block["last_symbol"] is None
         assert block["last_at"] is None
         assert block["window"] == "process_start"
+
+    def test_iki_halka_ORTAK_alan_kumesini_tasir(self):
+        """D27 incelemesi (D8): pano tek uyarı satırıyla ikisini de göstersin."""
+        import src.main as main_module
+
+        ortak = {"tp1_missing", "tp_wrong_side", "partial_fill_split", "window"}
+        assert ortak <= set(main_module._EMPTY_SCALPER_STATUS["order_health"])
+        assert ortak <= set(main_module._EMPTY_FOLLOWER_STATUS["order_health"])
 
     def test_bos_takipci_durumunda_order_health_blogu_vardir(self):
         import src.main as main_module
@@ -650,16 +684,36 @@ class TestDashboardWiring:
     def test_uyari_satiri_yalniz_sayi_sifirdan_buyukken_eklenir(self):
         """Sağlıklı bir botta pano temiz kalmalı (uyarı yorgunluğu)."""
         html = self._html()
-        condition = "if (tp1Missing > 0 || tp2Missing > 0){"
+        condition = "if (tp1Missing > 0 || tp2Missing > 0 || tp1Unid > 0"
         assert condition in html
 
         branch_start = html.index(condition)
-        banner_create = html.index('el("div", "order-health-banner")')
+        banner_create = html.index(
+            'el("div", "order-health-banner")', branch_start
+        )
         # Rozet, koşul dalının İÇİNDE kurulur (kaba ama yeterli sıra kontrolü).
         assert branch_start < banner_create
 
         # AP kartındaki uyarı da sayı > 0 koşuluna bağlıdır.
         assert "if (apTp1Missing > 0){" in html
+
+    def test_pano_yeni_emir_sagligi_alanlarini_okur(self):
+        """D27 incelemesi (O7/O8/D8): kimliksiz emir, arıza ve ters yön."""
+        html = self._html()
+
+        assert "oh.tp1_unidentified" in html
+        assert "oh.tp_wrong_side" in html
+        assert "oh.partial_fill_split" in html
+        assert "if (oh.error){" in html
+        assert "apOh.tp_wrong_side" in html
+
+    def test_pano_karsi_olgu_kayip_sayaclarini_gosterir(self):
+        """D27 incelemesi (D9): "neden `measured` 0?" cevabı bu üç sayaçtadır."""
+        html = self._html()
+
+        assert "cfx.expired" in html
+        assert "cfx.dropped_full" in html
+        assert "cfx.log_dropped" in html
 
     def test_pano_yeni_bir_uc_cagirmaz(self):
         """nginx beyaz listesi yalnız MEVCUT uçları taşır; yeni uç 404 alırdı.

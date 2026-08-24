@@ -228,10 +228,14 @@ class TestCloseLedgerGross:
         assert abs(ledger.gross_pnl - single_leg) > 1.0
 
     async def test_net_estimate_is_unchanged_by_the_new_fields(self):
-        """Net hesabı D27 ÖNCESİ formülle BİREBİR aynı: gross−fees−giriş."""
+        """Net hesabı D27 ÖNCESİ formülle BİREBİR aynı: gross−fees−giriş.
+
+        D27 incelemesi-2 (bulgu 10): beklenen değer LİTERALDİR. Formülü test
+        içinde yeniden uygulamak, kodda değişse bile testin yeşil kalmasına
+        yol açabilirdi. Aritmetik: (0.8 − 2.4) − (0.05 + 0.03) − 0.1 = −1.78.
+        """
         ledger = await self._build_ledger()
-        expected = (0.8 - 2.4) - (0.05 + 0.03) - (100.0 * 2.0 * 0.0005)
-        assert ledger.net_pnl_estimate == pytest.approx(expected)
+        assert ledger.net_pnl_estimate == pytest.approx(-1.78)
         # Ve net, yeni GÖRÜNÜR brütten türetilebilir olmalı (tutarlılık).
         assert ledger.net_pnl_estimate == pytest.approx(
             ledger.gross_pnl - 0.08 - 0.1

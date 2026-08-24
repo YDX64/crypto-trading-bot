@@ -1103,18 +1103,25 @@ class TestLedgerReportCounterfactual:
         assert "## 5d) Karşı-olgu defteri — reddedilen niyetler (D27/B)" in md
         assert "| RetGerekçesi | n |" in md
 
-    def test_profit_factor_none_satiri_tire_ile_basilir(self):
-        """PF hesaplanamayan satır 0.0 DEĞİL '—' basılmalı (biçim çökmemeli)."""
+    def test_profit_factor_none_satiri_0_basmaz(self):
+        """PF hesaplanamayan satır 0.0 DEĞİL — biçim çökmemeli.
+
+        D27 incelemesi (D4): `profit_factor is None` iki ZIT anlama
+        gelebiliyordu. Tek pozitif ROI'li bu satırda payda 0'dır ("kayıp
+        yok"), "hiç ölçüm yok" DEĞİL — rapor ikisini artık ayırt eder.
+        """
         section = lr.build_counterfactual_report([_cf_satir(roi=20.0)])
-        assert section["by_reason"][0]["profit_factor"] is None
+        satir_sozluk = section["by_reason"][0]
+        assert satir_sozluk["profit_factor"] is None
+        assert satir_sozluk["profit_factor_note"] == "no_loss"
         text = lr.render_text(self._rapor(section))
         satir = next(
             line for line in text.splitlines()
             if line.startswith(intent.REASON_TV_CONFLUENCE)
         )
+        assert "∞(kayıpsız)" in satir
+        # n<2 olduğu için %95 GA yoktur — o '—' basılır.
         assert "—" in satir
-        # n<2 olduğu için %95 GA da yoktur — o da '—'.
-        assert satir.count("—") >= 2
 
     def test_olculemeyen_satir_ortalamaya_girmez(self):
         section = lr.build_counterfactual_report([
@@ -1193,13 +1200,44 @@ class TestApiSurface:
 
         blok = _EMPTY_SCALPER_STATUS["counterfactual"]
         assert isinstance(blok, dict)
-        assert {
-            "enabled", "window", "pending", "registered", "resolved", "measured",
-        } <= set(blok)
+        # D27 incelemesi-2 (bulgu 4): beklenen anahtar kümesi LİTERALDİR.
+        # Eskiden `set(blok) == set(store.counters_snapshot())` yazıyordu ve
+        # bu bir TAUTOLOJİYDİ — `main.py` zaten aynı çağrıyı yapıyordu, yani
+        # `counters_snapshot()`tan bir anahtar SİLEN mutasyon 2483 testin
+        # hepsini geçiyordu. Literal küme 13+1 anahtarın hepsini korur.
+        beklenen = {
+            "enabled", "window", "horizons_h", "dedup_sec", "max_pending",
+            "pending", "registered", "dedup_hits", "dropped_full", "expired",
+            "resolved", "measured", "logged", "log_dropped",
+        }
+        assert set(blok) == beklenen
+        assert set(store.counters_snapshot()) == beklenen
         assert blok["window"] == "process_start"
-        # Motor VARKEN aynı blok `counters_snapshot()`tan gelir. Anahtar
-        # kümesi BİREBİR aynı olmalı (inceleme bulgusu): motorsuz gövdede
-        # eksik bir alt alan, panoda "ölçüm yok" ile "alan yok"u
-        # karıştırırdı — `test_key_sets_are_identical` yalnız ÜST düzeyi
-        # karşılaştırdığı için bunu yakalayamaz.
-        assert set(blok) == set(store.counters_snapshot())
+        # D27 incelemesi-2 (bulgu 6): blok IMPORT ANINDA donmamalı. Defter o
+        # sırada AÇIK ve dolu olsa bile motorsuz gövde SIFIR demelidir.
+        assert blok["enabled"] is False
+        for sayac in (
+            "pending", "registered", "dedup_hits", "dropped_full", "expired",
+            "resolved", "measured", "logged", "log_dropped",
+        ):
+            assert blok[sayac] == 0, sayac
+
+    def test_motorsuz_govde_defter_DOLUYKEN_de_sifir_der(self):
+        """D27 incelemesi-2 (bulgu 6): import anında donmuş sözlük YALAN söylerdi."""
+        import importlib
+
+        import src.main as main_module
+
+        kur(horizons_h=(1.0,), dedup_sec=0.0)
+        for i in range(7):
+            kaydet(at_epoch=BASE + i)
+        assert store.counters_snapshot()["registered"] == 7
+
+        yeniden = importlib.reload(main_module)
+        try:
+            blok = yeniden._EMPTY_SCALPER_STATUS["counterfactual"]
+            assert blok["enabled"] is False
+            assert blok["registered"] == 0
+            assert blok["pending"] == 0
+        finally:
+            importlib.reload(main_module)

@@ -237,6 +237,180 @@ class TestInferExitReason:
 # 2) PARİTE — kayıp-cooldown kapısı ESKİ etiket uzayını okur
 # --------------------------------------------------------------------------
 
+class TestCooldownParityEndToEnd:
+    """UÇTAN UCA parite — zinciri TEST DEĞİL, ÜRETİM KODU kurar.
+
+    ⚠️ NEDEN VAR (D27 düşmanca incelemesi-2, KRİTİK bulgu 1). Aşağıdaki
+    `TestCooldownParity` sınıfı `_maybe_start_loss_cooldown`a etiketi ELLE
+    veriyor, yani "üretimde kapıya HANGİ ucun gittiğini" hiç sınamıyordu.
+    Kanıt: `exits.py`de `cooldown_reason` ifadesini
+    `_infer_exit_reason_legacy` → `_infer_exit_reason` yapan (yani D27/A1
+    paritesini BOZAN) tek satırlık mutasyon **2483 testin tamamını geçti**.
+    Bu, "motor karar yolu bayt bayt aynı" iddiasını kanıtlanmamış bırakıyordu
+    ve ARTIDA kesilen 12 pozisyonda cooldown sessizce kaybolabilirdi.
+
+    Bu sınıf gerçek `_handle_closed` → `_finalize_close` yolunu koşar:
+    borsa istemcisi sahtedir, KARAR ZİNCİRİ gerçektir.
+    """
+
+    @staticmethod
+    def _cfg():
+        return SimpleNamespace(
+            scalper_tp1_roi=10.0,
+            scalper_tp2_roi=25.0,
+            scalper_breakeven_buffer_pct=0.05,
+            scalper_tp1_fraction=0.4,
+            scalper_tp2_fraction=0.3,
+            scalper_chandelier_atr_mult=3.0,
+            scalper_chandelier_atr_period=22,
+            scalper_forensics_enabled=False,
+        )
+
+    def _kur(self, *, income_pnl: str, exit_price: float):
+        """Gerçek `ExitManager` + sahte borsa. `(manager, sp, cooldowns, tracker)`.
+
+        `_verified_close_ledger` GERÇEK koddur ve `get_algo_order` /
+        `get_account_trades` OLMADIĞI için `None` döner (üretimdeki "reaper
+        MARKET emri algo değildir, ledger onu göremez" hâlinin aynısı) —
+        yani zincir `_infer_exit_reason` dalına ÜRETİMDEKİ gibi düşer.
+        """
+        from unittest.mock import AsyncMock
+
+        from src.strategies.scalper.types import Direction
+
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        client = SimpleNamespace(
+            cancel_all_open_orders=AsyncMock(),
+            get_current_price=AsyncMock(return_value=exit_price),
+            get_order=AsyncMock(return_value={"updateTime": now_ms - 5000}),
+            get_income_history=AsyncMock(return_value=[
+                {"symbol": "BTCUSDT", "incomeType": "REALIZED_PNL",
+                 "income": income_pnl, "time": now_ms, "tranId": 1},
+            ]),
+        )
+        cooldowns: list = []
+        tracker = SimpleNamespace(record_close=AsyncMock())
+        manager = ExitManager(
+            client=client,
+            pm=SimpleNamespace(),
+            tracker=tracker,
+            cfg=self._cfg(),
+            kline_fetch=AsyncMock(return_value=[]),
+            loss_cooldown_cb=cooldowns.append,
+        )
+        manager.INCOME_RETRY_DELAYS = (0.0,)
+        sp = SimpleNamespace(
+            trade_id=7,
+            signal=SimpleNamespace(direction=Direction.LONG),
+            position=SimpleNamespace(
+                entry_price=100.0,
+                quantity=2.0,
+                leverage=20,
+                current_price=exit_price,
+                opened_at=datetime.now(timezone.utc),
+                entry_order_id="123",
+                sl_order_id=None,
+                current_stoploss=99.0,
+            ),
+            plan=SimpleNamespace(
+                initial_stop=99.0,
+                tp1_price=102.0,
+                tp1_algo_id=None,
+                tp2_algo_id=None,
+                entry_fee_rate=0.0004,
+            ),
+            trailing_active=False,
+            tp1_done=False,
+            tp2_done=False,
+            mae_pct=-2.0,
+            mfe_pct=4.0,
+            # D27/A1 damgası: 8 saatlik yaş kesmesi bu pozisyonu kapattı.
+            reaper_close_at="2026-08-24T09:00:00+00:00",
+        )
+        return manager, sp, cooldowns, tracker
+
+    async def test_ARTIDA_kesilen_reaper_pozisyonunda_cooldown_YINE_baslar(self):
+        """SÖZLEŞMENİN TEK DAVRANIŞSAL KÖŞESİ — mutasyon testi buradan ısırır.
+
+        Somut vaka: 8 saati dolmuş, stop tarafına yakın kapanan ama fonlama
+        geliriyle NET ARTIDA olan bir pozisyon. Eski etiket uzayında bu
+        "SL"dir ve cooldown BAŞLATIR. Yeni "REAPER" etiketi kapıya sızarsa
+        `exit_reason != "SL" and realized_pnl >= threshold` erken döner ve
+        cooldown SESSİZCE KAYBOLUR.
+
+        Bu test `exits.py:cooldown_reason` ifadesini `_infer_exit_reason_legacy`
+        yerine `_infer_exit_reason` yapan mutasyonda KIRMIZI olur.
+        """
+        manager, sp, cooldowns, tracker = self._kur(
+            income_pnl="5.0", exit_price=99.4
+        )
+
+        await manager._handle_closed("BTCUSDT", sp)
+
+        # 1) Kayıp-cooldown kapısına ESKİ etiket gitti → cooldown BAŞLADI.
+        assert cooldowns == ["BTCUSDT"], (
+            "PARİTE İHLALİ: kayıp-cooldown kapısına YENİ etiket ('REAPER') "
+            "sızdı; D27 öncesinde bu kapanış cooldown BAŞLATIYORDU."
+        )
+        # 2) Deftere/adli kayda YENİ etiket yazıldı.
+        kapanis = tracker.record_close.await_args.kwargs
+        assert kapanis["exit_reason"] == EXIT_REASON_REAPER
+        assert kapanis["realized_pnl"] == pytest.approx(5.0)
+        assert kapanis["pnl_source"] == "binance_income_net"
+
+    async def test_KAYIPTA_iki_uc_de_ayni_sonucu_verir(self):
+        """Kayıpta kapı etiketten BAĞIMSIZDIR — parite kendiliğinden korunur."""
+        manager, sp, cooldowns, tracker = self._kur(
+            income_pnl="-7.0", exit_price=99.4
+        )
+
+        await manager._handle_closed("BTCUSDT", sp)
+
+        assert cooldowns == ["BTCUSDT"]
+        assert tracker.record_close.await_args.kwargs["exit_reason"] == (
+            EXIT_REASON_REAPER
+        )
+
+    async def test_ledger_dogrulanan_kapanista_damga_OKUNMAZ_bilincli_sinir(self):
+        """D27 incelemesi-2 (bulgu 2): BİLİNÇLİ SINIR, testle sabitlenir.
+
+        `ledger is not None` dalında hem defter hem cooldown etiketi
+        `ledger.exit_reason`dır; reaper damgası OKUNMAZ. Bu bir kusur DEĞİL,
+        kasıtlı önceliktir: **borsa kanıtı çıkarımı yener.** Reaper'ın düz
+        reduce-only MARKET emri algo DEĞİLDİR ve `_verified_close_ledger`
+        yalnız algo adaylarına (SL/TP1/TP2/TP3) bakar — yani ledger doluysa
+        pozisyonu FİİLEN kapatan bir SL/TP fill'idir, reaper değil.
+
+        Sonuç: REAPER ayrımı bu köşede EKSİK SAYAR (asla FAZLA saymaz).
+        """
+        from src.strategies.scalper.exits import _CloseLedger
+
+        manager, sp, cooldowns, tracker = self._kur(
+            income_pnl="5.0", exit_price=99.4
+        )
+        ledger = _CloseLedger(
+            exit_price=102.0,
+            exit_reason="TP_LADDER",
+            net_pnl_estimate=4.0,
+            close_fills=1,
+            flatten_kind="TP1",
+            gross_pnl=4.5,
+            legs=1,
+        )
+
+        async def sahte_ledger(**kwargs):
+            return ledger
+
+        manager._verified_close_ledger = sahte_ledger
+
+        await manager._handle_closed("BTCUSDT", sp)
+
+        # Damga VARDI ama ledger kazandı: etiket TP_LADDER.
+        assert tracker.record_close.await_args.kwargs["exit_reason"] == "TP_LADDER"
+        # Kapı da AYNI ucu okur → artıda cooldown BAŞLAMAZ (D27 öncesiyle aynı).
+        assert cooldowns == []
+
+
 class TestCooldownParity:
     """D27/A1 sözleşmesi: etiket ayrışır, KARAR YOLU bayt bayt aynı kalır.
 
