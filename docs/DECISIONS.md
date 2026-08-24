@@ -2313,7 +2313,7 @@ Değişen: (i) kapanışın deftere yazılan ETİKETİ ve FİYAT KAYNAĞI, (ii) 
 seviyeleri, (iii) durum alanları ve pano önbelleği, (iv) varsayılan KAPALI bir
 ağırlık telemetrisi/geri çekilmesi.
 
-### D23 — Tek container dağıtım yolu (taşınabilirlik) · 2026-08-24 · **AKTİF (EK YOL — canlı supervisord DEĞİŞMEDİ)**
+### D25 — Tek container dağıtım yolu (taşınabilirlik) · 2026-08-24 · **AKTİF (EK YOL — canlı supervisord DEĞİŞMEDİ)**
 
 **Ne.** Bot tek bir `python:3.12-slim` görüntüsüne paketlendi: `Dockerfile`,
 `docker-compose.yml`, `.dockerignore`, `scripts/docker_run.sh`,
