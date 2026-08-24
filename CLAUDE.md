@@ -83,7 +83,7 @@ Yeni sinyal kaynağı (haber botu vb.) eklemek: `docs/INTEGRATIONS.md`. Otomatik
 
 ## Nasıl çalıştırılır / test edilir / deploy edilir
 ```bash
-python3 -m pytest tests -q                      # 2123 test, ~60 sn — her değişiklikten önce
+python3 -m pytest tests -q                      # 2242 test, ~65 sn — her değişiklikten önce
 =======
 - **GerçekleşMEyen niyetler (D24):** kapı reddi / TV sağlaması dolmadı / emir hatası
   artık `logs/trades.jsonl`'e `event="intent"` olarak yazılır (niyet→karar→borsa

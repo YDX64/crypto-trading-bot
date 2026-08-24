@@ -159,6 +159,15 @@ def events(monkeypatch):
     return captured
 
 
+def _ai_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Yalnız AI kararı satırları.
+
+    D24 (ölçüm paketi) aynı `logs/trades.jsonl` akışına `intent` satırları da
+    yazar; bu testler AI kararını inceler, SIRAYA değil OLAY TİPİNE bakmalıdır.
+    """
+    return [e for e in events if e.get("event") == ag.EVENT_NAME]
+
+
 def _gate(cfg: Optional[_Cfg] = None, **kwargs: Any) -> ag.AiGate:
     return ag.AiGate(cfg or _Cfg(), logger=SimpleNamespace(
         info=lambda *a, **k: None,
@@ -1080,8 +1089,9 @@ class TestEngineZeroDrift:
 
         # Gölge turu bir KARAR ürettiyse yalnız kayıt olarak vardır.
         await asyncio.gather(*list(shadow_engine._ai_gate._tasks))
-        assert events and events[0]["ai"]["applied"] is False
-        assert events[0]["ai"]["verdict"] == "deny"
+        _ai = _ai_events(events)
+        assert _ai and _ai[0]["ai"]["applied"] is False
+        assert _ai[0]["ai"]["verdict"] == "deny"
         # ...ve red kararına rağmen giriş YAPILMIŞTIR (yalnız engelleyen
         # katman GÖLGEDE hiçbir şeyi engellemez).
         shadow_engine.executor.try_open.assert_awaited_once()
@@ -1103,11 +1113,11 @@ class TestEngineZeroDrift:
         assert not tasks[0].done(), "motor AI kararını BEKLEMEMELİ"
         # Kanca `_entry_lock` DIŞINDADIR: karar uçuştayken kilit SERBEST.
         assert engine._entry_lock.locked() is False
-        assert events == []                      # henüz kayıt yok
+        assert _ai_events(events) == []          # henüz AI kaydı yok
 
         blocker.set()
         await asyncio.gather(*tasks)
-        assert events[0]["ai"]["status"] == ag.STATUS_OK
+        assert _ai_events(events)[0]["ai"]["status"] == ag.STATUS_OK
 
     async def test_gate_failure_never_breaks_the_entry_path(self):
         engine = _engine(_CfgProxy(scalper_ai_gate_mode="shadow"),
@@ -1155,7 +1165,8 @@ class TestEngineZeroDrift:
         await _run_symbol(engine)
 
         assert provider.calls == []
-        assert events and events[0]["outcome"] == "no_trade"
+        _ai = _ai_events(events)
+        assert _ai and _ai[0]["outcome"] == "no_trade"
 
 
 # ==========================================================================
