@@ -962,6 +962,21 @@ class ScalperEngine:
     async def _attempt_recovery(self) -> bool:
         """Reconcile persistent maker intents, then verify every OPEN scalp."""
 
+        if bool(getattr(self.cfg, "scalper_shadow_mode", False)):
+            # D28: gerçek shadow süreç hesap kilidini bilinçli olarak atlar.
+            # Bu nedenle yalnız YENİ girişteki `executor.try_open` kapısı
+            # yetmez: eski DB'deki OPEN/maker satırını recover etmek,
+            # `exits.recover` veya pending reconciliation üzerinden borsaya
+            # koruma/iptal emri gönderebilirdi. Shadow gözlem halkası hiçbir
+            # gerçek pozisyonu sahiplenmez; recovery-ready yalnız scan
+            # ölçümünün fail-closed readiness kapısından geçebilmesi içindir.
+            self._recovery_ready = True
+            self.logger.warning(
+                "👻 GÖLGE MODU: maker/pozisyon recovery ATLANDI — "
+                "borsadaki gerçek pozisyonlar sahiplenilmez"
+            )
+            return True
+
         try:
             recovered_pending = await self.executor.recover_pending()
             self._track_opened_positions(

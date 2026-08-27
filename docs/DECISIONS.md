@@ -3003,7 +3003,10 @@ göndermez. D28 son incelemesinde bu söz uygulama-geneline genişletildi: shado
 ile ayrı/gömülü follower birlikteyse config fail-fast; Telegram sinyal kuyruğu
 başlamaz ve manuel `/signal` 503 döner. Aksi halde scalper gölge olsa bile
 Telegram orchestrator'ı veya follower gerçek emir açıp kilidi sessizce
-atlayabilirdi. Ayarlar: `TRADING_ACCOUNT_LOCK_ENABLED=true`,
+atlayabilirdi. Ayrıca shadow başlangıcında maker/pozisyon recovery tamamen
+atlanır: eski DB'deki `OPEN` satırı `exits.recover` üzerinden koruma/iptal
+emri üretemez ve borsadaki gerçek pozisyon sahiplenilmez. Ayarlar:
+`TRADING_ACCOUNT_LOCK_ENABLED=true`,
 `TRADING_ACCOUNT_LOCK_DIR=/tmp/tradingbot-account-locks`.
 
 **Kayıp asimetrisi ve AlgoPro kararı.** İncelenen 32 kapanışta 23W/9L olmasına

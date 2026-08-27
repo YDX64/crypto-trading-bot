@@ -26,6 +26,7 @@ import time
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Dict, List
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -661,6 +662,27 @@ class TestShadowModeStartupBanner:
         engine._maybe_log_shadow_mode_banner()
 
         assert warnings == []
+
+
+class TestShadowModeRecovery:
+    @pytest.mark.asyncio
+    async def test_shadow_eski_open_ve_maker_kayitlarini_recover_etmez(self):
+        """Hesap kilidini atlayan shadow hiçbir gerçek pozisyonu sahiplenemez."""
+        engine = object.__new__(ScalperEngine)
+        engine.cfg = SimpleNamespace(scalper_shadow_mode=True)
+        engine.logger = SimpleNamespace(warning=lambda *a, **kw: None)
+        engine._recovery_ready = False
+        engine.executor = SimpleNamespace(
+            recover_pending=AsyncMock(side_effect=AssertionError("çağrılmamalı"))
+        )
+        engine.exits = SimpleNamespace(
+            recover=AsyncMock(side_effect=AssertionError("çağrılmamalı"))
+        )
+
+        assert await engine._attempt_recovery() is True
+        assert engine._recovery_ready is True
+        engine.executor.recover_pending.assert_not_awaited()
+        engine.exits.recover.assert_not_awaited()
 
 
 # --------------------------------------------------------------------------
