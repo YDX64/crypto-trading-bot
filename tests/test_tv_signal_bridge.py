@@ -220,3 +220,87 @@ class TestTvWebhookSourceLogging:
         assert result["source"] == "luxosc"
         assert "source_raw_rejected" not in result
         assert warnings == []
+
+
+class TestTvEntrySourceBlocklist:
+    """D28: kötü performanslı basit TV kaynağı scalper oyundan kesilir;
+    ret yine niyet/karşı-olgu defterine yazılır."""
+
+    async def test_algopro_karantinasi_emir_oyu_ve_forward_acmaz(
+        self, monkeypatch, _tv_webhook_ready
+    ):
+        recorded = []
+        counterfactual = []
+        forwarded = []
+        monkeypatch.setattr(
+            main_module.settings, "tv_entry_source_blocklist", " AlgoPro "
+        )
+        monkeypatch.setattr(
+            main_module.scalp_intent,
+            "record",
+            lambda **kwargs: recorded.append(kwargs),
+        )
+        monkeypatch.setattr(
+            main_module.counterfactual_store,
+            "register",
+            lambda **kwargs: counterfactual.append(kwargs),
+        )
+        monkeypatch.setattr(
+            main_module,
+            "_maybe_forward_to_follower",
+            lambda *args, **kwargs: forwarded.append((args, kwargs)),
+        )
+        body = json.dumps(
+            {"secret": SECRET, "symbol": "BTCUSDT", "side": "buy"}
+        )
+
+        result = await main_module.tradingview_webhook(
+            _FakeRequest(body.encode(), {"src": "algopro"})
+        )
+
+        assert result == {
+            "symbol": "BTCUSDT",
+            "direction": "LONG",
+            "accepted": False,
+            "blocked_by": "tv_source_blocked",
+            "source": "algopro",
+        }
+        _tv_webhook_ready.external_signal.assert_not_awaited()
+        assert forwarded == []
+        assert recorded[0]["reason"] == "tv_source_blocked"
+        assert counterfactual[0]["reason"] == "tv_source_blocked"
+
+    async def test_lux_kaynagi_karantinadan_etkilenmez(
+        self, monkeypatch, _tv_webhook_ready
+    ):
+        monkeypatch.setattr(
+            main_module.settings, "tv_entry_source_blocklist", "algopro"
+        )
+        body = json.dumps(
+            {"secret": SECRET, "symbol": "ETHUSDT", "side": "sell"}
+        )
+        result = await main_module.tradingview_webhook(
+            _FakeRequest(body.encode(), {"src": "luxosc"})
+        )
+        assert result["accepted"] is True
+        assert result["source"] == "luxosc"
+        _tv_webhook_ready.external_signal.assert_awaited_once()
+
+    async def test_dry_run_karantina_kararini_yan_etkisiz_gosterir(
+        self, monkeypatch, _tv_webhook_ready
+    ):
+        monkeypatch.setattr(
+            main_module.settings, "tv_entry_source_blocklist", "algopro"
+        )
+        body = json.dumps(
+            {"secret": SECRET, "symbol": "SOLUSDT", "side": "buy"}
+        )
+        result = await main_module.tradingview_webhook(
+            _FakeRequest(
+                body.encode(), {"src": "algopro", "dry_run": "true"}
+            )
+        )
+        assert result["dry_run"] is True
+        assert result["would"]["accepted"] is False
+        assert result["would"]["blocked_by"] == "tv_source_blocked"
+        _tv_webhook_ready.external_signal.assert_not_awaited()

@@ -61,6 +61,44 @@
 > edilmesiyle yazıldı; ilgili depoda lisans YOKTUR, hiçbir metin kopyalanmadı
 > — buradaki formülasyon bize aittir.
 
+### Saklı pencere açılışı 1 — D28 TP1 %8 adayı (2026-08-27, SONUÇTAN ÖNCE İLAN)
+
+**Durum: KOŞULDU — ADAY VETO EDİLDİ.** Bu paragraf sonuç verisi indirilmeden
+ve komut çalıştırılmadan yazıldı. TP1 ailesinin tek kullanımlık saklı penceresi
+`2026-03-01 → 2026-04-01` UTC (`[start,end)`) olarak sabitlendi; aday alanın
+(`2026-02-15 → 2026-06-25`) içindedir ve daha önce hiçbir backtest/cache koşusunda
+kullanılmamıştır.
+
+Karşılaştırma yalnız `SCALPER_TP1_ROI=10` tabanı ile `=8` adayıdır. İkisinde de:
+1m/5m/15m, C-only, fixed stop ROI %50, market day gate %1.3, run gate kapalı,
+diverjans açık, 8 majör sembol, marj %1 ve kapasite 5 aynı kalır. **Veto kuralı:**
+aday PF < 1.10 ise, aday toplam PnL'i tabandan >%20 düşükse veya aday maxDD'si
+tabandan yüksekse RED. Saklı pencere yalnız veto eder; iyi sonuç testnet soak
+şartını kaldırmaz. Sonuç ve tam komut bu başlığın altına koşudan sonra, sonucu
+ne olursa olsun eklenecek. Bu açılışla sayaç `0 → 1` olur; TP1 ailesi için bu
+pencere yeniden kullanılamaz.
+
+**Sonuç (aynı gün, ilan satırı commit edilmeden ama dosyaya yazıldıktan SONRA
+koşuldu):** taban TP10 = 291 işlem / WR %85.6 / PnL **−349.87** / PF **0.84** /
+maxDD **529.43**; aday TP8 = 317 işlem / WR %89.3 / PnL **−263.11** / PF
+**0.85** / maxDD **530.13**. TP8 kaybı azalttı ama PF 1.10 eşiğini geçmedi ve
+maxDD tabandan 0.70 daha yüksek kaldı → iki ayrı veto koşuluyla **RED**. Açık
+üç penceredeki üstünlük OOS genellenmedi; TP8 testnet ayarına UYGULANMAYACAK.
+
+Komut (iki koşuda yalnız `SCALPER_TP1_ROI=10|8` değişti):
+```bash
+env <sunucu-SCALPER-paritesi> SCALPER_TF_ENTRY=1m SCALPER_TF_CONTEXT=5m \
+  SCALPER_TF_REGIME=15m SCALPER_STOP_MODE=fixed_roi \
+  SCALPER_FIXED_STOP_ROI_PCT=50 SCALPER_TP1_ROI=<10|8> \
+  SCALPER_MAX_MARGIN_PCT=1 SCALPER_MAX_POSITIONS=5 \
+  python3 -m src.strategies.scalper.backtest --strategies C \
+  --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,BNBUSDT,ADAUSDT,LTCUSDT \
+  --start 2026-03-01 --end 2026-04-01 --cache-dir data/klines_cache
+```
+Loglar: `.test-logs/d28/hidden_BASE.log`, `.test-logs/d28/hidden_TP8.log`;
+JSON: `logs/backtest_20260827_182535.json`,
+`logs/backtest_20260827_182641.json`. Bu pencere TP1 ailesi için **YANIKTIR**.
+
 Kural: bir satırın kanıt sayılması için **komut + pencere + env kaynağı + log yolu** gerekir.
 Harness ≥ 7640c0a (kapı-pariteli). Pencereler: AYI 2026-01-23→02-13 · YATAY 07-01→07-21 · BOĞA 08-07→08-21.
 Komut kalıbı:

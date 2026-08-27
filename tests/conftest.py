@@ -96,7 +96,11 @@ def _reset_rest_weight_state():
 #: testleri kendi sahte sağlayıcılarıyla açıkça açar
 #: (tests/test_ai_gate.py).
 _ISOLATED_ENV_PREFIXES = ("FOLLOWER_", "SCALPER_AI_GATE_")
-_ISOLATED_ENV_NAMES = ("BOT_MODE",)
+_ISOLATED_ENV_NAMES = (
+    "BOT_MODE",
+    "TRADING_ACCOUNT_LOCK_ENABLED",
+    "TV_ENTRY_SOURCE_BLOCKLIST",
+)
 
 
 def _isolated_settings_fields():
@@ -114,12 +118,18 @@ def _isolated_settings_fields():
             name.startswith("follower_")
             or name.startswith("scalper_ai_gate_")
             or name == "bot_mode"
+            or name == "tv_entry_source_blocklist"
+            or name == "trading_account_lock_enabled"
         ):
             continue
         default = field.default
         if default is PydanticUndefined:
             continue
         pinned[name] = default
+    # Deploy testleri çalışan canlı süreçle AYNI `.env` API anahtarını okur.
+    # Yaşam döngüsü testleri gerçek hesap kilidini almaya çalışmamalı; kilidin
+    # kendisi `test_account_lock.py` içinde doğrudan ve izole dizinde sınanır.
+    pinned["trading_account_lock_enabled"] = False
     return pinned
 
 

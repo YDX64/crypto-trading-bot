@@ -277,6 +277,42 @@ class TestRegister:
 # --------------------------------------------------------------------------
 
 class TestResolveSymbol:
+    def test_1m_kayan_pencereler_8saatlik_ufku_rest_eklemeden_biriktirir(self):
+        """D28: 150 x 1m tek başına 8h ufku kapsamaz; ardışık motor
+        turları aynı bekleyen niyet için birleşince ölçüm tam olmalıdır."""
+        kur(horizons_h=(8.0,))
+        kaydet(price=100.0, stop_price=90.0, tp1_price=110.0)
+
+        candles = [
+            mum(
+                BASE + minute * 60.0,
+                high=100.5,
+                low=99.5,
+                close=100.0,
+                dakika=1.0,
+            )
+            for minute in range(480)
+        ]
+        for end in (150, 300, 450):
+            out = store.resolve_symbol(
+                "BTCUSDT",
+                candles[max(0, end - 150):end],
+                BASE + end * 60.0,
+            )
+            assert out == []
+
+        out = store.resolve_symbol(
+            "BTCUSDT", candles[-150:], BASE + 8 * HOUR + 1.0
+        )
+        assert len(out) == 1
+        assert out[0]["measured"] is True
+        assert out[0]["sim"]["outcome"] == "open"
+        assert out[0]["sim"]["bars"] == 480
+        snap = store.counters_snapshot()
+        assert snap["measured"] == 1
+        assert snap["candle_buffer_symbols"] == 0
+        assert snap["candle_buffer_bars"] == 0
+
     def test_olgunlasmamis_kayit_kuyrukta_kalir(self):
         kur(horizons_h=(1.0,))
         kaydet()
@@ -1209,6 +1245,7 @@ class TestApiSurface:
             "enabled", "window", "horizons_h", "dedup_sec", "max_pending",
             "pending", "registered", "dedup_hits", "dropped_full", "expired",
             "resolved", "measured", "logged", "log_dropped",
+            "candle_buffer_symbols", "candle_buffer_bars",
         }
         assert set(blok) == beklenen
         assert set(store.counters_snapshot()) == beklenen

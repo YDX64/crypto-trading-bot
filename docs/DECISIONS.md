@@ -155,14 +155,16 @@ P2'yi "AYI ve YATAY birlikte iyileşti" koluyla geçti, AYI PF hâlâ <1.1. Kena
 (≥5 gün) bitmeden uygulanmaz — değişiklikler üst üste bindirilmez (soak kirlenir). Yeniden değerlendirme:
 D6 soak raporuyla birlikte; o zaman da boğa kazancını korumalı. Log: logs/autoresearch/2026-08-21/.
 
-### D12 — TP1 %10→%8 (autoresearch E4f) · 2026-08-21 · ADAY (en güçlü), UYGULANMADI
+### D12 — TP1 %10→%8 (autoresearch E4f) · 2026-08-21 · REDDEDİLDİ (D28 OOS VETOSU)
 Tur-2: AYI 1.06→1.13 (+1573), YATAY 1.33→1.40 (+2744), BOĞA 2.18→2.90 (+4203); maxDD üç pencerede
 ↓ (3574→2604, 3181→2154, 735→514); WR ↑; işlem 229/162/104. Mekanizma: BE'ye daha erken geçiş → daha az SL.
 Alternatif E4g TP1 %12 (+1713) boğa PF'yi düşürüp ayı DD'yi artırıyor → E4f tercih.
 Kapasite-kapılı harness ile yeniden doğrulama (2026-08-22 01:5x; yeni taban AYI 1.04/DD 3683, YATAY 1.29/3229,
 BOĞA 2.43/735): E4f AYI 1.12/+1415/DD 2604 · YATAY 1.38/+2604/2154 · BOĞA 3.71/+4598/514 (PF↑ DD↓ her yerde);
 E4g +2204 toplam ama AYI DD 4107 (tabanın üstü), PF 1.07 → risk-ayarlı tercih E4f değişmedi. Uygulama zamanı:
-D6 soak'u (≥5 gün) bittikten sonra; kullanıcı isterse daha erken (atıf bulanıklaşır). Log: logs/autoresearch/2026-08-21/.
+D6 soak'u (≥5 gün) bittikten sonra değerlendirilmek üzere adaydı. D28'de sonuçtan önce
+kilitlenen 2026-03-01→04-01 saklı pencerede PF 0.85 ve tabandan daha yüksek DD verdi;
+artık uygulanmayacak. Log: logs/autoresearch/2026-08-21/ ve `docs/EXPERIMENTS.md` D28.
 
 ### D13 — Kaldıraç tavanı bulgusu (E4i/E4j) · 2026-08-21 · ARAŞTIRMA
 DYN_LEV_MAX 20→10: AYI PF 1.68 / +5624 (taban +886), BOĞA 55 işlem (örneklem yetersiz); 15: ayı +3293, boğa −%39.
@@ -2979,12 +2981,83 @@ düzeltmeleri (A1–A3) kod yolundadır ve bayrakla kapanmaz — geri almak içi
 commit revert. `--counterfactual` verilmezse rapor gövdesi eskisiyle birebir
 aynıdır.
 
+### D28 — Tek hesap yöneticisi, AlgoPro karantinası ve OOS TP vetosu · 2026-08-27 · KOD HAZIR, TESTNET DEPLOY BEKLİYOR
+
+**Canlı kök neden.** `157.180.97.188:9443` Nginx upstream'i kanonik
+`tradingbot_v2:9091` yerine `/opt/tradingbot-shadow:9092` sürecine gidiyordu.
+Üstelik iki süreçte de `SCALPER_SHADOW_MODE=false`, orchestrator açık ve aynı
+Binance testnet hesabı kullanılıyordu; ayrı SQLite defterleri ve süreç-içi
+sembol rezervasyonları birbirini göremiyordu. Somut yarış: 2026-08-25'te shadow
+SOL SHORT açtı, 16 saniye sonra kanonik süreç aynı hesapta SOL LONG açtı.
+Hesap-seviyesi income sorgusu da iki defterdeki PnL'i birbirine yazdı. Operasyonel
+düzeltme olarak `tradingbot_shadow` durduruldu ve autostart/autorestart kapatıldı;
+9443 dashboard + `/tv-signal` upstream'leri 9091'e çevrildi. Yeni girişler,
+mevcut BTC/BNB pozisyon yönetimi kesilmeden `risk_event_halt.json` ile durduruldu.
+
+**Kalıcı çift-yönetici sigortası.** Non-shadow süreç, lifespan başında Binance
+API key'inin SHA-256 kimliğine göre Linux/macOS `flock` hesabı kilidi alır;
+aynı hesabın ikinci yöneticisi DB/recovery/emir yoluna girmeden fail-closed
+başlatılmaz. Anahtarın kendisi loga veya kilit dosyasına yazılmaz. Gerçek
+`SCALPER_SHADOW_MODE=true` ölçüm süreci kilidi bilinçli olarak atlar çünkü emir
+göndermez. Ayarlar: `TRADING_ACCOUNT_LOCK_ENABLED=true`,
+`TRADING_ACCOUNT_LOCK_DIR=/tmp/tradingbot-account-locks`.
+
+**Kayıp asimetrisi ve AlgoPro kararı.** İncelenen 32 kapanışta 23W/9L olmasına
+rağmen net yalnız **+0.665**, ortalama kazanç **+6.698**, ortalama kayıp
+**−17.044**, payoff **0.393** ve başabaş WR **%71.79** idi. 25–26 Ağustos
+altkümesi 18W/9L ama **−41.871**, PF **0.727**; `REAPER` 7 işlemde **−97.076**,
+iki gerçek SL **−56.319** üretti. Aynı dönemde basit AlgoPro dahil confluence
+çiftleri 13 işlem / 6W / **−110.370** / PF **0.177**; AlgoPro'suz LuxOSC+LuxSO
+9 işlem / 8W / **+38.533** / PF **3.014**. Bu yüzden kod korunarak yalnız basit
+AlgoPro giriş oyu `TV_ENTRY_SOURCE_BLOCKLIST=algopro` ile karantinaya alınacak;
+oy, `external_signal` ve follower-forward yan etkilerinin tamamı kesilir ve
+`tv_source_blocked` niyeti yazılır. Katı embedded follower parser'ı bloktan önce
+kalır ama ölçülmüş edge olmadığı için testnet soak env'inde
+`FOLLOWER_EMBEDDED=false` tutulur.
+
+**D27 ölçüm hatası.** D27'de 1883 niyet kaydolup 1394 çözülmesine rağmen
+`measured=0` olmasının nedeni motorun yalnız son 150 adet 1m mumunu (~2.5 saat)
+tutarken sonucu 8 saat sonra çözmeye çalışmasıydı. Store artık pending niyet
+varken sembol başına dedup edilmiş rolling mum geçmişini `max horizon + padding`
+kadar biriktirir; yeni REST isteği eklemez, bucket çözülünce belleği temizler.
+
+**Backtest ve TP kararı.** Üç açık 1m/5m/15m rejim penceresinde TP10 tabanı
+AYI/YATAY/BOĞA sırasıyla PF **1.20/1.28/2.18**, PnL
+**197.66/208.16/327.71**; TP8 adayı PF **1.38/1.38/3.07**, PnL
+**265.76/223.24/359.91** görünüyordu. Fakat sonuçtan önce kilitlenen tek
+kullanımlık 2026-03-01→04-01 OOS penceresinde TP10 **−349.87 / PF 0.84 /
+DD 529.43**, TP8 **−263.11 / PF 0.85 / DD 530.13** verdi. PF<1.10 ve DD artışı
+iki ayrı veto olduğundan **TP8 REDDEDİLDİ; TP10/stop50 değiştirilmeyecek.**
+5m girişe taşıma da üç rejimde C için PF 0.36/0.65/0.89; A yalnız bazı
+rejimlerde, B örneklemsiz, E negatif kaldığı için reddedildi. Tam komutlar ve
+log yolları `docs/EXPERIMENTS.md` D28 bölümünde.
+
+**Risk sınırı ve terfi kararı.** OOS PF 1'in altında olduğu için mainnet
+**NO-GO**. Testnet deployundan sonra yalnız yeni işlemler için sanal sermaye
+1000 USDT, `SCALPER_MAX_MARGIN_PCT=0.5`, günlük kayıp limiti %1, kapasite 5;
+1m/5m/15m ve TP10/stop50 aynı kalacak. Bu ölçek TP/stop ekonomisini değiştirmez,
+yalnız kötü OOS davranışı ölçerken mutlak maruziyeti azaltır. Mainnet terfisi
+en az 5 günlük testnet soak (en az bir düşüş günü), AlgoPro'suz pozitif net,
+PF≥1.10, kabul edilebilir DD, sıfır çift-manager/kilit ve yeterli ölçülmüş D27
+örneği olmadan yapılamaz.
+
+**Kanıt/geri alma.** Hesap kilidi testleri aynı hesap reddi, farklı hesap
+eşzamanlılığı, release/reacquire ve secret sızıntısızlığını; webhook testleri
+blocked source'un oy/forward/emir üretmediğini; counterfactual testi ardışık
+150×1m pencerelerden 480 bar birikip 8h ölçüm çıktığını doğrular. Operasyonel
+geri alma: 9443 upstream'i 9092'ye almak ve shadow'u açmak teknik olarak mümkün
+ama çift-yönetici kök nedenini geri getirir ve **yasaktır**. Kod geri alma tek
+commit revert; AlgoPro karantinası yalnız env'den blocklist kaldırılarak geri
+alınabilir, fakat yeni pozitif soak kanıtı olmadan yapılmaz.
+
 ## Reddedilen kararlar (kanıtla)
 
 | Fikir | Tarih | Sonuç | Neden reddedildi |
 |---|---|---|---|
 | Kaldıraç tavanı 50x | 08-19 | +9.4k → −18k | fixed_roi'de kaldıraç ↑ = stop mesafesi ↓ → gürültü stop'u |
 | TP1 %10→%15 | 08-21 | −3974, WR −10pp | SL'lerin 38/39'u %10'u görmeden ölüyor; BE@%10 dokunulmaz |
+| TP1 %10→%8 (D28 OOS) | 08-27 | Açık pencerelerde iyi; saklı pencerede −263.11 / PF 0.85 / DD 530.13 | PF veto + tabandan daha yüksek DD; pencere yandı, deploy yok |
+| C giriş TF 1m→5m (D28) | 08-27 | AYI/YATAY/BOĞA PF 0.36/0.65/0.89 | üç rejimin tamamında zarar; 1m scalping korunur |
 | Stop ROI 50→30 | 08-21 | AYI −6108 (baz −2042), SL 120→224 | dar stop trail'e ulaşacak işlemleri kesiyor |
 | Rejim TF 15m→4h | 08-21 | BOĞA +2798→−63, YATAY −9090 | yavaş rejim boğayı yok ediyor |
 | RANGE'de C kapalı | 08-21 | YATAY −7170 | yatay pencere RANGE'den ibaret değil |

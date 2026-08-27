@@ -90,6 +90,13 @@ SWEEP_MIN_INTERVAL_SEC = 60.0
 #: pay ile karşılar. Bundan uzak bir "ilk mum" referans giriş sayılamaz.
 PLAN_REF_MAX_LAG_SEC = 900.0
 
+# Motor her turda yalnız son 150 giriş mumu getirir. 1m profilinde bu 2,5
+# saattir; D27'nin 8 saatlik ufku tek bir turdaki pencereye sığmaz. Aynı
+# mumları süreç içinde biriktirmek YENİ REST çağrısı açmadan tam pencereyi
+# korur. Bir saatlik pay; niyetin yarım muma denk gelmesini, tarama jitter'ını
+# ve en uzun mumun kapanışını kapsar.
+CANDLE_HISTORY_PADDING_SEC = 3600.0
+
 
 # --------------------------------------------------------------------------
 # Modül durumu
@@ -111,6 +118,9 @@ _policy_leverage: int = 0
 #: sembol → bekleyen kayıtlar (kayıt sırasına göre).
 _pending: Dict[str, List[Dict[str, Any]]] = {}
 _pending_count: int = 0
+#: sembol → open_epoch → motorun zaten çektiği mum. Yalnız o sembolde
+#: bekleyen karşı-olgu varken tutulur; son kayıt çözülünce hemen bırakılır.
+_candle_history: Dict[str, Dict[float, Any]] = {}
 #: Son GLOBAL yaş süpürmesinin anı (çağıranın saatiyle, saniye).
 _last_sweep_epoch: float = 0.0
 
@@ -399,6 +409,7 @@ def _sweep_expired_locked(now_epoch: Any, *, force: bool = False) -> int:
             _pending[key] = keep
         else:
             _pending.pop(key, None)
+            _candle_history.pop(key, None)
     if dropped:
         _expired += dropped
         _pending_count -= dropped
@@ -441,13 +452,41 @@ def resolve_symbol(
             if not _enabled:
                 return out
             key = cf._symbol(symbol)
-            bucket = _pending.get(key or "")
+            normalized_key = key or ""
+            bucket = _pending.get(normalized_key)
             if not bucket:
+                _candle_history.pop(normalized_key, None)
                 # Kova boş olsa bile GLOBAL süpürme koşar: bu çağrının asıl
                 # ikinci işi, tarama evreninden ÇIKMIŞ sembollerin
                 # kayıtlarını sona erdirmektir (Y2).
                 _sweep_expired_locked(now_epoch)
                 return out
+
+            # D28: tek taramadaki 150 mumu değil, bu bekleyen kayıt yaşarken
+            # motorun ZATEN çekmiş olduğu örtüşen pencerelerin birleşimini
+            # kullan. Bu özellikle 1m × 150 (=2,5h) ile 8h ufuk arasındaki
+            # sessiz ölçüm açığını kapatır; hiçbir ek Binance isteği yoktur.
+            history = _candle_history.setdefault(normalized_key, {})
+            for candle in candles or []:
+                opened = cf._open_epoch(candle)
+                if opened is not None:
+                    history[opened] = candle
+            max_horizon_sec = max(_horizons or DEFAULT_HORIZONS) * cf.SECONDS_PER_HOUR
+            cutoff = float(now_epoch) - max_horizon_sec - CANDLE_HISTORY_PADDING_SEC
+            # Çözüm taraması gecikmiş olabilir (sembol top-N dışında kaldı,
+            # market-data geçici kesildi). Bekleyen EN ESKİ niyetin başlangıç
+            # mumlarını sırf `now` ilerledi diye çözümden hemen önce silme.
+            intent_epochs = [
+                float(row["at_epoch"])
+                for row in bucket
+                if row.get("at_epoch") is not None
+            ]
+            if intent_epochs:
+                cutoff = min(cutoff, min(intent_epochs) - CANDLE_HISTORY_PADDING_SEC)
+            for opened in list(history):
+                if opened < cutoff:
+                    history.pop(opened, None)
+            combined_candles = [history[opened] for opened in sorted(history)]
 
             keep: List[Dict[str, Any]] = []
             islenen = 0
@@ -463,9 +502,11 @@ def resolve_symbol(
                             # Planı olmayan niyet (ör. TV sağlaması):
                             # referans girişi niyet anından SONRAKİ ilk
                             # mumdan tak. Look-ahead YOK.
-                            _fill_plan(row, candles)
+                            _fill_plan(row, combined_candles)
                         resolved = cf.resolve(
-                            pending=row, candles=candles, now_epoch=now_epoch
+                            pending=row,
+                            candles=combined_candles,
+                            now_epoch=now_epoch,
                         )
                     except Exception:  # pragma: no cover - bozuk satır savunması
                         keep.append(row)
@@ -493,6 +534,7 @@ def resolve_symbol(
                     _pending[key] = kalan
                 else:
                     _pending.pop(key, None)
+                    _candle_history.pop(normalized_key, None)
             # GLOBAL yaş süpürmesi ÇÖZÜMDEN SONRA koşar: bu turda taranan
             # sembolün kayıtları önce ÖLÇÜLME şansını alır (yaşı geçmiş ama
             # mumları elde olan bir satırı sessizce düşürmek, ölçebilecekken
@@ -546,6 +588,8 @@ def counters_snapshot() -> Dict[str, Any]:
             "measured": _measured,
             "logged": _logged,
             "log_dropped": _log_dropped,
+            "candle_buffer_symbols": len(_candle_history),
+            "candle_buffer_bars": sum(len(rows) for rows in _candle_history.values()),
         }
 
 
@@ -598,6 +642,7 @@ def reset() -> None:
     with _lock:
         _last_sweep_epoch = 0.0
         _pending.clear()
+        _candle_history.clear()
         _recent.clear()
         _pending_count = 0
         _registered = 0

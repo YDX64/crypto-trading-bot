@@ -83,6 +83,11 @@ class Settings(BaseSettings):
     # `from <ana-IP> lookup 100` kuralı sayesinde bind edilen soket tüneli
     # atlar ve temiz, yalnız bize ait weight bütçesinden harcar.
     binance_bind_ip: str = ""
+    # D28: aynı API anahtarıyla iki emir motorunun ayrı DB/rezervasyonlarla
+    # aynı hesabı yönetmesini kernel dosya kilidiyle fail-closed engeller.
+    # Gerçek `SCALPER_SHADOW_MODE=true` emir göndermediği için kilidi almaz.
+    trading_account_lock_enabled: bool = True
+    trading_account_lock_dir: str = "/tmp/tradingbot-account-locks"
     # 2026-08-23 (D17): PUBLIC piyasa verisi (yalnız /fapi/v1/klines) için AYRI
     # host. Boş = bugünkü davranış (binance_base_url ile aynı host).
     # NEDEN: canlı bot TESTNET'teyken RSI/Bollinger/diverjans/rejim/ATR
@@ -374,6 +379,11 @@ class Settings(BaseSettings):
     tv_source_allowlist: str = (
         "luxosc,luxso,algopro,botv3,tv,luxso_exit,luxso_trend,pac_choch,algopro_tp1"
     )
+    # D28: giriş kaynağı karantinası (CSV). Katı AlgoPro takipçi alert()'leri
+    # bu kapıdan ÖNCE süreç-içi takipçiye yönlendirilir; burada engellenen,
+    # yalnız AlgoPro'nun scalper sağlamasına sıradan oy veren basit TV giriş
+    # kaynağıdır. Boş = geriye uyumlu, hiçbir kaynak engellenmez.
+    tv_entry_source_blocklist: str = ""
     # "Olay kaynağı" etiketleri (D19a bulgu A). Bu listedeki bir `src`
     # `kind=entry` ile GİRİŞ OYU VEREMEZ — istek 422 ile reddedilir. Gerekçe:
     # bir çıkış alarmında `kind` belirteci düşerse (yazım hatası, iç içe JSON,

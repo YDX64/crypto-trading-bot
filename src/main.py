@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core.config import settings
 from src.core.logger import app_logger
 from src.core.database import init_db, close_db, get_db
+from src.core.account_lock import TradingAccountLock
 from src.models.waiting_signal import WaitingSignalModel, WaitingStatus
 from src.models.scalp_trade import ScalpTradeModel
 from src.services.telegram_bot import TelegramBotService
@@ -111,6 +112,7 @@ telegram_supervisor_task: Optional[asyncio.Task] = None
 # AlgoPro takipçi halkası (D20, BOT_MODE=follower). Scalper modunda DAİMA
 # None kalır — bu dosyadaki her takipçi dalı o modda ölü koddur.
 follower_engine = None
+trading_account_lock: Optional[TradingAccountLock] = None
 
 
 def _risk_engine():
@@ -299,7 +301,7 @@ async def _telegram_supervisor(service: TelegramBotService) -> None:
 async def lifespan(app: FastAPI):
     """Uygulama yaşam döngüsü"""
     global telegram_bot, orchestrator, scalper_engine, telegram_supervisor_task
-    global follower_engine
+    global follower_engine, trading_account_lock
 
     app_logger.info("=" * 80)
     app_logger.info("🚀 TRADING BOT BAŞLATILIYOR")
@@ -311,6 +313,28 @@ async def lifespan(app: FastAPI):
 
     db_ready = False
     try:
+        # D28: DB ve süreç-içi sembol rezervasyonları iki AYRI süreci
+        # koordine edemez. Emir gönderebilen her halka aynı Binance API
+        # anahtarı için kernel kilidini DB/recovery'den ÖNCE alır.
+        if bool(getattr(settings, "trading_account_lock_enabled", True)) and not bool(
+            getattr(settings, "scalper_shadow_mode", False)
+        ):
+            trading_account_lock = TradingAccountLock.acquire(
+                api_key=settings.binance_api_key,
+                lock_dir=settings.trading_account_lock_dir,
+                app_env=settings.app_env,
+                bot_mode=settings.bot_mode,
+                network="testnet" if settings.is_testnet else "mainnet",
+            )
+            app_logger.info(
+                "🔐 Binance hesabı tek-yönetici kilidi alındı "
+                f"(pid={os.getpid()}, mode={settings.bot_mode})"
+            )
+        else:
+            app_logger.warning(
+                "👻 Binance hesap kilidi atlandı "
+                "(gerçek shadow mode veya TRADING_ACCOUNT_LOCK_ENABLED=false)"
+            )
         await init_db()
         db_ready = True
         app_logger.info("✅ Veritabanı hazır")
@@ -480,6 +504,11 @@ async def lifespan(app: FastAPI):
                 await close_db()
             except Exception as e:
                 app_logger.error(f"❌ Veritabanı kapatılırken hata: {e}", exc_info=True)
+
+        if trading_account_lock is not None:
+            trading_account_lock.release()
+            trading_account_lock = None
+            app_logger.info("🔓 Binance hesabı tek-yönetici kilidi bırakıldı")
 
         telegram_bot = None
         scalper_engine = None
@@ -1104,6 +1133,12 @@ _TV_EVENT_SHORT_RE = re.compile(
 def _tv_source_allowlist() -> set:
     """?src= için izinli kaynak kümesi (küçük harf, boşluksuz)."""
     raw = getattr(settings, "tv_source_allowlist", "") or ""
+    return {s.strip().lower() for s in raw.split(",") if s.strip()}
+
+
+def _tv_entry_source_blocklist() -> set:
+    """Scalper giriş oyundan karantinaya alınan TV kaynakları."""
+    raw = getattr(settings, "tv_entry_source_blocklist", "") or ""
     return {s.strip().lower() for s in raw.split(",") if s.strip()}
 
 
@@ -1929,6 +1964,16 @@ async def tradingview_webhook(request: Request):
             _maybe_forward_to_follower(request, raw)
         raise
 
+    source_fields = {"source": source}
+    if source_raw_rejected:
+        source_fields["source_raw_rejected"] = True
+    if body_src_rejected:
+        source_fields["body_src_rejected"] = True
+    elif body_fields.get("src"):
+        source_fields["source_from_body"] = True
+
+    source_blocked = source in _tv_entry_source_blocklist()
+
     # `?dry_run=1` GİRİŞ yolunda da yan etkisizdir (bütünleşme incelemesi):
     # daha önce sessizce YOK SAYILIYORDU, yani RUNBOOK'un "doğrulama"
     # komutu sağlamaya OY yazıp `external_signal` üzerinden GERÇEK EMİR
@@ -1944,8 +1989,56 @@ async def tradingview_webhook(request: Request):
             "would": {
                 "symbol": symbol,
                 "direction": direction.value,
-                "source": source,
+                **source_fields,
+                **(
+                    {
+                        "accepted": False,
+                        "blocked_by": scalp_intent.REASON_TV_SOURCE_BLOCKED,
+                    }
+                    if source_blocked
+                    else {}
+                ),
             },
+        }
+
+    # D28: katı AlgoPro alert() gövdesi yukarıda gömülü takipçide tüketildi.
+    # Buraya kalan basit `src=algopro` oyu, canlı defterde zararın ana kaynağı
+    # olduğu ölçüldüğünde karantinaya alınabilir. Oyu confluence halkasına
+    # YAZMA ve HTTP takipçi köprüsüne iletme; aksi hâlde kapı yalnız görünüşte
+    # çalışır. Reddedilen niyet ölçüm defterinde yaşamaya devam eder.
+    if source_blocked:
+        intent_epoch = time.time()
+        intent_at = datetime.fromtimestamp(intent_epoch, timezone.utc).isoformat()
+        try:
+            scalp_intent.record(
+                at=intent_at,
+                symbol=symbol,
+                direction=direction,
+                stage=scalp_intent.STAGE_DECIDED,
+                decision=scalp_intent.DECISION_DENY,
+                reason=scalp_intent.REASON_TV_SOURCE_BLOCKED,
+                source=source,
+            )
+            counterfactual_store.register(
+                at=intent_at,
+                at_epoch=intent_epoch,
+                symbol=symbol,
+                direction=direction,
+                reason=scalp_intent.REASON_TV_SOURCE_BLOCKED,
+                source=source,
+            )
+        except Exception:  # pragma: no cover - teşhis kaydı akışı ASLA kesmez
+            pass
+        app_logger.warning(
+            f"TV girişi performans karantinasında: {symbol} "
+            f"{direction.value} ← {source}"
+        )
+        return {
+            "symbol": symbol,
+            "direction": direction.value,
+            "accepted": False,
+            "blocked_by": scalp_intent.REASON_TV_SOURCE_BLOCKED,
+            **source_fields,
         }
 
     _maybe_forward_to_follower(request, raw)
@@ -1963,14 +2056,6 @@ async def tradingview_webhook(request: Request):
             f"TV webhook: allowlist dışı gövde src='{str(body_fields.get('src'))[:32]}' — "
             f"yok sayıldı, kaynak '{source}' (?src=/parmak izi) olarak kaldı"
         )
-
-    source_fields = {"source": source}
-    if source_raw_rejected:
-        source_fields["source_raw_rejected"] = True
-    if body_src_rejected:
-        source_fields["body_src_rejected"] = True
-    elif body_fields.get("src"):
-        source_fields["source_from_body"] = True
 
     required = max(1, int(getattr(settings, "tv_confluence_required", 1) or 1))
     if required > 1:
@@ -2767,6 +2852,8 @@ _EMPTY_SCALPER_STATUS = {
         "measured": 0,
         "logged": 0,
         "log_dropped": 0,
+        "candle_buffer_symbols": 0,
+        "candle_buffer_bars": 0,
     },
     # D23: AI karar katmanı (gölge). Motor yokken de ŞEKİL aynı olmalı —
     # pano "alan yok" ile "katman kapalı"yı karıştırmasın.

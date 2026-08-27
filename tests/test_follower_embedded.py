@@ -834,6 +834,20 @@ class TestEmbeddedRouting:
         # Gömülü modda HTTP köprüsü de kullanılmaz (çift teslim olmaz).
         assert wired.forwarded == []
 
+    async def test_strict_algopro_body_blocklistten_once_takipciye_gider(
+        self, wired, monkeypatch
+    ):
+        monkeypatch.setattr(
+            main_module.settings, "tv_entry_source_blocklist", "algopro"
+        )
+        body = f"{REAL_SELL} secret={TV_SECRET}"
+        result = await main_module.tradingview_webhook(
+            _FakeRequest(body.encode(), {})
+        )
+        assert result["routed"] == "follower"
+        wired.follower.handle_event.assert_awaited_once()
+        wired.scalper.external_signal.assert_not_called()
+
     async def test_hit_event_is_routed_instead_of_422(self, wired):
         """HIT mesajları ana botta 422 alır; gömülü modda takipçiye GİDER.
 

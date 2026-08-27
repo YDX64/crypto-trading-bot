@@ -76,6 +76,7 @@ REASON_MARKET_GATE_RUN = "market_gate_run"
 REASON_STRUCTURE_GATE = "structure_gate"
 REASON_TV_STRUCTURE_GATE = "tv_structure_gate"
 REASON_TV_CONFLUENCE = "tv_confluence"
+REASON_TV_SOURCE_BLOCKED = "tv_source_blocked"
 REASON_LOSS_COOLDOWN = "loss_cooldown"
 REASON_CAPACITY = "capacity"
 REASON_RESERVATION = "reservation"
@@ -107,6 +108,7 @@ REASON_LABELS: Dict[str, str] = {
     REASON_STRUCTURE_GATE: "yapı kapısı: son swing kırılımına ters yön",
     REASON_TV_STRUCTURE_GATE: "TV yapı kapısı: CHoCH/trend olayına ters yön",
     REASON_TV_CONFLUENCE: "TV sağlaması dolmadı (yeterli farklı kaynak yok)",
+    REASON_TV_SOURCE_BLOCKED: "TV giriş kaynağı performans karantinasında",
     REASON_LOSS_COOLDOWN: "zarar sonrası sembol cooldown'ı aktif",
     REASON_CAPACITY: "eşzamanlı pozisyon kapasitesi dolu",
     REASON_RESERVATION: "sembol rezervasyonu alınamadı",
@@ -132,6 +134,7 @@ KNOWN_REASONS: frozenset = frozenset(
         REASON_STRUCTURE_GATE,
         REASON_TV_STRUCTURE_GATE,
         REASON_TV_CONFLUENCE,
+        REASON_TV_SOURCE_BLOCKED,
         REASON_LOSS_COOLDOWN,
         REASON_CAPACITY,
         REASON_RESERVATION,
