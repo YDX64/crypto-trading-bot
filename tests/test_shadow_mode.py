@@ -598,6 +598,22 @@ class TestShadowModeMainnetValidation:
         )
         assert s.scalper_shadow_mode is True
 
+    def test_shadow_mode_embedded_follower_ile_fail_fast(self):
+        with pytest.raises(ValueError, match="SCALPER_SHADOW_MODE"):
+            self._settings(
+                scalper_shadow_mode=True,
+                follower_embedded=True,
+                follower_virtual_capital_usdt=1000,
+            )
+
+    def test_shadow_mode_ayri_follower_halkasi_ile_fail_fast(self):
+        with pytest.raises(ValueError, match="SCALPER_SHADOW_MODE"):
+            self._settings(
+                scalper_shadow_mode=True,
+                bot_mode="follower",
+                risk_event_secret="risk-secret",
+            )
+
     def test_mainnet_entry_halt_check_still_enforced_regardless_of_shadow(self):
         """Gölge modu YALNIZ risk/webhook/allowlist zorunluluğunu bypass eder;
         SCALPER_ENTRY_HALT_ENABLED=false mainnet'te HALA yasaktır."""

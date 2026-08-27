@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 
 import src.main as main_module
@@ -902,3 +903,32 @@ def test_lifespan_source_gates_orchestrator_on_shadow_mode():
     assert gate_at < start_at, "gölge kapısı orchestrator.start()'tan SONRA"
     tail = src[gate_at:start_at]
     assert "else:" in tail, "orchestrator.start() else dalında değil"
+
+
+def test_lifespan_source_does_not_start_telegram_queue_in_shadow_mode():
+    """Hesap kilidi atlanan shadow, Telegram üzerinden emir açamaz."""
+    import inspect
+    import src.main as main_module
+
+    src = inspect.getsource(main_module.lifespan)
+    gate_at = src.index("if is_orderless_shadow:")
+    start_at = src.index("await telegram_bot.start()")
+    assert gate_at < start_at
+    assert "else:" in src[gate_at:start_at]
+
+
+@pytest.mark.asyncio
+async def test_manual_signal_is_fail_closed_in_shadow_mode(monkeypatch):
+    """`/signal` orchestrator'a ulaşmadan 503 olmalı."""
+    import src.main as main_module
+
+    fake = SimpleNamespace(process_signal=AsyncMock())
+    monkeypatch.setattr(main_module.settings, "scalper_shadow_mode", True)
+    monkeypatch.setattr(main_module, "orchestrator", fake)
+
+    with pytest.raises(HTTPException) as exc:
+        await main_module.manual_signal(
+            main_module.SignalRequest(message="BTCUSDT BUY"), db=None
+        )
+    assert exc.value.status_code == 503
+    fake.process_signal.assert_not_awaited()

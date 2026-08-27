@@ -316,9 +316,10 @@ async def lifespan(app: FastAPI):
         # D28: DB ve süreç-içi sembol rezervasyonları iki AYRI süreci
         # koordine edemez. Emir gönderebilen her halka aynı Binance API
         # anahtarı için kernel kilidini DB/recovery'den ÖNCE alır.
-        if bool(getattr(settings, "trading_account_lock_enabled", True)) and not bool(
+        is_orderless_shadow = bool(
             getattr(settings, "scalper_shadow_mode", False)
-        ):
+        )
+        if bool(getattr(settings, "trading_account_lock_enabled", True)) and not is_orderless_shadow:
             trading_account_lock = TradingAccountLock.acquire(
                 api_key=settings.binance_api_key,
                 lock_dir=settings.trading_account_lock_dir,
@@ -333,7 +334,8 @@ async def lifespan(app: FastAPI):
         else:
             app_logger.warning(
                 "👻 Binance hesap kilidi atlandı "
-                "(gerçek shadow mode veya TRADING_ACCOUNT_LOCK_ENABLED=false)"
+                "(uygulama-geneli emirsiz shadow veya "
+                "TRADING_ACCOUNT_LOCK_ENABLED=false)"
             )
         await init_db()
         db_ready = True
@@ -457,17 +459,27 @@ async def lifespan(app: FastAPI):
         # Telegram ağ/409 hatası scalper safety döngülerini öldürmemeli.
         # Supervisor tam yaşam döngüsünü await eder ve bounded backoff ile
         # yeniden dener; health Telegram'ı ayrı bir bileşen olarak raporlar.
-        try:
-            await telegram_bot.start()
-            app_logger.info("✅ Telegram bot ilk denemede hazır")
-        except Exception as e:
-            app_logger.error(
-                f"⚠️ Telegram ilk başlatma başarısız; scalper/safety çalışıyor ve "
-                f"supervisor yeniden deneyecek: {e}"
+        if is_orderless_shadow:
+            # D28: Telegram kuyruğu doğrudan orchestrator.process_signal'a
+            # gider ve ScalperExecutor'ın shadow kapısından GEÇMEZ. Gerçek
+            # shadow süreç, hesap kilidini güvenle paylaşabilmek için bütün
+            # mutasyon yollarını kapatır; manuel `/signal` da aşağıda 503'tür.
+            app_logger.warning(
+                "👻 GÖLGE MODU: Telegram sinyal kuyruğu BAŞLATILMADI — "
+                "uygulama-geneli hiçbir emir yolu çalışmaz"
             )
-        telegram_supervisor_task = asyncio.create_task(
-            _telegram_supervisor(telegram_bot), name="telegram-supervisor"
-        )
+        else:
+            try:
+                await telegram_bot.start()
+                app_logger.info("✅ Telegram bot ilk denemede hazır")
+            except Exception as e:
+                app_logger.error(
+                    f"⚠️ Telegram ilk başlatma başarısız; scalper/safety çalışıyor ve "
+                    f"supervisor yeniden deneyecek: {e}"
+                )
+            telegram_supervisor_task = asyncio.create_task(
+                _telegram_supervisor(telegram_bot), name="telegram-supervisor"
+            )
 
         app_logger.info("=" * 80)
         app_logger.info(f"✅ TRADING BOT HAZIR - {settings.app_env.upper()}")
@@ -2667,6 +2679,11 @@ async def manual_signal(
     db: AsyncSession = Depends(get_db),
 ):
     """Manuel sinyal gönder — GERÇEK EMİR AÇAR, API anahtarı zorunludur."""
+    if bool(getattr(settings, "scalper_shadow_mode", False)):
+        raise HTTPException(
+            status_code=503,
+            detail="Gölge modunda manuel emir yolu devre dışı",
+        )
     if not orchestrator:
         raise HTTPException(status_code=503, detail="Orchestrator hazır değil")
 

@@ -2999,7 +2999,11 @@ API key'inin SHA-256 kimliğine göre Linux/macOS `flock` hesabı kilidi alır;
 aynı hesabın ikinci yöneticisi DB/recovery/emir yoluna girmeden fail-closed
 başlatılmaz. Anahtarın kendisi loga veya kilit dosyasına yazılmaz. Gerçek
 `SCALPER_SHADOW_MODE=true` ölçüm süreci kilidi bilinçli olarak atlar çünkü emir
-göndermez. Ayarlar: `TRADING_ACCOUNT_LOCK_ENABLED=true`,
+göndermez. D28 son incelemesinde bu söz uygulama-geneline genişletildi: shadow
+ile ayrı/gömülü follower birlikteyse config fail-fast; Telegram sinyal kuyruğu
+başlamaz ve manuel `/signal` 503 döner. Aksi halde scalper gölge olsa bile
+Telegram orchestrator'ı veya follower gerçek emir açıp kilidi sessizce
+atlayabilirdi. Ayarlar: `TRADING_ACCOUNT_LOCK_ENABLED=true`,
 `TRADING_ACCOUNT_LOCK_DIR=/tmp/tradingbot-account-locks`.
 
 **Kayıp asimetrisi ve AlgoPro kararı.** İncelenen 32 kapanışta 23W/9L olmasına

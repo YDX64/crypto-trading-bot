@@ -1315,6 +1315,18 @@ class Settings(BaseSettings):
            TESTNET host'unu gösteremez -> ValueError. Gerçek para sahte
            mumlarla yönetilemez.
         """
+        if self.scalper_shadow_mode and self.follower_active:
+            # D28: shadow yalnız ScalpExecutor'ın emir dalını susturur.
+            # Ayrı/gömülü follower'ın kendi executor'ı vardır ve shadow
+            # bayrağına bakmaz; bu iki ayarı birlikte kabul etmek, hesap
+            # kilidini atlayan ama gerçek emir gönderebilen süreç üretirdi.
+            raise ValueError(
+                "GÜVENLİK HATASI: SCALPER_SHADOW_MODE=true iken AlgoPro "
+                "takipçisi (BOT_MODE=follower veya FOLLOWER_EMBEDDED=true) "
+                "çalıştırılamaz. Shadow süreç hiçbir emir yolu taşımamalı; "
+                "takipçiyi kapatın veya ayrı, hesap kilitli halkada çalıştırın."
+            )
+
         if self.follower_embedded and not self.scalper_enabled:
             # Gömülü takipçi scalper halkasının İÇİNDE koşar. SCALPER_ENABLED
             # kapalıyken motor hiç kurulmaz ve her AlgoPro alarmı 503 alır —
