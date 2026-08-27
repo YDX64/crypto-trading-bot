@@ -767,12 +767,15 @@ class TestD6UfukUyarisi:
         motor.logger = SimpleNamespace(warning=uyarilar.append)
         return motor
 
-    def test_1m_diliminde_8_saatlik_ufuk_UYARIR(self):
+    def test_1m_diliminde_8_saatlik_ufuk_RESTART_RISKINI_UYARIR(self):
         kur(horizons_h=(8.0,))
         uyarilar: List[str] = []
         self._engine("1m", uyarilar)._warn_counterfactual_horizon_fit()
         assert len(uyarilar) == 1
-        assert "kısmi pencere" in uyarilar[0]
+        assert "rolling mum tamponu" in uyarilar[0]
+        assert "restart" in uyarilar[0]
+        assert "Ufku küçültmek gerekmez" in uyarilar[0]
+        assert "no_data" not in uyarilar[0]
 
     def test_5m_diliminde_8_saatlik_ufuk_UYARMAZ(self):
         kur(horizons_h=(8.0,))

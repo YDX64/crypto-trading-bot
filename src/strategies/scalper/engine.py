@@ -2664,9 +2664,11 @@ class ScalperEngine:
     def _counterfactual_resolve(self, symbol: str, ctx: StrategyContext) -> None:
         """Olgunlaşmış karşı-olgu kayıtlarını ZATEN ÇEKİLMİŞ mumlarla çöz.
 
-        **Yeni REST çağrısı YOKTUR**: `ctx.candles_5m` bu tarama turunda
-        zaten çekildi (giriş dilimi, ~150 mum ≈ 12.5 saat — en büyük
-        varsayılan ufuk 8 saati kapsar). Hata hâlinde sessizce döner: bir
+        **Yeni REST çağrısı YOKTUR**: `ctx.candles_5m` adı tarihsel olsa da
+        giriş diliminin bu tarama turunda zaten çekilmiş ~150 mumunu taşır.
+        `counterfactual_store` bekleyen niyet boyunca örtüşen turları rolling
+        tamponda birleştirir; böylece 1m profildeki 2.5 saatlik tek pencere de
+        8 saatlik ufku süreç içinde kapsar. Hata hâlinde sessizce döner: bir
         ölçüm kaydı bir tarama turunu ASLA düşürmemeli.
         """
         try:
@@ -3975,15 +3977,15 @@ class ScalperEngine:
     }
 
     def _warn_counterfactual_horizon_fit(self) -> None:
-        """D27 incelemesi (D6): ufuk mum penceresine SIĞIYOR mu?
+        """D27/D28: ufuk tek tarama penceresinden büyükse uptime riskini bildir.
 
         Karşı-olgu çözümü tarama turunun ZATEN çektiği ~150 giriş-dilimi
         mumuyla yapılır. 5m dilimde bu ≈12.5 saattir ve en büyük varsayılan
-        ufku (8 sa) kapsar. **Hızlı profilde (1m) pencere 2.5 saate düşer** ve
-        8 saatlik ufuk ARTIK KAPSANMAZ: her karşı-olgu kısmi pencereye düşer
-        ve `no_data` olarak kapanır (bkz. `counterfactual._covers`). İkisi
-        arasında bugüne dek HİÇBİR doğrulama yoktu; sessizce ölçmeyen bir
-        defter, yanlış ölçen bir defter kadar kötüdür.
+        ufku (8 sa) tek turda kapsar. **Hızlı profilde (1m) tek pencere 2.5
+        saate düşer**, fakat D28 rolling mum tamponu örtüşen turları bekleyen
+        niyet boyunca birleştirerek ufku kapsar. Operasyonel sınır şudur:
+        kuyruk ve tampon süreç-içidir; ufuk dolmadan restart olursa o ölçüm
+        kohortu sıfırlanır. Ufku küçültmek gerekmez.
 
         Yalnız UYARIR: bir teşhis kaydı motoru başlatmayı engellememeli.
         """
@@ -4000,10 +4002,12 @@ class ScalperEngine:
             if largest >= window_h:
                 self.logger.warning(
                     f"⚠️ Karşı-olgu ufku ({largest:g} sa) giriş dilimi mum "
-                    f"penceresinden ({tf} × {self.COUNTERFACTUAL_CANDLE_COUNT} "
-                    f"= {window_h:.1f} sa) BÜYÜK — ölçümler kısmi pencereye "
-                    f"düşer ve `no_data` olarak kapanır. "
-                    f"SCALPER_COUNTERFACTUAL_HORIZONS_H değerini küçültün."
+                    f"tek-tarama penceresinden ({tf} × "
+                    f"{self.COUNTERFACTUAL_CANDLE_COUNT} = {window_h:.1f} sa) "
+                    f"BÜYÜK — rolling mum tamponu ufku süreç içinde "
+                    f"biriktirecek. Tam ölçüm için süreç en az {largest:g} sa "
+                    f"kesintisiz çalışmalı; restart bekleyen kayıtları ve "
+                    f"tamponu sıfırlar. Ufku küçültmek gerekmez."
                 )
         except Exception:  # pragma: no cover - teşhis uyarısı motoru düşürmez
             return
