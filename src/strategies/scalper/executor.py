@@ -214,6 +214,30 @@ class ScalpExecutor:
     # gerçek fee ledger'ı kaybetmekten daha güvenlidir.
     FAILED_LEDGER_RETRY_DELAYS = (0.0, 0.25, 0.75, 1.5)
 
+    # `SCALPER_MAKER_FILL_TIMEOUT_CANDLES` bir MUM sayısıdır; canlı yolun
+    # bunu sabit 5m/300 sn kabul etmesi 1m profilde 3 mumluk niyeti 15 dk
+    # açık bırakıyordu. Backtest gerçek giriş mumlarını saydığı için bu aynı
+    # zamanda canlı/backtest parite hatasıydı. Bilinmeyen bir dilimde tarihsel
+    # 5m yedeği korunur; desteklenen canlı dilimler açıkça haritalıdır.
+    _MAKER_TIMEFRAME_SECONDS: Dict[str, float] = {
+        "1m": 60.0,
+        "3m": 180.0,
+        "5m": 300.0,
+        "15m": 900.0,
+        "30m": 1_800.0,
+        "1h": 3_600.0,
+        "2h": 7_200.0,
+        "4h": 14_400.0,
+    }
+
+    def _maker_timeout_seconds(self) -> float:
+        candles = max(
+            0, int(getattr(self.cfg, "scalper_maker_fill_timeout_candles", 3))
+        )
+        timeframe = str(getattr(self.cfg, "scalper_tf_entry", "5m") or "5m")
+        candle_seconds = self._MAKER_TIMEFRAME_SECONDS.get(timeframe, 300.0)
+        return candles * candle_seconds
+
     def __init__(
         self,
         client: ImprovedBinanceClient,
@@ -2001,9 +2025,7 @@ class ScalpExecutor:
 
         client_order_id = self._new_client_order_id()
         created_at_ms = int(time.time() * 1000)
-        timeout_candles = max(
-            0, int(getattr(self.cfg, "scalper_maker_fill_timeout_candles", 3))
-        )
+        timeout_seconds = self._maker_timeout_seconds()
         pending = PendingEntry(
             signal=signal,
             order_id=None,
@@ -2012,7 +2034,7 @@ class ScalpExecutor:
             quantity=quantity,
             created_monotonic=time.monotonic(),
             created_at_ms=created_at_ms,
-            expires_at_ms=created_at_ms + timeout_candles * 300_000,
+            expires_at_ms=created_at_ms + int(timeout_seconds * 1000),
         )
         # KRİTİK SIRA: kalıcı intent atomik olarak diske yazılmadan POST yok.
         # Ağ yanıtı kaybolursa restart sonrası aynı clientOrderId ile
@@ -2227,17 +2249,17 @@ class ScalpExecutor:
         if status == "NEW":
             self._record_order_state(pending, order, phase="WORKING")
             pending.scans_waited += 1
-            timeout_candles = max(0, int(getattr(self.cfg, "scalper_maker_fill_timeout_candles", 3)))
             # Poll sıklığı engine tarafında değişebilir (güvenlik döngüsü
             # 2sn, ana tarama 30sn vb.). Timeout bu nedenle tur sayısına değil
-            # gerçek monotonic zamana bağlıdır: bir mum = 300 saniye.
+            # gerçek monotonic zamana ve yapılandırılmış giriş diliminin mum
+            # süresine bağlıdır (örn. 1m × 3 = 180 saniye).
             elapsed = max(0.0, time.monotonic() - pending.created_monotonic)
-            timeout_seconds = timeout_candles * 300.0
+            timeout_seconds = self._maker_timeout_seconds()
             wall_expired = (
                 pending.expires_at_ms > 0
                 and int(time.time() * 1000) >= pending.expires_at_ms
             )
-            if timeout_candles == 0 or elapsed >= timeout_seconds or wall_expired:
+            if timeout_seconds <= 0 or elapsed >= timeout_seconds or wall_expired:
                 return await self._cancel_pending(
                     symbol, pending, reason="timeout"
                 )

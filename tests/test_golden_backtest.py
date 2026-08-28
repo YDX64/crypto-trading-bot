@@ -149,11 +149,11 @@ class _GoldenCfg:
     # Kayıp sonrası soğuma
     scalper_loss_cooldown_minutes: float = 60.0    # görev: "loss cooldown 60"
 
-    # Yalnız KAYIT amaçlı — backtest.simulate_symbol/manage_position bu
-    # alanları OKUMAZ (yalnız canlı engine.py kullanır); golden sonuçları
-    # ETKİLEMEZLER. Görev talimatındaki "mirror" listesiyle tutarlılık için
-    # burada tutuluyorlar.
-    scalper_max_hold_hours: float = 8.0            # görev: "max hold 8h" — İNERT (bkz. yukarı)
+    # Backtest/canlı paritesi: TP1 görmemiş pozisyon 8 saatte REAPER ile
+    # kapanır. Bu dar fixture'daki işlemler sınırı aşmadığı için golden
+    # sayıları bugün değişmez, fakat alan artık davranışsaldır.
+    scalper_max_hold_hours: float = 8.0
+    # Yalnız kayıt amaçlı — evren CLI'dan sabit verilir.
     scalper_symbol_allowlist: str = "BTCUSDT,ETHUSDT"  # görev: "symbol allowlist" — İNERT
 
 

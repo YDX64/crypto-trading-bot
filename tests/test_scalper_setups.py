@@ -629,6 +629,8 @@ class _FakeClient:
     def __init__(self, balance: float = 10_000.0):
         self.balance = balance
         self.calls: list[str] = []
+        self.open_market_requests: list[dict] = []
+        self.take_profit_requests: list[dict] = []
 
     async def get_account_balance(self):
         self.calls.append("get_account_balance")
@@ -649,10 +651,19 @@ class _FakeClient:
 
     async def open_market_order(self, symbol, side, quantity):
         self.calls.append("open_market_order")
+        self.open_market_requests.append({
+            "symbol": symbol, "side": side, "quantity": quantity,
+        })
         return {"orderId": 111}
 
     async def place_take_profit(self, symbol, side, stop_price, quantity):
         self.calls.append("place_take_profit")
+        self.take_profit_requests.append({
+            "symbol": symbol,
+            "side": side,
+            "stop_price": stop_price,
+            "quantity": quantity,
+        })
         return {"orderId": 222}
 
 
@@ -766,6 +777,48 @@ class TestExecutorRiskRewardGate:
         assert tracker.calls == []
 
 
+class TestExecutorUserU50Economics:
+    """D29: 1000 USDT sermaye × %10 marjin × tam TP1 ROI50 sözleşmesi."""
+
+    async def test_full_tp1_closes_100_usdt_margin_for_50_usdt_gross(self):
+        cfg = _ExecCfg(
+            scalper_min_rr=0.0,
+            scalper_risk_percentage=10.0,
+            scalper_leverage=20,
+            scalper_tp1_roi=50.0,
+            scalper_tp1_fraction=1.0,
+            scalper_tp2_roi=100.0,
+            scalper_tp2_fraction=0.0,
+        )
+        cfg.scalper_max_margin_pct = 10.0
+        cfg.scalper_entry_mode = "taker"
+
+        client = _FakeClient(balance=1_000.0)
+        # Risk boyutlaması önce 40 birim çıkarır; %10 marjin tavanı bunu
+        # 20 birime kırpar: 20 × 100 / 20x = 100 USDT marjin.
+        pm = _FakePm(entry_price=100.0, filled_qty=20.0)
+        executor = ScalpExecutor(
+            client=client, pm=pm, tracker=_FakeTracker(), cfg=cfg
+        )
+
+        result = await executor.try_open(
+            _mk_exec_signal(100.0, 97.5), _mk_exec_ctx()
+        )
+
+        assert result is not None
+        assert client.open_market_requests[0]["quantity"] == pytest.approx(20.0)
+        assert result.position.position_size / result.position.leverage == pytest.approx(100.0)
+        assert result.plan.tp1_quantity == pytest.approx(20.0)
+        assert result.plan.tp2_quantity == 0.0
+        assert result.plan.runner_quantity == 0.0
+        assert len(client.take_profit_requests) == 1
+        request = client.take_profit_requests[0]
+        assert request["quantity"] == pytest.approx(20.0)
+        assert request["stop_price"] == pytest.approx(102.5)
+        gross_at_tp1 = (request["stop_price"] - 100.0) * request["quantity"]
+        assert gross_at_tp1 == pytest.approx(50.0)
+
+
 # --------------------------------------------------------------------------
 # ScalpExecutor — maker (limit) giriş modu: iki fazlı giriş
 #
@@ -784,6 +837,7 @@ def _mk_maker_cfg(**overrides) -> _ExecCfg:
     slotless olduğundan bu güvenlidir."""
     cfg = _ExecCfg()
     cfg.scalper_entry_mode = "maker"
+    cfg.scalper_tf_entry = overrides.pop("scalper_tf_entry", "5m")
     cfg.scalper_maker_fill_timeout_candles = overrides.pop("scalper_maker_fill_timeout_candles", 3)
     for key, value in overrides.items():
         setattr(cfg, key, value)
@@ -1311,6 +1365,34 @@ class TestExecutorCheckPendingTimeout:
             {"orderId": 555, "status": "NEW"},
         ]
         await executor.check_pending()
+        assert client.cancel_calls == [555]
+        assert executor.pending_symbols() == set()
+
+    async def test_one_minute_entry_uses_three_minutes_not_fifteen(self):
+        cfg = _mk_maker_cfg(
+            scalper_tf_entry="1m", scalper_maker_fill_timeout_candles=3
+        )
+        client = _FakeClientMaker(limit_order_id=555)
+        executor = ScalpExecutor(
+            client=client,
+            pm=_FakePm(entry_price=100.0, filled_qty=1.0),
+            tracker=_FakeTracker(),
+            cfg=cfg,
+        )
+        await executor.try_open(
+            _mk_exec_signal(100.0, 99.5), _mk_exec_ctx()
+        )
+
+        pending = executor._pending["TESTUSDT"]
+        assert pending.expires_at_ms - pending.created_at_ms == 180_000
+
+        pending.created_monotonic -= 181.0
+        client.get_order_responses[555] = [
+            {"orderId": 555, "status": "NEW"},
+            {"orderId": 555, "status": "NEW"},
+        ]
+        await executor.check_pending()
+
         assert client.cancel_calls == [555]
         assert executor.pending_symbols() == set()
 

@@ -93,6 +93,7 @@ class _Cfg:
     scalper_min_rr: float = 1.2
     scalper_regime_filter: bool = True
     scalper_max_positions: int = 3
+    scalper_max_hold_hours: float = 0.0
 
 
 def _mk_signal(entry_price: float, stop_price: float,
@@ -281,6 +282,32 @@ class TestTp1BreakevenTrailFlow:
         # SL gerçekten break-even'e taşınmış olmalı (yapısal stop 99.0'dan farklı)
         assert pos.breakeven_price > 99.0
         assert pos.breakeven_price == pytest.approx(pos.entry_price * (1 + cfg.scalper_breakeven_buffer_pct / 100.0))
+
+
+class TestMaxHoldReaperParity:
+    def test_unprotected_position_closes_at_first_bar_after_age_limit(self):
+        cfg = _Cfg(scalper_max_hold_hours=1.0)
+        cfg.scalper_min_rr = 0.0
+        signal = _mk_signal(entry_price=100.0, stop_price=99.0)
+        candles_5m = [
+            _mk_candle(i, 100.0, 100.2, 99.8, 100.0)
+            for i in range(14)
+        ]
+
+        pos = open_position(
+            signal, candles_5m, signal_idx=0, cfg=cfg, balance=10_000.0
+        )
+        assert pos is not None
+        assert pos.tp1_filled is False
+
+        trade = manage_position(pos, candles_5m, cfg)
+
+        assert trade.exit_reason == "REAPER"
+        assert trade.legs[-1]["label"] == "REAPER"
+        # 5m harness ancak mum kapanışında karar verebilir: 1 saatlik sınır
+        # ilk kez idx13 kapanışında görülür, dolayısıyla süre yaklaşık65 dk.
+        assert trade.duration_minutes == pytest.approx(65.0, abs=0.001)
+        assert trade.exit_price == pytest.approx(100.0)
 
 
 # --------------------------------------------------------------------------

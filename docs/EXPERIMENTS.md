@@ -99,6 +99,88 @@ Loglar: `.test-logs/d28/hidden_BASE.log`, `.test-logs/d28/hidden_TP8.log`;
 JSON: `logs/backtest_20260827_182535.json`,
 `logs/backtest_20260827_182641.json`. Bu pencere TP1 ailesi için **YANIKTIR**.
 
+### D29 — Kullanıcı profili U50: TP1 ROI %50 / pozisyonun tamamı (2026-08-28, SONUÇTAN ÖNCE İLAN)
+
+**Durum: KOŞULDU — KÂR PROFİLİ RED; SAKLI PENCERE AÇILMADI.** Kullanıcının kesinleştirdiği tek
+aday aranmayacak/taranmayacaktır: 1000 USDT sanal sermayede işlem başına
+yaklaşık 100 USDT marjin ve TP1'de tamamının kapanması. Canlı env karşılığı:
+`SCALPER_MAX_MARGIN_PCT=10`, `SCALPER_TP1_ROI=50`,
+`SCALPER_TP1_FRACTION=1.0`, `SCALPER_TP2_FRACTION=0.0`. Sabit stop ROI %50
+olduğundan teorik brüt sonuç TP veya SL'de yaklaşık `+50 / -50 USDT`'dir;
+komisyon sonrası oran 1:1'den biraz kötüdür. Günlük %1 kayıp kilidi ilk
+`-50` USDT stopu önceden engelleyemez; yalnız gerçekleşen kayıptan SONRA yeni
+girişleri durdurur. Bu nedenle U50, kanıt çıksa bile **yalnız testnet** adayıdır.
+
+**A/B karşılaştırması.** B10 tabanı da marjin %10 ile koşulur; yalnız çıkış
+ekonomisi farklıdır: B10 = TP1 ROI10/fraksiyon0.40 + TP2 ROI25/fraksiyon0.20
+ve runner0.40; U50 = TP1 ROI50/fraksiyon1.00 + TP2 fraksiyon0. Aynı kalan
+ayarlar: 1m/5m/15m, C-only, fixed stop ROI50, market day gate %1.3, run gate
+kapalı, diverjans açık, 8 majör sembol, kapasite5, maker timeout3 giriş mumu,
+max-hold/reaper8 saat, ücret ve kayma modeli aynı. Harness koşudan ÖNCE iki
+canlı-parite düzeltmesi taşımalıdır: maker bekleme süresi gerçek giriş
+zaman-dilimine göre hesaplanmalı (1m × 3 = 180 sn; sabit 900 sn değil) ve TP1
+görmeyen pozisyonun 8 saatlik REAPER kapanışı modellenmelidir.
+
+**Açık aşama ve önceden kilitli veto:** AYI `2026-01-23→02-13`, YATAY
+`2026-07-01→07-21`, BOĞA `2026-08-07→08-21`. U50 şu koşullardan herhangi
+birinde kâr profili olarak RED: herhangi bir pencerede PF < 1.00; üç pencere
+birleşik PF < 1.10; birleşik net PnL ≤ 0; ya da tek-pencere maxDD başlangıç
+sermayesinin %20'sini aşarsa. Ayrıca U50'nin birleşik PF'si B10'dan düşükse
+"büyük hedef küçük kazanç sorununu çözdü" denemez. Harness başlangıç bakiyesi
+10,000 USDT ve marjin %10 olduğundan nominal sonuçlar kullanıcının 1000 USDT
+profili için yaklaşık 10'a bölünerek okunur; PF/WR değişmez.
+
+**Saklı aşama (yalnız açık aşama geçerse):** `2026-04-01→2026-05-01` UTC
+(`[start,end)`) D29/U50 için sonuç görülmeden seçildi; defter/log/cache aramasında
+bu pencereye ait önceki koşu bulunmadı. Açık veto geçilmezse bu pencere
+AÇILMAYACAK ve yanmayacaktır. Açılırsa yalnız veto eder: PF < 1.10, net PnL ≤0
+veya maxDD > başlangıç sermayesinin %20'si RED; sonuç ne olursa olsun buraya
+yazılır. Hiçbir backtest sonucu 5+ günlük canlı testnet soak ve gerçek fill
+ekonomisi doğrulamasının yerini tutmaz.
+
+**Açık aşama sonucu (aynı gün):** Harness önce 1m maker timeout paritesi
+(3 mum = 180 sn) ve max-hold8/REAPER modeliyle düzeltildi; ilgili birim testler
+ve tüm paket (`2561 passed, 2 skipped`) geçti. Env kaynağı AWA
+`/opt/tradingbot-v2/.env` içindeki hassas olmayan `SCALPER_*` snapshot'ıdır;
+iki profilde yalnız aşağıdaki exit değişkenleri ve ortak marjin %10 override'ı
+uygulandı.
+
+| Profil / pencere | İşlem | WR | Net PnL | PF | maxDD | REAPER | Tam TP |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| B10 AYI | 161 | %86.3 | +6687.65 | 2.07 | 1599.77 | 12 | 0 |
+| B10 YATAY | 156 | %76.3 | +4812.62 | 1.92 | 848.21 | 31 | 0 |
+| B10 BOĞA | 118 | %69.5 | +1585.95 | 1.37 | 1227.11 | 43 | 0 |
+| U50 AYI | 134 | %58.2 | +9649.63 | 1.71 | **2146.65** | 82 | 34 |
+| U50 YATAY | 127 | %49.6 | +1957.68 | 1.22 | **2098.67** | 108 | 8 |
+| U50 BOĞA | 108 | %58.3 | +6661.28 | 2.29 | **2373.31** | 89 | 13 |
+
+Birleşik B10: 435 işlem / 340W / net +13086.21 / PF **1.829** / 86 REAPER.
+Birleşik U50: 369 işlem / 204W / net +18268.60 / PF **1.658** / 279 REAPER /
+55 tam TP. Yani U50 nominal neti büyüttü fakat kaliteyi düşürdü: PF tabandan
+düşük, işlemlerin %75.6'sı TP'ye ulaşmadan REAPER oldu ve üç pencerenin
+üçünde de önceden kilitlenen 2000 USDT (%20) maxDD tavanını aştı. 1000 USDT
+kullanıcı ölçeğinde yaklaşık maxDD'ler 214.67 / 209.87 / 237.33 USDT'dir
+(harness 10,000 başlangıcının 10'a ölçeklenmiş okuması). Bu iki bağımsız veto
+nedeniyle U50 **kâr profili olarak RED**; `2026-04-01→05-01` saklı penceresi
+AÇILMADI ve yanmadı. Kullanıcının açık talebi nedeniyle yalnız TESTNET'te
+kontrollü gerçek-fill deneyi yapılabilir; bu sonuç MAINNET terfisi değildir.
+
+Komut kalıbı (B10/U50 ve üç pencere sırayla; paralel koşulmadı):
+```bash
+env <awa-.env-hassas-olmayan-SCALPER-snapshot> \
+  SCALPER_MAX_MARGIN_PCT=10 SCALPER_MAX_HOLD_HOURS=8 \
+  SCALPER_TP1_ROI=<10|50> SCALPER_TP1_FRACTION=<0.40|1.0> \
+  SCALPER_TP2_ROI=<25|100> SCALPER_TP2_FRACTION=<0.20|0.0> \
+  python3 -m src.strategies.scalper.backtest --strategies C \
+  --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,BNBUSDT,ADAUSDT,LTCUSDT \
+  --start <pencere-başı> --end <pencere-sonu> --cache-dir data/klines_cache
+```
+JSON logları sırayla B10 AYI/YATAY/BOĞA:
+`logs/backtest_20260828_152748.json`, `logs/backtest_20260828_152920.json`,
+`logs/backtest_20260828_153030.json`; U50 AYI/YATAY/BOĞA:
+`logs/backtest_20260828_153146.json`, `logs/backtest_20260828_153316.json`,
+`logs/backtest_20260828_153420.json`.
+
 Kural: bir satırın kanıt sayılması için **komut + pencere + env kaynağı + log yolu** gerekir.
 Harness ≥ 7640c0a (kapı-pariteli). Pencereler: AYI 2026-01-23→02-13 · YATAY 07-01→07-21 · BOĞA 08-07→08-21.
 Komut kalıbı:
@@ -1001,14 +1083,15 @@ aşağıda.
   (işgal penceresi %100, kapasite 0, cooldown 0).
 - **Yine de bir ölçüm eseri DEĞİL:** sembol-içi işgal penceresi canlıda da gerçektir (motor da
   bir sembolde tek pozisyon tutar), yani kazanca sayılır — yalnız ATFI doğru yapmak gerekir.
-  ⚠️ Ama tam da bu kanal harness'ın en zayıf modellediği yerdir: 8 saatlik reaper canlıda
-  pencereyi ERKEN kapatır, harness'ta kapatmaz (aşağıdaki reaper notu).
+  ⚠️ Bu tarihsel E7 koşularında tam da bu kanal harness'ın en zayıf modellediği yerdi: 8
+  saatlik reaper canlıda pencereyi ERKEN kapatıyor, o koşuların harness'ı kapatmıyordu
+  (aşağıdaki reaper notu). D29'dan sonraki koşular bu boşluğu modellemektedir.
 - Not: **+225** (üç pencere yalnız-engelleme toplamı, +224.82) ile **−225** (AYI LONG bacağı,
   −224.87) FARKLI büyüklüklerdir — yakınlıkları tesadüf.
 
-⚠️ **Reaper sapması — büyüklük DEĞİL, MARUZ KALAN KÜME ölçüldü.** Harness
-`SCALPER_MAX_HOLD_HOURS`'ü (D4, canlıda 8 sa) hiç uygulamaz; pozisyon SL/TP/trail'e kadar açık
-kalır. Reaper'ın gerçek popülasyonu (süre > 480 dk **ve** TP1 görmemiş — `_reap_aged_positions`
+⚠️ **Tarihsel reaper sapması — büyüklük DEĞİL, MARUZ KALAN KÜME ölçüldü.** E7 harness'ı
+`SCALPER_MAX_HOLD_HOURS`'ü (D4, canlıda 8 sa) hiç uygulamıyordu; pozisyon SL/TP/trail'e kadar açık
+kalıyordu. Reaper'ın gerçek popülasyonu (süre > 480 dk **ve** TP1 görmemiş — `_reap_aged_positions`
 şartı) AYI penceresinde: V0'da **13 işlem / −6681.25**, V1 ve V1c'de **9 işlem / −4624.75**.
 Kapının engellediği işlemlerin **4'ü** bu tanıma girer ve **−2056.50** taşır — yani V1 AYI
 Δ'sının (+2415) **%85'i**, V1c'nin (+3228) **%64'ü**, canlıda 8 saatte MARKET ile kapanacak
@@ -1016,9 +1099,10 @@ pozisyonların harness'ta SL'ye kadar taşınmasına dayanıyor. Ayrıca sapman�
 canlıda erken boşalması) tam olarak **yeniden tahsis kanalını** vurur — yani yukarıdaki tablonun
 (b) sütunu harness'ın en zayıf modellediği mekanizmadır. **Net işaret ÖLÇÜLMEDİ ve tek bir
 yüzdeyle özetlenemez**; ama etkinin dokunduğu taban Δ'nın çoğunluğudur → **E7'nin AYI sayıları
-yukarı yanlı kabul edilmelidir.** Ölçmek için harness'a reaper eklenmesi gerekir (ayrı iş, kendi
-parite testiyle). Kod tarafındaki karşılığı: `backtest.py` `_apply_capacity_gate` "BİLİNEN
-SAPMALAR" madde 3. Betik: `scripts/decompose_gate_runs.py --reaper`.
+yukarı yanlı kabul edilmelidir.** D29 (2026-08-28) harness'a aynı sıra ile max-hold/REAPER
+kapanışını ekledi ve kendi parite testiyle sabitledi; bu düzeltme tarihsel E7 sayılarını geriye
+dönük değiştirmez. D29 ve sonraki koşular reaper-paritelidir. Betik:
+`scripts/decompose_gate_runs.py --reaper`.
 
 **Lider (BTCUSDT) tetik istatistiği** (pencere içi günler, `1d` serisinden türetildi):
 | Pencere | gün-içi %1 LONG-blok günü | gün-içi %1 SHORT-blok günü | uzama %15/3g LONG-blok | uzama %15/3g SHORT-blok |

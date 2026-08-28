@@ -543,8 +543,9 @@ koşuda birebir aynı → atıf temiz (V1 ve V1c için ayrı ayrı 0 uyuşmazlı
   kapısı yeniden koşulmadı).
 - **İkinci-derece terim bir ölçüm eseri DEĞİL:** sembol-içi işgal penceresi canlıda da gerçektir
   (motor da bir sembolde tek pozisyon tutar) — kazanca sayılır, yalnız ATFI doğru yapmak gerekir.
-  Ama harness'ın en zayıf modellediği kanal tam da budur: 8 saatlik reaper canlıda pencereyi
-  ERKEN kapatır, harness'ta hiç kapatmaz (aşağıdaki reaper maddesi).
+  Bu tarihsel koşularda harness'ın en zayıf modellediği kanal tam da buydu: 8 saatlik reaper
+  canlıda pencereyi ERKEN kapatıyor, o koşuların harness'ı hiç kapatmıyordu (aşağıdaki reaper
+  maddesi). D29'dan sonraki koşular bu boşluğu modellemektedir.
 
 **Çapraz kontrol (E8 sinyal otopsisi, aynı gün):** E8 kapıyı bağımsız olarak harness JSON'u
 üzerinde POST-HOC ölçtü. Yöntem farkı önemli: E8'de engellenen sinyal kapasiteyi serbest
@@ -622,10 +623,10 @@ Uzama alt-kapısının başlangıç WARNING'i KALDI (`RUN_PCT>0` bırakan operat
 RUNBOOK'un açma komutu üç değişkeni de açıkça yazmaya devam ediyor — varsayılana güvenmek bir
 kontrol değildir. `env.example` uyumlu. Geri alma: `.env`'de eski değerleri açıkça yaz.
 
-**Bilinen sapma — 8 saatlik reaper harness'ta MODELLENMİYOR (2026-08-23 inceleme).** Canlı motor
+**Tarihsel sapma — 8 saatlik reaper D29'da MODELLENDİ (ilk bulgu 2026-08-23).** Canlı motor
 `SCALPER_MAX_HOLD_HOURS` (D4, sunucuda 8) dolan ve TP1 görmemiş pozisyonu reduce-only MARKET ile
-kapatır (`engine._reap_aged_positions`); `backtest.simulate_symbol`'de böyle bir çıkış YOKTUR —
-pozisyon SL/TP/trail'e kadar açık kalır. İki ters etki: (a) uzun sürünen kaybedenler harness'ta
+kapatır (`engine._reap_aged_positions`); tarihsel E7 harness'ında böyle bir çıkış YOKTU —
+pozisyon SL/TP/trail'e kadar açık kalıyordu. İki ters etki: (a) uzun sürünen kaybedenler harness'ta
 tam SL'ye taşınır (kapının "kestiği zarar" olduğundan büyük görünür), (b) slot canlıda 8 saatte
 boşalırken harness'ta daha uzun dolu kalır — ki bu tam olarak yukarıdaki **yeniden tahsis**
 kanalını vurur.
@@ -637,8 +638,10 @@ harness'ta SL'ye kadar taşınmasına dayanıyor. **Net işaret ÖLÇÜLMEDİ ve
 özetlenemez**; ama etkinin dokunduğu taban Δ'nın çoğunluğu olduğu için **E7'nin AYI sayıları
 yukarı yanlı kabul edilmelidir.** (Bu not önce "~%17" diyordu — kaynağı ve yöntemi olmayan,
 ham veriden yeniden üretilemeyen ve etkiyi KÜÇÜK gösteren bir sayıydı; CLAUDE.md yasak #6 gereği
-çıkarıldı.) Kod tarafındaki karşılığı: `backtest.py` `_apply_capacity_gate` "BİLİNEN SAPMALAR"
-madde 3. Reaper'ı harness'a eklemek AYRI bir iştir (kendi parite testiyle).
+çıkarıldı.) **D29 düzeltmesi (2026-08-28):** `backtest.manage_position` artık canlı safety
+sırasıyla TP1 görmemiş pozisyonu `SCALPER_MAX_HOLD_HOURS` sınırında mum kapanışından `REAPER`
+olarak kapatır ve taker çıkış ücretini düşer; birim parite testi eklendi. Bu düzeltme yukarıdaki
+tarihsel E7 sayılarını geriye dönük değiştirmez; D29 ve sonraki koşular reaper-paritelidir.
 
 **Kanıt (kod):** `tests/test_market_gate.py` — 149 test (saf fonksiyon: her alt-kapı/yön/eşik
 sınırı/eksik-geçersiz veri; gün açılışı türetmesi: gerçek 00:00 UTC açılışı + vekil yolu; motor:

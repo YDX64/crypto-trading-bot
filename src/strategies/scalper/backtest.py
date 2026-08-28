@@ -21,10 +21,12 @@ simüle edilir; canlı motorun `scalper_max_positions` KAPASİTE kapısı
 sembol-içi değil, semboller-ARASI bir kısıt olduğundan run_backtest()
 seviyesinde, tüm sembollerin aday işlemleri birleştirildikten SONRA,
 giriş zamanına göre kronolojik tek bir POST-HOC geçişle uygulanır (bkz.
-`_apply_capacity_gate`, 2026-08-21 "parite: kapasite kapısı"). Kapasite
+`_apply_capacity_gate`, 2026-08-21 "parite: kapasite kapısı"). `manage_position`
+TP1 görmemiş pozisyonlara canlıdaki `SCALPER_MAX_HOLD_HOURS`/REAPER yaş
+kesmesini de uygular. Kapasite
 yüzünden reddedilen adaylar `missed_counter["capacity"]`'de sayılır ve
 işleme dahil edilmez. Bilinen sapmalar `_apply_capacity_gate` docstring'inde
-(3 madde; #3 = 8 saatlik reaper/`SCALPER_MAX_HOLD_HOURS` harness'ta YOK).
+(2 madde) listelenir.
 
 CLI:
     python -m src.strategies.scalper.backtest --days 30 \\
@@ -1097,8 +1099,9 @@ def manage_position(
 
     `structure_feed` verilirse (yalnız `SCALPER_STRUCTURE_EXIT != off`) her
     mum sonunda yapı-tabanlı çıkış kararı da uygulanır — canlı safety
-    turundaki sıra ile AYNI: önce SL/TP (intrabar), sonra trailing, en son
-    yapı. Verilmezse (varsayılan) kod yolu bugünküyle birebir aynıdır.
+    turundaki sıra ile AYNI: önce SL/TP (intrabar), sonra trailing, yapı ve
+    son olarak TP1 görmemiş pozisyonun max-hold/REAPER kesmesi. Verilmezse
+    yalnız yapı adımı atlanır; REAPER cfg'deki yaş limiti >0 ise yine işler.
     """
     n = len(candles_5m)
     exit_idx = n - 1
@@ -1136,6 +1139,27 @@ def manage_position(
             if action == "be":
                 pos.current_stop = pos.breakeven_price
                 pos.structure_be_applied = True
+
+        # Canlı `_safety_tick` sırası: exits.step → structure → TV event →
+        # reaper. Tarihsel harness TV olaylarını modellemez; bu yüzden aynı
+        # sıradaki son modellenebilir adım burada REAPER'dır. Canlıdaki gibi
+        # yalnız TP1'i hiç görmemiş (`trailing_active == False`) pozisyonu
+        # yaş sınırında reduce-only MARKET karşılığı mum kapanışından kapatır.
+        # Mum içi SL/TP her zaman önce işlendi; çıkış ücreti `_close_remaining`
+        # tarafından taker oranıyla düşülür.
+        max_hold_h = float(
+            getattr(cfg, "scalper_max_hold_hours", 0.0) or 0.0
+        )
+        age_ms = c.close_time - pos.entry_time
+        if (
+            max_hold_h > 0.0
+            and not pos.trailing_active
+            and age_ms >= max_hold_h * 3_600_000.0
+        ):
+            _close_remaining(pos, c.close, c.close_time, "REAPER")
+            exit_idx = idx
+            _mark_equity(pos, c)
+            break
         _mark_equity(pos, c)
     else:
         exit_idx = n - 1
@@ -1947,18 +1971,6 @@ def _apply_capacity_gate(
        GERÇEKLEŞMİŞ gibi hesaba katılmıştır — sembol simülasyonu
        kapasiteden habersiz, kendi başına tamamlanır. Tam parite; kapasiteyi
        BİLEN tek bir küresel event-driven simülasyona geçmeyi gerektirir.
-    3) **REAPER MODELLENMİYOR** (2026-08-23 inceleme bulgusu). Canlı motor
-       `SCALPER_MAX_HOLD_HOURS` (D4, sunucuda 8) dolan ve TP1 görmemiş
-       pozisyonu reduce-only MARKET ile KAPATIR
-       (`engine._reap_aged_positions`); harness'ta böyle bir çıkış YOKTUR —
-       pozisyon SL/TP/trail'e kadar açık kalır. İki yönlü etkisi var:
-       (a) uzun sürünen kaybedenler harness'ta tam SL'ye kadar taşınır,
-       (b) o pozisyon slotu canlıda 8 saatte boşalırken harness'ta daha uzun
-       dolu kalır ve `_apply_capacity_gate` sonraki adayları fazladan reddeder.
-       Bu ikisi ters yönlü olduğu için NET işaret ölçülmedi; kapı gibi
-       kaybedenleri kesen değişikliklerin AYI penceresindeki kazancı bu
-       yüzden yukarı yanlı olabilir. Harness'a reaper eklemek AYRI bir iş
-       (kendi parite testiyle) — bilerek kapsam dışında.
     """
     max_positions_raw = getattr(cfg, "scalper_max_positions", 3)
     max_positions = int(max_positions_raw) if max_positions_raw is not None else 3
