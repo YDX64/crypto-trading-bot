@@ -2981,7 +2981,7 @@ düzeltmeleri (A1–A3) kod yolundadır ve bayrakla kapanmaz — geri almak içi
 commit revert. `--counterfactual` verilmezse rapor gövdesi eskisiyle birebir
 aynıdır.
 
-### D28 — Tek hesap yöneticisi, AlgoPro karantinası ve OOS TP vetosu · 2026-08-27 · KOD HAZIR, TESTNET DEPLOY BEKLİYOR
+### D28 — Tek hesap yöneticisi, AlgoPro karantinası ve OOS TP vetosu · 2026-08-27 · TESTNET SOAK AKTİF, MAINNET NO-GO
 
 **Canlı kök neden.** `157.180.97.188:9443` Nginx upstream'i kanonik
 `tradingbot_v2:9091` yerine `/opt/tradingbot-shadow:9092` sürecine gidiyordu.
@@ -3027,6 +3027,9 @@ kalır ama ölçülmüş edge olmadığı için testnet soak env'inde
 tutarken sonucu 8 saat sonra çözmeye çalışmasıydı. Store artık pending niyet
 varken sembol başına dedup edilmiş rolling mum geçmişini `max horizon + padding`
 kadar biriktirir; yeni REST isteği eklemez, bucket çözülünce belleği temizler.
+`3e049eb`, eski “kısmi pencere/no_data” başlangıç uyarısını bu yeni davranışla
+uyumlu hâle getirdi: tek 1m tarama penceresi 8 saati kapsamaz ama rolling tampon
+kapsar; yalnız süreç 8 saat dolmadan restart edilirse süreç-içi kohort sıfırlanır.
 
 **Backtest ve TP kararı.** Üç açık 1m/5m/15m rejim penceresinde TP10 tabanı
 AYI/YATAY/BOĞA sırasıyla PF **1.20/1.28/2.18**, PnL
@@ -3047,6 +3050,25 @@ yalnız kötü OOS davranışı ölçerken mutlak maruziyeti azaltır. Mainnet t
 en az 5 günlük testnet soak (en az bir düşüş günü), AlgoPro'suz pozitif net,
 PF≥1.10, kabul edilebilir DD, sıfır çift-manager/kilit ve yeterli ölçülmüş D27
 örneği olmadan yapılamaz.
+
+**Testnet aktivasyon kanıtı.** D28 zinciri standart `scripts/deploy.sh awa`
+hattıyla yayımlandı; son temiz restart `3e049eb` üzerinde 2026-08-27
+23:51 UTC'de tamamlandı ve sunucuda **2558 passed, 2 skipped** sonucu alındı.
+Temiz kohorttan önce BTC `#264` ve BNB `#265`, `/risk-event flatten` ile
+reduce-only kapatıldı (sırasıyla −0.934 ve −4.405 USDT); borsada açık pozisyon
+ve açık algo emri kalmadığı ayrıca doğrulandı. Yeni ölçüm/sermaye sınırı
+`SCALPER_VIRTUAL_CAPITAL_START_TRADE_ID=266`dır.
+
+İdari flatten negatif kapandığı için normal güvenlik davranışı olarak BTC/BNB
+üzerinde 60 dakikalık `loss_exit` cooldown'u oluştu. Bu iki kayıt stratejik
+kayıp değildi; temiz test başlangıcı için **yalnız bir kez**, risk-event halt ve
+süreç STOPPED iken kalıcı dosyadan çıkarıldı. Önce
+`backups/scalper_cooldowns.json.bak-20260827T2359Z-forced-flatten` yedeği
+alındı; başka cooldown girdisi yoktu. Kod/env değiştirilmedi ve
+`SCALPER_LOSS_COOLDOWN_MINUTES=60` doğrulandı. Son restart sayaçları
+`counterfactual registered/pending=0/0` yaptı; 2026-08-28 00:02 UTC'de halt
+kaldırıldı. Bundan sonraki gerçek kayıp aynı cooldown frenini normal biçimde
+yeniden başlatır.
 
 **Kanıt/geri alma.** Hesap kilidi testleri aynı hesap reddi, farklı hesap
 eşzamanlılığı, release/reacquire ve secret sızıntısızlığını; webhook testleri
