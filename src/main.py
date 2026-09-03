@@ -3253,6 +3253,7 @@ async def scalper_counterfactual(
     since: Optional[str] = None,
     reason: Optional[str] = None,
     limit: int = 50,
+    _log_dir: Optional[str] = None,
 ):
     """D27/B — ret gerekçesi × KARŞI-OLGU sonucu: "girilseydi ne olurdu".
 
@@ -3298,7 +3299,7 @@ async def scalper_counterfactual(
     def _read_and_summarize() -> Dict[str, Any]:
         """Disk okuması + özet — AYRI İŞ PARÇACIĞINDA (bkz. aşağıdaki not)."""
         result = forensics_log.read_events_detailed(
-            "counterfactual", since_iso=since_iso
+            "counterfactual", since_iso=since_iso, directory=_log_dir
         )
         rows = result.rows
         if wanted:

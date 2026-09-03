@@ -1190,6 +1190,8 @@ class TestApiSurface:
 
     async def test_uc_jsonl_satirlarini_ozetler(self, tmp_path):
         import src.main as main_module
+        # `_log_dir` parametresi test izolasyonu için: scalper_counterfactual
+        # gerçek log dizini yerine tmp_path'i okur (env kalıcı değişmez).
 
         jsonl_yaz(tmp_path, [
             _cf_satir(roi=20.0, outcome="tp1"),
@@ -1198,7 +1200,9 @@ class TestApiSurface:
                 ts="2026-08-24T13:00:00.000+00:00",
             ),
         ])
-        payload = await main_module.scalper_counterfactual(since=None)
+        payload = await main_module.scalper_counterfactual(
+            since=None, _log_dir=str(tmp_path)
+        )
         assert payload["summary"]["total"] == 2
         assert len(payload["rows"]) == 2
         # En yeni önce.
@@ -1215,7 +1219,7 @@ class TestApiSurface:
             ),
         ])
         payload = await main_module.scalper_counterfactual(
-            since=None, reason="regime_gate"
+            since=None, reason="regime_gate", _log_dir=str(tmp_path)
         )
         assert payload["reason"] == intent.REASON_REGIME_GATE
         assert len(payload["rows"]) == 1
@@ -1225,7 +1229,9 @@ class TestApiSurface:
         import src.main as main_module
 
         jsonl_yaz(tmp_path, [_cf_satir() for _ in range(5)])
-        payload = await main_module.scalper_counterfactual(since=None, limit=2)
+        payload = await main_module.scalper_counterfactual(
+            since=None, limit=2, _log_dir=str(tmp_path)
+        )
         assert len(payload["rows"]) == 2
         # Özet TÜM satırları görür; `limit` yalnız ham satırları kırpar.
         assert payload["summary"]["total"] == 5
