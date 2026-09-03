@@ -368,6 +368,10 @@ class ScalperEngine:
         self._risk_equity_source: str = "unavailable"
         self._daily_loss_threshold_usdt: Optional[float] = None
         self._virtual_equity_cache: Tuple[Optional[float], float] = (None, 0.0)
+        # Sanal sermaye kapanışla değişir. TTL tek başına kullanılırsa yeni
+        # gerçekleşen zarar/kâr risk kapısına gecikmeli yansır; follower ile
+        # aynı şekilde tracker kapanış sayacı cache'i anında geçersiz kılar.
+        self._virtual_equity_cache_close_seq: int = -1
         self._daily_income_cache: Tuple[Optional[float], float, Optional[str]] = (
             None,
             0.0,
@@ -4230,10 +4234,12 @@ class ScalperEngine:
         cached_equity, cached_at = getattr(
             self, "_virtual_equity_cache", (None, 0.0)
         )
+        close_seq = getattr(self.tracker, "close_seq", 0)
         now_monotonic = time.monotonic()
         if (
             cached_equity is not None
             and now_monotonic - cached_at < self._VIRTUAL_EQUITY_CACHE_TTL
+            and getattr(self, "_virtual_equity_cache_close_seq", -1) == close_seq
         ):
             return cached_equity
 
@@ -4248,6 +4254,7 @@ class ScalperEngine:
                 if resolved is not None and float(resolved) > 0:
                     equity = float(resolved)
                     self._virtual_equity_cache = (equity, now_monotonic)
+                    self._virtual_equity_cache_close_seq = close_seq
                     return equity
             except Exception as e:
                 self.logger.error(f"Scalper sizing equity çözülemedi: {e}")
@@ -4264,6 +4271,7 @@ class ScalperEngine:
                 continue
             if equity > 0:
                 self._virtual_equity_cache = (equity, now_monotonic)
+                self._virtual_equity_cache_close_seq = close_seq
                 return equity
         return None
 

@@ -551,10 +551,15 @@ def test_docker_run_sh_redaction_actually_masks_secrets():
 
 
 def test_container_ports_match_the_ring_table():
-    """Container portları `scripts/restart_safe.sh` halka tablosuyla AYNI olmalı."""
+    """Container portları `scripts/restart_safe.sh` halka tablosuyla AYNI olmalı.
+
+    D32: halka tablosu sağlık yoklamasını `/api/status` yerine `/health` ile yapar
+    (force-fresh `/api/status` REST ağırlığını yiyordu); port paritesi aynen aranır.
+    """
     restart_sh = _read(REPO_ROOT / "scripts" / "restart_safe.sh")
-    assert f"127.0.0.1:{SCALPER_PORT}/api/status" in restart_sh, "testnet halkası portu değişmiş"
-    assert f"127.0.0.1:{FOLLOWER_PORT}/api/status" in restart_sh, "follower halkası portu değişmiş"
+    assert f"127.0.0.1:{SCALPER_PORT}/health" in restart_sh, "testnet halkası portu değişmiş"
+    assert f"127.0.0.1:{FOLLOWER_PORT}/health" in restart_sh, "follower halkası portu değişmiş"
+    assert "/api/status" not in restart_sh, "sağlık yoklaması /health olmalı (D32), /api/status kaldı"
 
 
 # ── 8) Opsiyonel duman testi (docker daemon GEREKİR; yoksa ATLANIR) ─────────

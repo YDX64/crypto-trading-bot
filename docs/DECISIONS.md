@@ -3156,6 +3156,43 @@ nedeniyle değiştirilmez.
 
 **Testler.** `tests/test_tv_signal_bridge.py` (coin alanı + allowlist).
 
+### D32 — Tek yerel çalışma alanı + deploy/restart sertleştirmesi + sanal-sermaye cache'i · 2026-09-03 · AKTİF (kod), sunucuya deploy BEKLİYOR
+
+**Soru.** Yerelde üç tradingbot klasörü vardı (`/Users/max/TRADINGBOT` eski düz bot,
+`/Users/max/TRADINGBOT/v2` bu reponun klonu, `~/Downloads/Downloads/TRADINGBOT` aynı
+reponun eski klonu). Downloads klonunda 31 Ağu 04:15–06:27 tarihli 8 dosyalık
+commit'siz iş bulundu (deploy/restart sertleştirme + engine cache). Hangisi gerçek?
+
+**Karar.** Tek yerel klon `/Users/max/TRADINGBOT/v2`; Downloads klonu arşivlendi
+(`.env`, `scripts/.scalper_env_snapshot.txt`, `data/klines_cache` buraya taşındı).
+31 Ağu yaması bu commit'le alındı:
+1. `scripts/deploy.sh` / `server_deploy.sh` / `restart_safe.sh`: sağlık URL'i
+   `/api/status` → `/health` ve katı JSON kontrolü (`status=="healthy" &&
+   core_healthy==true`; salt HTTP 200 yetmez). Neden: `/api/status` force-fresh
+   çağrısı REST ağırlığını yiyordu (D22 ölçümü, "dashboard polling açlığı").
+2. Deploy ile güvenli restart aynı `logs/deploy-restart.lock` üzerinde `flock -n`
+   alır; ikinci işlem beklemeden RED olur (çift restart/deploy yarışı kapandı).
+3. venv yoksa restart fail-closed; temiz-ağaç kapısı `--untracked-files=all`
+   (başıboş dosya ile deploy yok). `deploy.sh` yerel git kapılarını cwd'ye değil
+   script'in kendi checkout'una sabitler.
+4. `engine._resolve_virtual_equity`: TTL önbelleği `tracker.close_seq` değişince
+   ANINDA geçersizleşir (takipçi motorunda zaten vardı); `tracker` başarısız-koruma
+   kaydında da `close_seq` artırır. Neden: gerçekleşen zarar günlük kayıp kapısına
+   TTL kadar gecikmeli yansıyordu.
+5. `.gitignore`: `state/` (runtime: cooldown/halt/pending) ve `.venv*/`.
+6. `tests/test_container.py` halka-port paritesi `/health` bekler.
+
+**Kanıt.** Yama bugünkü koda (bfb890e) temiz uygulandı; tam paket 2597 geçti,
+yalnız sunucuda da dışlanan 3 `TestApiSurface` testi + sandbox'ta yerel soket/dosya
+izni isteyen `test_news_bot_client` (yamasız da aynı) başarısız. İlgili testler:
+`tests/test_deploy_scripts.py`, `tests/test_runtime_liveness.py`,
+`tests/test_scalper_fee_exit_safety.py`, `tests/test_container.py`.
+
+**Sunucu notu.** `awa:/opt/tradingbot-v2` şu an bfb890e'de; bu commit deploy
+edilmeden önce `.venv-old/` silinmeli ve `docs/.follower_note` taşınmalı — aksi
+hâlde yeni kapı fail-closed durur (istenen davranış). Deploy = restart = 8 saatlik
+karşı-olgu kohortu sıfırlanır; açık pozisyon yokken yapılmalı.
+
 ## Reddedilen kararlar (kanıtla)
 
 | Fikir | Tarih | Sonuç | Neden reddedildi |

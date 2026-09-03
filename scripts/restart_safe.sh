@@ -29,15 +29,15 @@ STAMP="$(date -u +%Y%m%d-%H%M%S)"
 case "$RING" in
   testnet)
     RING_REPO_DIR="/opt/tradingbot-v2";   RING_PROGRAM="tradingbot_v2"
-    RING_HEALTH_URL="http://127.0.0.1:9091/api/status"
+    RING_HEALTH_URL="http://127.0.0.1:9091/health"
     RING_HALT_FILE="state/scalper_entry_halt.json" ;;
   follower)
     RING_REPO_DIR="/opt/tradingbot-ap";   RING_PROGRAM="tradingbot_ap"
-    RING_HEALTH_URL="http://127.0.0.1:9093/api/status"
+    RING_HEALTH_URL="http://127.0.0.1:9093/health"
     RING_HALT_FILE="state/follower_entry_halt.json" ;;
   mainnet)
     RING_REPO_DIR="/opt/tradingbot-main"; RING_PROGRAM="tradingbot_main"
-    RING_HEALTH_URL="http://127.0.0.1:9092/api/status"
+    RING_HEALTH_URL="http://127.0.0.1:9092/health"
     RING_HALT_FILE="state/scalper_entry_halt.json" ;;
   *)
     echo "HATA: geçersiz halka: '$RING' (testnet|follower|mainnet olmalı)" >&2
@@ -67,6 +67,12 @@ fi
 
 cd "$REPO_DIR" || die "repo dizini yok: $REPO_DIR"
 mkdir -p backups logs
+
+# server_deploy.sh ile ayni repo-kapsamli, nonblocking kilit. Ayni anda iki
+# restart ya da deploy+restart calisamaz; ikinci islem mevcut olani beklemez.
+command -v flock >/dev/null 2>&1 || die "flock bulunamadi — deploy/restart kilidi kurulamiyor (fail-closed)"
+exec 9>"$REPO_DIR/logs/deploy-restart.lock" || die "deploy/restart kilit dosyasi acilamadi"
+flock -n 9 || die "başka bir deploy/restart işlemi aktif — restart iptal"
 
 # ── Ön kontroller (server_deploy.sh ile AYNI) ──────────────────────────────
 ENV_BOT_MODE=""
@@ -118,10 +124,9 @@ fi
 
 # ── Ayar doğrulaması: bozuk .env ile restart, süreci ölü bırakır ───────────
 PY="$REPO_DIR/.venv/bin/python"
-if [ -x "$PY" ]; then
-  "$PY" -c "from src.core.config import settings as s; print('env ok | bot_mode', s.bot_mode)" | tee -a "$LOG" \
-    || die ".env parse edilemedi — restart YAPILMADI (yedek: backups/env.bak-$STAMP-$LABEL)"
-fi
+[ -x "$PY" ] || die "venv Python yok: $PY — ayar ve /health JSON'i doğrulanamayacağı için restart YAPILMADI"
+"$PY" -c "from src.core.config import settings as s; print('env ok | bot_mode', s.bot_mode)" | tee -a "$LOG" \
+  || die ".env parse edilemedi — restart YAPILMADI (yedek: backups/env.bak-$STAMP-$LABEL)"
 
 # ── Restart + sağlık ───────────────────────────────────────────────────────
 log "restart [$RING] $PROGRAM"
@@ -131,14 +136,28 @@ fi
 
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-240}"
 waited=0; healthy=0
+health_is_strictly_healthy() {
+  local payload
+  payload="$(curl -fsS -m 5 "$HEALTH_URL" 2>/dev/null)" || return 1
+  printf '%s' "$payload" | "$PY" -c '
+import json
+import sys
+
+try:
+    body = json.load(sys.stdin)
+except (json.JSONDecodeError, UnicodeDecodeError):
+    raise SystemExit(1)
+raise SystemExit(0 if body.get("status") == "healthy" and body.get("core_healthy") is True else 1)
+' >/dev/null 2>&1
+}
 while [ "$waited" -lt "$HEALTH_TIMEOUT" ]; do
   if ! supervisorctl status "$PROGRAM" | grep -q RUNNING; then
     die "süreç RUNNING değil ($(supervisorctl status "$PROGRAM" | awk '{print $2}')) — .env yedeği: backups/env.bak-$STAMP-$LABEL"
   fi
-  if curl -fsS -m 5 "$HEALTH_URL" 2>/dev/null | grep -q '"status"'; then healthy=1; break; fi
+  if health_is_strictly_healthy; then healthy=1; break; fi
   sleep 5; waited=$((waited+5))
 done
-[ "$healthy" = "1" ] || die "sağlık uç noktası ${HEALTH_TIMEOUT}s içinde cevap vermedi: $HEALTH_URL — .env yedeği: backups/env.bak-$STAMP-$LABEL"
+[ "$healthy" = "1" ] || die "/health ${HEALTH_TIMEOUT}s içinde status=healthy ve core_healthy=true vermedi: $HEALTH_URL — .env yedeği: backups/env.bak-$STAMP-$LABEL"
 
 PID="$(supervisorctl pid "$PROGRAM" || echo '?')"
 log "TAMAM [ring=$RING]: $PROGRAM RUNNING pid=$PID (sağlık ${waited}s sonra)"

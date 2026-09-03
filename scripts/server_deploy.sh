@@ -28,15 +28,15 @@ STAMP="$(date -u +%Y%m%d-%H%M%S)"
 case "$RING" in
   testnet)
     RING_REPO_DIR="/opt/tradingbot-v2";   RING_PROGRAM="tradingbot_v2"
-    RING_HEALTH_URL="http://127.0.0.1:9091/api/status"
+    RING_HEALTH_URL="http://127.0.0.1:9091/health"
     RING_HALT_FILE="state/scalper_entry_halt.json" ;;
   follower)
     RING_REPO_DIR="/opt/tradingbot-ap";   RING_PROGRAM="tradingbot_ap"
-    RING_HEALTH_URL="http://127.0.0.1:9093/api/status"
+    RING_HEALTH_URL="http://127.0.0.1:9093/health"
     RING_HALT_FILE="state/follower_entry_halt.json" ;;
   mainnet)
     RING_REPO_DIR="/opt/tradingbot-main"; RING_PROGRAM="tradingbot_main"
-    RING_HEALTH_URL="http://127.0.0.1:9092/api/status"
+    RING_HEALTH_URL="http://127.0.0.1:9092/health"
     RING_HALT_FILE="state/scalper_entry_halt.json" ;;
   *)
     echo "HATA: geçersiz RING: '$RING' (testnet|follower|mainnet olmalı)" >&2
@@ -70,6 +70,12 @@ fi
 
 cd "$REPO_DIR" || die "repo dizini yok: $REPO_DIR"
 mkdir -p backups logs
+
+# Deploy ile guvenli restart ayni checkout icin ayni kilidi kullanir. `-n`
+# beklemez: ikinci operator/otomasyon mevcut islemi ezmek yerine hemen RED olur.
+command -v flock >/dev/null 2>&1 || die "flock bulunamadi — deploy/restart kilidi kurulamiyor (fail-closed)"
+exec 9>"$REPO_DIR/logs/deploy-restart.lock" || die "deploy/restart kilit dosyasi acilamadi"
+flock -n 9 || die "başka bir deploy/restart işlemi aktif — bu deploy iptal"
 
 # ── Ön kontroller ──────────────────────────────────────────────────────────
 # Halka ↔ BOT_MODE bağı (D20a bulgu 4): `.env` hangi motoru başlatacağını
@@ -129,7 +135,7 @@ BAN_SINCE="$(date -d '15 minutes ago' '+%Y-%m-%d %H:%M' 2>/dev/null || true)"
 if grep -qE 'HTTP 418|banned' <(tail -n 2000 logs/bot.log 2>/dev/null | awk -v s="$BAN_SINCE" '($1" "substr($2,1,5))>=s'); then
   die "son 15 dk'da Binance ban izi var (yerel saat penceresi: >= $BAN_SINCE) — ban aktifken restart YASAK"
 fi
-[ -n "$(git status --porcelain --untracked-files=no)" ] && die "çalışma ağacında commit'lenmemiş değişiklik var; deploy yalnız temiz ağaçta"
+[ -n "$(git status --porcelain --untracked-files=all)" ] && die "çalışma ağacında commit'lenmemiş veya untracked değişiklik var; deploy yalnız temiz ağaçta"
 
 # ── Mainnet'e özel ön kontrol (bkz. docs/MAINNET_PLAN.md §3) ────────────────
 if [ "$RING" = "mainnet" ]; then
@@ -209,12 +215,26 @@ fi
 # portu sabırla yokla; süreç düşerse ya da HEALTH_TIMEOUT dolarsa geri al.
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-240}"
 waited=0; healthy=0
+health_is_strictly_healthy() {
+  local payload
+  payload="$(curl -fsS -m 5 "$HEALTH_URL" 2>/dev/null)" || return 1
+  printf '%s' "$payload" | "$PY" -c '
+import json
+import sys
+
+try:
+    body = json.load(sys.stdin)
+except (json.JSONDecodeError, UnicodeDecodeError):
+    raise SystemExit(1)
+raise SystemExit(0 if body.get("status") == "healthy" and body.get("core_healthy") is True else 1)
+' >/dev/null 2>&1
+}
 while [ "$waited" -lt "$HEALTH_TIMEOUT" ]; do
   if ! supervisorctl status "$PROGRAM" | grep -q RUNNING; then log "süreç RUNNING değil ($(supervisorctl status "$PROGRAM" | awk '{print $2}'))"; rollback; fi
-  if curl -fsS -m 5 "$HEALTH_URL" 2>/dev/null | grep -q '"status"'; then healthy=1; break; fi
+  if health_is_strictly_healthy; then healthy=1; break; fi
   sleep 5; waited=$((waited+5))
 done
-if [ "$healthy" != "1" ]; then log "sağlık uç noktası ${HEALTH_TIMEOUT}s içinde cevap vermedi: $HEALTH_URL"; rollback; fi
+if [ "$healthy" != "1" ]; then log "/health ${HEALTH_TIMEOUT}s içinde status=healthy ve core_healthy=true vermedi: $HEALTH_URL"; rollback; fi
 PID="$(supervisorctl pid "$PROGRAM" || echo '?')"
 if [ "$RING" = "testnet" ]; then
   log "TAMAM: $PROGRAM RUNNING pid=$PID commit=$NEW (sağlık ${waited}s sonra)"

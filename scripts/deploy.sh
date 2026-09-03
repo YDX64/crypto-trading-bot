@@ -10,7 +10,7 @@
 #
 # Takipçi halkası (D20, docs/RUNBOOK.md "AlgoPro takipçi halkası"):
 #   - REPO_DIR=/opt/tradingbot-ap, PROGRAM=tradingbot_ap,
-#     HEALTH_URL=http://127.0.0.1:9093/api/status
+#     HEALTH_URL=http://127.0.0.1:9093/health
 #   - hedef kuralları testnet ile AYNI (origin/main serbest); ayrı Binance
 #     testnet hesabı, ayrı .env/DB/state/log. Mainnet onayı GEREKMEZ — takipçi
 #     halkası mainnet'e çıkamaz (config.py fail-fast, docs/MAINNET_PLAN.md §6).
@@ -18,11 +18,16 @@
 # Mainnet halkası (bkz. docs/MAINNET_PLAN.md §1, §5):
 #   - hedef MUTLAKA "vX.Y.Z" biçiminde bir git TAG olmalı — `origin/main` ya da çıplak commit RED edilir
 #   - etiket origin'de bulunmalı (yalnız yerelde var olan/push edilmemiş etiket RED edilir)
-#   - REPO_DIR=/opt/tradingbot-main, PROGRAM=tradingbot_main, HEALTH_URL=http://127.0.0.1:9092/api/status
+#   - REPO_DIR=/opt/tradingbot-main, PROGRAM=tradingbot_main, HEALTH_URL=http://127.0.0.1:9092/health
 #   - onay istemi: ekrana ring/host/hedef özeti basılır, "MAINNET" kelimesi yazılmalı;
 #     otomasyon için DEPLOY_CONFIRM=MAINNET env'i ile onay istemi atlanabilir
 # Testnet halkasının davranışı bu değişiklikten ETKİLENMEZ (varsayılan yol aynı kalır).
 set -euo pipefail
+
+# Script herhangi bir dizinden cagrilabilir. Tum yerel git kapilari kullanicinin
+# o anki cwd'sine degil, bu script'in ait oldugu checkout'a sabitlenir.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+LOCAL_REPO_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 
 RING="testnet"
 ARGS=()
@@ -55,27 +60,28 @@ TARGET="${ARGS[1]:-origin/main}"
 if [ "$RING" = "mainnet" ]; then
   REPO_DIR="${REPO_DIR:-/opt/tradingbot-main}"
   PROGRAM="${PROGRAM:-tradingbot_main}"
-  HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:9092/api/status}"
+  HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:9092/health}"
 elif [ "$RING" = "follower" ]; then
   REPO_DIR="${REPO_DIR:-/opt/tradingbot-ap}"
   PROGRAM="${PROGRAM:-tradingbot_ap}"
-  HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:9093/api/status}"
+  HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:9093/health}"
 else
   REPO_DIR="${REPO_DIR:-/opt/tradingbot-v2}"
 fi
 
-# Yerel ön koşullar: temiz ağaç, main push edilmiş olmalı
-if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+# Yerel ön koşullar: temiz ağaç, main push edilmiş olmalı. Ignored
+# dosyalar haric tum untracked dosyalar da deploy'u durdurur.
+if [ -n "$(git -C "$LOCAL_REPO_DIR" status --porcelain --untracked-files=all)" ]; then
   echo "yerel ağaçta commit'lenmemiş değişiklik var — önce commit/push" >&2; exit 1
 fi
-git fetch -q origin
+git -C "$LOCAL_REPO_DIR" fetch -q origin
 
 if [ "$RING" = "mainnet" ]; then
   if ! printf '%s' "$TARGET" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
     echo "mainnet halkası yalnız 'vX.Y.Z' biçiminde bir etiket kabul eder (verilen: '$TARGET') — 'origin/main' ya da çıplak commit YASAK" >&2
     exit 1
   fi
-  if ! git ls-remote --exit-code --tags origin "refs/tags/$TARGET" >/dev/null 2>&1; then
+  if ! git -C "$LOCAL_REPO_DIR" ls-remote --exit-code --tags origin "refs/tags/$TARGET" >/dev/null 2>&1; then
     echo "etiket origin'de yok: $TARGET — önce 'git tag $TARGET && git push origin $TARGET'" >&2
     exit 1
   fi
@@ -98,7 +104,7 @@ if [ "$RING" = "mainnet" ]; then
     fi
   fi
 else
-  if [ "$TARGET" = "origin/main" ] && [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+  if [ "$TARGET" = "origin/main" ] && [ "$(git -C "$LOCAL_REPO_DIR" rev-parse HEAD)" != "$(git -C "$LOCAL_REPO_DIR" rev-parse origin/main)" ]; then
     echo "yerel HEAD origin/main ile aynı değil — önce 'git push' (ya da hedef commit'i açıkça ver)" >&2; exit 1
   fi
 fi

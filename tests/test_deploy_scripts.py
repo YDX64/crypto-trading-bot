@@ -8,8 +8,10 @@ duymaz (yalnız bash yerleşikleri + gerçek `grep`/`read`/`printf`/`echo`).
 """
 
 import os
+import shlex
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -54,6 +56,7 @@ def _make_fake_bin(tmp_path: Path) -> tuple[Path, Path]:
 
     Sahte git davranışı env değişkenleriyle yönlendirilir:
       FAKE_GIT_DIRTY=1              → `git status --porcelain` kirli ağaç bildirir
+      FAKE_GIT_UNTRACKED=1          → ignored olmayan untracked dosya bildirir
       FAKE_GIT_HEAD=<sha>           → `git rev-parse HEAD`
       FAKE_GIT_ORIGIN_MAIN=<sha>    → `git rev-parse origin/main` (varsayılan: HEAD ile aynı)
       FAKE_GIT_REMOTE_TAGS="v1 v2"  → `git ls-remote --exit-code --tags origin refs/tags/<X>`
@@ -63,15 +66,30 @@ def _make_fake_bin(tmp_path: Path) -> tuple[Path, Path]:
     """
     bin_dir = tmp_path / "fake_bin"
     bin_dir.mkdir()
+    git_log = tmp_path / "git_calls.log"
+    git_log.write_text("")
 
     _write_executable(
         bin_dir / "git",
         r"""#!/usr/bin/env bash
+: "${GIT_CALL_LOG:?GIT_CALL_LOG not set}"
+printf 'git' >> "$GIT_CALL_LOG"
+printf ' %s' "$@" >> "$GIT_CALL_LOG"
+printf '\n' >> "$GIT_CALL_LOG"
+if [ "${1:-}" = "-C" ]; then
+  shift 2
+fi
 sub="$1"; shift || true
 case "$sub" in
   status)
     if [ "${FAKE_GIT_DIRTY:-0}" = "1" ]; then
       echo " M fake/dirty/file"
+    fi
+    if [ "${FAKE_GIT_UNTRACKED:-0}" = "1" ]; then
+      case " $* " in
+        *" --untracked-files=no "*) ;;
+        *) echo "?? fake/untracked/file" ;;
+      esac
     fi
     exit 0
     ;;
@@ -130,6 +148,7 @@ def _run_deploy(
     env_extra: dict | None = None,
     stdin_text: str = "",
     fake_git_dirty: bool = False,
+    fake_git_untracked: bool = False,
     fake_git_head: str = "headsha",
     fake_git_origin_main: str | None = None,
     fake_git_remote_tags: str = "",
@@ -149,7 +168,9 @@ def _run_deploy(
         env.pop(key, None)
     env["PATH"] = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
     env["SSH_CALL_LOG"] = str(ssh_log)
+    env["GIT_CALL_LOG"] = str(tmp_path / "git_calls.log")
     env["FAKE_GIT_DIRTY"] = "1" if fake_git_dirty else "0"
+    env["FAKE_GIT_UNTRACKED"] = "1" if fake_git_untracked else "0"
     env["FAKE_GIT_HEAD"] = fake_git_head
     env["FAKE_GIT_ORIGIN_MAIN"] = fake_git_origin_main or fake_git_head
     env["FAKE_GIT_REMOTE_TAGS"] = fake_git_remote_tags
@@ -220,6 +241,24 @@ class TestDefaultRingTestnetUnchanged:
         assert proc.returncode != 0
         assert "commit'lenmemiş değişiklik" in proc.stderr
         assert _ssh_call_count(ssh_log) == 0
+
+    def test_untracked_file_refuses_before_ssh(self, tmp_path):
+        proc, ssh_log = _run_deploy(tmp_path, [], fake_git_untracked=True)
+        assert proc.returncode != 0
+        assert "commit'lenmemiş değişiklik" in proc.stderr
+        assert _ssh_call_count(ssh_log) == 0
+        assert (
+            f"git -C {REPO_ROOT} status --porcelain --untracked-files=all"
+            in (tmp_path / "git_calls.log").read_text()
+        )
+
+    def test_git_checks_are_anchored_to_script_repo_not_caller_cwd(self, tmp_path):
+        proc, _ = _run_deploy(tmp_path, [])
+        assert proc.returncode == 0, proc.stderr
+        calls = (tmp_path / "git_calls.log").read_text().splitlines()
+        assert calls
+        assert all(f"git -C {REPO_ROOT}" in call for call in calls)
+        assert all(f"git -C {tmp_path}" not in call for call in calls)
 
 
 class TestMainnetRefusesOriginMain:
@@ -296,7 +335,7 @@ class TestMainnetRequiresConfirmationWord:
         assert "cd /opt/tradingbot-main &&" in log
         assert "RING=mainnet" in log
         assert "PROGRAM=tradingbot_main" in log
-        assert "HEALTH_URL=http://127.0.0.1:9092/api/status" in log
+        assert "HEALTH_URL=http://127.0.0.1:9092/health" in log
         assert "bash /tmp/server_deploy.sh 'v1.2.0'" in log
 
 
@@ -337,7 +376,7 @@ class TestFollowerRing:
         assert "cd /opt/tradingbot-ap &&" in log
         assert "RING=follower" in log
         assert "PROGRAM=tradingbot_ap" in log
-        assert "HEALTH_URL=http://127.0.0.1:9093/api/status" in log
+        assert "HEALTH_URL=http://127.0.0.1:9093/health" in log
         assert "bash /tmp/server_deploy.sh 'origin/main'" in log
 
     def test_follower_ring_accepts_origin_main_without_confirmation(self, tmp_path):
@@ -422,7 +461,7 @@ RESTART_SAFE_SH = SCRIPTS / "restart_safe.sh"
 
 
 def _make_server_bin(tmp_path: Path, *, restart_fails=False, healthy=True):
-    """Sahte supervisorctl/curl/git/date + çağrı kaydı döner."""
+    """Sahte supervisorctl/curl/git/date/flock/sleep + çağrı kaydı döner."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     call_log = tmp_path / "calls.log"
@@ -443,19 +482,37 @@ esac
         bin_dir / "curl",
         f"""#!/usr/bin/env bash
 echo "curl $*" >> "{call_log}"
-{'echo \'{"status":"ok"}\'' if healthy else 'exit 7'}
+{'printf \'%s\\n\' "$FAKE_HEALTH_BODY"' if healthy else 'exit 7'}
 """,
     )
     _write_executable(
         bin_dir / "git",
         f"""#!/usr/bin/env bash
 echo "git $*" >> "{call_log}"
-case "$1 $2" in
-  "rev-parse HEAD") echo "aaaaaaa" ;;
-  "status --porcelain") ;;
-  "log -1") echo "sahte commit" ;;
-  *) ;;
+case "$1" in
+  rev-parse) [ "$2" = "HEAD" ] && echo "aaaaaaa" ;;
+  status)
+    case " $* " in
+      *" --untracked-files=no "*) ;;
+      *) [ -n "${{FAKE_SERVER_GIT_STATUS:-}}" ] && printf '%s\n' "$FAKE_SERVER_GIT_STATUS" ;;
+    esac
+    ;;
+  log) echo "sahte commit" ;;
 esac
+exit 0
+""",
+    )
+    _write_executable(
+        bin_dir / "flock",
+        f"""#!/usr/bin/env bash
+echo "flock $*" >> "{call_log}"
+[ "${{FAKE_FLOCK_BUSY:-0}}" != "1" ]
+""",
+    )
+    _write_executable(
+        bin_dir / "sleep",
+        f"""#!/usr/bin/env bash
+echo "sleep $*" >> "{call_log}"
 exit 0
 """,
     )
@@ -486,10 +543,20 @@ def _make_ring_dir(
     if halt_file:
         (repo / halt_file).parent.mkdir(parents=True, exist_ok=True)
         (repo / halt_file).write_text("{}")
-    # Ayar doğrulaması adımı için sahte venv python'u.
+    # Ayar doğrulaması sahte; /health JSON kontrolü ise gerçek Python'la
+    # koşar ki bozuk/eksik JSON testleri grep benzeri bir kapıya dönüşmesin.
     venv_python = repo / ".venv" / "bin" / "python"
     venv_python.parent.mkdir(parents=True, exist_ok=True)
-    _write_executable(venv_python, "#!/usr/bin/env bash\necho 'env ok'\n")
+    real_python = shlex.quote(sys.executable)
+    _write_executable(
+        venv_python,
+        f"""#!/usr/bin/env bash
+if [[ "${{2:-}}" == *"json.load"* ]]; then
+  exec {real_python} "$@"
+fi
+echo 'env ok'
+""",
+    )
     return repo
 
 
@@ -501,6 +568,7 @@ def _run_server_deploy(tmp_path, repo, bin_dir, env_extra=None, args=()):
     env["DEPLOY_SKIP_TESTS"] = "1"
     env["DEPLOY_NO_RESTART"] = "1"
     env["ROLLBACK_SETTLE_SECONDS"] = "0"
+    env["FAKE_HEALTH_BODY"] = '{"status":"healthy","core_healthy":true}'
     for key in ("RING", "PROGRAM", "HEALTH_URL"):
         env.pop(key, None)
     if env_extra:
@@ -540,7 +608,7 @@ class TestServerDeployRingBotModeBinding:
             env_extra={
                 "RING": "mainnet",
                 "PROGRAM": "tradingbot_main",
-                "HEALTH_URL": "http://127.0.0.1:9092/api/status",
+                "HEALTH_URL": "http://127.0.0.1:9092/health",
             },
         )
         assert proc.returncode != 0
@@ -556,7 +624,7 @@ class TestServerDeployRingBotModeBinding:
             env_extra={
                 "RING": "follower",
                 "PROGRAM": "tradingbot_ap",
-                "HEALTH_URL": "http://127.0.0.1:9093/api/status",
+                "HEALTH_URL": "http://127.0.0.1:9093/health",
             },
         )
         assert proc.returncode != 0
@@ -572,7 +640,7 @@ class TestServerDeployRingBotModeBinding:
             env_extra={
                 "RING": "follower",
                 "PROGRAM": "tradingbot_ap",
-                "HEALTH_URL": "http://127.0.0.1:9093/api/status",
+                "HEALTH_URL": "http://127.0.0.1:9093/health",
             },
         )
         # BOT_MODE kapısını GEÇTİ (sonraki adımlarda sahte git ile ilerler).
@@ -608,7 +676,7 @@ class TestServerDeployRingBinding:
             tmp_path,
             repo,
             bin_dir,
-            env_extra={"HEALTH_URL": "http://127.0.0.1:9093/api/status"},
+            env_extra={"HEALTH_URL": "http://127.0.0.1:9093/health"},
         )
         assert proc.returncode != 0
         assert "HEALTH_URL" in proc.stderr
@@ -637,7 +705,7 @@ class TestServerDeployRingBinding:
             env_extra={
                 "RING": "follower",
                 "PROGRAM": "tradingbot_ap",
-                "HEALTH_URL": "http://127.0.0.1:9093/api/status",
+                "HEALTH_URL": "http://127.0.0.1:9093/health",
             },
         )
         assert proc.returncode != 0
@@ -670,6 +738,35 @@ class TestServerDeployRingBinding:
         assert "gömülü takipçi entry-halt aktif" not in (proc.stdout + proc.stderr)
 
 
+class TestServerDeployWorkspaceAndOperationLock:
+    def test_untracked_server_file_refuses_before_checkout(self, tmp_path):
+        repo = _make_ring_dir(tmp_path)
+        bin_dir, call_log = _make_server_bin(tmp_path)
+        proc = _run_server_deploy(
+            tmp_path,
+            repo,
+            bin_dir,
+            env_extra={"FAKE_SERVER_GIT_STATUS": "?? stray-not-ignored.py"},
+        )
+        assert proc.returncode != 0
+        assert "untracked" in (proc.stdout + proc.stderr)
+        calls = call_log.read_text()
+        assert "git status --porcelain --untracked-files=all" in calls
+        assert "git checkout" not in calls
+
+    def test_busy_nonblocking_lock_refuses_deploy(self, tmp_path):
+        repo = _make_ring_dir(tmp_path)
+        bin_dir, call_log = _make_server_bin(tmp_path)
+        proc = _run_server_deploy(
+            tmp_path, repo, bin_dir, env_extra={"FAKE_FLOCK_BUSY": "1"}
+        )
+        assert proc.returncode != 0
+        assert "başka bir deploy/restart işlemi aktif" in (proc.stdout + proc.stderr)
+        assert "flock -n 9" in call_log.read_text()
+        assert "supervisorctl restart" not in call_log.read_text()
+        assert (repo / "logs" / "deploy-restart.lock").exists()
+
+
 class TestServerDeployRestartFailureRollsBack:
     """Ana oturum eki (B): `supervisorctl restart` hatası GERİ ALINIR."""
 
@@ -695,7 +792,39 @@ class TestServerDeployRestartFailureRollsBack:
         )
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert "TAMAM" in proc.stdout
-        assert "curl" in call_log.read_text()
+        assert "curl -fsS -m 5 http://127.0.0.1:9091/health" in call_log.read_text()
+
+    @pytest.mark.parametrize(
+        "health_body",
+        [
+            '{"status":"healthy"}',
+            '{"status":"healthy","core_healthy":false}',
+            '{"status":"degraded","core_healthy":true}',
+            '{"status":"healthy","core_healthy":1}',
+            "not-json",
+        ],
+    )
+    def test_http_success_without_strict_healthy_json_rolls_back(
+        self, tmp_path, health_body
+    ):
+        repo = _make_ring_dir(tmp_path)
+        bin_dir, call_log = _make_server_bin(tmp_path)
+        proc = _run_server_deploy(
+            tmp_path,
+            repo,
+            bin_dir,
+            env_extra={
+                "DEPLOY_NO_RESTART": "0",
+                "HEALTH_TIMEOUT": "5",
+                "FAKE_HEALTH_BODY": health_body,
+            },
+        )
+        assert proc.returncode != 0
+        assert "status=healthy ve core_healthy=true vermedi" in (
+            proc.stdout + proc.stderr
+        )
+        assert "GERİ ALINIYOR" in proc.stdout
+        assert call_log.read_text().count("supervisorctl restart") == 2
 
 
 class TestRestartSafe:
@@ -706,6 +835,7 @@ class TestRestartSafe:
         env["PATH"] = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
         env["REPO_DIR"] = str(repo)
         env["DEPLOY_REPO_DIR_OVERRIDE"] = "1"
+        env["FAKE_HEALTH_BODY"] = '{"status":"healthy","core_healthy":true}'
         for key in ("RING", "PROGRAM", "HEALTH_URL", "RESTART_LABEL"):
             env.pop(key, None)
         if env_extra:
@@ -739,7 +869,20 @@ class TestRestartSafe:
         # Saniye damgası: aynı gün ikinci uygulama temiz yedeği EZMEZ.
         assert len(backups[0].name.split("-")[2]) == 6
         assert "supervisorctl restart tradingbot_v2" in call_log.read_text()
+        assert "curl -fsS -m 5 http://127.0.0.1:9091/health" in call_log.read_text()
         assert "TAMAM" in proc.stdout
+
+    def test_busy_nonblocking_lock_refuses_restart(self, tmp_path):
+        repo = _make_ring_dir(tmp_path)
+        bin_dir, call_log = _make_server_bin(tmp_path)
+        proc = self._run(
+            tmp_path, repo, bin_dir, env_extra={"FAKE_FLOCK_BUSY": "1"}
+        )
+        assert proc.returncode != 0
+        assert "başka bir deploy/restart işlemi aktif" in (proc.stdout + proc.stderr)
+        assert "flock -n 9" in call_log.read_text()
+        assert "supervisorctl restart" not in call_log.read_text()
+        assert (repo / "logs" / "deploy-restart.lock").exists()
 
     def test_embedded_follower_halt_blocks_the_restart(self, tmp_path):
         """D20b: gömülü takipçinin kilidi testnet halkasında restart'ı durdurur."""
@@ -789,7 +932,28 @@ class TestRestartSafe:
             tmp_path, repo, bin_dir, env_extra={"HEALTH_TIMEOUT": "5"}
         )
         assert proc.returncode != 0
-        assert "sağlık uç noktası" in proc.stdout
+        assert "status=healthy ve core_healthy=true vermedi" in proc.stdout
+
+    @pytest.mark.parametrize(
+        "health_body",
+        [
+            '{"status":"healthy"}',
+            '{"status":"healthy","core_healthy":false}',
+            '{"status":"degraded","core_healthy":true}',
+            "not-json",
+        ],
+    )
+    def test_http_success_without_strict_healthy_json_fails(self, tmp_path, health_body):
+        repo = _make_ring_dir(tmp_path)
+        bin_dir, _ = _make_server_bin(tmp_path)
+        proc = self._run(
+            tmp_path,
+            repo,
+            bin_dir,
+            env_extra={"HEALTH_TIMEOUT": "5", "FAKE_HEALTH_BODY": health_body},
+        )
+        assert proc.returncode != 0
+        assert "status=healthy ve core_healthy=true vermedi" in proc.stdout
 
     def test_ring_mapping_matches_server_deploy(self):
         """İki script AYNI halka eşlemesini taşımalı (kopya kayması yok)."""
@@ -805,6 +969,10 @@ class TestRestartSafe:
             "state/follower_entry_halt.json",
             "state/scalper_entry_halt.json",
             "HTTP 418|banned",
+            "logs/deploy-restart.lock",
+            "flock -n 9",
+            'body.get("status") == "healthy"',
+            'body.get("core_healthy") is True',
         ):
             assert needle in restart_text, needle
             assert needle in deploy_text, needle

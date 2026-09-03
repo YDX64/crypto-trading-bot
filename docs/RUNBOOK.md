@@ -182,6 +182,24 @@ scripts/deploy.sh awa --ring follower        # takipçi halkası (aynı repo, ay
 scripts/deploy.sh awa v1.2.0 --ring mainnet  # yalnız etiketli sürüm + elle 'MAINNET' onayı
 ```
 
+**Yerel çalışma alanı (TEK yapı, 2026-09-03 — D32).** Bu reponun yereldeki tek klonu
+`/Users/max/TRADINGBOT/v2` (eski düz botun `/Users/max/TRADINGBOT` klasörü içinde; dış
+repo `v2/`yi `.git/info/exclude` ile görmez). `~/Downloads/Downloads/TRADINGBOT` klonu
+2026-09-03'te arşivlendi; oradaki commit'siz 31 Ağu sertleştirme yaması D32 ile buraya
+alındı, `.env` / `scripts/.scalper_env_snapshot.txt` / `data/klines_cache` taşındı.
+Claude proje hafızası da `/Users/max/TRADINGBOT` projesine birleştirildi. Başka yerel
+kopya AÇMA: iki kopya = commit'siz iş kaybı (bu olayın kendisi).
+
+**Deploy/restart sertleştirmesi (D32).** `scripts/deploy.sh`, `server_deploy.sh`,
+`restart_safe.sh`: sağlık yoklaması `/health` ve katı JSON kontrolü (`status=="healthy"`
+**ve** `core_healthy==true`; salt HTTP 200 yetmez — `/api/status` force-fresh çağrısı
+REST ağırlığını yiyordu), aynı checkout için `logs/deploy-restart.lock` üzerinde
+`flock -n` (ikinci deploy/restart beklemez, RED olur), venv yoksa fail-closed,
+temiz-ağaç kapısı artık **untracked dosyaları da** sayar (`--untracked-files=all`).
+⚠️ Sunucuda bu kapı `.venv-old/` ve `docs/.follower_note` gibi başıboş dosyalara takılır:
+D32 sonrası ilk deploy'dan önce `rm -rf /opt/tradingbot-v2/.venv-old` ve
+`docs/.follower_note`'u taşı/sil. `state/` ve `.venv*/` artık `.gitignore`'dadır.
+
 > **Container yolu (EK dağıtım).** Botu tek bir görüntüde başka sunucuya taşımak için
 > `scripts/docker_run.sh` + "Container ile çalıştırma / başka sunucuya taşıma" bölümüne
 > bakın. ⛔ supervisord ile container **AYNI ANDA ÇALIŞTIRILAMAZ** (aynı Binance hesabı,

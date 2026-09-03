@@ -84,6 +84,72 @@ def _sp(*, current_stop=99.0, tp1_done=False, tp2_done=False):
     )
 
 
+@pytest.mark.asyncio
+async def test_failed_execution_close_advances_tracker_close_seq(monkeypatch):
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def add(self, trade):
+            trade.id = 17
+
+        async def commit(self):
+            return None
+
+    monkeypatch.setattr(tracker_module, "AsyncSessionLocal", lambda: _Session())
+    tracker = ScalpTracker()
+
+    trade_id = await tracker.record_failed_execution(
+        signal=_signal(),
+        entry_price=100.0,
+        exit_price=99.8,
+        quantity=1.0,
+        leverage=10,
+        realized_pnl=-0.27,
+        pnl_source="binance_account_trades_net",
+    )
+
+    assert trade_id == 17
+    assert tracker.close_seq == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_execution_does_not_advance_close_seq_when_commit_fails(
+    monkeypatch,
+):
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def add(self, trade):
+            trade.id = 17
+
+        async def commit(self):
+            raise RuntimeError("commit failed")
+
+    monkeypatch.setattr(tracker_module, "AsyncSessionLocal", lambda: _Session())
+    tracker = ScalpTracker()
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        await tracker.record_failed_execution(
+            signal=_signal(),
+            entry_price=100.0,
+            exit_price=99.8,
+            quantity=1.0,
+            leverage=10,
+            realized_pnl=-0.27,
+            pnl_source="binance_account_trades_net",
+        )
+
+    assert tracker.close_seq == 0
+
+
 @pytest.mark.parametrize("direction", [Direction.LONG, Direction.SHORT])
 def test_fee_aware_breakeven_satisfies_exact_net_zero_equation(direction):
     entry = 100.0

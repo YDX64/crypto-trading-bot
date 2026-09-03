@@ -280,6 +280,7 @@ class ScalpTracker:
             )
             session.add(trade)
             await session.commit()
+            self.close_seq += 1
             self.logger.warning(
                 f"🧾 Başarısız koruma işlemi kaydedildi: #{trade.id} "
                 f"{signal.symbol} PNL={realized_pnl:.8f} kaynak={pnl_source}",

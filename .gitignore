@@ -88,3 +88,7 @@ backups/
 # Backtest kline onbellegi (harness; fixture dosyalari tests/fixtures altinda)
 data/klines_cache/
 scripts/.scalper_env_snapshot.txt
+
+# D32 (2026-09-03): runtime durum dizini (cooldown/halt/pending) ve eski venv kopyaları
+state/
+.venv*/

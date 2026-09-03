@@ -54,6 +54,7 @@ def _make_engine(*, tracked=None, pending=None) -> ScalperEngine:
     engine._risk_equity_source = "unavailable"
     engine._daily_loss_threshold_usdt = None
     engine._virtual_equity_cache = (None, 0.0)
+    engine._virtual_equity_cache_close_seq = -1
     engine._daily_income_cache = (0.0, time.monotonic(), None)
     engine._risk_ready = True
     engine._kill_switch = False
@@ -545,6 +546,22 @@ class TestScalperRuntimeLiveness:
         assert engine._daily_loss_threshold_usdt == pytest.approx(-150.0)
         assert engine._kill_switch is True
         engine.client.get_wallet_balance.assert_not_awaited()
+
+    async def test_virtual_risk_equity_cache_invalidates_on_tracker_close(self):
+        engine = _make_engine()
+        engine.cfg.scalper_virtual_capital_usdt = 1000.0
+        engine.tracker.close_seq = 0
+        engine.executor.get_sizing_equity = AsyncMock(side_effect=[1000.0, 940.0])
+
+        assert await engine._virtual_risk_equity() == pytest.approx(1000.0)
+        assert await engine._virtual_risk_equity() == pytest.approx(1000.0)
+        assert engine.executor.get_sizing_equity.await_count == 1
+
+        # A newly committed close changes virtual capital immediately; the
+        # risk gate must not keep the pre-close value until the TTL expires.
+        engine.tracker.close_seq = 1
+        assert await engine._virtual_risk_equity() == pytest.approx(940.0)
+        assert engine.executor.get_sizing_equity.await_count == 2
 
     def test_snapshot_exposes_fee_aware_exit_cooldown_and_sizing_telemetry(self):
         engine = _make_engine()

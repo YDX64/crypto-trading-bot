@@ -25,6 +25,9 @@ Yeni sinyal kaynağı (haber botu vb.) eklemek: `docs/INTEGRATIONS.md`. Otomatik
 ## Nerede çalışır? (gerçeğin kaynağı)
 - **Kod:** GitHub `YDX64/crypto-trading-bot` `main` — tek gerçek. Sunucu repo'su
   (`awa:/opt/tradingbot-v2`) bunu izler; **scp ile dosya kopyalama YASAK**.
+- **Yerel klon (TEK):** `/Users/max/TRADINGBOT/v2` — başka yerel kopya tutma
+  (`~/Downloads/Downloads/TRADINGBOT` 2026-09-03'te arşivlendi; D32). Çalışma
+  ağacı temiz olmalı: deploy kapısı untracked dosyayı da RED eder.
 - **Canlı süreç (TESTNET):** supervisord programı `tradingbot_v2`
   (`/opt/tradingbot-v2/.venv/bin/python -m uvicorn src.main:app :9091`).
   `systemctl`'deki `live-bot.service` **trading botu DEĞİLDİR** (futbol botu).
