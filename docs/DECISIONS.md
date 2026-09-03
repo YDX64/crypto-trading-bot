@@ -3082,6 +3082,60 @@ ama çift-yönetici kök nedenini geri getirir ve **yasaktır**. Kod geri alma t
 commit revert; AlgoPro karantinası yalnız env'den blocklist kaldırılarak geri
 alınabilir, fakat yeni pozitif soak kanıtı olmadan yapılmaz.
 
+### D30 — Bayat-kâr kapanışı `STALE_TP` (`SCALPER_STALE_TP_HOURS` / `_MIN_ROI_PCT`) · 2026-09-03 · **ADAY, HOLDOUT REDDETTİ — kod varsayılanı KAPALI, canlıda AÇILMADI**
+
+**Soru.** 2026-08-22'den beri canlı defter neden bozuldu ve çıkış tarafında
+düzeltilebilir bir şey var mı? Sunucu (`awa`, `/opt/tradingbot-v2`) defteri ve
+aynı kodla mainnet mumları üzerinde 5 pencerelik harness koşusu birlikte okundu.
+
+**Bulgu (kök neden, çıkış tarafı).** 5 pencere / 886 işlemde (AYI · YATAY · BOĞA ·
+OOS Mart · ÇÖKÜŞ 08-21→09-03) `REAPER` (D4, 8 sa yaş kesmesi) **165 işlem, WR %14.5,
+−958 USDT** ile tek başına en büyük kayıp kaynağı; 30–240 dk içinde biten işlemlerin
+PF'si 1.6–7 iken 8 saati dolduranlar neredeyse hep zararda kapanıyor. Canlı
+defterde de aynı: 25–26 Ağustos'ta `REAPER` 7 işlem / −97 (D28 ile uyumlu).
+Payoff yapısı (TP1 ≈ %0.5 fiyat, stop ≈ %2.5 fiyat, 20x) başabaş WR'yi ≈ %71–85'e
+itiyor; bu yüzden küçük kazançlar seyrek ama büyük stop/reaper kayıplarıyla siliniyor.
+
+**Denenen varyantlar (aynı 5 pencere, toplam net · OOS Mart).**
+
+| Varyant | Toplam | OOS |
+|---|---|---|
+| Baz (sunucu env) | +339 | −130 |
+| `SCALPER_MAX_HOLD_HOURS=3` | +305 | −76 |
+| `SCALPER_FIXED_STOP_ROI_PCT=30` | +256 | −191 |
+| `SCALPER_TF_REGIME=1h` | +362 | −51 |
+| UP rejimde LONG yasak | +377 | −77 |
+| **STALE_TP 2 sa / ROI ≥ %2** | **+448** | **+11** (maxDD 190 → 97) |
+
+STALE_TP = TP1 görmemiş pozisyon 2 saati doldurdu ve o an ROI ≥ %2 ise reduce-only
+MARKET ile kapat; zararda olana dokunma. 1.5–2 sa × %0–2 ızgarasında düz (+420–450).
+
+**Holdout (seçimde HİÇ kullanılmamış iki pencere, karar bundan sonra kilitlendi).**
+
+| Pencere | Baz | STALE_TP 2 sa/%2 |
+|---|---|---|
+| 2026-05-04→05-25 | −336.80 · PF 0.61 · maxDD 359 | **−381.61** · PF 0.51 · maxDD 403 |
+| 2026-06-08→06-29 | +70.64 · PF 1.13 · maxDD 98 | **+58.55** · PF 1.13 · maxDD 108 |
+
+İki pencerede de net düştü, maks. düşüş büyüdü. Mekanizma: kural `REAPER`
+zararını az azaltıyor (−423 → −335) ama `TRAIL` kazancını çok kesiyor
+(+523 → +323) — 2 saatte %2'de duran işlemlerin bir kısmı TP1'e varıp koşucu
+oluyordu. Seçim pencerelerindeki kazanç, o pencerelere uyumdu.
+
+**Karar.** P2 kuralı gereği (OOS/holdout kötüleşmesi tek başına veto) canlıda
+**AÇILMAZ**. Kod, varsayılan `0` ile depoda kalır: canlı motor
+(`engine._close_stale_profitable_positions`, reaper ile aynı reduce-only MARKET
+yolu, tur başına tek kapanış, bayat fiyatla karar yok) ve harness
+(`backtest.manage_position`) aynı saf kararı (`types.stale_tp_should_close`) aynı
+sırayla (TV olayı → STALE_TP → REAPER) uygular; etiket `STALE_TP` kendi ailesidir
+(`ledger_report`, `forensics`). Kapalıyken hiçbir kod yolu davranış değiştirmez
+(golden backtest testi). Testler: `tests/test_stale_tp_exit.py` (30).
+
+**Asıl sonuç.** Çıkış tarafındaki hiçbir tek parametre (hold, stop, rejim TF,
+STALE_TP) bozulmayı pencereler arasında tutarlı biçimde düzeltmiyor; sorun giriş
+kalitesi ve payoff yapısındadır. D28'in testnet soak / marj %0.5 / mainnet NO-GO
+kararı yerinde kalır. Komutlar ve log yolları: `docs/EXPERIMENTS.md` E11.
+
 ## Reddedilen kararlar (kanıtla)
 
 | Fikir | Tarih | Sonuç | Neden reddedildi |

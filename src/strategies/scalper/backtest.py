@@ -101,9 +101,12 @@ from src.strategies.scalper.types import (
     Direction,
     ScalpSignal,
     StrategyContext,
+    EXIT_REASON_STALE_TP,
     StrategyProtocol,
+    position_roi_pct,
     price_at_roi,
     resolve_trail_mult,
+    stale_tp_should_close,
 )
 
 # --------------------------------------------------------------------------
@@ -1099,9 +1102,10 @@ def manage_position(
 
     `structure_feed` verilirse (yalnız `SCALPER_STRUCTURE_EXIT != off`) her
     mum sonunda yapı-tabanlı çıkış kararı da uygulanır — canlı safety
-    turundaki sıra ile AYNI: önce SL/TP (intrabar), sonra trailing, yapı ve
-    son olarak TP1 görmemiş pozisyonun max-hold/REAPER kesmesi. Verilmezse
-    yalnız yapı adımı atlanır; REAPER cfg'deki yaş limiti >0 ise yine işler.
+    turundaki sıra ile AYNI: önce SL/TP (intrabar), sonra trailing, yapı,
+    TP1 görmemiş pozisyonun bayat-kâr kapanışı (STALE_TP, D30) ve son olarak
+    max-hold/REAPER kesmesi. Verilmezse yalnız yapı adımı atlanır; STALE_TP
+    ve REAPER cfg'deki eşikleri >0 ise yine işler.
     """
     n = len(candles_5m)
     exit_idx = n - 1
@@ -1141,16 +1145,33 @@ def manage_position(
                 pos.structure_be_applied = True
 
         # Canlı `_safety_tick` sırası: exits.step → structure → TV event →
-        # reaper. Tarihsel harness TV olaylarını modellemez; bu yüzden aynı
-        # sıradaki son modellenebilir adım burada REAPER'dır. Canlıdaki gibi
-        # yalnız TP1'i hiç görmemiş (`trailing_active == False`) pozisyonu
-        # yaş sınırında reduce-only MARKET karşılığı mum kapanışından kapatır.
+        # bayat-kâr kapanışı (D30) → reaper. Tarihsel harness TV olaylarını
+        # modellemez; bu yüzden aynı sıradaki son modellenebilir adımlar
+        # burada STALE_TP ve REAPER'dır. Canlıdaki gibi yalnız TP1'i hiç
+        # görmemiş (`trailing_active == False`) pozisyonu yaş sınırında
+        # reduce-only MARKET karşılığı mum kapanışından kapatır.
         # Mum içi SL/TP her zaman önce işlendi; çıkış ücreti `_close_remaining`
         # tarafından taker oranıyla düşülür.
+        age_ms = c.close_time - pos.entry_time
+        # D30 — bayat-kâr kapanışı: yaş ≥ SCALPER_STALE_TP_HOURS ve mum
+        # KAPANIŞINDAKİ ROI ≥ SCALPER_STALE_TP_MIN_ROI_PCT ise kalanı kapat.
+        # Canlı karşılığı `engine._close_stale_profitable_positions`: AYNI saf
+        # karar (`stale_tp_should_close`), fiyat = safety turundaki güncel
+        # fiyat. Kapalıyken (varsayılan 0) bu blok hiç çalışmaz.
+        if not pos.trailing_active and stale_tp_should_close(
+            cfg,
+            age_ms=age_ms,
+            roi_pct=position_roi_pct(
+                pos.entry_price, c.close, pos.leverage, pos.direction
+            ),
+        ):
+            _close_remaining(pos, c.close, c.close_time, EXIT_REASON_STALE_TP)
+            exit_idx = idx
+            _mark_equity(pos, c)
+            break
         max_hold_h = float(
             getattr(cfg, "scalper_max_hold_hours", 0.0) or 0.0
         )
-        age_ms = c.close_time - pos.entry_time
         if (
             max_hold_h > 0.0
             and not pos.trailing_active

@@ -198,9 +198,14 @@ def _direction_value(direction: Any) -> str:
 # postmortem'in `losing` kuralı REAPER'ı artık yalnız NET PnL negatifse kayıplı
 # sayar; ARTIDA kesilen bir pozisyonda `noise_stop` ("stop sonrası fiyat girişe
 # döndü") sorusunun zaten anlamı yoktur.
+# D30: `STALE_TP` = bayat-kâr kapanışı (TP1 görmemiş, yaşlı, KÂRDA pozisyonun
+# reduce-only MARKET kesmesi). KENDİ AİLESİ: TP_LADDER değildir (hedefe
+# varılmadı), SL değildir (kârda kapandı). `losing` kuralı için REAPER gibi
+# yalnız NET PnL negatifse kayıplı sayılır.
 _EXIT_REASON_FAMILY = {
     "SL": "SL",
     "REAPER": "REAPER",
+    "STALE_TP": "STALE_TP",
     "TP_LADDER": "TP_LADDER",
     "TRAIL": "TRAIL",
     "TRAIL_MARKET": "TRAIL",

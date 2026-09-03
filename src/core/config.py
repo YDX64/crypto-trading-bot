@@ -214,6 +214,24 @@ class Settings(BaseSettings):
     # Pozisyon bu saatten yaşlıysa reaper reduce-only MARKET ile kapatır
     # (0 = kapalı). Scalp ufkunu aşan pozisyon slot+sermaye israfıdır.
     scalper_max_hold_hours: float = 0.0
+    # --- Bayat-kâr kapanışı ("STALE_TP", D30) — ADAY, HOLDOUT REDDETTİ ------
+    # VARSAYILAN KAPALI; CANLIDA AÇMAYIN (docs/DECISIONS.md D30).
+    # TP1'i HİÇ görmemiş bir pozisyon bu yaşa (saat) ulaştığında ve o anki
+    # ROI'si (marj üzerinden, kaldıraçlı) `scalper_stale_tp_min_roi_pct`'nin
+    # ÜSTÜNDEYSE reduce-only MARKET ile kapatılır; zararda olana DOKUNMAZ.
+    # Seçim pencerelerinde (5 pencere / 886 işlem) 2 sa / %2 eşiği toplam neti
+    # +339 → +448, OOS'u −130 → +11 yapmıştı; ama seçimde HİÇ kullanılmamış iki
+    # holdout penceresinde (May 04–25, Haz 08–29) sonuç TERS: −337 → −382 ve
+    # +71 → +59, maks. düşüş her ikisinde büyüdü. Kural REAPER zararını az
+    # azaltıp TRAIL kazançlarını (TP1'e varacak koşucuları) kesiyor. Kod, ileri
+    # deneyler için opt-in bir ölçüm aracı olarak durur; harness
+    # (`backtest.manage_position`) AYNI kuralı AYNI sırayla uygular (parite).
+    # 0 = kapalı → hiçbir kod yolu davranış değiştirmez (golden backtest aynı).
+    scalper_stale_tp_hours: float = 0.0
+    # Kapanış için asgari ROI (%, marj üzerinden). Maker giriş + taker çıkış
+    # ≈ %1.4 ROI komisyon (20x); %2 eşiği yalnız komisyonu aşan pozisyonu
+    # kapatır. Yalnız `scalper_stale_tp_hours > 0` iken okunur.
+    scalper_stale_tp_min_roi_pct: float = 2.0
     # Rejime ters C girislerini engelle (LONG yasak DOWN'da, SHORT yasak
     # UP'ta; RANGE/UNKNOWN serbest).
     scalper_regime_filter: bool = True

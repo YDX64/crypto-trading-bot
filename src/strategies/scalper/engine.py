@@ -79,7 +79,9 @@ from src.strategies.scalper.types import (
     Regime,
     ScalpSignal,
     StrategyContext,
+    position_roi_pct,
     price_at_roi,
+    stale_tp_should_close,
 )
 from src.trading.binance_client_improved import (
     ImprovedBinanceClient,
@@ -1362,6 +1364,10 @@ class ScalperEngine:
         # pozisyonlara bakar. Reaper'dan ÖNCE: bir olay varsa kapanış nedeni
         # "yaş" değil "TV_EVENT" olarak etiketlenmeli.
         await self._apply_tv_event_exits()
+        # D30 bayat-kâr kapanışı reaper'dan ÖNCE: ikisi de TP1 görmemiş yaşlı
+        # pozisyona bakar; kârda olanı "yaş" değil "STALE_TP" kapatmalı.
+        # Backtest harness'i (`backtest.manage_position`) AYNI sırayı izler.
+        await self._close_stale_profitable_positions()
         await self._reap_aged_positions()
         # D21 post-mortem: TÜM çıkış/koruma işlerinden SONRA ve AYRI bir
         # task'ta — safety turu onu BEKLEMEZ. Yavaş/5xx bir veri host'unda
@@ -1492,6 +1498,99 @@ class ScalperEngine:
                 )
             return  # tur başına en fazla bir aksiyon
 
+    # STALE_TP kararında kullanılan güncel fiyatın azami yaşı, safety turu
+    # cinsinden: fiyat `exits.step` tarafından AYNI turda tazelenir; bundan
+    # eski bir fiyat (fiyat çekimi hata verdi, restart'ın ilk turu vb.) ile
+    # "kârda" hükmü verilmez — kural o turda sessizce atlanır (fail-closed).
+    _STALE_TP_PRICE_MAX_AGE_TICKS = 3.0
+
+    async def _close_stale_profitable_positions(self) -> None:
+        """D30 — bayat-kâr kapanışı: TP1 görmemiş, yaşlı ve KÂRDA pozisyonu kapat.
+
+        `SCALPER_STALE_TP_HOURS` (0 = kapalı) yaşını dolduran, TP1'i hiç
+        görmemiş (`trailing_active` False) ve safety turundaki güncel fiyata
+        göre ROI ≥ `SCALPER_STALE_TP_MIN_ROI_PCT` olan pozisyon reduce-only
+        MARKET ile kapatılır. Karar saf fonksiyondan gelir
+        (`types.stale_tp_should_close`); backtest harness'i
+        (`backtest.manage_position`) AYNI fonksiyonu mum kapanışıyla çağırır
+        — parite (DECISIONS P1).
+
+        Durum (docs/DECISIONS.md D30): ADAY — HOLDOUT REDDETTİ, canlıda
+        AÇILMADI (kod varsayılanı 0). Hipotez: TP1'e ulaşamayıp 8 saati
+        dolduran REAPER kapanışları (5 pencere / 886 işlem: WR %14.5 / −958
+        USDT) en büyük kayıp kaynağıydı; 2 saatte hedefe varmamış işlemin
+        küçük kârını almak beklemekten iyi olmalıydı. Seçim pencerelerinde
+        öyle göründü (+339 → +448), ama seçimde kullanılmamış iki holdout
+        penceresinde tersine döndü (−337 → −382, +71 → +59): kural REAPER
+        zararını az azaltıp TP1'e varacak koşucuların TRAIL kazancını kesiyor.
+        Kod, ileri deneyler için opt-in ölçüm aracı olarak durur.
+
+        Reaper ile aynı disiplin: `_submit_reduce_only_market_close` (TEK emir
+        yolu), tur başına EN FAZLA BİR kapanış (2026-08-14 watchdog dersi),
+        ledger doğrulaması bir sonraki safety turunda `exits.step` ile,
+        etiket damgası (`sp.stale_tp_close_at`) yalnız emir BORSAYA GİTTİKTEN
+        sonra. Güncel fiyat bayatsa (bkz. `_STALE_TP_PRICE_MAX_AGE_TICKS`)
+        karar verilmez.
+        """
+        cfg = self.cfg
+        if float(getattr(cfg, "scalper_stale_tp_hours", 0.0) or 0.0) <= 0.0:
+            return
+        interval = float(getattr(cfg, "scalper_safety_interval_seconds", 2.0) or 2.0)
+        max_price_age = max(1.0, interval) * self._STALE_TP_PRICE_MAX_AGE_TICKS
+        now = datetime.now(timezone.utc)
+        now_mono = time.monotonic()
+        for symbol in list(self.exits.tracked_symbols()):
+            sp = self.exits._positions.get(symbol)
+            if sp is None:
+                continue
+            if getattr(sp, "trailing_active", False) or getattr(sp, "tp1_done", False):
+                continue  # TP1 görmüş / BE korumalı koşucu: tek çıkış stop/trailing
+            if getattr(sp, "stale_tp_close_at", None) or getattr(sp, "reaper_close_at", None):
+                continue  # kapanış zaten gönderildi; ledger doğrulaması bekleniyor
+            opened = getattr(sp.position, "opened_at", None)
+            if opened is None:
+                continue
+            if opened.tzinfo is None:
+                opened = opened.replace(tzinfo=timezone.utc)
+            age_ms = (now - opened).total_seconds() * 1000.0
+            price = getattr(sp.position, "current_price", None)
+            price_ts = getattr(sp, "price_ts", None)
+            if not price or price <= 0 or price_ts is None or (now_mono - price_ts) > max_price_age:
+                continue  # taze fiyat yok → bu turda karar verme (fail-closed)
+            direction = getattr(getattr(sp, "signal", None), "direction", None)
+            if direction is None:
+                side_val = str(getattr(sp.position.side, "value", sp.position.side))
+                direction = Direction.LONG if side_val.endswith("LONG") else Direction.SHORT
+            roi_pct = position_roi_pct(
+                float(sp.position.entry_price),
+                float(price),
+                int(getattr(sp.position, "leverage", 0) or 0),
+                direction,
+            )
+            if not stale_tp_should_close(cfg, age_ms=age_ms, roi_pct=roi_pct):
+                continue
+            side_val = getattr(sp.position.side, "value", str(sp.position.side))
+            close_side = "SELL" if str(side_val).endswith("LONG") else "BUY"
+            qty = abs(float(sp.position.quantity))
+            try:
+                qty = await self.client.quantize_quantity(symbol, qty)
+                await self._submit_reduce_only_market_close(symbol, close_side, qty)
+                try:
+                    sp.stale_tp_close_at = _utcnow_iso()
+                except Exception:  # pragma: no cover - test çiftleri (SimpleNamespace)
+                    pass
+                self.logger.info(
+                    f"🕒 STALE_TP: {symbol} {age_ms / 3_600_000.0:.1f}sa yaşında, TP1 yok, "
+                    f"ROI %{roi_pct:.2f} ≥ %{float(getattr(cfg, 'scalper_stale_tp_min_roi_pct', 0.0) or 0.0):.2f} — "
+                    f"reduce-only kapanış gönderildi; ledger doğrulaması safety turunda",
+                    extra={"trade": True},
+                )
+            except Exception as e:
+                self.logger.warning(
+                    f"🕒 STALE_TP: {symbol} kapanışı gönderilemedi ({e}); sonraki turda denenecek"
+                )
+            return  # tur başına en fazla bir kapanış
+
     async def _reap_aged_positions(self) -> None:
         """Yaş limitini aşan KORUMASIZ pozisyonları kapat (ölü-sermaye reaper'ı).
 
@@ -1518,6 +1617,11 @@ class ScalperEngine:
                 continue
             if getattr(sp, "trailing_active", False):
                 continue  # BE korumalı koşucu: tek çıkış stop/trailing
+            if getattr(sp, "stale_tp_close_at", None):
+                # D30: bayat-kâr kapanışı bu turda/önceki turda zaten gönderildi;
+                # aynı pozisyona ikinci bir reduce-only MARKET göndermek -2022
+                # gürültüsü ve yanlış "REAPER" damgası üretir.
+                continue
             opened = getattr(sp.position, "opened_at", None)
             if opened is None:
                 continue

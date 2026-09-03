@@ -82,6 +82,37 @@ class TestSymbolResolution:
             _resolve(f"Bullish signal secret={SECRET}")
         assert e.value.status_code == 422
 
+    def test_awaxx_pine_coin_field_completed_to_usdt(self):
+        # Kullanıcının kendi Pine alarmı (awaxx_scalp_alert*.pine, eski bot
+        # sözleşmesi): parite `coin` alanında USDT'siz gelir; metinde de
+        # geçmez. Eskiden 422 alıyordu — artık SOLUSDT/LONG çözülür.
+        raw = json.dumps({
+            "secret": SECRET, "coin": "SOL", "direction": "LONG",
+            "entry": 99.5, "stoploss": 97.1, "targets": [100.1, 100.6],
+            "leverage": 20, "source": "awaxx_scalp", "score": 80,
+        })
+        assert _resolve(raw) == ("SOLUSDT", Direction.LONG)
+
+    def test_coin_field_accepts_full_pair_and_perp_suffix(self):
+        raw = json.dumps({"secret": SECRET, "coin": "binance:xrpusdt.p", "side": "sell"})
+        assert _resolve(raw) == ("XRPUSDT", Direction.SHORT)
+
+    def test_symbol_field_wins_over_coin(self):
+        raw = json.dumps({"secret": SECRET, "symbol": "BTCUSDT", "coin": "SOL", "side": "buy"})
+        assert _resolve(raw) == ("BTCUSDT", Direction.LONG)
+
+    def test_ticker_field_accepted(self):
+        raw = json.dumps({"secret": SECRET, "ticker": "BINANCE:ETHUSDT.P", "side": "buy"})
+        assert _resolve(raw) == ("ETHUSDT", Direction.LONG)
+
+    def test_garbage_coin_field_still_422(self):
+        # Coin alanı parite kodu değilse USDT EKLENMEZ (rastgele metin
+        # pariteye çevrilmez) → sembol çözülemez → 422.
+        raw = json.dumps({"secret": SECRET, "coin": "not a coin!", "side": "buy"})
+        with pytest.raises(HTTPException) as e:
+            _resolve(raw)
+        assert e.value.status_code == 422
+
 
 class TestDirectionResolution:
     def test_payload_side_wins_over_text(self):

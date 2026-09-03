@@ -70,9 +70,12 @@ REGIME_ORDER = ["UP", "FLAT", "DOWN", "?"]
 # kesilmişti. **GERİYE DÖNÜK VERİ DÜZELTMESİ YOKTUR** — 2026-08-24 öncesinde
 # kapanan yaş kesmeleri defterde hâlâ "SL"dir; rapor bunu REAPER_SPLIT_NOTE
 # ile söyler.
+# "STALE_TP" (D30): TP1 görmemiş, ≥SCALPER_STALE_TP_HOURS yaşında ve KÂRDA
+# pozisyonun reduce-only MARKET kapanışı (reaper'ın kârlı erken kardeşi).
+# KENDİ AİLESİ — TP_LADDER'a katılmaz: hedefe varılmadı, hedef düşürüldü.
 EXIT_REASON_ORDER = [
-    "SL", "REAPER", "TP_LADDER", "TRAIL", "TRAIL_MARKET", "BE_MARKET",
-    "MANUAL", "UNKNOWN",
+    "SL", "REAPER", "STALE_TP", "TP_LADDER", "TRAIL", "TRAIL_MARKET",
+    "BE_MARKET", "MANUAL", "UNKNOWN",
 ]
 REAPER_SPLIT_NOTE = (
     "REAPER ayrımı 2026-08-24'ten itibaren geçerlidir (D27/A1): daha eski yaş "
@@ -82,6 +85,7 @@ REAPER_SPLIT_NOTE = (
 EXIT_REASON_FAMILY = {
     "SL": "SL",
     "REAPER": "REAPER",
+    "STALE_TP": "STALE_TP",
     "TP_LADDER": "TP_LADDER",
     "TRAIL": "TRAIL",
     "TRAIL_MARKET": "TRAIL",

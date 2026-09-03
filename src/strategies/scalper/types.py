@@ -155,6 +155,47 @@ def price_at_roi(entry: float, roi_pct: float, leverage: int,
     return entry + delta if direction == Direction.LONG else entry - delta
 
 
+# D30 — bayat-kâr kapanışı etiketi. Burada (bağımlılıksız modülde) durur ki
+# canlı defter (`exits.py`) ve backtest harness'i (`backtest.py`) AYNI dizeyi
+# kullansın; harness `exits`i import etmez (ağ/istemci bağımlılığı taşımaz).
+EXIT_REASON_STALE_TP = "STALE_TP"
+
+
+def position_roi_pct(
+    entry: float, price: float, leverage: int, direction: Direction
+) -> float:
+    """Açık pozisyonun `price`taki kaldıraçlı ROI'si (%, marj üzerinden).
+
+    `exits._update_mae_mfe` ile AYNI tanım (fiyat farkı % × kaldıraç; SHORT'ta
+    işaret ters). Komisyon DÜŞÜLMEZ — eşikler bunu bilerek konur (bkz.
+    `scalper_stale_tp_min_roi_pct`). Geçersiz giriş fiyatında 0.0 döner.
+    """
+    if entry <= 0:
+        return 0.0
+    lev = leverage if leverage and leverage > 0 else 1
+    delta_pct = (price - entry) / entry * 100.0
+    if direction == Direction.SHORT:
+        delta_pct = -delta_pct
+    return delta_pct * lev
+
+
+def stale_tp_should_close(cfg: Any, *, age_ms: float, roi_pct: float) -> bool:
+    """D30 — bayat-kâr kapanışı kararı (SAF; canlı motor ve harness ortak).
+
+    True ⇔ özellik açık (`scalper_stale_tp_hours` > 0) VE pozisyon yaşı bu
+    saati doldurmuş VE anlık ROI ≥ `scalper_stale_tp_min_roi_pct`.
+    Çağıran taraf "TP1 görülmemiş" (trailing_active False) ön koşulunu kendi
+    uygular — reaper ile aynı muafiyet: BE korumalı koşucuya dokunulmaz.
+    """
+    hours = float(getattr(cfg, "scalper_stale_tp_hours", 0.0) or 0.0)
+    if hours <= 0.0:
+        return False
+    if age_ms < hours * 3_600_000.0:
+        return False
+    min_roi = float(getattr(cfg, "scalper_stale_tp_min_roi_pct", 0.0) or 0.0)
+    return roi_pct >= min_roi
+
+
 def resolve_trail_mult(cfg: Any, peak_roi_pct: float) -> float:
     """Kademeli gevşeyen iz: TEPE ROI (high-water mark) büyüdükçe chandelier
     çarpanı büyür — küçük kârda sıkı koru, dev trendde geniş bırak.

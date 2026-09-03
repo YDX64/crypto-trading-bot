@@ -1077,6 +1077,8 @@ def _tv_confluence():
 
 
 _TV_SYMBOL_RE = re.compile(r"\b([A-Z0-9]{2,15}USDT)(?:\.P)?\b")
+# Açık `coin` alanı için: yalın coin kodu ("SOL", "1000PEPE") ya da tam parite.
+_TV_COIN_RE = re.compile(r"[A-Z0-9]{2,15}")
 _TV_SECRET_RE = re.compile(r"secret[=:]\s*([^\s\"',}]+)")
 _TV_LONG_WORDS = ("buy", "long", "bull")
 _TV_SHORT_WORDS = ("sell", "short", "bear")
@@ -1491,11 +1493,25 @@ def _tv_provided_secret(payload: dict, raw: str, url_secret: str) -> str:
 
 
 def _tv_symbol(payload: dict, raw: str) -> str:
-    """Sembolü `symbol` alanından veya metinden çöz. Hata → 422."""
-    symbol = str(payload.get("symbol") or "").upper().strip()
+    """Sembolü `symbol`/`ticker`/`coin` alanından veya metinden çöz. Hata → 422.
+
+    `coin` (2026-09-03): kullanıcının kendi Pine alarmları
+    (`awaxx_scalp_alert*.pine`, eski bot sözleşmesi) pariteyi `"coin":"SOL"`
+    biçiminde, USDT'siz gönderir. Bu gövdeler v2'de 422 alıyordu (sembol
+    metinde de geçmiyor). Yalnız AÇIK `coin` alanı USDT ile tamamlanır —
+    serbest metindeki rastgele kelimeler asla pariteye çevrilmez.
+    """
+    symbol = str(payload.get("symbol") or payload.get("ticker") or "").upper().strip()
     symbol = symbol.split(":")[-1]  # "BINANCE:BTCUSDT" → "BTCUSDT"
     if symbol.endswith(".P"):
         symbol = symbol[:-2]
+    if not symbol:
+        coin = str(payload.get("coin") or "").upper().strip()
+        coin = coin.split(":")[-1]
+        if coin.endswith(".P"):
+            coin = coin[:-2]
+        if coin and _TV_COIN_RE.fullmatch(coin):
+            symbol = coin if coin.endswith("USDT") else coin + "USDT"
     if not symbol:
         match = _TV_SYMBOL_RE.search(raw.upper())
         symbol = match.group(1) if match else ""

@@ -1407,3 +1407,46 @@ burada da geçerlidir.
 Kenar iki strese de dayanıyor ama ince: maliyet iki katına çıkarsa kârın %58'i, giriş
 bir mum gecikirse %50'si gidiyor. Mainnet kayması testnet'ten yüksektir — bu tablo
 canlı para kararında bağlayıcıdır.
+
+## E11 — Çıkış tarafı: REAPER kaybı ve bayat-kâr kapanışı `STALE_TP` (2026-09-03, D30)
+
+**Soru.** 2026-08-22'den beri canlı defter bozuldu. Çıkış tarafında pencereler arasında
+tutarlı bir düzeltme var mı? (Karar: `docs/DECISIONS.md` D30.)
+
+**Kurulum.** C-only, 8 majör, sunucu env'i (`SCALPER_*`/`TV_*` — gizli değerler
+yok), mainnet mumları. Beş pencere: AYI 01-23→02-13 · YATAY 07-01→07-21 · BOĞA
+08-07→08-21 · OOS Mart 03-01→04-01 · ÇÖKÜŞ 08-21→09-03. Baz koşular
+`logs/backtest_20260903_122725/123053/123200/123333/130010.json`.
+
+**Bulgu.** 886 işlemde `REAPER` 165 işlem / WR %14.5 / **−958**; SL 83 / −1.9k;
+TRAIL +3.2k. Süre kovaları: 30–240 dk PF 1.6–7, >360 dk PF < 0.3. Kaybeden REAPER
+işlemlerinin ~%40'ı bir noktada MFE ≥ %5 ROI görmüştü (TP1 = %10).
+
+**Varyantlar (toplam net / OOS Mart):** hold 3 sa +305/−76 · stop %30 +256/−191 ·
+rejim TF 1h +362/−51 · UP-LONG yasak +377/−77 · **STALE_TP 2 sa/%2 +448/+11**
+(ızgara 1.5–2 sa × %0–2 düz: +420–450). Deney koşucusu harness'i monkeypatch
+etmişti; kural koda alındıktan sonra AYNI sayılar `SCALPER_STALE_TP_HOURS=2
+SCALPER_STALE_TP_MIN_ROI_PCT=2` ile birebir yeniden üretildi (parite):
+ÇÖKÜŞ −121.60 → `logs/backtest_20260903_140948.json`, OOS +10.57 →
+`logs/backtest_20260903_141053.json`.
+
+**Holdout (seçimde kullanılmamış, sonuçtan önce kilitlendi):**
+
+| Pencere | Baz | STALE_TP 2 sa/%2 | Log |
+|---|---|---|---|
+| 05-04→05-25 | −336.80 / PF 0.61 / DD 359 · REAPER 50/−423 · TRAIL 125/+523 | −381.61 / PF 0.51 / DD 403 · REAPER 28/−335 · STALE_TP 83/+67 · TRAIL 78/+323 | `141831` / `141907` |
+| 06-08→06-29 | +70.64 / PF 1.13 / DD 98 · REAPER 38/−301 · TRAIL 140/+608 | +58.55 / PF 1.13 / DD 108 · REAPER 24/−273 · STALE_TP 67/+77 · TRAIL 101/+439 | `142233` / `142313` |
+
+**Sonuç.** İki holdout penceresinde de net düştü ve düşüş büyüdü → **REDDEDİLDİ**
+(P2: OOS kötüleşmesi tek başına veto). Mekanizma açık: kural REAPER zararının
+küçük bir kısmını kesiyor ama TP1'e varacak koşucuların TRAIL kazancını daha çok
+kesiyor. Seçim pencerelerindeki +109'luk kazanç o pencerelere uyumdu. Ders:
+5 pencerelik ızgara bile holdout'un yerini tutmuyor; bundan sonra her çıkış
+kuralı adayı seçimden ÖNCE kilitlenmiş en az iki taze pencerede koşulmalı.
+
+**Komut (holdout, harness'e dokunmadan `settings` alanı ile):**
+```
+python -m src.strategies.scalper.backtest --strategies C \
+  --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,BNBUSDT,ADAUSDT,LTCUSDT \
+  --start 2026-05-04 --end 2026-05-25     # SCALPER_STALE_TP_HOURS=0 | =2
+```

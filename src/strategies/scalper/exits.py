@@ -25,6 +25,7 @@ from src.strategies.scalper.executor import ScalpPosition
 from src.strategies.scalper.indicators import chandelier_stop
 from src.strategies.scalper.tracker import ScalpTracker
 from src.strategies.scalper.types import (
+    EXIT_REASON_STALE_TP,
     FOLLOWER_LEDGER_STRATEGY,
     Candle,
     Direction,
@@ -79,6 +80,15 @@ MARKET_EXIT_REASONS = frozenset({EXIT_REASON_TRAIL_MARKET, EXIT_REASON_BE_MARKET
 # yeni kapanışlar "REAPER" yazılır. Raporlar bunu "REAPER ayrımı
 # 2026-08-24'ten itibaren" notuyla söyler (scripts/ledger_report.py).
 EXIT_REASON_REAPER = "REAPER"
+
+# D30 — BAYAT-KÂR KAPANIŞI ("STALE_TP"): `engine._close_stale_profitable_
+# positions` TP1 görmemiş, `SCALPER_STALE_TP_HOURS` yaşını doldurmuş ve o an
+# ROI ≥ `SCALPER_STALE_TP_MIN_ROI_PCT` olan pozisyonu reduce-only MARKET ile
+# kapatır. REAPER gibi düz bir MARKET emridir → `_verified_close_ledger`
+# göremez → kaba çıkarıma düşer; damga (`ScalpPosition.stale_tp_close_at`)
+# olmadan bu kapanış "TP_LADDER"/"SL" diye yanlış etiketlenirdi. Dize
+# `types.EXIT_REASON_STALE_TP`ten gelir (harness ile ortak; yukarıda import
+# edildi, bu modülden de `EXIT_REASON_STALE_TP` adıyla erişilir).
 
 # --- D17: ayrı market-data host'unda fiyat uzayı çevirisi ----------------
 # Chandelier seviyesi VERİ host'unun mumlarından çıkar ama emir İŞLEM host'una
@@ -2244,7 +2254,14 @@ class ExitManager:
         normalde bir arada olamaz; olduysa (TP1 emirle aynı turda dolduysa)
         pozisyonu FİİLEN kapatan reaper'ın MARKET emridir. Borsa kanıtı
         (gerçek bir SL/TP fill) varsa buraya HİÇ düşülmez — ledger kazanır.
+
+        D30 — STALE_TP damgası reaper damgasından ÖNCE okunur: safety turunda
+        bayat-kâr kapanışı reaper'dan önce koşar ve emri gönderdiği turda
+        döner (tur başına tek kapanış); ikisi normalde bir arada olamaz,
+        olduysa borsaya ilk giden emir bayat-kâr kapanışıdır.
         """
+        if getattr(sp, "stale_tp_close_at", None):
+            return EXIT_REASON_STALE_TP
         if getattr(sp, "reaper_close_at", None):
             return EXIT_REASON_REAPER
         return ExitManager._infer_exit_reason_legacy(sp, exit_price, realized_pnl)

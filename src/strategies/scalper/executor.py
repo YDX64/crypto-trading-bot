@@ -144,6 +144,12 @@ class ScalpPosition:
     # borsa kanıtını da EZER; reaper'da borsa kanıtı (gerçek bir SL/TP fill)
     # varsa doğru etiket ODUR.
     reaper_close_at: Optional[str] = None
+    # --- D30: STALE_TP çıkış etiketi — reaper damgasıyla AYNI sözleşme -----
+    # `engine._close_stale_profitable_positions` reduce-only MARKET kapanışı
+    # BORSAYA GÖNDERDİKTEN SONRA doldurulur (ISO UTC). Yalnız etiketi ayırır;
+    # hiçbir kapı okumaz. Bellekte durur (DB sütunu yok) → restart'ta kaybolur
+    # ve kapanış eski yoldan etiketlenir (eksik sayar, fazla saymaz).
+    stale_tp_close_at: Optional[str] = None
     # --- D27/A3: MAE yoklama sıklığı — YALNIZ ÖLÇÜM ------------------------
     # `mae_pct`/`mfe_pct` safety turunda (≈2 sn) ÖRNEKLENİR: iki yoklama
     # arasındaki fitil GÖRÜLMEZ. Ölçüldü (2026-08-24): 6 stop-out'ta `mae_roi`
