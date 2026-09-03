@@ -3156,7 +3156,7 @@ nedeniyle değiştirilmez.
 
 **Testler.** `tests/test_tv_signal_bridge.py` (coin alanı + allowlist).
 
-### D32 — Tek yerel çalışma alanı + deploy/restart sertleştirmesi + sanal-sermaye cache'i · 2026-09-03 · AKTİF (kod), sunucuya deploy BEKLİYOR
+### D32 — Tek yerel çalışma alanı + deploy/restart sertleştirmesi + sanal-sermaye cache'i · 2026-09-03 · AKTİF — sunucuya deploy edildi 18:28 UTC (pid 3402042)
 
 **Soru.** Yerelde üç tradingbot klasörü vardı (`/Users/max/TRADINGBOT` eski düz bot,
 `/Users/max/TRADINGBOT/v2` bu reponun klonu, `~/Downloads/Downloads/TRADINGBOT` aynı
@@ -3188,10 +3188,13 @@ izni isteyen `test_news_bot_client` (yamasız da aynı) başarısız. İlgili te
 `tests/test_deploy_scripts.py`, `tests/test_runtime_liveness.py`,
 `tests/test_scalper_fee_exit_safety.py`, `tests/test_container.py`.
 
-**Sunucu notu.** `awa:/opt/tradingbot-v2` şu an bfb890e'de; bu commit deploy
-edilmeden önce `.venv-old/` silinmeli ve `docs/.follower_note` taşınmalı — aksi
-hâlde yeni kapı fail-closed durur (istenen davranış). Deploy = restart = 8 saatlik
-karşı-olgu kohortu sıfırlanır; açık pozisyon yokken yapılmalı.
+**Sunucu (yapıldı, 2026-09-03).** `.venv-old/` ve `docs/.follower_note` temizlendi;
+`state/` sunucuda `.git/info/exclude`'a da alındı (eski `.gitignore` ile ön kontrol
+geçsin diye). `scripts/deploy.sh awa` 18:25→18:28 UTC: sunucu testleri 2611 geçti,
+`tradingbot_v2` pid 3402042, `/health` healthy+core_healthy. Restart sırasında açık
+olan BTCUSDT #328 (TV luxosc+luxso 2/2, 20:10 sunucu saati) `recover()` ile izlemeye
+geri alındı; borsadaki STOP_MARKET + 2 TAKE_PROFIT_MARKET algo emri korundu.
+Karşı-olgu kohortu restart'la sıfırlandı (bilinen sınır, D27).
 
 ## Reddedilen kararlar (kanıtla)
 

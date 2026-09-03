@@ -196,9 +196,10 @@ kopya AÇMA: iki kopya = commit'siz iş kaybı (bu olayın kendisi).
 REST ağırlığını yiyordu), aynı checkout için `logs/deploy-restart.lock` üzerinde
 `flock -n` (ikinci deploy/restart beklemez, RED olur), venv yoksa fail-closed,
 temiz-ağaç kapısı artık **untracked dosyaları da** sayar (`--untracked-files=all`).
-⚠️ Sunucuda bu kapı `.venv-old/` ve `docs/.follower_note` gibi başıboş dosyalara takılır:
-D32 sonrası ilk deploy'dan önce `rm -rf /opt/tradingbot-v2/.venv-old` ve
-`docs/.follower_note`'u taşı/sil. `state/` ve `.venv*/` artık `.gitignore`'dadır.
+⚠️ Sunucuda bu kapı başıboş dosyalara takılır (2026-09-03'te `.venv-old/` ve
+`docs/.follower_note` bu yüzden temizlendi). Sunucuya elle dosya BIRAKMA; geçici
+bir şey gerekiyorsa `backups/` altına koy (gitignore). `state/` ve `.venv*/`
+`.gitignore`'dadır ve `state/` sunucuda ayrıca `.git/info/exclude`'dadır.
 
 > **Container yolu (EK dağıtım).** Botu tek bir görüntüde başka sunucuya taşımak için
 > `scripts/docker_run.sh` + "Container ile çalıştırma / başka sunucuya taşıma" bölümüne
