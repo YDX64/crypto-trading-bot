@@ -394,8 +394,15 @@ class Settings(BaseSettings):
     # mevcut 49 alarmın davranışı değişmez. ⚠️ Sunucu `.env`'i
     # TV_SOURCE_ALLOWLIST'i AÇIKÇA set ediyorsa bu varsayılan devreye
     # GİRMEZ — o satıra da eklenmeli (docs/RUNBOOK.md "TV olay kanalı").
+    # 2026-09-03: kullanıcının kendi Pine alarmları (`awaxx_scalp`,
+    # `awaxx_v2`) allowlist'e eklendi. Eskiden bilinmeyen kaynak "tv"
+    # jeneriğine düşüyordu — iki farklı awaxx alarmı tek oy sayılıyordu
+    # ve luxosc + awaxx_scalp sağlama kotasını dolduramıyordu (aynı
+    # "tv" kovası). Salt genişletme: bu adları göndermeyen alarmlar
+    # etkilenmez.
     tv_source_allowlist: str = (
-        "luxosc,luxso,algopro,botv3,tv,luxso_exit,luxso_trend,pac_choch,algopro_tp1"
+        "luxosc,luxso,algopro,botv3,tv,luxso_exit,luxso_trend,pac_choch,"
+        "algopro_tp1,awaxx_scalp,awaxx_v2"
     )
     # D28: giriş kaynağı karantinası (CSV). Katı AlgoPro takipçi alert()'leri
     # bu kapıdan ÖNCE süreç-içi takipçiye yönlendirilir; burada engellenen,

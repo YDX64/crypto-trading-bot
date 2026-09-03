@@ -178,9 +178,19 @@ class TestTvSourceAllowlist:
         assert rejected is False
 
     def test_all_default_allowlist_entries_pass_through(self):
-        for name in ("luxosc", "luxso", "algopro", "botv3", "tv"):
+        for name in (
+            "luxosc", "luxso", "algopro", "botv3", "tv",
+            "awaxx_scalp", "awaxx_v2",
+        ):
             source, rejected = resolve_tv_source(name, "")
             assert (source, rejected) == (name, False)
+
+    def test_awaxx_scalp_is_not_collapsed_to_generic_tv(self):
+        # Kullanıcının Pine alarmı (`source":"awaxx_scalp"`) artık kendi
+        # kovasında sayılır — luxosc + awaxx_scalp = 2 farklı oy.
+        source, rejected = resolve_tv_source("awaxx_scalp", "")
+        assert source == "awaxx_scalp"
+        assert rejected is False
 
     def test_custom_allowlist_setting_is_respected(self, monkeypatch):
         # tv_source_allowlist ayarı gerçekten okunuyor mu (yalnız varsayılan

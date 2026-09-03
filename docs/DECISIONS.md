@@ -3136,6 +3136,26 @@ STALE_TP) bozulmayı pencereler arasında tutarlı biçimde düzeltmiyor; sorun 
 kalitesi ve payoff yapısındadır. D28'in testnet soak / marj %0.5 / mainnet NO-GO
 kararı yerinde kalır. Komutlar ve log yolları: `docs/EXPERIMENTS.md` E11.
 
+### D31 — Pine köprüsü: `coin` alanı + `awaxx_scalp`/`awaxx_v2` allowlist · 2026-09-03 · AKTİF
+
+**Soru.** Kullanıcının kendi Pine alarmları (`awaxx_scalp_alert*.pine`) v2
+webhook'una neden oy yazmıyor ve luxosc oyları 1/2'de kalıyor?
+
+**Bulgu.** İki bağımsız kırık: (1) alarm gövdesi `"coin":"SOL"` gönderiyor,
+v2 yalnız `symbol`/`ticker` okuyordu → 422. (2) `source":"awaxx_scalp"`
+allowlist'te yoktu → "tv" jeneriğine düşüyordu; ikinci bir "tv" oyu sayılmaz,
+luxosc + awaxx_scalp sağlama kotasını dolduramazdı. Canlı logda yalnız
+`luxosc (1/2)` görünmesinin nedeni budur — ikinci kaynak ya 422 alıyor ya
+da aynı kovaya yazılıyordu.
+
+**Karar.** `resolve_tv_signal` açık `coin` alanını USDT ile tamamlar
+(`ticker` de kabul). Allowlist'e `awaxx_scalp,awaxx_v2` eklenir (salt
+genişletme). `TV_CONFLUENCE_REQUIRED=2` yerinde kalır — tek kaynakla
+eşik düşürülmez. Çıkış parametreleri (TP1/stop/hold) D30 holdout
+nedeniyle değiştirilmez.
+
+**Testler.** `tests/test_tv_signal_bridge.py` (coin alanı + allowlist).
+
 ## Reddedilen kararlar (kanıtla)
 
 | Fikir | Tarih | Sonuç | Neden reddedildi |
