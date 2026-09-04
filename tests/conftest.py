@@ -96,11 +96,23 @@ def _reset_rest_weight_state():
 #: testleri kendi sahte sağlayıcılarıyla açıkça açar
 #: (tests/test_ai_gate.py).
 _ISOLATED_ENV_PREFIXES = ("FOLLOWER_", "SCALPER_AI_GATE_")
+# D33 genel giriş kapıları: canlı `.env`'de AÇIKKEN sunucu deploy testleri
+# (sabit fixture'lı CLI/golden koşuları) bloklanır — testler varsayılanı görür;
+# kapı testleri kendi cfg nesneleriyle açıkça açar (tests/test_entry_gates.py).
+_D33_GATE_FIELDS = (
+    "scalper_c_blocked_cells",
+    "scalper_entry_block_hours_utc",
+    "scalper_entry_block_weekdays_utc",
+    "scalper_entry_block_weekdays_direction",
+    "scalper_symbol_direction_block",
+    "scalper_min_atr_pct",
+    "scalper_max_atr_pct",
+)
 _ISOLATED_ENV_NAMES = (
     "BOT_MODE",
     "TRADING_ACCOUNT_LOCK_ENABLED",
     "TV_ENTRY_SOURCE_BLOCKLIST",
-)
+) + tuple(f.upper() for f in _D33_GATE_FIELDS)
 
 
 def _isolated_settings_fields():
@@ -120,6 +132,7 @@ def _isolated_settings_fields():
             or name == "bot_mode"
             or name == "tv_entry_source_blocklist"
             or name == "trading_account_lock_enabled"
+            or name in _D33_GATE_FIELDS
         ):
             continue
         default = field.default

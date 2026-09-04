@@ -1589,3 +1589,15 @@ sermayenin %2'si; günlük kesici ≈ 3 net SL. Geri alma:
 (+240 sn sağlık). Soak raporu: `scripts/ledger_report.py --since "2026-08-23 02:57"`.
 Backtest/autoresearch tabanı: `scripts/.scalper_env_snapshot.txt` güncellendi — eski sayılarla
 (E4/E5/E6 tabanı) karşılaştırırken ölçek farkını (marj %10→5 = PnL/DD ×0.5) hesaba kat.
+
+## Yeni env anahtarı getiren kod deploy'u — SIRA (2026-09-04 dersi, D33)
+
+`Settings` `extra_forbidden`'dır: `.env`'de ESKİ kodun tanımadığı bir anahtar varsa süreç BAŞLAMAZ.
+2026-09-04 02:09'da env önce yazılıp sonra deploy edilince, deploy testte düşüp eski koda döndü ve eski
+kod yeni anahtarlı `.env` ile açılamadı → `tradingbot_v2` 2,5 dk EXITED (env yedeği geri yüklenerek kalktı).
+DOĞRU SIRA: (1) kodu `scripts/deploy.sh awa` ile deploy et (`.env` DEĞİŞMEDEN; yeni alanlar varsayılan
+kapalı), sağlık yeşil; (2) `.env`'e anahtarı ekle (yedekle); (3) `RESTART_LABEL=<etiket>
+scripts/restart_safe.sh testnet`. Geri alma gerekirse ÖNCE `.env`'den anahtarı çıkar, SONRA eski commit'e dön.
+Ayrıca sunucu testleri canlı `.env` ile koşar: yeni bir kapı `.env`'de AÇIKKEN deploy testleri (ör.
+`test_backtest_measurement::TestCliWiring`) sabit fixture'ları bloklayıp düşebilir — testler kapı
+alanlarını `tests/conftest.py` autouse fixture'ıyla varsayılana sabitler (D33c).
