@@ -368,6 +368,9 @@ DİLİMLİDİR (içinde bulunulan takvim dakikasının tepesi).
 | `scalper_c_rsi_long_max/short_min` | `25.0/75.0` | C'nin RSI uç eşiği |
 | `scalper_c_require_divergence` | `True` | C'de RSI diverjans şartı |
 | `scalper_c_allowed_regimes` | `"UP,DOWN,RANGE"` | C'nin çalıştığı rejim kümesi (UNKNOWN her zaman kapalı) |
+| `scalper_c_blocked_cells` | `""` | Rejim×yön hücresi yasağı (`"RANGE:SHORT,UP:LONG"`), rejim kapısının ÜSTÜNE ek yasak; sinyal doğduktan sonra, niyet defterine `cell_gate` yazar — `entry_gates.py`, **varsayılan KAPALI**, post-hoc tarama adayı; motor + harness AYNI saf fonksiyon (P1, `tests/test_entry_gates.py`) |
+| `scalper_entry_block_hours_utc` | `""` | UTC saat penceresi yasağı (`"0-6,22-24"`; başlangıç dahil, bitiş hariç, `"22-3"` gece yarısını sarar); saat = son KAPANMIŞ giriş mumunun `close_time`'ı (duvar saati DEĞİL) — `hour_gate`, **varsayılan KAPALI** |
+| `scalper_min_atr_pct` / `scalper_max_atr_pct` | `0.0` / `0.0` | ATR% bandı (ATR(14)/giriş fiyatı×100, HAM sinyal, `apply_stop_policy` ÖNCESİ); 0 = o uç kapalı, `<min` / `>max` → `atr_gate` (eşitlik serbest), ATR yoksa fail-open — **varsayılan KAPALI** |
 | `scalper_stop_mode` | `"structural"` | `structural` (yapısal+ATR taban) veya `fixed_roi` (marj-yüzdesi stop) |
 | `scalper_fixed_stop_roi_pct` | `50.0` | `fixed_roi` modunda SL'nin vurduğu marj kaybı yüzdesi |
 | `scalper_stop_atr_floor_mult` | `0.5` | Yapısal stop girişe çok yakınsa ATR×mult tabanına genişlet |

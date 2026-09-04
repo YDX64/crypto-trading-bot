@@ -1450,3 +1450,90 @@ python -m src.strategies.scalper.backtest --strategies C \
   --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,BNBUSDT,ADAUSDT,LTCUSDT \
   --start 2026-05-04 --end 2026-05-25     # SCALPER_STALE_TP_HOURS=0 | =2
 ```
+
+## E12 — "Daha çok işlem" için diverjans şartını gevşetmek (2026-09-03 gece) — RED
+
+**Soru.** Kullanıcı daha fazla işlem istiyor. Canlı defterde kârlı hücre UP-günü LONG dip alımları;
+diverjans şartı (D6) işlem sayısını ~3-4× azaltıyor. Şart kaldırılınca (özellikle UP/LONG hücresinde)
+kazanç artar mı?
+
+**Kurulum.** Aynı kod (ed80e4e harness), sunucu env (D28 profili, marj 50, 1m/5m/15m, lider kapısı açık),
+8 majör, 7 pencere; tek fark `SCALPER_C_REQUIRE_DIVERGENCE=false`. Pencere sınıfları: SEÇİM (AYI/YATAY/BOĞA)
+ve DOKUNULMAMIŞ (Mart/Çöküş/Mayıs/Haziran).
+
+| Pencere | div=AÇIK (taban) | div=KAPALI | Log |
+|---|---|---|---|
+| AYI 01-23→02-13 | 161 / +334.4 / PF 2.07 / DD 80 | 593 / +345.3 / PF 1.19 / DD 315 | `logs/backtest_20260903_213418.json` |
+| YATAY 07-01→07-21 | 156 / +240.6 / 1.92 / 42 | 432 / −180.1 / 0.88 / 459 | `…_213507.json` |
+| BOĞA 08-07→08-21 | 118 / +79.3 / 1.37 / 61 | 254 / +115.5 / 1.21 / 152 | `…_213528.json` |
+| MART 03-01→04-01 | 316 / −130.4 / 0.88 / 190 | 791 / −486.7 / 0.84 / 584 | `…_213719.json` |
+| ÇÖKÜŞ 08-21→09-03 | 135 / −185.1 / 0.67 / 268 | 381 / −229.6 / 0.84 / 503 | `…_213744.json` |
+| MAYIS 05-04→05-25 | 192 / −336.8 / 0.61 / 359 | 410 / −822.1 / 0.55 / 916 | `…_213825.json` |
+| HAZİRAN 06-08→06-29 | 190 / +70.6 / 1.13 / 98 | 499 / −144.0 / 0.92 / 333 | `…_213920.json` |
+
+**Hücre bazında (KAPALI − AÇIK, 7 pencere toplamı):** UP LONG **−765.6**, RANGE SHORT −697.3, DOWN SHORT −39.5,
+RANGE LONG +28.1. Yani "kârlı hücrede diverjanssız daha çok giriş" fikri de çürüdü: UP LONG hücresi
+diverjanssız yalnız BOĞA'da (+84) kazanıyor, dokunulmamış dört pencerenin dördünde daha kötü
+(Mart −366, Mayıs −249, Haziran −175, Çöküş −25).
+
+**Sonuç.** Diverjans şartı her rejimde ve her yönde kalır; işlem sayısını filtre gevşeterek artırmak
+her pencerede maksimum düşüşü 2-3× büyütüyor. "Daha çok işlem" ancak YENİ bilgi taşıyan bir sinyal
+kaynağıyla (mevcut filtreyi gevşeterek değil) düşünülebilir. Komut:
+`env $(grep ^SCALPER_ scripts/.scalper_env_snapshot.txt | xargs) SCALPER_C_REQUIRE_DIVERGENCE=false
+python3 -m src.strategies.scalper.backtest --strategies C --symbols <8 majör> --start … --end …`.
+
+## E13 — Deterministik giriş-filtresi taraması (post-hoc, 7 pencere, 2026-09-04 gece)
+
+**Soru.** AI olmadan, yalnız giriş anında bilinen bilgiyle (saat/gün, rejim×yön, sembol, volatilite),
+C'nin dokunulmamış pencerelerdeki bozulmasını tutarlı biçimde düzelten bir kural var mı?
+
+**Kurulum.** 7 taban JSON (E11 ile aynı kod/env; taban `logs/backtest_20260903_{123200,123053,122725,
+123333,130010,141831,142233}.json`), 1.268 işlem. Pencere sınıfı: SEÇİM (AYI/YATAY/BOĞA — 21 Ağu'dan beri
+ayar seçiminde kullanıldı) vs DOKUNULMAMIŞ (Mart/Çöküş/Mayıs/Haziran). 5 mercek (saat-gün, rejim×yön,
+sembol, volatilite-süre, kapasite) ~305 kural taradı; yargıç + bağımsız yeniden hesap (aşağıdaki tablo).
+Karar kuralı: dokunulmamış 4'te toplam net ↑ ve ≥3/4 pencere kötüleşmez (tolerans brütün %5'i); seçim
+toplam kaybı ≤ %20; her pencerede kalan işlem ≥ %60; yalnız giriş-anı bilgisi; komşuluk sağlam.
+
+| Kural (post-hoc) | Δ dokunulmamış | Δ seçim | kötüleşen dok. | min kalan | Mart/Çöküş/May/Haz |
+|---|---|---|---|---|---|
+| Hafta sonu LONG yasak | **+232.7** | −35.4 (%5) | 1 (Haz −59) | %81 | +99 / +163 / +29 / −59 |
+| ADA+DOGE LONG yasak | +204.2 | −24.2 | 0 | %85 | +75 / +22 / +79 / +28 |
+| UP rejim LONG yasak | +279.6 | −110.1 (%17; BOĞA −84 = tüm kârı) | 0 | %68 | +131 / +70 / +77 / +1 |
+| Saat 11-14 UTC yasak | +289.5 | −37.7 | 0 | %85 | +105 / +36 / +137 / +11 |
+| Saat 00-06 UTC yasak | +338.1 | −273.6 (%42 → RED) | 0 | %68 | +86 / +137 / +79 / +35 |
+| RANGE SHORT yasak | +183.9 | −161.1 (%25 → RED) | 1 | %61 | −13 / +25 / +230 / −59 |
+| Hafta sonu hepsi yasak | +306.6 | −51.1 | 1 | %69 | +29 / +235 / +104 / −61 |
+| DOGE LONG yasak | +109.8 | +1.2 | 1 | %91 | +55 / −23 / +48 / +30 |
+
+**Çoklu-test gerçeği (yargıç).** ~305 kural için Bonferroni eşiği 1.6e−4, BH q=0.10 için ≤3.3e−4;
+gözlenen en küçük OOS p ≈ 0.004. Küresel sıfır altında ~15 kural p<0.05 beklenir; bulunan 3.
+**Taramanın bütünü gürültüden ayırt edilemez.** Yalnız a priori mekanizması olan kurallar (hafta sonu
+likidite → LONG dip alımları 8 saatte çürüyor: engellenen hafta sonu LONG'ların REAPER/SL ağırlığı)
+"koşullu aday" sayılır; sembol-özgü kurallar (ADA/DOGE) madenciliktir.
+
+**Yapısal teşhis.** Dokunulmamış dört pencerede LONG tarafı sistematik zararda (UP LONG ve RANGE LONG
+ikisi de); DOWN SHORT 7 pencerenin 5'inde pozitif, en tutarlı hücre. Bu bir 2026 Mar–Ağu rejim
+özelliği olabilir; kural değil, izleme konusu.
+
+**Sonraki adım.** Post-hoc tarama kapasite/cooldown ikamesini görmez (E8.6). Genel kapılar
+(`SCALPER_C_BLOCKED_CELLS`, `SCALPER_ENTRY_BLOCK_HOURS_UTC`, `SCALPER_MIN/MAX_ATR_PCT`; D33) ile gerçek
+harness koşuları + hiç kullanılmamış iki taze pencere (2026-02-13→03-01, 2026-07-21→08-07) son sınav.
+Nisan 2026 (`…_213004.json`, −470/PF 0.61) yargıç tarafından teyit için açıldığından artık taze sayılmaz.
+Canlıda: kapı açılırsa D27 karşı-olgu defteri engellenen girişlerin "girilseydi" sonucunu ölçer —
+canlı A/B bu yolla yapılır. Diverjans gevşetme (E12) ve "daha çok işlem" fikirleri kapalıdır.
+
+### E13.1 — Gerçek harness teyidi: post-hoc kapasite ikamesini gösteriyor (2026-09-04 01:00)
+
+Aynı sunucu env + genel kapılar (D33 kod, `logs/backtest_20260904_0056xx–0110xx.json`):
+
+| Kural | Mart | Çöküş | Mayıs | Haziran | AYI | YATAY | BOĞA |
+|---|---|---|---|---|---|---|---|
+| Taban | −130.4 | −185.1 | −336.8 | +70.6 | +334.4 | +240.6 | +79.3 |
+| `SCALPER_C_BLOCKED_CELLS=UP:LONG` (post-hoc +131/+70/+77/+1) | −77.1 (+53) | −121.7 (+63) | −235.2 (+102) | +91.7 (+21) | +340.5 | +238.3 | **−2.7 (−82)** |
+| `SCALPER_ENTRY_BLOCK_HOURS_UTC=11-14` (post-hoc +105/+36/+137/+11) | −10.8 (+120) | −115.7 (+69) | −227.1 (+110) | +85.5 (+15) | +338.8 | +202.7 | +94.1 |
+
+Okuma: (1) UP-LONG yasağı gerçek koşuda post-hoc'un ~yarısını veriyor (boşalan slot başka işlemle
+doluyor) ve BOĞA'nın kârını siliyor → RED kesinleşti. (2) 11-14 saat yasağı gerçek koşuda da dört
+dokunulmamış pencerede pozitif; ama bu dört pencere kuralın SEÇİM kümesidir ve taze Nisan'da
+rastgelenin altında kaldı (doğrulayıcı hükmü) → kabul için ön-kayıtlı taze pencere şart. (3) Post-hoc
+tarama artık yalnız ön eleme; her aday gerçek harness'ta koşulur.

@@ -932,6 +932,11 @@ class _CfgProxy:
         "scalper_structure_gate": False,
         "scalper_tv_events_mode": "off",
         "scalper_regime_filter": False,
+        # D33 genel giriş kapıları — sunucu .env'inde açılsa da testler kapalı görsün
+        "scalper_c_blocked_cells": "",
+        "scalper_entry_block_hours_utc": "",
+        "scalper_min_atr_pct": 0.0,
+        "scalper_max_atr_pct": 0.0,
     }
 
     def __init__(self, **overrides):

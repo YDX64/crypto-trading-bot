@@ -72,7 +72,15 @@ class _CfgProxy:
     # Diğer giriş kapıları (lider piyasa kapısı D15, yapı kapısı D18) sunucu
     # .env'inde AÇIK olabilir — bu testler yalnız TV yapı kapısını ölçer; o
     # kapılar burada daima KAPALI (env-bağımsız test; deploy 2026-08-23 dersi).
-    _ISOLATION = {"scalper_market_gate": False, "scalper_structure_gate": False}
+    _ISOLATION = {
+        "scalper_market_gate": False,
+        "scalper_structure_gate": False,
+        # D33 genel giriş kapıları — sunucu .env'inde açılsa da testler kapalı görsün
+        "scalper_c_blocked_cells": "",
+        "scalper_entry_block_hours_utc": "",
+        "scalper_min_atr_pct": 0.0,
+        "scalper_max_atr_pct": 0.0,
+    }
 
     def __init__(self, **overrides):
         merged = dict(self._ISOLATION)

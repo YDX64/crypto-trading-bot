@@ -65,6 +65,10 @@ from src.core.logger import app_logger
 from src.strategies.scalper import kline_cache
 from src.strategies.scalper.data import KlineFetcher
 from src.strategies.scalper.indicators import atr, chandelier_stop
+from src.strategies.scalper.entry_gates import (
+    evaluate_entry_gates,
+    validate_entry_gate_settings,
+)
 from src.strategies.scalper.market_gate import (
     MARKET_GATE_INTRADAY_TF,
     evaluate_market_gate,
@@ -1225,8 +1229,19 @@ def simulate_symbol(
     `missed_counter["market_gate_day"/"market_gate_run"]` altında sayılır.
     Kapı kapalıyken (varsayılan) bu blok HİÇ çalışmaz; çıktı bit düzeyinde
     değişmez (bkz. tests/test_golden_backtest.py).
+
+    Genel deterministik giriş kapıları (2026-09-03; `cfg.scalper_c_blocked_cells`
+    / `scalper_entry_block_hours_utc` / `scalper_min_atr_pct` /
+    `scalper_max_atr_pct`, hepsi varsayılan KAPALI) yapı kapısının ardında,
+    `apply_stop_policy`'den ÖNCE, canlı motorla AYNI saf fonksiyonla
+    (`entry_gates.evaluate_entry_gates`) uygulanır. Engellenenler
+    `missed_counter["cell_gate"/"hour_gate"/"atr_gate"]` altında sayılır;
+    kapalıyken anahtar EKLENMEZ.
     """
     trades: List[BacktestTrade] = []
+    # D33: geçersiz kapı ayarı, kapıya hiç sinyal ulaşmayan pencerede bile
+    # sessizce 'kapı kapalı' ölçümü üretmesin — alanlar yok/boş/0 iken no-op.
+    validate_entry_gate_settings(cfg)
     n5 = len(candles_5m)
     if n5 < 2:
         return trades
@@ -1336,6 +1351,34 @@ def simulate_symbol(
                     )
                 i += 1
                 continue
+
+        # Canlı parite (2026-09-03): genel deterministik giriş kapıları — rejim×yön
+        # hücresi / UTC saat penceresi / ATR% bandı — motordaki
+        # (engine._evaluate_symbol) sırayla birebir: yapı kapılarının HEMEN
+        # ardında, apply_stop_policy'den ÖNCE, AYNI saf fonksiyon
+        # (entry_gates.evaluate_entry_gates) AYNI argümanlarla:
+        #   * zaman = bu mumun close_time'ı (close_times_5m[i]; piyasa kapısının
+        #     kesim zamanıyla aynı değer — duvar saati YOK),
+        #   * ATR% = HAM sinyal (raw_signal; apply_stop_policy ÖNCESİ).
+        # Üçü de varsayılan KAPALI: kapalıyken None döner, missed_counter'a
+        # anahtar bile EKLENMEZ (tests/test_golden_backtest.py byte-for-byte).
+        # İstisna BİLİNÇLİ olarak yutulmaz (yapı kapısındaki gerekçe): hatalı
+        # bir ayar sessizce "kapı kapalı" ölçümü üretmektense patlamalı.
+        entry_gate_reason = evaluate_entry_gates(
+            ctx.regime,
+            raw_signal.direction,
+            close_times_5m[i],
+            raw_signal.atr_5m,
+            raw_signal.entry_price,
+            cfg,
+        )
+        if entry_gate_reason is not None:
+            if missed_counter is not None:
+                missed_counter[entry_gate_reason] = (
+                    missed_counter.get(entry_gate_reason, 0) + 1
+                )
+            i += 1
+            continue
 
         signal = apply_stop_policy(raw_signal, cfg)
 

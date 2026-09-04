@@ -3196,6 +3196,31 @@ olan BTCUSDT #328 (TV luxosc+luxso 2/2, 20:10 sunucu saati) `recover()` ile izle
 geri alındı; borsadaki STOP_MARKET + 2 TAKE_PROFIT_MARKET algo emri korundu.
 Karşı-olgu kohortu restart'la sıfırlandı (bilinen sınır, D27).
 
+### D33 — Genel deterministik giriş kapıları (hücre / saat / ATR%) · 2026-09-04 · KOD VAR, HEPSİ KAPALI, canlıda AÇILMADI
+
+**Soru.** Kullanıcı "AI olmadan en iyi algoritma ve ayarlar" istedi. E13 taraması (~305 kural, 7 pencere)
+hangi giriş kuralı tutarlı diye baktı; her aday gerçek harness'ta ölçülebilsin diye kurallar env ile
+açılıp kapanan GENEL kapılar olarak kodlandı.
+
+**Karar.** `src/strategies/scalper/entry_gates.py` (saf, IO/duvar-saati yok) + motor `_evaluate_symbol`
+(yapı kapılarından sonra, `apply_stop_policy` ÖNCESİ, fail-open) + harness `simulate_symbol` (aynı
+fonksiyon, aynı argümanlar, fail-closed) + `intent` gerekçeleri `cell_gate`/`hour_gate`/`atr_gate`:
+- `SCALPER_C_BLOCKED_CELLS` = "REJIM:YON,…" (rejim×yön hücre yasağı; C VE TV dış sinyali aynı kapıdan geçer),
+- `SCALPER_ENTRY_BLOCK_HOURS_UTC` = "0-6,22-24" (karar mumunun close_time'ı; 04:59:59.999 → saat 4),
+- `SCALPER_MIN_ATR_PCT` / `SCALPER_MAX_ATR_PCT` (ATR% = atr_5m/entry×100, ham sinyal).
+Varsayılan hepsi KAPALI: golden backtest byte-for-byte aynı (2 işlem / 26.77 / {"regime_gate": 4}),
+tam paket 2725 geçti; parite testi `tests/test_entry_gates.py::TestEngineHarnessParity` (aynı fonksiyon
+nesnesi + spy ile argüman eşitliği). Araç: `scripts/run_windows.sh <etiket> VAR=deger…` (7 pencere sıralı;
+`FRESH=1` yalnız son sınav).
+
+**Kanıt durumu (E13, E13.1).** Post-hoc tarama gürültüden ayırt edilemiyor (çoklu-test); gerçek harness
+post-hoc etkinin ~yarısını veriyor (kapasite ikamesi). UP-LONG yasağı RED (BOĞA kârını siler), 11-14 saat
+yasağı seçim kümesine uyum. Kalan adaylar: hafta sonu LONG yasağı (a priori mekanizma; gerçek harness +
+taze pencere teyidi BEKLİYOR — hafta günü×yön kapısı henüz yok) ve ADA LONG yasağı (sembol-özgü, şüpheli).
+Hiçbir kapı sunucu `.env`'inde açık değildir. Açılırsa D27 karşı-olgu defteri engellenen girişleri canlıda ölçer.
+
+**Geri alma.** Kapılar env ile kapanır; kod kaldırılmak istenirse D33 commit'i revert.
+
 ## Reddedilen kararlar (kanıtla)
 
 | Fikir | Tarih | Sonuç | Neden reddedildi |

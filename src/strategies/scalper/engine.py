@@ -48,6 +48,16 @@ from src.strategies.scalper import intent
 from src.strategies.scalper import counterfactual_store
 from urllib.parse import urlsplit
 
+from src.strategies.scalper.entry_gates import (
+    REASON_ENV_VARS as ENTRY_GATE_ENV_VARS,
+    atr_gate_enabled,
+    atr_pct_of,
+    entry_gate_detail,
+    evaluate_entry_gates,
+    format_entry_gate_detail,
+    cell_gate_enabled,
+    hour_gate_enabled,
+)
 from src.strategies.scalper.market_gate import (
     MARKET_GATE_INTRADAY_LIMIT,
     MARKET_GATE_INTRADAY_TF,
@@ -2214,6 +2224,86 @@ class ScalperEngine:
                     source=intent_source,
                 )
                 continue
+            # 2026-09-03 genel deterministik giriş kapıları — rejim×yön hücresi
+            # (SCALPER_C_BLOCKED_CELLS), UTC saat penceresi
+            # (SCALPER_ENTRY_BLOCK_HOURS_UTC), ATR% bandı (SCALPER_MIN/MAX_ATR_PCT);
+            # üçü de VARSAYILAN KAPALI (post-hoc tarama adayları; kazanan kural
+            # yalnız env ile açılır). TEK giriş noktası: C taraması ve TV dış
+            # sinyali AYNI kapıdan geçer. Harness (backtest.simulate_symbol)
+            # AYNI saf fonksiyonu AYNI argümanlarla çağırır (DECISIONS P1;
+            # tests/test_entry_gates.py parite testi):
+            #   * zaman = son KAPANMIŞ giriş mumunun close_time'ı (duvar saati
+            #     DEĞİL — piyasa kapısının `cutoff_ms` gerekçesiyle aynı),
+            #   * ATR% = HAM sinyal, apply_stop_policy ÖNCESİ (dinamik kaldıraç
+            #     kararından bağımsız).
+            # Fail-OPEN: istisna tarama turunu düşürmez, kapı o sinyalde
+            # uygulanmaz ve bir kez WARNING loglanır (yapı kapısı kalıbı).
+            # Kapalıyken evaluate_entry_gates üç ucuz alan okumasıyla None döner.
+            entry_gate_reason: Optional[str] = None
+            entry_close_time_ms: Optional[int] = None
+            try:
+                # getattr: sadeleştirilmiş test çiftleri `close_time` taşımayabilir
+                # (repo konvansiyonu — bkz. _counterfactual_resolve); yoksa saat
+                # kapısı o sinyalde uygulanmaz (entry_gates.hour_gate_blocks → None
+                # = fail-open), diğer iki kapı etkilenmez.
+                entry_close_time_ms = getattr(ctx.candles_5m[-1], "close_time", None)
+                entry_gate_reason = evaluate_entry_gates(
+                    ctx.regime,
+                    sig.direction,
+                    entry_close_time_ms,
+                    sig.atr_5m,
+                    sig.entry_price,
+                    self.cfg,
+                )
+                # ATR bandı AÇIK ama ATR ölçülemedi → kapı uygulanmadı; sessiz
+                # kalmasın (kapı kapalıyken bu dal HİÇ çalışmaz).
+                if (
+                    entry_gate_reason is None
+                    and atr_gate_enabled(self.cfg)
+                    and atr_pct_of(sig.atr_5m, sig.entry_price) is None
+                ):
+                    self.logger.warning(
+                        f"⚠️ {symbol}: ATR% hesaplanamadı (atr_5m={sig.atr_5m!r}, "
+                        f"entry={sig.entry_price!r}) — ATR bandı kapısı bu sinyalde "
+                        f"UYGULANMADI (fail-open)"
+                    )
+            except Exception as e:
+                entry_gate_reason = None
+                if not getattr(self, "_entry_gates_error_logged", False):
+                    self._entry_gates_error_logged = True
+                    self.logger.warning(
+                        f"⚠️ {symbol}: giriş kapıları değerlendirilemedi ({e}) — "
+                        f"fail-open; bu uyarı bir kez loglanır "
+                        f"(SCALPER_C_BLOCKED_CELLS / SCALPER_ENTRY_BLOCK_HOURS_UTC / "
+                        f"SCALPER_MIN_ATR_PCT / SCALPER_MAX_ATR_PCT ayarlarını kontrol edin)"
+                    )
+            if entry_gate_reason is not None:
+                yon = getattr(sig.direction, "value", str(sig.direction))
+                kaynak = "TV sinyali" if is_external else "girişi"
+                gate_detail = entry_gate_detail(
+                    entry_gate_reason, ctx.regime, sig.direction,
+                    entry_close_time_ms, sig.atr_5m, sig.entry_price, self.cfg,
+                )
+                self.logger.info(
+                    f"⛔ {symbol}: "
+                    f"{intent.REASON_LABELS.get(entry_gate_reason, entry_gate_reason)} "
+                    f"— {yon} {kaynak} engellendi "
+                    f"({format_entry_gate_detail(gate_detail)}; "
+                    f"{ENTRY_GATE_ENV_VARS.get(entry_gate_reason, '')})"
+                )
+                self._count_engine_reject(entry_gate_reason)
+                self._record_intent(  # (e2) D24/madde 7 — yalnız kayıt
+                    symbol=symbol,
+                    direction=sig.direction,
+                    signal=sig,
+                    stage=intent.STAGE_DECIDED,
+                    decision=intent.DECISION_DENY,
+                    reason=entry_gate_reason,
+                    strategy=getattr(sig, "strategy", None),
+                    source=intent_source,
+                    extra=gate_detail,
+                )
+                continue
             # Ortak stop politikası: structural modda ATR tabanı, fixed_roi
             # modda marj-yüzdesi stopu. Backtest'te simulate_symbol aynı
             # dönüşümü uygular — canlı/backtest paritesi bozulmamalı.
@@ -2851,6 +2941,10 @@ class ScalperEngine:
                 }.get(tv_mode, "off"),
                 "capacity": "passed",
                 "cooldown": "passed",
+                # D33 genel giriş kapıları (açıkken "passed", kapalıyken "off")
+                "cell": "passed" if cell_gate_enabled(self.cfg) else "off",
+                "hour": "passed" if hour_gate_enabled(self.cfg) else "off",
+                "atr": "passed" if atr_gate_enabled(self.cfg) else "off",
             }
 
             tv_structure = None

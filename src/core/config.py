@@ -506,6 +506,34 @@ class Settings(BaseSettings):
     # "off" (varsayılan, hiçbir şey) | "be" (stopu break-even'a çek) |
     # "close" (reduce-only MARKET ile kapat).
     scalper_structure_exit: str = "off"
+    # --- Genel deterministik giriş kapıları (2026-09-03) — VARSAYILAN KAPALI ---
+    # Post-hoc tarama (canlı defter + harness) hangi BASİT kuralın kayıp
+    # yoğunlaşmasını kestiğini ölçüyor; kazanan kural YALNIZ env ile açılır ve
+    # canlı motor ile harness AYNI saf fonksiyonu
+    # (src/strategies/scalper/entry_gates.py → evaluate_entry_gates) AYNI
+    # girdiyle uygular (DECISIONS #P1). KAPALIYKEN hiçbir kod yolu davranış
+    # değiştirmez (byte-for-byte aynı backtest — tests/test_golden_backtest.py).
+    # Açmadan önce 3 rejim penceresinde backtest şart (CLAUDE.md yasak #1).
+    # 1) Rejim×yön hücresi yasağı: "RANGE:SHORT,UP:LONG" (rejim UP|DOWN|RANGE|
+    #    UNKNOWN, yön LONG|SHORT). Mevcut rejim kapısının (DOWN+LONG / UP+SHORT,
+    #    scalper_regime_filter) ÜSTÜNE ek yasak; sinyal DOĞDUKTAN sonra, diğer
+    #    kapıların yanında çalışır ve niyet defterine yazar
+    #    (scalper_c_allowed_regimes ise sinyal doğmadan, sessizce eler).
+    #    Geçersiz token → startup'ta ValueError (yalnız alan doluyken).
+    scalper_c_blocked_cells: str = ""
+    # 2) UTC saat penceresi yasağı: "0-6,22-24" (başlangıç DAHİL, bitiş HARİÇ;
+    #    gece yarısını saran "22-3" kabul). Zaman kaynağı duvar saati DEĞİL,
+    #    son KAPANMIŞ giriş mumunun close_time'ı (parite; piyasa kapısının
+    #    cutoff_ms gerekçesi) — 04:55-05:00 mumu saat 4 sayılır
+    #    (close_time 04:59:59.999).
+    scalper_entry_block_hours_utc: str = ""
+    # 3) ATR% bandı (ATR(14, giriş TF) / giriş fiyatı × 100; 0 = o uç kapalı):
+    #    ATR% < min → RED, ATR% > max → RED (eşitlik serbest). HAM sinyalle,
+    #    apply_stop_policy'den ÖNCE ölçülür (dinamik kaldıraç kararından
+    #    bağımsız); ATR yoksa/≤0 kapı UYGULANMAZ (fail-open, loglanır).
+    #    İkisi de >0 ise min < max şart (startup'ta doğrulanır).
+    scalper_min_atr_pct: float = 0.0
+    scalper_max_atr_pct: float = 0.0
     # --- İşlem adli kaydı (D21, 2026-08-23) — YALNIZ GÖZLEM -------------
     # Hiçbir kapı/boyutlama/çıkış kararı bu ayarları okumaz; kapatılırsa
     # yalnız kayıt tutulmaz, motor davranışı HER İKİ durumda da aynıdır.
@@ -1129,6 +1157,23 @@ class Settings(BaseSettings):
                 f"SCALPER_STRUCTURE_PIVOT >= 1 olmalı (verilen: {self.scalper_structure_pivot})"
             )
         _structure.resolve_structure_role(self)  # çözülemezse ValueError
+        return self
+
+    @model_validator(mode="after")
+    def _validate_entry_gates(self) -> "Settings":
+        """Genel giriş kapıları (hücre / UTC saat / ATR% bandı) AÇIKKEN
+        ayarların anlamlı olduğunu startup'ta doğrula. Kapalıyken (varsayılan:
+        "", "", 0, 0) hiçbir kontrol yapılmaz — kapalı bir özelliğin ayarı
+        botu başlatmamazlık etmemeli (_validate_structure_gate ile aynı ilke).
+
+        Sessiz yanlış davranış riski: "RANGE:SHRT" gibi bir yazım hatası
+        hücreyi hiç eşleştirmez ve kapı "açık görünüp" hiç engellemezdi;
+        "25-26" gibi bir saat aralığı da öyle; min ≥ max ise ATR bandı boş
+        küme olur ve HER sinyali keserdi. Fail-fast, sessizlikten iyidir.
+        """
+        from src.strategies.scalper import entry_gates as _entry_gates  # saf modül, döngüsel import yok
+
+        _entry_gates.validate_entry_gate_settings(self)  # sorun varsa ValueError
         return self
 
     @model_validator(mode="after")

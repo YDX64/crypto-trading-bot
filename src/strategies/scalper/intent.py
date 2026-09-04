@@ -75,6 +75,11 @@ REASON_MARKET_GATE_DAY = "market_gate_day"
 REASON_MARKET_GATE_RUN = "market_gate_run"
 REASON_STRUCTURE_GATE = "structure_gate"
 REASON_TV_STRUCTURE_GATE = "tv_structure_gate"
+# 2026-09-03 genel deterministik giriş kapıları (entry_gates.py, varsayılan
+# KAPALI) — dizeler entry_gates.REASON_* ile BİREBİR aynıdır (test edilir).
+REASON_CELL_GATE = "cell_gate"
+REASON_HOUR_GATE = "hour_gate"
+REASON_ATR_GATE = "atr_gate"
 REASON_TV_CONFLUENCE = "tv_confluence"
 REASON_TV_SOURCE_BLOCKED = "tv_source_blocked"
 REASON_LOSS_COOLDOWN = "loss_cooldown"
@@ -107,6 +112,9 @@ REASON_LABELS: Dict[str, str] = {
     REASON_MARKET_GATE_RUN: "piyasa kapısı: liderin çok-günlük uzaması",
     REASON_STRUCTURE_GATE: "yapı kapısı: son swing kırılımına ters yön",
     REASON_TV_STRUCTURE_GATE: "TV yapı kapısı: CHoCH/trend olayına ters yön",
+    REASON_CELL_GATE: "hücre kapısı: rejim×yön çifti yasak listesinde",
+    REASON_HOUR_GATE: "saat kapısı: giriş mumunun UTC saati yasak pencerede",
+    REASON_ATR_GATE: "ATR kapısı: ATR% bandı dışında",
     REASON_TV_CONFLUENCE: "TV sağlaması dolmadı (yeterli farklı kaynak yok)",
     REASON_TV_SOURCE_BLOCKED: "TV giriş kaynağı performans karantinasında",
     REASON_LOSS_COOLDOWN: "zarar sonrası sembol cooldown'ı aktif",
@@ -133,6 +141,9 @@ KNOWN_REASONS: frozenset = frozenset(
         REASON_MARKET_GATE_RUN,
         REASON_STRUCTURE_GATE,
         REASON_TV_STRUCTURE_GATE,
+        REASON_CELL_GATE,
+        REASON_HOUR_GATE,
+        REASON_ATR_GATE,
         REASON_TV_CONFLUENCE,
         REASON_TV_SOURCE_BLOCKED,
         REASON_LOSS_COOLDOWN,
