@@ -3224,8 +3224,11 @@ Hiçbir kapı sunucu `.env`'inde açık değildir. Açılırsa D27 karşı-olgu 
 (+`_DIRECTION`) ve `SCALPER_SYMBOL_DIRECTION_BLOCK`; harness JSON'una `signal_close_time`. Gerçek harness:
 hafta sonu LONG yasağı dokunulmamış +260 / seçim −%19 / Haziran −52; ADA LONG +88 / −%4; birleşim seçim
 −%26 (RED). Ön-kayıtlı taze son sınav (Şubat, Temmuz): ikisi de geçer ama +17 / +20 (küçük).
-**Karar:** testnet `.env`'e `SCALPER_ENTRY_BLOCK_WEEKDAYS_UTC=5,6` + `SCALPER_ENTRY_BLOCK_WEEKDAYS_DIRECTION=LONG`
-(yedek `backups/env.bak-…-d33-weekend-long`), diğer kapılar kapalı. Amaç kâr iddiası değil ölçüm: ≥5 gün
+**Karar / uygulama (2026-09-04 02:19 UTC):** kod ea38dd2 deploy edildi (env değişmeden; sunucu 2791 test),
+sonra testnet `.env`'e `SCALPER_ENTRY_BLOCK_WEEKDAYS_UTC=5,6` + `SCALPER_ENTRY_BLOCK_WEEKDAYS_DIRECTION=LONG`
+(yedek `backups/env.bak-20260904T0218xxZ-pre-d33-weekend-long`), `restart_safe.sh` pid 3263489, read-back doğrulandı;
+diğer kapılar kapalı. İlk deneme (02:09) yanlış sırayla 2,5 dk kesinti yarattı — RUNBOOK "Yeni env anahtarı
+getiren kod deploy'u — SIRA". İlk hafta sonu etkisi 2026-09-05/06. Amaç kâr iddiası değil ölçüm: ≥5 gün
 (en az bir hafta sonu) sonra `ledger_report.py --counterfactual` ile engellenen hafta sonu LONG'ların
 "girilseydi" sonucu okunur; net negatifse kural kalır, pozitifse kapatılır. ADA LONG açılmadı.
 
