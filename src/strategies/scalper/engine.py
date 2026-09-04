@@ -57,6 +57,8 @@ from src.strategies.scalper.entry_gates import (
     format_entry_gate_detail,
     cell_gate_enabled,
     hour_gate_enabled,
+    weekday_gate_enabled,
+    symbol_dir_gate_enabled,
 )
 from src.strategies.scalper.market_gate import (
     MARKET_GATE_INTRADAY_LIMIT,
@@ -2226,19 +2228,22 @@ class ScalperEngine:
                 continue
             # 2026-09-03 genel deterministik giriş kapıları — rejim×yön hücresi
             # (SCALPER_C_BLOCKED_CELLS), UTC saat penceresi
-            # (SCALPER_ENTRY_BLOCK_HOURS_UTC), ATR% bandı (SCALPER_MIN/MAX_ATR_PCT);
-            # üçü de VARSAYILAN KAPALI (post-hoc tarama adayları; kazanan kural
-            # yalnız env ile açılır). TEK giriş noktası: C taraması ve TV dış
-            # sinyali AYNI kapıdan geçer. Harness (backtest.simulate_symbol)
-            # AYNI saf fonksiyonu AYNI argümanlarla çağırır (DECISIONS P1;
-            # tests/test_entry_gates.py parite testi):
+            # (SCALPER_ENTRY_BLOCK_HOURS_UTC), hafta günü×yön
+            # (SCALPER_ENTRY_BLOCK_WEEKDAYS_UTC/_DIRECTION, 2026-09-04),
+            # sembol×yön (SCALPER_SYMBOL_DIRECTION_BLOCK, 2026-09-04), ATR% bandı
+            # (SCALPER_MIN/MAX_ATR_PCT); BEŞİ de VARSAYILAN KAPALI (post-hoc tarama
+            # adayları; kazanan kural yalnız env ile açılır). TEK giriş noktası:
+            # C taraması ve TV dış sinyali AYNI kapıdan geçer. Harness
+            # (backtest.simulate_symbol) AYNI saf fonksiyonu AYNI argümanlarla
+            # çağırır (DECISIONS P1; tests/test_entry_gates.py parite testi):
             #   * zaman = son KAPANMIŞ giriş mumunun close_time'ı (duvar saati
-            #     DEĞİL — piyasa kapısının `cutoff_ms` gerekçesiyle aynı),
+            #     DEĞİL — piyasa kapısının `cutoff_ms` gerekçesiyle aynı; hafta
+            #     günü kapısı da AYNI değeri kullanır),
             #   * ATR% = HAM sinyal, apply_stop_policy ÖNCESİ (dinamik kaldıraç
             #     kararından bağımsız).
             # Fail-OPEN: istisna tarama turunu düşürmez, kapı o sinyalde
             # uygulanmaz ve bir kez WARNING loglanır (yapı kapısı kalıbı).
-            # Kapalıyken evaluate_entry_gates üç ucuz alan okumasıyla None döner.
+            # Kapalıyken evaluate_entry_gates birkaç ucuz alan okumasıyla None döner.
             entry_gate_reason: Optional[str] = None
             entry_close_time_ms: Optional[int] = None
             try:
@@ -2253,6 +2258,7 @@ class ScalperEngine:
                     entry_close_time_ms,
                     sig.atr_5m,
                     sig.entry_price,
+                    symbol,
                     self.cfg,
                 )
                 # ATR bandı AÇIK ama ATR ölçülemedi → kapı uygulanmadı; sessiz
@@ -2275,14 +2281,17 @@ class ScalperEngine:
                         f"⚠️ {symbol}: giriş kapıları değerlendirilemedi ({e}) — "
                         f"fail-open; bu uyarı bir kez loglanır "
                         f"(SCALPER_C_BLOCKED_CELLS / SCALPER_ENTRY_BLOCK_HOURS_UTC / "
-                        f"SCALPER_MIN_ATR_PCT / SCALPER_MAX_ATR_PCT ayarlarını kontrol edin)"
+                        f"SCALPER_ENTRY_BLOCK_WEEKDAYS_UTC / "
+                        f"SCALPER_ENTRY_BLOCK_WEEKDAYS_DIRECTION / "
+                        f"SCALPER_SYMBOL_DIRECTION_BLOCK / SCALPER_MIN_ATR_PCT / "
+                        f"SCALPER_MAX_ATR_PCT ayarlarını kontrol edin)"
                     )
             if entry_gate_reason is not None:
                 yon = getattr(sig.direction, "value", str(sig.direction))
                 kaynak = "TV sinyali" if is_external else "girişi"
                 gate_detail = entry_gate_detail(
                     entry_gate_reason, ctx.regime, sig.direction,
-                    entry_close_time_ms, sig.atr_5m, sig.entry_price, self.cfg,
+                    entry_close_time_ms, sig.atr_5m, sig.entry_price, symbol, self.cfg,
                 )
                 self.logger.info(
                     f"⛔ {symbol}: "
@@ -2944,6 +2953,8 @@ class ScalperEngine:
                 # D33 genel giriş kapıları (açıkken "passed", kapalıyken "off")
                 "cell": "passed" if cell_gate_enabled(self.cfg) else "off",
                 "hour": "passed" if hour_gate_enabled(self.cfg) else "off",
+                "weekday": "passed" if weekday_gate_enabled(self.cfg) else "off",
+                "symbol_dir": "passed" if symbol_dir_gate_enabled(self.cfg) else "off",
                 "atr": "passed" if atr_gate_enabled(self.cfg) else "off",
             }
 

@@ -76,9 +76,12 @@ REASON_MARKET_GATE_RUN = "market_gate_run"
 REASON_STRUCTURE_GATE = "structure_gate"
 REASON_TV_STRUCTURE_GATE = "tv_structure_gate"
 # 2026-09-03 genel deterministik giriş kapıları (entry_gates.py, varsayılan
-# KAPALI) — dizeler entry_gates.REASON_* ile BİREBİR aynıdır (test edilir).
+# KAPALI; hafta günü + sembol×yön 2026-09-04 eklendi) — dizeler
+# entry_gates.REASON_* ile BİREBİR aynıdır (test edilir).
 REASON_CELL_GATE = "cell_gate"
 REASON_HOUR_GATE = "hour_gate"
+REASON_WEEKDAY_GATE = "weekday_gate"
+REASON_SYMBOL_DIR_GATE = "symbol_dir_gate"
 REASON_ATR_GATE = "atr_gate"
 REASON_TV_CONFLUENCE = "tv_confluence"
 REASON_TV_SOURCE_BLOCKED = "tv_source_blocked"
@@ -114,6 +117,8 @@ REASON_LABELS: Dict[str, str] = {
     REASON_TV_STRUCTURE_GATE: "TV yapı kapısı: CHoCH/trend olayına ters yön",
     REASON_CELL_GATE: "hücre kapısı: rejim×yön çifti yasak listesinde",
     REASON_HOUR_GATE: "saat kapısı: giriş mumunun UTC saati yasak pencerede",
+    REASON_WEEKDAY_GATE: "hafta günü kapısı: giriş mumunun UTC hafta günü×yönü yasak",
+    REASON_SYMBOL_DIR_GATE: "sembol×yön kapısı: sembol×yön çifti yasak listesinde",
     REASON_ATR_GATE: "ATR kapısı: ATR% bandı dışında",
     REASON_TV_CONFLUENCE: "TV sağlaması dolmadı (yeterli farklı kaynak yok)",
     REASON_TV_SOURCE_BLOCKED: "TV giriş kaynağı performans karantinasında",
@@ -143,6 +148,8 @@ KNOWN_REASONS: frozenset = frozenset(
         REASON_TV_STRUCTURE_GATE,
         REASON_CELL_GATE,
         REASON_HOUR_GATE,
+        REASON_WEEKDAY_GATE,
+        REASON_SYMBOL_DIR_GATE,
         REASON_ATR_GATE,
         REASON_TV_CONFLUENCE,
         REASON_TV_SOURCE_BLOCKED,

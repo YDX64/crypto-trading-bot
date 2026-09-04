@@ -935,6 +935,9 @@ class _CfgProxy:
         # D33 genel giriş kapıları — sunucu .env'inde açılsa da testler kapalı görsün
         "scalper_c_blocked_cells": "",
         "scalper_entry_block_hours_utc": "",
+        "scalper_entry_block_weekdays_utc": "",
+        "scalper_entry_block_weekdays_direction": "BOTH",
+        "scalper_symbol_direction_block": "",
         "scalper_min_atr_pct": 0.0,
         "scalper_max_atr_pct": 0.0,
     }

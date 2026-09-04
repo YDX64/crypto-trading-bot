@@ -45,6 +45,8 @@ from src.strategies.scalper.entry_gates import (
     REASON_CELL,
     REASON_ENV_VARS,
     REASON_HOUR,
+    REASON_SYMBOL_DIR,
+    REASON_WEEKDAY,
     atr_gate_blocks,
     atr_gate_enabled,
     atr_pct_of,
@@ -58,9 +60,16 @@ from src.strategies.scalper.entry_gates import (
     hour_gate_enabled,
     hour_in_ranges,
     parse_blocked_cells,
+    parse_blocked_weekdays,
     parse_hour_ranges,
+    parse_symbol_direction_block,
+    symbol_dir_gate_blocks,
+    symbol_dir_gate_enabled,
     utc_hour_of,
+    utc_weekday_of,
     validate_entry_gate_settings,
+    weekday_gate_blocks,
+    weekday_gate_enabled,
 )
 from src.strategies.scalper.types import (
     Candle,
@@ -78,6 +87,9 @@ _MIN_MS = 60_000
 _ENV_KEYS = (
     "SCALPER_C_BLOCKED_CELLS",
     "SCALPER_ENTRY_BLOCK_HOURS_UTC",
+    "SCALPER_ENTRY_BLOCK_WEEKDAYS_UTC",
+    "SCALPER_ENTRY_BLOCK_WEEKDAYS_DIRECTION",
+    "SCALPER_SYMBOL_DIRECTION_BLOCK",
     "SCALPER_MIN_ATR_PCT",
     "SCALPER_MAX_ATR_PCT",
 )
@@ -90,6 +102,9 @@ class _GateCfg:
 
     scalper_c_blocked_cells: str = ""
     scalper_entry_block_hours_utc: str = ""
+    scalper_entry_block_weekdays_utc: str = ""
+    scalper_entry_block_weekdays_direction: str = "BOTH"
+    scalper_symbol_direction_block: str = ""
     scalper_min_atr_pct: float = 0.0
     scalper_max_atr_pct: float = 0.0
 
@@ -108,10 +123,12 @@ class TestConstants:
         `missed_counter`a `entry_gates.REASON_*` — ikisi AYNI dize olmalı."""
         assert REASON_CELL == intent.REASON_CELL_GATE == "cell_gate"
         assert REASON_HOUR == intent.REASON_HOUR_GATE == "hour_gate"
+        assert REASON_WEEKDAY == intent.REASON_WEEKDAY_GATE == "weekday_gate"
+        assert REASON_SYMBOL_DIR == intent.REASON_SYMBOL_DIR_GATE == "symbol_dir_gate"
         assert REASON_ATR == intent.REASON_ATR_GATE == "atr_gate"
 
     def test_reasons_are_known_and_labelled(self):
-        for name in (REASON_CELL, REASON_HOUR, REASON_ATR):
+        for name in (REASON_CELL, REASON_HOUR, REASON_WEEKDAY, REASON_SYMBOL_DIR, REASON_ATR):
             assert name in intent.KNOWN_REASONS
             assert intent.REASON_LABELS[name].strip()
             assert REASON_ENV_VARS[name]
@@ -265,6 +282,158 @@ class TestHourGate:
             hour_gate_blocks(_ms(3, 5), _GateCfg(scalper_entry_block_hours_utc="25-26"))
 
 
+class TestWeekdayGate:
+    """`_ms(day, ...)`'te gün 0 = 1970-01-01 = Perşembe (weekday=3); yani
+    gün 1 = Cuma, gün 2 = Cumartesi, gün 3 = Pazar, gün 4 = Pazartesi
+    (`datetime.weekday()` ile Pazartesi=0 … Pazar=6)."""
+
+    def test_utc_weekday_of_epoch_and_known_dates(self):
+        assert utc_weekday_of(0) == 3  # 1970-01-01 Perşembe
+        # 2026-08-07 00:00:00 UTC = Cuma (1_786_060_800_000 ms)
+        assert utc_weekday_of(1_786_060_800_000) == 4
+
+    def test_friday_end_saturday_start_sunday_end_monday_start_boundary(self):
+        """Görev talimatının sınır değerleri: Cuma 23:59:59.999 → weekday 4
+        serbest, Cumartesi 00:00:00.000 → weekday 5 blok; Pazar 23:59:59.999
+        blok; Pazartesi 00:00 serbest (yasak listesi yalnız {5, 6})."""
+        friday_end = _ms(2, 0) - 1          # gün1 (Cuma) son ms
+        saturday_start = _ms(2, 0)          # gün2 (Cumartesi) ilk ms
+        sunday_end = _ms(4, 0) - 1          # gün3 (Pazar) son ms
+        monday_start = _ms(4, 0)            # gün4 (Pazartesi) ilk ms
+        assert utc_weekday_of(friday_end) == 4
+        assert utc_weekday_of(saturday_start) == 5
+        assert utc_weekday_of(sunday_end) == 6
+        assert utc_weekday_of(monday_start) == 0
+
+        cfg = _GateCfg(scalper_entry_block_weekdays_utc="5,6")
+        assert weekday_gate_blocks(friday_end, "LONG", cfg) is False
+        assert weekday_gate_blocks(saturday_start, "LONG", cfg) is True
+        assert weekday_gate_blocks(sunday_end, "LONG", cfg) is True
+        assert weekday_gate_blocks(monday_start, "LONG", cfg) is False
+
+    def test_parse_normalises_whitespace(self):
+        assert parse_blocked_weekdays(" 5 , 6 ,, ") == frozenset({5, 6})
+        assert parse_blocked_weekdays("0,1,2,3,4,5,6") == frozenset(range(7))
+
+    @pytest.mark.parametrize("raw", ["", "   ", None])
+    def test_parse_empty_is_empty(self, raw):
+        assert parse_blocked_weekdays(raw) == frozenset()
+
+    @pytest.mark.parametrize("raw", ["7", "-1", "abc", "5,7", "5.5", "3-4"])
+    def test_parse_invalid_raises(self, raw):
+        with pytest.raises(ValueError):
+            parse_blocked_weekdays(raw)
+
+    def test_off_never_blocks(self):
+        cfg = _GateCfg()
+        assert weekday_gate_enabled(cfg) is False
+        for day in range(7):
+            for direction in Direction:
+                assert weekday_gate_blocks(_ms(day, 12), direction, cfg) is False
+
+    def test_missing_field_is_off(self):
+        assert weekday_gate_blocks(_ms(2, 0), Direction.LONG, SimpleNamespace()) is False
+
+    def test_blocks_only_listed_weekday(self):
+        cfg = _GateCfg(scalper_entry_block_weekdays_utc="5,6")
+        assert weekday_gate_enabled(cfg) is True
+        assert weekday_gate_blocks(_ms(2, 12), Direction.LONG, cfg) is True   # Cumartesi
+        assert weekday_gate_blocks(_ms(3, 12), Direction.LONG, cfg) is True   # Pazar
+        assert weekday_gate_blocks(_ms(1, 12), Direction.LONG, cfg) is False  # Cuma
+        assert weekday_gate_blocks(_ms(4, 12), Direction.LONG, cfg) is False  # Pazartesi
+
+    def test_direction_default_is_both(self):
+        cfg = _GateCfg(scalper_entry_block_weekdays_utc="5")
+        assert weekday_gate_blocks(_ms(2, 12), Direction.LONG, cfg) is True
+        assert weekday_gate_blocks(_ms(2, 12), Direction.SHORT, cfg) is True
+        assert weekday_gate_blocks(_ms(2, 12), "long", cfg) is True  # düz dize de kabul
+
+    def test_direction_filter_only_matching_direction_blocked(self):
+        cfg = _GateCfg(
+            scalper_entry_block_weekdays_utc="5,6",
+            scalper_entry_block_weekdays_direction="LONG",
+        )
+        assert weekday_gate_blocks(_ms(2, 12), Direction.LONG, cfg) is True
+        assert weekday_gate_blocks(_ms(2, 12), Direction.SHORT, cfg) is False
+        cfg_short = _GateCfg(
+            scalper_entry_block_weekdays_utc="5,6",
+            scalper_entry_block_weekdays_direction="short",  # küçük harf de kabul
+        )
+        assert weekday_gate_blocks(_ms(2, 12), Direction.SHORT, cfg_short) is True
+        assert weekday_gate_blocks(_ms(2, 12), Direction.LONG, cfg_short) is False
+
+    @pytest.mark.parametrize("bad", [None, "abc", float("nan"), True])
+    def test_unresolvable_time_is_fail_open(self, bad):
+        cfg = _GateCfg(scalper_entry_block_weekdays_utc="0,1,2,3,4,5,6")
+        assert weekday_gate_blocks(bad, Direction.LONG, cfg) is False
+
+    def test_invalid_weekday_raises_at_gate_time(self):
+        with pytest.raises(ValueError):
+            weekday_gate_blocks(_ms(2, 0), Direction.LONG, _GateCfg(scalper_entry_block_weekdays_utc="9"))
+
+    def test_invalid_direction_raises_at_gate_time_only_when_weekdays_filled(self):
+        with pytest.raises(ValueError):
+            weekday_gate_blocks(
+                _ms(2, 0), Direction.LONG,
+                _GateCfg(scalper_entry_block_weekdays_utc="5", scalper_entry_block_weekdays_direction="UP"),
+            )
+        # Hafta günü alanı BOŞken bozuk yön ayarı kapıyı ASLA patlatmaz (kapalı kapı inert).
+        assert weekday_gate_blocks(
+            _ms(2, 0), Direction.LONG,
+            _GateCfg(scalper_entry_block_weekdays_direction="UP"),
+        ) is False
+
+
+class TestSymbolDirGate:
+    def test_parse_normalises_case_and_whitespace(self):
+        pairs = parse_symbol_direction_block(" adausdt : long , DOGEUSDT:short ,, ")
+        assert pairs == frozenset({("ADAUSDT", "LONG"), ("DOGEUSDT", "SHORT")})
+
+    @pytest.mark.parametrize("raw", ["", "   ", None])
+    def test_parse_empty_is_empty(self, raw):
+        assert parse_symbol_direction_block(raw) == frozenset()
+
+    @pytest.mark.parametrize(
+        "raw",
+        ["ADAUSDT-LONG", "ADAUSDT", "ADAUSDT:LONG:SHORT", ":LONG", "ADAUSDT:",
+         "ADAUSDT:BOTH", "ADAUSDT:UP"],
+    )
+    def test_parse_invalid_token_raises(self, raw):
+        with pytest.raises(ValueError):
+            parse_symbol_direction_block(raw)
+
+    def test_off_never_blocks(self):
+        cfg = _GateCfg()
+        assert symbol_dir_gate_enabled(cfg) is False
+        for direction in Direction:
+            assert symbol_dir_gate_blocks("ADAUSDT", direction, cfg) is False
+
+    def test_missing_field_is_off(self):
+        assert symbol_dir_gate_blocks("ADAUSDT", Direction.LONG, SimpleNamespace()) is False
+
+    def test_blocks_only_listed_symbol_direction(self):
+        cfg = _GateCfg(scalper_symbol_direction_block="ADAUSDT:LONG,DOGEUSDT:LONG")
+        assert symbol_dir_gate_enabled(cfg) is True
+        assert symbol_dir_gate_blocks("ADAUSDT", Direction.LONG, cfg) is True
+        assert symbol_dir_gate_blocks("DOGEUSDT", Direction.LONG, cfg) is True
+        # Listede olmayan yön/sembol serbest.
+        assert symbol_dir_gate_blocks("ADAUSDT", Direction.SHORT, cfg) is False
+        assert symbol_dir_gate_blocks("BTCUSDT", Direction.LONG, cfg) is False
+
+    def test_symbol_and_direction_normalised_case_insensitive(self):
+        cfg = _GateCfg(scalper_symbol_direction_block="adausdt:long")
+        assert symbol_dir_gate_blocks("ADAUSDT", "LONG", cfg) is True
+        assert symbol_dir_gate_blocks("adausdt", "long", cfg) is True
+        assert symbol_dir_gate_blocks("AdaUsdt", Direction.LONG, cfg) is True
+
+    def test_invalid_config_raises_at_gate_time(self):
+        with pytest.raises(ValueError):
+            symbol_dir_gate_blocks(
+                "ADAUSDT", Direction.LONG,
+                _GateCfg(scalper_symbol_direction_block="ADAUSDT-LONG"),
+            )
+
+
 class TestAtrGate:
     def test_atr_pct_formula_matches_setups(self):
         # setups.apply_stop_policy: atr_pct = atr_5m / entry_price * 100
@@ -321,37 +490,68 @@ class TestAtrGate:
 class TestEvaluateEntryGates:
     def test_all_off_returns_none_without_touching_inputs(self):
         # Girdiler bilerek ANLAMSIZ: kapalıyken hiçbiri okunmamalı.
-        assert evaluate_entry_gates(object(), object(), "x", "y", "z", _GateCfg()) is None
-        assert evaluate_entry_gates(Regime.RANGE, Direction.SHORT, 0, 1.0, 100.0, SimpleNamespace()) is None
+        assert evaluate_entry_gates(object(), object(), "x", "y", "z", object(), _GateCfg()) is None
+        assert evaluate_entry_gates(
+            Regime.RANGE, Direction.SHORT, 0, 1.0, 100.0, "ETHUSDT", SimpleNamespace()
+        ) is None
 
-    def test_order_cell_then_hour_then_atr(self):
+    def test_order_cell_then_hour_then_weekday_then_symbol_dir_then_atr(self):
         cfg = _GateCfg(
             scalper_c_blocked_cells="RANGE:SHORT",
             scalper_entry_block_hours_utc="0-24",
+            scalper_entry_block_weekdays_utc="0,1,2,3,4,5,6",
+            scalper_symbol_direction_block="ETHUSDT:LONG",
             scalper_min_atr_pct=5.0,
         )
-        # Üçü de tetikte → hücre kazanır.
-        assert evaluate_entry_gates(Regime.RANGE, Direction.SHORT, _ms(3, 5), 1.0, 100.0, cfg) == REASON_CELL
+        # Beşi de tetikte → hücre kazanır.
+        assert evaluate_entry_gates(Regime.RANGE, Direction.SHORT, _ms(3, 5), 1.0, 100.0, "ETHUSDT", cfg) == REASON_CELL
         # Hücre geçerse saat.
-        assert evaluate_entry_gates(Regime.RANGE, Direction.LONG, _ms(3, 5), 1.0, 100.0, cfg) == REASON_HOUR
-        # Saat de geçerse ATR.
-        cfg2 = _GateCfg(scalper_c_blocked_cells="RANGE:SHORT", scalper_entry_block_hours_utc="0-6", scalper_min_atr_pct=5.0)
-        assert evaluate_entry_gates(Regime.RANGE, Direction.LONG, _ms(3, 12), 1.0, 100.0, cfg2) == REASON_ATR
+        assert evaluate_entry_gates(Regime.RANGE, Direction.LONG, _ms(3, 5), 1.0, 100.0, "ETHUSDT", cfg) == REASON_HOUR
+        # Saat de geçerse hafta günü (hours artık dar: 0-6, mum saat 12'de).
+        cfg2 = _GateCfg(
+            scalper_c_blocked_cells="RANGE:SHORT",
+            scalper_entry_block_hours_utc="0-6",
+            scalper_entry_block_weekdays_utc="0,1,2,3,4,5,6",
+            scalper_symbol_direction_block="ETHUSDT:LONG",
+            scalper_min_atr_pct=5.0,
+        )
+        assert evaluate_entry_gates(Regime.RANGE, Direction.LONG, _ms(3, 12), 1.0, 100.0, "ETHUSDT", cfg2) == REASON_WEEKDAY
+        # Hafta günü de geçerse (kapalı) sembol×yön.
+        cfg3 = _GateCfg(
+            scalper_c_blocked_cells="RANGE:SHORT",
+            scalper_entry_block_hours_utc="0-6",
+            scalper_symbol_direction_block="ETHUSDT:LONG",
+            scalper_min_atr_pct=5.0,
+        )
+        assert evaluate_entry_gates(Regime.RANGE, Direction.LONG, _ms(3, 12), 1.0, 100.0, "ETHUSDT", cfg3) == REASON_SYMBOL_DIR
+        # Sembol×yön de geçerse (kapalı) ATR.
+        cfg4 = _GateCfg(scalper_c_blocked_cells="RANGE:SHORT", scalper_entry_block_hours_utc="0-6", scalper_min_atr_pct=5.0)
+        assert evaluate_entry_gates(Regime.RANGE, Direction.LONG, _ms(3, 12), 1.0, 100.0, "ETHUSDT", cfg4) == REASON_ATR
         # Hepsi geçerse None.
-        assert evaluate_entry_gates(Regime.RANGE, Direction.LONG, _ms(3, 12), 10.0, 100.0, cfg2) is None
+        assert evaluate_entry_gates(Regime.RANGE, Direction.LONG, _ms(3, 12), 10.0, 100.0, "ETHUSDT", cfg4) is None
 
     def test_detail_and_format(self):
         cfg = _GateCfg(scalper_entry_block_hours_utc="0-6", scalper_min_atr_pct=0.5, scalper_max_atr_pct=2.0)
-        d = entry_gate_detail(REASON_CELL, Regime.RANGE, Direction.SHORT, _ms(3, 5), 1.0, 100.0, cfg)
+        d = entry_gate_detail(REASON_CELL, Regime.RANGE, Direction.SHORT, _ms(3, 5), 1.0, 100.0, "ETHUSDT", cfg)
         assert d == {"gate": REASON_CELL, "regime": "RANGE", "direction": "SHORT"}
         assert "RANGE:SHORT" in format_entry_gate_detail(d)
-        d = entry_gate_detail(REASON_HOUR, Regime.RANGE, Direction.SHORT, _ms(3, 5, 4, 59, 999), 1.0, 100.0, cfg)
+        d = entry_gate_detail(REASON_HOUR, Regime.RANGE, Direction.SHORT, _ms(3, 5, 4, 59, 999), 1.0, 100.0, "ETHUSDT", cfg)
         assert d["hour_utc"] == 5 and d["block_hours"] == "0-6"
         assert "5" in format_entry_gate_detail(d)
-        d = entry_gate_detail(REASON_ATR, Regime.RANGE, Direction.SHORT, _ms(3, 5), 0.25, 100.0, cfg)
+        cfg_wd = _GateCfg(scalper_entry_block_weekdays_utc="5,6", scalper_entry_block_weekdays_direction="LONG")
+        d = entry_gate_detail(REASON_WEEKDAY, Regime.RANGE, Direction.LONG, _ms(2, 12), 1.0, 100.0, "ETHUSDT", cfg_wd)
+        assert d["weekday_utc"] == 5 and d["direction"] == "LONG"
+        assert d["block_weekdays"] == "5,6" and d["block_direction"] == "LONG"
+        formatted = format_entry_gate_detail(d)
+        assert "5" in formatted and "LONG" in formatted
+        cfg_sym = _GateCfg(scalper_symbol_direction_block="ETHUSDT:SHORT")
+        d = entry_gate_detail(REASON_SYMBOL_DIR, Regime.RANGE, Direction.SHORT, _ms(3, 5), 1.0, 100.0, "ethusdt", cfg_sym)
+        assert d == {"gate": REASON_SYMBOL_DIR, "symbol": "ETHUSDT", "direction": "SHORT"}
+        assert "ETHUSDT:SHORT" in format_entry_gate_detail(d)
+        d = entry_gate_detail(REASON_ATR, Regime.RANGE, Direction.SHORT, _ms(3, 5), 0.25, 100.0, "ETHUSDT", cfg)
         assert d["atr_pct"] == pytest.approx(0.25) and d["min_atr_pct"] == 0.5 and d["max_atr_pct"] == 2.0
         assert "0.250" in format_entry_gate_detail(d)
-        d = entry_gate_detail(REASON_ATR, Regime.RANGE, Direction.SHORT, _ms(3, 5), None, 100.0, cfg)
+        d = entry_gate_detail(REASON_ATR, Regime.RANGE, Direction.SHORT, _ms(3, 5), None, 100.0, "ETHUSDT", cfg)
         assert d["atr_pct"] is None  # "ölçülmedi" ≠ 0.0
         assert "?" in format_entry_gate_detail(d)
 
@@ -365,6 +565,9 @@ class TestValidateSettingsPure:
         validate_entry_gate_settings(_GateCfg(
             scalper_c_blocked_cells="RANGE:SHORT,UP:LONG",
             scalper_entry_block_hours_utc="0-6,22-3",
+            scalper_entry_block_weekdays_utc="5,6",
+            scalper_entry_block_weekdays_direction="LONG",
+            scalper_symbol_direction_block="ADAUSDT:LONG,DOGEUSDT:SHORT",
             scalper_min_atr_pct=0.3, scalper_max_atr_pct=3.0,
         ))
 
@@ -372,11 +575,21 @@ class TestValidateSettingsPure:
         validate_entry_gate_settings(_GateCfg(scalper_min_atr_pct=0.3))
         validate_entry_gate_settings(_GateCfg(scalper_max_atr_pct=3.0))
 
+    def test_weekday_direction_only_validated_when_weekdays_filled(self):
+        """Hafta günü alanı BOŞken bozuk yön ayarı botu ASLA durdurmaz
+        (kapalı bir özelliğin ayarı başlatmamazlık etmemeli)."""
+        validate_entry_gate_settings(_GateCfg(scalper_entry_block_weekdays_direction="GARBAGE"))
+
     @pytest.mark.parametrize(
         "kw",
         [dict(scalper_c_blocked_cells="RANGE:SHRT"),
          dict(scalper_entry_block_hours_utc="25-26"),
          dict(scalper_entry_block_hours_utc="6"),
+         dict(scalper_entry_block_weekdays_utc="7"),
+         dict(scalper_entry_block_weekdays_utc="-1"),
+         dict(scalper_entry_block_weekdays_utc="5", scalper_entry_block_weekdays_direction="UP"),
+         dict(scalper_symbol_direction_block="ADAUSDT-LONG"),
+         dict(scalper_symbol_direction_block="ADAUSDT:BOTH"),
          dict(scalper_min_atr_pct=2.0, scalper_max_atr_pct=1.0),
          dict(scalper_min_atr_pct=1.0, scalper_max_atr_pct=1.0),
          dict(scalper_min_atr_pct=-0.1),
@@ -418,10 +631,13 @@ class TestEntryGateSettings:
         s = self._settings(monkeypatch)
         assert s.scalper_c_blocked_cells == ""
         assert s.scalper_entry_block_hours_utc == ""
+        assert s.scalper_entry_block_weekdays_utc == ""
+        assert s.scalper_entry_block_weekdays_direction == "BOTH"
+        assert s.scalper_symbol_direction_block == ""
         assert s.scalper_min_atr_pct == 0.0
         assert s.scalper_max_atr_pct == 0.0
         assert entry_gates_enabled(s) is False
-        assert evaluate_entry_gates(Regime.RANGE, Direction.SHORT, _ms(3, 2), 0.01, 100.0, s) is None
+        assert evaluate_entry_gates(Regime.RANGE, Direction.SHORT, _ms(3, 2), 0.01, 100.0, "ETHUSDT", s) is None
 
     def test_env_overrides_are_parsed(self, monkeypatch):
         s = self._settings(monkeypatch, env={
@@ -434,10 +650,26 @@ class TestEntryGateSettings:
         assert s.scalper_entry_block_hours_utc == "0-6,22-24"
         assert s.scalper_min_atr_pct == 0.3
         assert s.scalper_max_atr_pct == 2.5
-        assert evaluate_entry_gates(Regime.RANGE, Direction.SHORT, _ms(3, 12), 1.0, 100.0, s) == REASON_CELL
-        assert evaluate_entry_gates(Regime.RANGE, Direction.LONG, _ms(3, 2), 1.0, 100.0, s) == REASON_HOUR
-        assert evaluate_entry_gates(Regime.RANGE, Direction.LONG, _ms(3, 12), 0.1, 100.0, s) == REASON_ATR
-        assert evaluate_entry_gates(Regime.RANGE, Direction.LONG, _ms(3, 12), 1.0, 100.0, s) is None
+        assert evaluate_entry_gates(Regime.RANGE, Direction.SHORT, _ms(3, 12), 1.0, 100.0, "ETHUSDT", s) == REASON_CELL
+        assert evaluate_entry_gates(Regime.RANGE, Direction.LONG, _ms(3, 2), 1.0, 100.0, "ETHUSDT", s) == REASON_HOUR
+        assert evaluate_entry_gates(Regime.RANGE, Direction.LONG, _ms(3, 12), 0.1, 100.0, "ETHUSDT", s) == REASON_ATR
+        assert evaluate_entry_gates(Regime.RANGE, Direction.LONG, _ms(3, 12), 1.0, 100.0, "ETHUSDT", s) is None
+
+    def test_weekday_and_symbol_dir_env_overrides_are_parsed(self, monkeypatch):
+        s = self._settings(monkeypatch, env={
+            "SCALPER_ENTRY_BLOCK_WEEKDAYS_UTC": "5,6",
+            "SCALPER_ENTRY_BLOCK_WEEKDAYS_DIRECTION": "LONG",
+            "SCALPER_SYMBOL_DIRECTION_BLOCK": "ADAUSDT:LONG,DOGEUSDT:LONG",
+        })
+        assert s.scalper_entry_block_weekdays_utc == "5,6"
+        assert s.scalper_entry_block_weekdays_direction == "LONG"
+        assert s.scalper_symbol_direction_block == "ADAUSDT:LONG,DOGEUSDT:LONG"
+        # Cumartesi (gün 2), LONG yön eşleşiyor → weekday_gate.
+        assert evaluate_entry_gates(Regime.RANGE, Direction.LONG, _ms(2, 12), 1.0, 100.0, "ETHUSDT", s) == REASON_WEEKDAY
+        # Cumartesi, SHORT yön eşleşmiyor (yalnız LONG yasaklı) → sembol×yön'e düşer.
+        assert evaluate_entry_gates(Regime.RANGE, Direction.SHORT, _ms(2, 12), 1.0, 100.0, "ADAUSDT", s) is None
+        assert evaluate_entry_gates(Regime.RANGE, Direction.LONG, _ms(1, 12), 1.0, 100.0, "ADAUSDT", s) == REASON_SYMBOL_DIR
+        assert evaluate_entry_gates(Regime.RANGE, Direction.LONG, _ms(1, 12), 1.0, 100.0, "ETHUSDT", s) is None
 
     @pytest.mark.parametrize(
         "env",
@@ -445,6 +677,10 @@ class TestEntryGateSettings:
          {"SCALPER_C_BLOCKED_CELLS": "SIDEWAYS:LONG"},
          {"SCALPER_ENTRY_BLOCK_HOURS_UTC": "25-26"},
          {"SCALPER_ENTRY_BLOCK_HOURS_UTC": "6-6"},
+         {"SCALPER_ENTRY_BLOCK_WEEKDAYS_UTC": "7"},
+         {"SCALPER_ENTRY_BLOCK_WEEKDAYS_UTC": "5", "SCALPER_ENTRY_BLOCK_WEEKDAYS_DIRECTION": "SIDEWAYS"},
+         {"SCALPER_SYMBOL_DIRECTION_BLOCK": "ADAUSDT-LONG"},
+         {"SCALPER_SYMBOL_DIRECTION_BLOCK": "ADAUSDT:SIDEWAYS"},
          {"SCALPER_MIN_ATR_PCT": "2", "SCALPER_MAX_ATR_PCT": "1"},
          {"SCALPER_MIN_ATR_PCT": "1", "SCALPER_MAX_ATR_PCT": "1"},
          {"SCALPER_MIN_ATR_PCT": "-1"}],
@@ -570,6 +806,9 @@ class _EngineCfg:
 
     scalper_c_blocked_cells: str = ""
     scalper_entry_block_hours_utc: str = ""
+    scalper_entry_block_weekdays_utc: str = ""
+    scalper_entry_block_weekdays_direction: str = "BOTH"
+    scalper_symbol_direction_block: str = ""
     scalper_min_atr_pct: float = 0.0
     scalper_max_atr_pct: float = 0.0
     scalper_market_gate: bool = False
@@ -707,6 +946,65 @@ class TestEngineEntryGates:
         assert any("ATR kapısı" in m and "TV sinyali engellendi" in m for m in infos), infos
         assert _denied(intents)[0]["reason"] == intent.REASON_ATR_GATE
 
+    async def test_weekday_gate_blocks_scanner_signal_and_records_intent(self):
+        """`_CANDLES` Pazartesi'ye (gün 4, weekday=0) hizalıdır (bkz. modül
+        docstring'i altındaki `_ENTRY_START`)."""
+        cfg = _EngineCfg(scalper_entry_block_weekdays_utc="0")
+        _, infos, intents = await _run_engine(cfg, _AlwaysSignalStrategy(Direction.LONG))
+        assert any("hafta günü kapısı" in m and "LONG girişi engellendi" in m for m in infos), infos
+        denied = _denied(intents)
+        assert len(denied) == 1
+        assert denied[0]["reason"] == intent.REASON_WEEKDAY_GATE
+        assert denied[0]["source"] == "scan"
+        assert denied[0]["extra"]["weekday_utc"] == 0
+        assert denied[0]["extra"]["direction"] == "LONG"
+        assert denied[0]["extra"]["block_weekdays"] == "0"
+
+    async def test_weekday_gate_blocks_external_tv_signal_with_direction_filter(self):
+        cfg = _EngineCfg(scalper_entry_block_weekdays_utc="0", scalper_entry_block_weekdays_direction="SHORT")
+        _, infos, intents = await _run_engine(cfg, _ExternalSignalLike(Direction.SHORT))
+        assert any("hafta günü kapısı" in m and "SHORT TV sinyali engellendi" in m for m in infos), infos
+        denied = _denied(intents)
+        assert len(denied) == 1 and denied[0]["reason"] == intent.REASON_WEEKDAY_GATE
+        assert denied[0]["source"] == "tv"
+
+    async def test_weekday_gate_off_day_lets_signal_through(self, monkeypatch):
+        cfg = _EngineCfg(scalper_entry_block_weekdays_utc="5,6")  # hafta sonu; mumlar Pazartesi
+        monkeypatch.setattr(engine_module, "apply_stop_policy", lambda sig, c: (_ for _ in ()).throw(_ReachedStopPolicy()))
+        with pytest.raises(_ReachedStopPolicy):
+            await _run_engine(cfg, _AlwaysSignalStrategy(Direction.LONG))
+
+    async def test_weekday_gate_direction_mismatch_lets_signal_through(self, monkeypatch):
+        cfg = _EngineCfg(scalper_entry_block_weekdays_utc="0", scalper_entry_block_weekdays_direction="SHORT")
+        monkeypatch.setattr(engine_module, "apply_stop_policy", lambda sig, c: (_ for _ in ()).throw(_ReachedStopPolicy()))
+        with pytest.raises(_ReachedStopPolicy):
+            await _run_engine(cfg, _AlwaysSignalStrategy(Direction.LONG))  # yön LONG, kapı yalnız SHORT'u keser
+
+    async def test_symbol_dir_gate_blocks_scanner_signal_and_records_intent(self):
+        cfg = _EngineCfg(scalper_symbol_direction_block="ETHUSDT:SHORT")
+        _, infos, intents = await _run_engine(cfg, _AlwaysSignalStrategy(Direction.SHORT))
+        assert any("sembol×yön kapısı" in m and "SHORT girişi engellendi" in m for m in infos), infos
+        denied = _denied(intents)
+        assert len(denied) == 1
+        assert denied[0]["reason"] == intent.REASON_SYMBOL_DIR_GATE
+        assert denied[0]["source"] == "scan"
+        assert denied[0]["extra"]["symbol"] == "ETHUSDT"
+        assert denied[0]["extra"]["direction"] == "SHORT"
+
+    async def test_symbol_dir_gate_blocks_external_tv_signal(self):
+        cfg = _EngineCfg(scalper_symbol_direction_block="ETHUSDT:LONG")
+        _, infos, intents = await _run_engine(cfg, _ExternalSignalLike(Direction.LONG))
+        assert any("sembol×yön kapısı" in m and "LONG TV sinyali engellendi" in m for m in infos), infos
+        denied = _denied(intents)
+        assert len(denied) == 1 and denied[0]["reason"] == intent.REASON_SYMBOL_DIR_GATE
+        assert denied[0]["source"] == "tv"
+
+    async def test_symbol_dir_gate_lets_unlisted_symbol_through(self, monkeypatch):
+        cfg = _EngineCfg(scalper_symbol_direction_block="ADAUSDT:LONG")  # motor sembolü ETHUSDT
+        monkeypatch.setattr(engine_module, "apply_stop_policy", lambda sig, c: (_ for _ in ()).throw(_ReachedStopPolicy()))
+        with pytest.raises(_ReachedStopPolicy):
+            await _run_engine(cfg, _AlwaysSignalStrategy(Direction.LONG))
+
     async def test_atr_gate_missing_atr_is_fail_open_and_logged(self, monkeypatch):
         cfg = _EngineCfg(scalper_min_atr_pct=5.0)
         monkeypatch.setattr(engine_module, "apply_stop_policy", lambda sig, c: (_ for _ in ()).throw(_ReachedStopPolicy()))
@@ -777,6 +1075,9 @@ class _SimCfg:
 
     scalper_c_blocked_cells: str = ""
     scalper_entry_block_hours_utc: str = ""
+    scalper_entry_block_weekdays_utc: str = ""
+    scalper_entry_block_weekdays_direction: str = "BOTH"
+    scalper_symbol_direction_block: str = ""
     scalper_min_atr_pct: float = 0.0
     scalper_max_atr_pct: float = 0.0
     scalper_market_gate: bool = False
@@ -819,6 +1120,8 @@ def _cfg_without_gate_fields(cfg: _SimCfg) -> SimpleNamespace:
     fields = {
         k: v for k, v in cfg.__dict__.items()
         if k not in {"scalper_c_blocked_cells", "scalper_entry_block_hours_utc",
+                     "scalper_entry_block_weekdays_utc", "scalper_entry_block_weekdays_direction",
+                     "scalper_symbol_direction_block",
                      "scalper_min_atr_pct", "scalper_max_atr_pct"}
     }
     return SimpleNamespace(**fields)
@@ -867,6 +1170,23 @@ class TestHarnessEntryGates:
         trades2, missed2 = _simulate(cfg, _AlwaysSignalStrategy(Direction.SHORT))
         assert REASON_CELL not in missed2
 
+    def test_weekday_gate_counts_into_missed_counter(self):
+        cfg = _SimCfg(scalper_entry_block_weekdays_utc="0")  # mumlar Pazartesi (weekday 0)
+        trades, missed = _simulate(cfg, _AlwaysSignalStrategy(Direction.LONG))
+        assert trades == []
+        assert missed.get(REASON_WEEKDAY, 0) == _DECISION_IDX + 1
+        assert REASON_CELL not in missed and REASON_HOUR not in missed
+        assert REASON_SYMBOL_DIR not in missed and REASON_ATR not in missed
+
+    def test_symbol_dir_gate_counts_into_missed_counter(self):
+        cfg = _SimCfg(scalper_symbol_direction_block="ETHUSDT:LONG")  # _simulate sembolü ETHUSDT
+        trades, missed = _simulate(cfg, _AlwaysSignalStrategy(Direction.LONG))
+        assert trades == []
+        assert missed.get(REASON_SYMBOL_DIR, 0) > 0
+        # Listede olmayan yön geçer.
+        trades2, missed2 = _simulate(cfg, _AlwaysSignalStrategy(Direction.SHORT))
+        assert REASON_SYMBOL_DIR not in missed2
+
     def test_gates_off_add_no_key_and_are_byte_identical(self):
         """Kapalıyken sözlüğe anahtar bile eklenmez ve çıktı, alanları hiç
         olmayan cfg ile BİREBİR aynıdır (golden backtest'in ön koşulu)."""
@@ -877,7 +1197,7 @@ class TestHarnessEntryGates:
             trades_abs, missed_abs = _simulate(cfg_absent, _AlwaysSignalStrategy(direction))
             assert _fingerprint(trades_off) == _fingerprint(trades_abs)
             assert missed_off == missed_abs
-            for key in (REASON_CELL, REASON_HOUR, REASON_ATR):
+            for key in (REASON_CELL, REASON_HOUR, REASON_WEEKDAY, REASON_SYMBOL_DIR, REASON_ATR):
                 assert key not in missed_off
 
     def test_hour_gate_outside_window_is_inert(self):
@@ -887,6 +1207,20 @@ class TestHarnessEntryGates:
         assert _fingerprint(trades) == _fingerprint(trades_abs)
         assert missed == missed_abs and REASON_HOUR not in missed
 
+    def test_weekday_gate_outside_window_is_inert(self):
+        cfg = _SimCfg(scalper_entry_block_weekdays_utc="5,6")  # mumlar Pazartesi
+        trades, missed = _simulate(cfg, _AlwaysSignalStrategy(Direction.LONG))
+        trades_abs, missed_abs = _simulate(_cfg_without_gate_fields(cfg), _AlwaysSignalStrategy(Direction.LONG))
+        assert _fingerprint(trades) == _fingerprint(trades_abs)
+        assert missed == missed_abs and REASON_WEEKDAY not in missed
+
+    def test_symbol_dir_gate_unlisted_symbol_is_inert(self):
+        cfg = _SimCfg(scalper_symbol_direction_block="ADAUSDT:LONG")  # _simulate sembolü ETHUSDT
+        trades, missed = _simulate(cfg, _AlwaysSignalStrategy(Direction.LONG))
+        trades_abs, missed_abs = _simulate(_cfg_without_gate_fields(cfg), _AlwaysSignalStrategy(Direction.LONG))
+        assert _fingerprint(trades) == _fingerprint(trades_abs)
+        assert missed == missed_abs and REASON_SYMBOL_DIR not in missed
+
     def test_harness_is_fail_closed_on_invalid_config(self):
         """Harness fail-CLOSED: hatalı ayar sessizce 'kapı kapalı' ölçümü
         üretmektense patlar (yapı kapısı gerekçesi)."""
@@ -894,11 +1228,19 @@ class TestHarnessEntryGates:
             _simulate(_SimCfg(scalper_c_blocked_cells="RANGE:SHRT"), _AlwaysSignalStrategy(Direction.LONG))
         with pytest.raises(ValueError):
             _simulate(_SimCfg(scalper_entry_block_hours_utc="25-26"), _AlwaysSignalStrategy(Direction.LONG))
+        with pytest.raises(ValueError):
+            _simulate(_SimCfg(scalper_entry_block_weekdays_utc="9"), _AlwaysSignalStrategy(Direction.LONG))
+        with pytest.raises(ValueError):
+            _simulate(_SimCfg(scalper_symbol_direction_block="ADAUSDT-LONG"), _AlwaysSignalStrategy(Direction.LONG))
 
     def test_gate_keys_are_visible_in_report(self, capsys):
-        backtest_module.print_report([], missed_counter={REASON_HOUR: 2, REASON_ATR: 1, REASON_CELL: 3})
+        backtest_module.print_report([], missed_counter={
+            REASON_HOUR: 2, REASON_ATR: 1, REASON_CELL: 3,
+            REASON_WEEKDAY: 4, REASON_SYMBOL_DIR: 5,
+        })
         out = capsys.readouterr().out
         assert REASON_HOUR in out and REASON_ATR in out and REASON_CELL in out
+        assert REASON_WEEKDAY in out and REASON_SYMBOL_DIR in out
 
 
 # ==========================================================================
@@ -916,16 +1258,17 @@ class TestEngineHarnessParity:
     def _spy(monkeypatch, module) -> List[tuple]:
         recorded: List[tuple] = []
 
-        def _record(regime, direction, close_time_ms, atr_5m, entry_price, cfg):
+        def _record(regime, direction, close_time_ms, atr_5m, entry_price, symbol, cfg):
             recorded.append((
                 str(getattr(regime, "value", regime)),
                 str(getattr(direction, "value", direction)),
                 int(close_time_ms),
                 float(atr_5m),
                 float(entry_price),
+                str(symbol),
             ))
             return entry_gates_module.evaluate_entry_gates(
-                regime, direction, close_time_ms, atr_5m, entry_price, cfg
+                regime, direction, close_time_ms, atr_5m, entry_price, symbol, cfg
             )
 
         monkeypatch.setattr(module, "evaluate_entry_gates", _record)
@@ -937,6 +1280,10 @@ class TestEngineHarnessParity:
             (dict(scalper_entry_block_hours_utc="3-4"), dict(scalper_entry_block_hours_utc="3-4"), REASON_HOUR),
             (dict(scalper_min_atr_pct=5.0), dict(scalper_min_atr_pct=5.0), REASON_ATR),
             (dict(scalper_c_blocked_cells="UNKNOWN:LONG"), dict(scalper_c_blocked_cells="UNKNOWN:LONG"), REASON_CELL),
+            # `_CANDLES` Pazartesi'ye (weekday 0) hizalıdır — bkz. `_ENTRY_START`.
+            (dict(scalper_entry_block_weekdays_utc="0"), dict(scalper_entry_block_weekdays_utc="0"), REASON_WEEKDAY),
+            # `_run_engine`/`simulate_symbol` ikisi de "ETHUSDT" sembolüyle çağrılır.
+            (dict(scalper_symbol_direction_block="ETHUSDT:LONG"), dict(scalper_symbol_direction_block="ETHUSDT:LONG"), REASON_SYMBOL_DIR),
         ],
     )
     async def test_identical_arguments_and_verdict(self, monkeypatch, engine_kw, sim_kw, expected):
@@ -977,6 +1324,7 @@ class TestEngineHarnessParity:
         assert engine_calls[0] == harness_calls[0]
         assert engine_calls[0][2] == _DECISION_MS  # zaman = karar mumunun close_time'ı
         assert engine_calls[0][3] == _ATR_5M       # HAM atr (stop politikası dokunmadı)
+        assert engine_calls[0][5] == "ETHUSDT"     # sembol — motor + harness AYNI (D33/GÖREV A)
         assert missed == {expected: 1}
 
     async def test_disabled_gate_is_evaluated_identically_and_allows_both(self, monkeypatch):
@@ -996,5 +1344,6 @@ class TestEngineHarnessParity:
             [_OnlyAtDecision(Direction.LONG, _DECISION_MS)], _SimCfg(), missed_counter=missed,
         )
         assert engine_calls == harness_calls and len(engine_calls) == 1
-        for key in (REASON_CELL, REASON_HOUR, REASON_ATR):
+        assert engine_calls[0][5] == "ETHUSDT"
+        for key in (REASON_CELL, REASON_HOUR, REASON_WEEKDAY, REASON_SYMBOL_DIR, REASON_ATR):
             assert key not in missed

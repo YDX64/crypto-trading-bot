@@ -506,14 +506,18 @@ class Settings(BaseSettings):
     # "off" (varsayılan, hiçbir şey) | "be" (stopu break-even'a çek) |
     # "close" (reduce-only MARKET ile kapat).
     scalper_structure_exit: str = "off"
-    # --- Genel deterministik giriş kapıları (2026-09-03) — VARSAYILAN KAPALI ---
+    # --- Genel deterministik giriş kapıları (2026-09-03, hafta günü + sembol×yön
+    # 2026-09-04 eklendi) — VARSAYILAN KAPALI ---
     # Post-hoc tarama (canlı defter + harness) hangi BASİT kuralın kayıp
     # yoğunlaşmasını kestiğini ölçüyor; kazanan kural YALNIZ env ile açılır ve
     # canlı motor ile harness AYNI saf fonksiyonu
     # (src/strategies/scalper/entry_gates.py → evaluate_entry_gates) AYNI
-    # girdiyle uygular (DECISIONS #P1). KAPALIYKEN hiçbir kod yolu davranış
-    # değiştirmez (byte-for-byte aynı backtest — tests/test_golden_backtest.py).
-    # Açmadan önce 3 rejim penceresinde backtest şart (CLAUDE.md yasak #1).
+    # girdiyle uygular (DECISIONS #P1). Bu kapılar C taraması VE TV dış sinyali
+    # için GEÇERLİDİR (ayrı bir TV anahtarı YOK — tek giriş noktası); harness
+    # yalnız C taramasını ölçer, TV etkisi canlı niyet defterinden okunur.
+    # KAPALIYKEN hiçbir kod yolu davranış değiştirmez (byte-for-byte aynı
+    # backtest — tests/test_golden_backtest.py). Açmadan önce 3 rejim
+    # penceresinde backtest şart (CLAUDE.md yasak #1).
     # 1) Rejim×yön hücresi yasağı: "RANGE:SHORT,UP:LONG" (rejim UP|DOWN|RANGE|
     #    UNKNOWN, yön LONG|SHORT). Mevcut rejim kapısının (DOWN+LONG / UP+SHORT,
     #    scalper_regime_filter) ÜSTÜNE ek yasak; sinyal DOĞDUKTAN sonra, diğer
@@ -527,7 +531,21 @@ class Settings(BaseSettings):
     #    cutoff_ms gerekçesi) — 04:55-05:00 mumu saat 4 sayılır
     #    (close_time 04:59:59.999).
     scalper_entry_block_hours_utc: str = ""
-    # 3) ATR% bandı (ATR(14, giriş TF) / giriş fiyatı × 100; 0 = o uç kapalı):
+    # 3) Hafta günü × yön yasağı: "5,6" (virgülle ayrılmış 0-6, Pazartesi=0 …
+    #    Pazar=6) + scalper_entry_block_weekdays_direction (LONG|SHORT|BOTH).
+    #    Zaman kaynağı saat kapısıyla AYNI close_time_ms →
+    #    datetime.fromtimestamp(ms/1000, UTC).weekday(). Kapı YALNIZ bu alan
+    #    doluyken çalışır; yön eşleşmezse (BOTH dışında) serbest. Geçersiz
+    #    gün/yön → startup'ta ValueError (yalnız alan doluyken).
+    scalper_entry_block_weekdays_utc: str = ""
+    scalper_entry_block_weekdays_direction: str = "BOTH"
+    # 4) Sembol × yön yasağı: "ADAUSDT:LONG,DOGEUSDT:LONG" (sembol büyük harfe
+    #    normalize edilir, yön LONG|SHORT — BOTH YOK). Cell gate'in rejim
+    #    yerine sembol kullanan eşleniği; belirli bir sembolün belirli yönde
+    #    girişini tamamen keser. Geçersiz token → startup'ta ValueError
+    #    (yalnız alan doluyken).
+    scalper_symbol_direction_block: str = ""
+    # 5) ATR% bandı (ATR(14, giriş TF) / giriş fiyatı × 100; 0 = o uç kapalı):
     #    ATR% < min → RED, ATR% > max → RED (eşitlik serbest). HAM sinyalle,
     #    apply_stop_policy'den ÖNCE ölçülür (dinamik kaldıraç kararından
     #    bağımsız); ATR yoksa/≤0 kapı UYGULANMAZ (fail-open, loglanır).
@@ -1161,15 +1179,21 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_entry_gates(self) -> "Settings":
-        """Genel giriş kapıları (hücre / UTC saat / ATR% bandı) AÇIKKEN
-        ayarların anlamlı olduğunu startup'ta doğrula. Kapalıyken (varsayılan:
-        "", "", 0, 0) hiçbir kontrol yapılmaz — kapalı bir özelliğin ayarı
-        botu başlatmamazlık etmemeli (_validate_structure_gate ile aynı ilke).
+        """Genel giriş kapıları (hücre / UTC saat / hafta günü×yön /
+        sembol×yön / ATR% bandı) AÇIKKEN ayarların anlamlı olduğunu
+        startup'ta doğrula. Kapalıyken (varsayılan: "", "", "", "BOTH", "",
+        0, 0) hiçbir kontrol yapılmaz — kapalı bir özelliğin ayarı botu
+        başlatmamazlık etmemeli (_validate_structure_gate ile aynı ilke).
 
         Sessiz yanlış davranış riski: "RANGE:SHRT" gibi bir yazım hatası
         hücreyi hiç eşleştirmez ve kapı "açık görünüp" hiç engellemezdi;
-        "25-26" gibi bir saat aralığı da öyle; min ≥ max ise ATR bandı boş
-        küme olur ve HER sinyali keserdi. Fail-fast, sessizlikten iyidir.
+        "25-26" gibi bir saat aralığı da öyle; "8" gibi 0-6 dışı bir hafta
+        günü ya da "ADAUSDT-LONG" gibi bozuk bir sembol:yön belirteci de
+        aynı sessiz arızayı yaratırdı; min ≥ max ise ATR bandı boş küme olur
+        ve HER sinyali keserdi. Fail-fast, sessizlikten iyidir. (Gerçek
+        doğrulama `src/strategies/scalper/entry_gates.py
+        validate_entry_gate_settings`'tedir — motor/harness ile AYNI saf
+        fonksiyon, burada yalnız çağrılır.)
         """
         from src.strategies.scalper import entry_gates as _entry_gates  # saf modül, döngüsel import yok
 

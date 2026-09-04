@@ -674,6 +674,13 @@ class BacktestTrade:
     duration_minutes: float
     exit_idx: int
     regime: str = "UNKNOWN"
+    # D33/GÖREV B (2026-09-04) — SİNYAL mumunun close_time'ı (dolum mumunun
+    # DEĞİL; bkz. OpenPosition.signal_close_time). Post-hoc analiz notu:
+    # harness'ta bu alan, canlıda `ScalpPosition.entry_candle_time` alanının
+    # karşılığıdır — `entry_time` DEĞİL (o dolum anıdır). `to_dict()`/JSON
+    # raporuna (`trades[]`) dahildir; eski koşulardan gelen kayıtlarda
+    # `None` olabilir (geriye dönük doldurma YOK).
+    signal_close_time: Optional[int] = None
     legs: List[Dict[str, Any]] = field(default_factory=list)
     # D24/A3 — bar-bazlı mark-to-market işaretleri (bkz. OpenPosition).
     # `to_dict` DIŞINDA tutulur: 800 işlemlik bir koşuda bar başına iki sayı
@@ -1048,6 +1055,7 @@ def _finalize_trade(pos: OpenPosition, exit_idx: int, candles_5m: List[Candle]) 
         duration_minutes=duration_minutes,
         exit_idx=exit_idx,
         regime=pos.regime,
+        signal_close_time=pos.signal_close_time,
         legs=pos.legs,
         equity_marks=list(pos.equity_marks),
     )
@@ -1230,13 +1238,18 @@ def simulate_symbol(
     Kapı kapalıyken (varsayılan) bu blok HİÇ çalışmaz; çıktı bit düzeyinde
     değişmez (bkz. tests/test_golden_backtest.py).
 
-    Genel deterministik giriş kapıları (2026-09-03; `cfg.scalper_c_blocked_cells`
-    / `scalper_entry_block_hours_utc` / `scalper_min_atr_pct` /
-    `scalper_max_atr_pct`, hepsi varsayılan KAPALI) yapı kapısının ardında,
-    `apply_stop_policy`'den ÖNCE, canlı motorla AYNI saf fonksiyonla
-    (`entry_gates.evaluate_entry_gates`) uygulanır. Engellenenler
-    `missed_counter["cell_gate"/"hour_gate"/"atr_gate"]` altında sayılır;
-    kapalıyken anahtar EKLENMEZ.
+    Genel deterministik giriş kapıları (2026-09-03; hafta günü + sembol×yön
+    2026-09-04 eklendi — `cfg.scalper_c_blocked_cells` /
+    `scalper_entry_block_hours_utc` / `scalper_entry_block_weekdays_utc` /
+    `scalper_entry_block_weekdays_direction` / `scalper_symbol_direction_block`
+    / `scalper_min_atr_pct` / `scalper_max_atr_pct`, hepsi varsayılan KAPALI)
+    yapı kapısının ardında, `apply_stop_policy`'den ÖNCE, canlı motorla AYNI
+    saf fonksiyonla (`entry_gates.evaluate_entry_gates`) uygulanır. Bu kapılar
+    C taraması İÇİNDİR — TV dış sinyali bu harness'ta simüle EDİLMEZ (ayrı bir
+    TV anahtarı da YOK; canlı motorda TV sinyali de AYNI kapıdan geçer, TV
+    etkisini ölçmek isteyen canlı niyet defterinden okumalıdır). Engellenenler
+    `missed_counter["cell_gate"/"hour_gate"/"weekday_gate"/"symbol_dir_gate"/
+    "atr_gate"]` altında sayılır; kapalıyken anahtar EKLENMEZ.
     """
     trades: List[BacktestTrade] = []
     # D33: geçersiz kapı ayarı, kapıya hiç sinyal ulaşmayan pencerede bile
@@ -1352,15 +1365,19 @@ def simulate_symbol(
                 i += 1
                 continue
 
-        # Canlı parite (2026-09-03): genel deterministik giriş kapıları — rejim×yön
-        # hücresi / UTC saat penceresi / ATR% bandı — motordaki
+        # Canlı parite (2026-09-03; hafta günü + sembol×yön 2026-09-04 eklendi):
+        # genel deterministik giriş kapıları — rejim×yön hücresi / UTC saat
+        # penceresi / hafta günü×yön / sembol×yön / ATR% bandı — motordaki
         # (engine._evaluate_symbol) sırayla birebir: yapı kapılarının HEMEN
         # ardında, apply_stop_policy'den ÖNCE, AYNI saf fonksiyon
         # (entry_gates.evaluate_entry_gates) AYNI argümanlarla:
         #   * zaman = bu mumun close_time'ı (close_times_5m[i]; piyasa kapısının
-        #     kesim zamanıyla aynı değer — duvar saati YOK),
-        #   * ATR% = HAM sinyal (raw_signal; apply_stop_policy ÖNCESİ).
-        # Üçü de varsayılan KAPALI: kapalıyken None döner, missed_counter'a
+        #     kesim zamanıyla aynı değer — duvar saati YOK; hafta günü kapısı
+        #     da AYNI değeri kullanır),
+        #   * ATR% = HAM sinyal (raw_signal; apply_stop_policy ÖNCESİ),
+        #   * sembol = bu koşunun `symbol` argümanı (motorda `_evaluate_symbol`'ün
+        #     kendi `symbol` argümanı — sembol×yön kapısı için).
+        # Beşi de varsayılan KAPALI: kapalıyken None döner, missed_counter'a
         # anahtar bile EKLENMEZ (tests/test_golden_backtest.py byte-for-byte).
         # İstisna BİLİNÇLİ olarak yutulmaz (yapı kapısındaki gerekçe): hatalı
         # bir ayar sessizce "kapı kapalı" ölçümü üretmektense patlamalı.
@@ -1370,6 +1387,7 @@ def simulate_symbol(
             close_times_5m[i],
             raw_signal.atr_5m,
             raw_signal.entry_price,
+            symbol,
             cfg,
         )
         if entry_gate_reason is not None:
