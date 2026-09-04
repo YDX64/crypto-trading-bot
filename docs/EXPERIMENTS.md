@@ -1537,3 +1537,38 @@ doluyor) ve BOĞA'nın kârını siliyor → RED kesinleşti. (2) 11-14 saat yas
 dokunulmamış pencerede pozitif; ama bu dört pencere kuralın SEÇİM kümesidir ve taze Nisan'da
 rastgelenin altında kaldı (doğrulayıcı hükmü) → kabul için ön-kayıtlı taze pencere şart. (3) Post-hoc
 tarama artık yalnız ön eleme; her aday gerçek harness'ta koşulur.
+
+### E13.2 — Gerçek harness: hafta sonu LONG ve ADA LONG yasağı (2026-09-04 03:30, D33b kapıları)
+
+`scripts/run_windows.sh` ile 7 pencere (`logs/run_windows/run7_{hs_long,ada_long,combo}.txt`):
+
+| Kural | Mart | Çöküş | Mayıs | Haziran | Δ dok. | AYI | YATAY | BOĞA | Δ seçim | min kalan | Karar |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `SCALPER_ENTRY_BLOCK_WEEKDAYS_UTC=5,6` + `…_DIRECTION=LONG` | −16.9 (+114) | −22.0 (+163) | −300.8 (+36) | +18.4 (−52) | **+260** | −13 | **−96** | −16 | −125 (%19.1) | %83 | GEÇER (sınırda) |
+| `SCALPER_SYMBOL_DIRECTION_BLOCK=ADAUSDT:LONG` | −121.9 (+9) | −138.4 (+47) | −305.4 (+31) | +71.8 (+1) | +88 | +14 | −23 | −16 | −25 (%3.9) | %93 | GEÇER (küçük etki) |
+| ikisi birlikte | −22.8 (+108) | −28.3 (+157) | −269.5 (+67) | +18.4 (−52) | +280 | −24 | −108 | −35 | −168 (%25.7) | %81 | GEÇMEZ (seçim >%20) |
+
+Okuma: hafta sonu LONG yasağının YATAY'daki gerçek kaybı (−96) post-hoc'un (−9) 10 katı — boşalan slotlar
+hafta içi daha kötü işlemlerle doldu (E8.6 ters yönde). Dokunulmamış etkinin %63'ü ÇÖKÜŞ (23/30 Ağu Pazar
+düşüşleri); Haziran kötüleşiyor. ADA LONG etkisi küçük ve sembol-özgü.
+
+**Son sınav (ÖN KAYIT, sonuç görülmeden yazıldı):** iki taze pencere 2026-02-13→03-01 ve 2026-07-21→08-07
+(taban `logs/backtest_20260904_011327.json`, `…_011624.json`; sayılarına bakılmadı). GEÇER = iki pencere
+toplam Δ > 0 VE hiçbir pencere brüt kârının %5'inden fazla kötüleşmez. Tek atış; sonuç ne olursa olsun
+tekrar aday seçilmez.
+
+### E13.3 — Son sınav sonucu ve hüküm (2026-09-04 04:10)
+
+| Kural | Şubat 13→Mar 1 (taban −189.4 / PF 0.71) | Temmuz 21→Ağu 7 (taban −162.3 / PF 0.66) | Toplam Δ | Ön-kayıtlı ölçüt |
+|---|---|---|---|---|
+| Hafta sonu LONG yasak | −188.5 (+0.9, PF 0.66, DD 381→346) | −146.2 (+16.1, PF 0.67, DD 208→192) | **+17.0** | GEÇER |
+| ADA LONG yasak | −174.2 (+15.2, PF 0.72) | −158.0 (+4.4, PF 0.65, DD 208→221) | +19.5 | GEÇER |
+
+Loglar: `logs/backtest_20260904_0205xx–0207xx.json`. **Hüküm:** iki kural da ölçütü geçiyor ama etki
+dokunulmamış pencerelerdeki büyüklüğün (+260) onda biri; taze aylar taban olarak zararlı ve işaret
+değişmiyor. Bu bir "kenar" değil, küçük bir fren. Kanıt disiplini gereği (P2 → testnet ≥5 gün)
+**yalnız hafta sonu LONG yasağı** (a priori mekanizma: hafta sonu likidite/8 sa REAPER) testnet'e
+ÖLÇÜM DENEYİ olarak alınır; D27 karşı-olgu defteri engellenen hafta sonu LONG'ların "girilseydi"
+sonucunu ölçer. ADA LONG (sembol-özgü, ikisi birlikte seçim kaybı %26) alınmaz. Asıl sonuç
+değişmedi: C'nin 2026 Mar–Ağu penceresinde kalıcı kenarı yok; giriş filtreleri kaybı küçültür, kâra
+çevirmez. "Daha çok işlem" ancak yeni bilgi taşıyan sinyalle.

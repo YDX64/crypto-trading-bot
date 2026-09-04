@@ -3196,7 +3196,7 @@ olan BTCUSDT #328 (TV luxosc+luxso 2/2, 20:10 sunucu saati) `recover()` ile izle
 geri alındı; borsadaki STOP_MARKET + 2 TAKE_PROFIT_MARKET algo emri korundu.
 Karşı-olgu kohortu restart'la sıfırlandı (bilinen sınır, D27).
 
-### D33 — Genel deterministik giriş kapıları (hücre / saat / ATR%) · 2026-09-04 · KOD VAR, HEPSİ KAPALI, canlıda AÇILMADI
+### D33 — Genel deterministik giriş kapıları (hücre / saat / hafta günü×yön / sembol×yön / ATR%) · 2026-09-04 · KOD VAR; yalnız hafta sonu LONG yasağı testnet'te ÖLÇÜM DENEYİ (04:20 UTC+2)
 
 **Soru.** Kullanıcı "AI olmadan en iyi algoritma ve ayarlar" istedi. E13 taraması (~305 kural, 7 pencere)
 hangi giriş kuralı tutarlı diye baktı; her aday gerçek harness'ta ölçülebilsin diye kurallar env ile
@@ -3220,6 +3220,14 @@ taze pencere teyidi BEKLİYOR — hafta günü×yön kapısı henüz yok) ve ADA
 Hiçbir kapı sunucu `.env`'inde açık değildir. Açılırsa D27 karşı-olgu defteri engellenen girişleri canlıda ölçer.
 
 **Geri alma.** Kapılar env ile kapanır; kod kaldırılmak istenirse D33 commit'i revert.
+**D33b (26f5350) + son sınav (E13.2/E13.3).** İki kapı daha: `SCALPER_ENTRY_BLOCK_WEEKDAYS_UTC`
+(+`_DIRECTION`) ve `SCALPER_SYMBOL_DIRECTION_BLOCK`; harness JSON'una `signal_close_time`. Gerçek harness:
+hafta sonu LONG yasağı dokunulmamış +260 / seçim −%19 / Haziran −52; ADA LONG +88 / −%4; birleşim seçim
+−%26 (RED). Ön-kayıtlı taze son sınav (Şubat, Temmuz): ikisi de geçer ama +17 / +20 (küçük).
+**Karar:** testnet `.env`'e `SCALPER_ENTRY_BLOCK_WEEKDAYS_UTC=5,6` + `SCALPER_ENTRY_BLOCK_WEEKDAYS_DIRECTION=LONG`
+(yedek `backups/env.bak-…-d33-weekend-long`), diğer kapılar kapalı. Amaç kâr iddiası değil ölçüm: ≥5 gün
+(en az bir hafta sonu) sonra `ledger_report.py --counterfactual` ile engellenen hafta sonu LONG'ların
+"girilseydi" sonucu okunur; net negatifse kural kalır, pozitifse kapatılır. ADA LONG açılmadı.
 
 ## Reddedilen kararlar (kanıtla)
 
