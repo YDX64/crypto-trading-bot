@@ -218,8 +218,9 @@ class TestSlBeforeTpRule:
         assert len(trade.legs) == 1
         assert trade.legs[0]["label"] == "SL"
         assert trade.legs[0]["quantity"] == pytest.approx(trade.quantity)
-        assert trade.legs[0]["price"] == pytest.approx(99.0)
-        assert trade.exit_price == pytest.approx(99.0)
+        # The live stop moves with the actual fill; signal risk stays $1/unit.
+        assert trade.legs[0]["price"] == pytest.approx(trade.entry_price - 1.0)
+        assert trade.exit_price == pytest.approx(trade.entry_price - 1.0)
 
     def test_sl_and_tp2_same_candle_after_tp1_sl_wins(self):
         # TP1 önceki mumda dolmuş (BE aktif); bu mumda hem BE-SL hem TP2 değiyor -> SL(TRAIL) kazanır
@@ -281,7 +282,129 @@ class TestTp1BreakevenTrailFlow:
 
         # SL gerçekten break-even'e taşınmış olmalı (yapısal stop 99.0'dan farklı)
         assert pos.breakeven_price > 99.0
-        assert pos.breakeven_price == pytest.approx(pos.entry_price * (1 + cfg.scalper_breakeven_buffer_pct / 100.0))
+        net_per_unit = (
+            pos.breakeven_price - pos.entry_price
+            - pos.entry_price * pos.entry_commission_rate
+            - pos.breakeven_price * pos.exit_commission_rate
+        )
+        assert net_per_unit == pytest.approx(
+            pos.entry_price * cfg.scalper_breakeven_buffer_pct / 100.0
+        )
+
+    @pytest.mark.parametrize("direction", [Direction.LONG, Direction.SHORT])
+    @pytest.mark.parametrize("entry_mode", ["maker", "taker"])
+    def test_breakeven_covers_both_fees_for_each_entry_mode(self, direction, entry_mode):
+        cfg = _Cfg(scalper_entry_mode=entry_mode, scalper_min_rr=0)
+        signal = _mk_signal(100, 99 if direction == Direction.LONG else 101, direction)
+        candles = [_mk_candle(i, 100, 100.5, 99.5, 100) for i in range(2)]
+
+        pos = open_position(signal, candles, 0, cfg)
+        assert pos is not None
+        gross = pos.breakeven_price - pos.entry_price
+        if direction == Direction.SHORT:
+            gross = -gross
+        entry_rate = (0.0002 if entry_mode == "maker" else 0.0005)
+        net = gross - pos.entry_price * entry_rate - pos.breakeven_price * 0.0005
+        assert net == pytest.approx(pos.entry_price * 0.0005)
+
+    @pytest.mark.parametrize("direction", [Direction.LONG, Direction.SHORT])
+    def test_tp2_fill_protects_remaining_runner_at_tp1(self, direction):
+        cfg = _Cfg(scalper_min_rr=0)
+        signal = _mk_signal(100, 99 if direction == Direction.LONG else 101, direction)
+        candles = [
+            _mk_candle(0, 100, 100, 100, 100),
+            _mk_candle(1, 100, 100.4, 99.7, 100),
+        ]
+        if direction == Direction.LONG:
+            candles += [
+                _mk_candle(2, 101, 103, 100.5, 102.8),
+                _mk_candle(3, 101.7, 102, 100.5, 100.9),
+            ]
+        else:
+            candles += [
+                _mk_candle(2, 99, 99.5, 97, 97.2),
+                _mk_candle(3, 98.3, 99.5, 98, 99.1),
+            ]
+
+        pos = open_position(signal, candles, 0, cfg)
+        trade = manage_position(pos, candles, cfg)
+
+        assert [leg["label"] for leg in trade.legs] == ["TP1", "TP2", "TRAIL"]
+        assert trade.exit_price == pytest.approx(pos.tp1_price)
+
+    def test_zero_tp2_fraction_does_not_raise_runner_floor(self):
+        cfg = _Cfg(scalper_min_rr=0, scalper_tp2_fraction=0)
+        signal = _mk_signal(100, 99)
+        candles = [
+            _mk_candle(0, 100, 100, 100, 100),
+            _mk_candle(1, 100, 100.4, 99.7, 100),
+            _mk_candle(2, 101, 103, 100.5, 102.8),
+            _mk_candle(3, 100.5, 100.7, 100, 100.2),
+        ]
+        pos = open_position(signal, candles, 0, cfg)
+        trade = manage_position(pos, candles, cfg)
+
+        assert pos.tp2_filled is False
+        assert [leg["label"] for leg in trade.legs] == ["TP1", "TRAIL"]
+        assert trade.exit_price == pytest.approx(pos.breakeven_price)
+
+    @pytest.mark.parametrize("direction", [Direction.LONG, Direction.SHORT])
+    def test_tp2_bar_crossing_new_floor_cannot_escape_on_next_gap(self, direction):
+        cfg = _Cfg(scalper_min_rr=0)
+        signal = _mk_signal(100, 99 if direction == Direction.LONG else 101, direction)
+        candles = [_mk_candle(i, 100, 100.4, 99.7, 100) for i in range(2)]
+        pos = open_position(signal, candles, 0, cfg)
+        # TP1 already filled on an earlier bar; this bar touches TP2 and
+        # reverses through its new floor without touching the old BE stop.
+        pos.tp1_filled = True
+        pos.current_stop = pos.breakeven_price
+        pos.remaining_qty = pos.tp2_qty + pos.runner_qty
+        middle = (pos.tp1_price + pos.breakeven_price) / 2
+        terminal = _mk_candle(
+            2, middle,
+            pos.tp2_price + 0.1 if direction == Direction.LONG else middle,
+            middle if direction == Direction.LONG else pos.tp2_price - 0.1,
+            middle,
+        )
+
+        closed = backtest_module._process_candle_exits(pos, terminal, direction)
+
+        assert closed is True
+        assert pos.remaining_qty == pytest.approx(0)
+        assert [leg["label"] for leg in pos.legs] == ["TP2", "TRAIL"]
+        assert pos.exit_price == pytest.approx(pos.tp1_price)
+
+
+class TestFillAnchoredStopParity:
+    @pytest.mark.parametrize("direction", [Direction.LONG, Direction.SHORT])
+    @pytest.mark.parametrize("fill_open", [95.0, 105.0])
+    def test_fill_drift_preserves_signal_stop_risk(self, direction, fill_open):
+        cfg = _Cfg(scalper_min_rr=0)
+        signal = _mk_signal(100, 99 if direction == Direction.LONG else 101, direction)
+        candles = [
+            _mk_candle(0, 100, 100, 100, 100),
+            _mk_candle(1, fill_open, fill_open + 0.1, fill_open - 0.1, fill_open),
+        ]
+
+        pos = open_position(signal, candles, 0, cfg, balance=10_000)
+
+        assert pos is not None
+        assert abs(pos.entry_price - pos.current_stop) == pytest.approx(1.0)
+        assert abs(pos.entry_price - pos.current_stop) * pos.qty_total == pytest.approx(200)
+        assert (pos.current_stop < pos.entry_price) == (direction == Direction.LONG)
+
+    def test_large_adverse_fill_caps_stop_distance_like_live(self):
+        cfg = _Cfg(scalper_min_rr=0, scalper_max_stop_pct=1)
+        signal = _mk_signal(100, 99)
+        candles = [
+            _mk_candle(0, 100, 100, 100, 100),
+            _mk_candle(1, 90, 90.1, 89.9, 90),
+        ]
+
+        pos = open_position(signal, candles, 0, cfg)
+
+        assert pos is not None
+        assert pos.current_stop == pytest.approx(pos.entry_price * 0.99)
 
 
 class TestMaxHoldReaperParity:
@@ -334,7 +457,7 @@ class TestCommissionAndSlippage:
         # --- Elle hesap (spesifikasyondaki formüllerle, koddan bağımsız) ---
         qty_expected = (balance * cfg.scalper_risk_percentage / 100.0) / abs(entry_hint - stop_price)
         entry_price_expected = entry_hint * 1.0002  # LONG: kayma aleyhte (yukarı)
-        exit_price_expected = stop_price             # SL dolumu yapısal stopta, kaymasız
+        exit_price_expected = entry_price_expected - abs(entry_hint - stop_price)
 
         gross_leg_pnl = (exit_price_expected - entry_price_expected) * qty_expected
         exit_commission = 0.0005 * qty_expected * exit_price_expected

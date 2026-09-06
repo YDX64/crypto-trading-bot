@@ -1,5 +1,12 @@
 # Deney defteri — backtest ve ölçüm kayıtları
 
+**6 Eyl 2026 — E14 çıkış paritesi düzeltmesi:** ücret-dahil BE, dolum-stop
+çapası ve TP2 runner tabanı eski harness'ta eksikti. Aynı güncel ayarla
+üç bilinen pencerenin eski/yeni sonuçları ve canlı zarar denetimi
+[D34 kaydında](audits/2026-09-06-d34.md#e14--çıkış-paritesinin-üç-bilinen-rejimde-etkisi).
+Golden iki işlem neti 26.77→23.79. Önceki strateji sıralamaları yeniden
+ölçülmeden terfi kanıtı değildir; D34 yeni strateji optimizasyonu değildir.
+
 > ## ⚠️ ÖNCE BUNU OKU — bu defterdeki sayılar OOS DEĞİLDİR (D24, 2026-08-24)
 >
 > **Olgu.** Bu dosyadaki E2…E9 varyantlarının **TAMAMI** aynı üç pencerede ölçüldü:

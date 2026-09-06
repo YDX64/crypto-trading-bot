@@ -291,6 +291,10 @@ def register(
                 _dropped_full += 1
                 return None
 
+            # Yaş süpürmesi kovayı değiştirmiş/silmiş olabilir. Eski listeyi
+            # yeniden yazmak, sona ermiş kayıtları diriltir ve pending
+            # sayacını gerçek kova boyutundan koparır.
+            bucket = _pending.get(key) or []
             bucket.append(row)
             _pending[key] = bucket
             _pending_count += 1
@@ -438,7 +442,8 @@ def resolve_symbol(
     SONRA çağırır: mumlar zaten oradadır, **yeni REST çağrısı YOKTUR**.
 
     Olgunlaşmamış kayıt kuyrukta KALIR. Olgunlaşmış ama mum penceresi boş
-    (ya da ufkun başını KAPSAMAYAN) kayıt `measured=False` ile çözülür —
+    (ya da ilk TP/stop'a kadar kesintisiz olmayan / OPEN için son ufka
+    ulaşmayan) kayıt `measured=False` ile çözülür —
     "ölçemedik" demek, uydurmaktan iyidir.
 
     Yaş kapısı bu çağrıda AMA sembolden BAĞIMSIZ koşar

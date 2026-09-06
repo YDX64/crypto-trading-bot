@@ -343,12 +343,33 @@ class ExitManager:
             return True
         return self._positions.get(symbol) is not sp
 
+    async def _tp_reduction_hint(self, symbol: str, quantity: float) -> float:
+        """Use the same LOT_SIZE rounding as the submitted TP order.
+
+        The plan stores pre-rounding fractions, including after recovery. A
+        small TP can round down by more than 10%, so comparing live quantity
+        with that raw fraction can prevent querying a fully filled TP forever.
+        Symbol filters are cached by the client; this does not add a signed
+        request. A failed filter lookup disables only this optimization: the
+        algo order and its actual fills must still prove the TP below.
+        """
+        quantize = getattr(self.client, "quantize_quantity", None)
+        if quantize is None:
+            return quantity
+        try:
+            rounded = float(await quantize(symbol, quantity))
+            if math.isfinite(rounded) and 0 <= rounded <= quantity:
+                return rounded
+        except Exception as exc:
+            self.logger.debug(f"{symbol}: TP quantity hint unavailable ({exc})")
+        return 0.0
+
     async def _check_tp1(self, symbol: str, sp: ScalpPosition, live_qty: float) -> None:
         filled = sp.position.quantity
-        if filled <= 0:
+        if filled <= 0 or live_qty >= filled or not sp.plan.tp1_algo_id:
             return
-        tp1_fraction = self.cfg.scalper_tp1_fraction
-        threshold = filled * (1 - tp1_fraction * 0.9)
+        expected = await self._tp_reduction_hint(symbol, sp.plan.tp1_quantity)
+        threshold = filled - expected * 0.9
 
         if live_qty > threshold:
             return  # TP1 henüz dolmadı
@@ -416,15 +437,19 @@ class ExitManager:
     async def _check_tp2(self, symbol: str, sp: ScalpPosition, live_qty: float) -> None:
         filled = sp.position.quantity
         expected = sp.plan.tp2_quantity
-        if filled <= 0 or expected <= 0:
+        if (
+            filled <= 0 or expected <= 0 or live_qty >= filled
+            or not sp.plan.tp2_algo_id
+        ):
             return
         # Bu eşik yalnız pahalı signed sorguyu erteleyen bir ipucudur; fill
         # kanıtı değildir. TP1/manual reduction tek başına state değiştiremez.
-        reduction_hint = (
-            self.cfg.scalper_tp1_fraction * 0.9
-            + self.cfg.scalper_tp2_fraction * 0.9
+        tp1_hint = (
+            await self._tp_reduction_hint(symbol, sp.plan.tp1_quantity)
+            if sp.plan.tp1_algo_id else 0.0
         )
-        if live_qty > filled * (1 - reduction_hint):
+        tp2_hint = await self._tp_reduction_hint(symbol, expected)
+        if live_qty > filled - (tp1_hint + tp2_hint) * 0.9:
             return
         if not await self._confirmed_algo_fill(
             symbol=symbol,

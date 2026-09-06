@@ -389,6 +389,7 @@ class TestOtherStopPathsAreLabelledToo:
         mgr = _manager(replace_result=_EMERGENCY, amounts=[0.0])
         mgr._confirmed_algo_fill = AsyncMock(return_value=True)
         sp = _sp(106.0)
+        sp.plan.tp1_algo_id = "11"
         await mgr._check_tp1("BTCUSDT", sp, live_qty=1.0)
 
         assert mgr.finalized == [
@@ -401,6 +402,7 @@ class TestOtherStopPathsAreLabelledToo:
         mgr = _manager(replace_result=_EMERGENCY, amounts=[0.0])
         mgr._confirmed_algo_fill = AsyncMock(return_value=True)
         sp = _sp(106.0)
+        sp.plan.tp2_algo_id = "12"
         sp.plan.tp2_quantity = 0.6
         sp.position.quantity = 2.0
         await mgr._check_tp2("BTCUSDT", sp, live_qty=0.2)
@@ -888,6 +890,7 @@ class TestDoubleFinalizeShield:
         mgr._update_mae_mfe = lambda sp, price: None
 
         sp = _sp(106.0)
+        sp.plan.tp1_algo_id = "11"
         mgr._positions["BTCUSDT"] = sp
 
         async def handle_closed(symbol, s, *, forced_exit_reason=None):

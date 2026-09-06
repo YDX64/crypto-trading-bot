@@ -836,6 +836,40 @@ class TestHttpHealthAndStats:
             monitor_task.cancel()
             await asyncio.gather(monitor_task, return_exceptions=True)
 
+    @pytest.mark.parametrize("follower_mode", [False, True])
+    async def test_health_counts_all_position_owners_without_exchange_reads(
+        self, monkeypatch, follower_mode
+    ):
+        def engine(symbols):
+            return SimpleNamespace(
+                running=True,
+                health_snapshot=lambda: {"healthy": True},
+                exits=SimpleNamespace(_positions=dict.fromkeys(symbols)),
+            )
+
+        monkeypatch.setattr(main_module, "orchestrator", SimpleNamespace(
+            active_positions={"BTCUSDT": object()},
+            health_snapshot=lambda: {"healthy": True, "monitoring_task_alive": True},
+        ))
+        monkeypatch.setattr(main_module, "telegram_bot", engine([]))
+        monkeypatch.setattr(main_module, "scalper_engine", engine(["BTCUSDT", "XRPUSDT"]))
+        monkeypatch.setattr(main_module, "follower_engine", engine(["SOLUSDT"]))
+        monkeypatch.setattr(main_module.settings, "bot_mode", "follower" if follower_mode else "scalper")
+        monkeypatch.setattr(main_module.settings, "scalper_enabled", True)
+        body = json.loads((await main_module.health_check()).body)
+        assert body["tracked_positions"] == (1 if follower_mode else 3)
+        assert body["tracked_positions_by_engine"] == (
+            {"follower": 1} if follower_mode else
+            {"orchestrator": 1, "scalper": 2, "follower": 1}
+        )
+
+    def test_health_counts_absent_engines_as_zero(self, monkeypatch):
+        for name in ("orchestrator", "scalper_engine", "follower_engine"):
+            monkeypatch.setattr(main_module, name, None)
+        assert main_module._tracked_position_counts() == {
+            "orchestrator": 0, "scalper": 0, "follower": 0, "total": 0,
+        }
+
     async def test_scalper_stats_normalizes_infinite_profit_factors(self, monkeypatch):
         tracker = SimpleNamespace(
             stats=AsyncMock(return_value={"C": {"trades": 2, "profit_factor": float("inf")}})

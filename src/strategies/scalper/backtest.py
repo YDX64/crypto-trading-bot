@@ -107,6 +107,8 @@ from src.strategies.scalper.types import (
     StrategyContext,
     EXIT_REASON_STALE_TP,
     StrategyProtocol,
+    fee_aware_breakeven_price,
+    fill_anchored_stop_price,
     position_roi_pct,
     price_at_roi,
     resolve_trail_mult,
@@ -830,6 +832,13 @@ def open_position(
     if qty <= 0:
         return None
 
+    stop_price = fill_anchored_stop_price(
+        entry_hint,
+        stop_price,
+        entry_price,
+        signal.direction,
+        float(getattr(cfg, "scalper_max_stop_pct", 0.0) or 0.0),
+    )
     entry_candle = candles_5m[entry_idx]
 
     tp1_price = price_at_roi(entry_price, cfg.scalper_tp1_roi, leverage, signal.direction)
@@ -838,10 +847,12 @@ def open_position(
     tp2_qty = qty * cfg.scalper_tp2_fraction
     runner_qty = max(qty - tp1_qty - tp2_qty, 0.0)
 
-    buffer_frac = cfg.scalper_breakeven_buffer_pct / 100.0
-    breakeven_price = (
-        entry_price * (1 + buffer_frac) if signal.direction == Direction.LONG
-        else entry_price * (1 - buffer_frac)
+    breakeven_price = fee_aware_breakeven_price(
+        entry=entry_price,
+        direction=signal.direction,
+        entry_fee_rate=entry_commission_rate,
+        exit_fee_rate=exit_commission_rate,
+        buffer_pct=cfg.scalper_breakeven_buffer_pct,
     )
 
     return OpenPosition(
@@ -937,7 +948,10 @@ def _process_candle_exits(pos: OpenPosition, c: Candle, direction: Direction) ->
 
     if pos.tp1_filled:
         sl_hit = _is_hit(c, pos.current_stop, direction, is_stop=True)
-        tp2_hit = (not pos.tp2_filled) and _is_hit(c, pos.tp2_price, direction, is_stop=False)
+        tp2_hit = (
+            not pos.tp2_filled and pos.tp2_qty > 0
+            and _is_hit(c, pos.tp2_price, direction, is_stop=False)
+        )
 
         if sl_hit:
             _close_remaining(pos, pos.current_stop, c.close_time, "TRAIL")
@@ -945,6 +959,22 @@ def _process_candle_exits(pos: OpenPosition, c: Candle, direction: Direction) ->
         if tp2_hit:
             _fill_leg(pos, pos.tp2_qty, pos.tp2_price, "TP2")
             pos.tp2_filled = True
+            # Live ExitManager raises the remaining runner's floor to TP1
+            # after a proven TP2 fill, while preserving any tighter stop.
+            pos.current_stop = (
+                max(pos.current_stop, pos.tp1_price)
+                if direction == Direction.LONG
+                else min(pos.current_stop, pos.tp1_price)
+            )
+            # As for TP1 -> BE above, an OHLC bar cannot establish whether
+            # its pullback preceded or followed TP2. Apply the same
+            # pessimistic convention; otherwise a next-bar gap could let a
+            # runner escape a floor already crossed in this bar.
+            if pos.remaining_qty > 1e-12 and _is_hit(
+                c, pos.current_stop, direction, is_stop=True
+            ):
+                _close_remaining(pos, pos.current_stop, c.close_time, "TRAIL")
+                return True
 
     return pos.remaining_qty <= 1e-12
 

@@ -1181,6 +1181,183 @@ class TestEngineZeroDrift:
 # 12) Durum yüzeyleri — /scalper/status ve /api/status
 # ==========================================================================
 
+class TestMakerFillObservation:
+    @staticmethod
+    def position(context=None, trade_id=601):
+        document = {**_ctx_document(), **_entry_document()}
+        document.update(
+            decision_epoch=time.time() - 10,
+            bar_close_time_ms=1_700_000_299_999,
+            signal_at="2026-09-06T12:00:00+00:00",
+            entry_mode="maker",
+        )
+        document.update(context or {})
+        return SimpleNamespace(
+            trade_id=trade_id,
+            signal=SimpleNamespace(direction=Direction.SHORT, strategy="C"),
+            position=SimpleNamespace(symbol="XRPUSDT", entry_price=100.0),
+            forensics_entry=document,
+        )
+
+    async def test_pending_submission_is_observed_only_after_protected_fill(self, events):
+        engine = _engine(_CfgProxy(scalper_ai_gate_mode="shadow"))
+        pending = set()
+        captured = {}
+
+        async def submit(signal, ctx, *, forensics=None):
+            captured.update(forensics)
+            pending.add(signal.symbol)
+            return None
+
+        engine.executor.try_open.side_effect = submit
+        engine.executor.pending_symbols = lambda: set(pending)
+        blocker = asyncio.Event()
+        provider = _FakeProvider(delay_event=blocker)
+        engine._ai_gate = ag.AiGate(
+            engine.cfg, provider=provider, logger=engine.logger,
+            tracker=engine.tracker,
+        )
+        await _run_symbol(engine)
+        assert provider.calls == []
+        assert _ai_events(events) == []  # pending is not "no_trade"
+        assert captured["bar_close_time_ms"] == _candles()[-1].close_time
+        assert captured["decision_epoch"] == captured["signal_epoch"]
+
+        position = self.position(captured)
+        engine.executor.handle_order_update = AsyncMock(return_value=position)
+        try:
+            await engine._handle_user_order_update({"e": "ORDER_TRADE_UPDATE"})
+            tasks = list(engine._ai_gate._tasks)
+            assert engine._signals_today == 1
+            assert len(tasks) == 1 and not tasks[0].done()
+            assert not engine._entry_lock.locked()
+            # REST reconciliation of that same DB trade must not ask twice.
+            engine._track_opened_positions(
+                [self.position(captured)], source="REST reconciliation"
+            )
+            assert len(engine._ai_gate._tasks) == 1
+            blocker.set()
+            await asyncio.gather(*tasks)
+        finally:
+            symbol_reservations.clear()
+        assert len(provider.calls) == 1
+        assert len(_ai_events(events)) == 1
+        assert _ai_events(events)[0]["trade_id"] == 601
+        assert _ai_events(events)[0]["outcome"] == "opened"
+
+    async def test_delayed_fill_uses_immutable_original_snapshot(self, events):
+        engine = _engine(_CfgProxy(scalper_ai_gate_mode="shadow"))
+        provider = _FakeProvider()
+        engine._ai_gate = ag.AiGate(
+            engine.cfg, provider=provider, logger=engine.logger,
+            tracker=engine.tracker,
+        )
+        position = self.position()
+        original_epoch = position.forensics_entry["decision_epoch"]
+        original_bar = position.forensics_entry["bar_close_time_ms"]
+        engine._ai_gate_observe_filled(position)
+        position.forensics_entry["indicators"]["rsi_entry"] = 99.0
+        engine._daily_pnl = 9999.0
+        engine.fetcher = SimpleNamespace(get_klines=AsyncMock(side_effect=AssertionError))
+        await asyncio.gather(*list(engine._ai_gate._tasks))
+        payload = json.loads(provider.calls[0]["user"].split("<<<PAYLOAD\n")[1].split("\nPAYLOAD>>>")[0])
+        assert payload["indicators"]["rsi_entry"] == 11.4
+        assert payload["account"]["daily_pnl"] == -12.5
+        assert payload["bar_close_time_ms"] == original_bar
+        assert position.forensics_entry["decision_epoch"] == original_epoch
+        engine.fetcher.get_klines.assert_not_awaited()
+
+    @pytest.mark.parametrize("context", [
+        {"decision_epoch": None},
+        {"decision_epoch": float("nan")},
+        {"bar_close_time_ms": None},
+        {"bar_close_time_ms": int((time.time() + 3600) * 1000)},
+    ])
+    async def test_missing_or_future_original_context_is_not_reconstructed(self, context, events):
+        engine = _engine(_CfgProxy(scalper_ai_gate_mode="shadow"))
+        provider = _FakeProvider()
+        engine._ai_gate = ag.AiGate(engine.cfg, provider=provider, logger=engine.logger)
+        engine._ai_gate_observe_filled(self.position(context))
+        assert provider.calls == []
+        assert engine._ai_gate._tasks == set()
+        assert _ai_events(events) == []
+
+    def test_shadow_off_does_not_construct_layer(self):
+        engine = _engine(_CfgProxy(scalper_ai_gate_mode="off"))
+        engine._ai_gate_observe_filled(self.position())
+        assert engine._ai_gate is None
+
+    def test_observation_failure_does_not_undo_tracking(self):
+        engine = _engine(_CfgProxy(scalper_ai_gate_mode="shadow"))
+        tracked = []
+        engine.exits.track = tracked.append
+        engine._ai_gate = SimpleNamespace(
+            observe=lambda **kw: (_ for _ in ()).throw(RuntimeError("provider unavailable"))
+        )
+        position = self.position()
+        try:
+            engine._track_opened_positions([position], source="restart maker recovery")
+        finally:
+            symbol_reservations.clear()
+        assert tracked == [position]
+        assert engine._signals_today == 1
+
+    def test_dedup_storage_discards_closed_ids_but_keeps_old_open_runner(self):
+        engine = _engine(_CfgProxy(scalper_ai_gate_mode="shadow"))
+        calls = []
+        engine._ai_gate = SimpleNamespace(observe=lambda **kw: calls.append(kw))
+        runner = self.position(trade_id=1)
+        runner.position.symbol = "ETHUSDT"
+        engine.exits._positions["ETHUSDT"] = runner
+        engine._ai_gate_observe_filled(runner)
+        for trade_id in range(2, 202):
+            position = self.position(trade_id=trade_id)
+            engine.exits._positions["XRPUSDT"] = position
+            engine._ai_gate_observe_filled(position)
+        engine._ai_gate_observe_filled(runner)
+        assert len(calls) == 201
+        assert engine._ai_gate_observed_trade_ids == {1, 201}
+
+    async def test_shutdown_cancel_fill_does_not_restart_closed_ai_layer(self, events):
+        engine = _engine(_CfgProxy(scalper_ai_gate_mode="shadow"))
+        provider = _FakeProvider()
+        engine._ai_gate = ag.AiGate(engine.cfg, provider=provider, logger=engine.logger)
+        engine._task = engine._safety_task = engine._exchange_task = None
+        engine.user_stream = SimpleNamespace(stop=AsyncMock())
+        engine.fetcher = SimpleNamespace(close=AsyncMock())
+        engine.scanner = SimpleNamespace(close=AsyncMock())
+        engine.client.close = AsyncMock()
+        position = self.position()
+        tracked = []
+        engine.exits.track = tracked.append
+        engine.executor.cancel_all_pending = AsyncMock(return_value=[position])
+        try:
+            await engine.stop()
+        finally:
+            symbol_reservations.clear()
+        assert tracked == [position]
+        assert provider.calls == []
+        assert engine._ai_gate._tasks == set()
+        assert _ai_events(events) == []
+
+    async def test_cancel_fill_schedules_without_waiting_inside_entry_lock(self, events):
+        engine = _engine(_CfgProxy(scalper_ai_gate_mode="shadow"))
+        blocker = asyncio.Event()
+        provider = _FakeProvider(delay_event=blocker)
+        engine._ai_gate = ag.AiGate(engine.cfg, provider=provider, logger=engine.logger)
+        try:
+            async with engine._entry_lock:
+                engine._track_opened_positions([self.position()], source="cancel fill")
+                tasks = list(engine._ai_gate._tasks)
+                assert len(tasks) == 1 and not tasks[0].done()
+                assert engine._entry_lock.locked()
+            blocker.set()
+            await asyncio.gather(*tasks)
+        finally:
+            symbol_reservations.clear()
+        assert len(provider.calls) == 1
+
+
 class TestStatusSurfaces:
     def test_engine_snapshot_shape_when_layer_is_off(self):
         engine = _engine(_CfgProxy(scalper_ai_gate_mode="off"))

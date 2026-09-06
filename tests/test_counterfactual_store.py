@@ -1201,7 +1201,7 @@ class TestApiSurface:
             ),
         ])
         payload = await main_module.scalper_counterfactual(
-            since=None, _log_dir=str(tmp_path)
+            since=_CF_SINCE.isoformat(), _log_dir=str(tmp_path)
         )
         assert payload["summary"]["total"] == 2
         assert len(payload["rows"]) == 2
@@ -1219,7 +1219,7 @@ class TestApiSurface:
             ),
         ])
         payload = await main_module.scalper_counterfactual(
-            since=None, reason="regime_gate", _log_dir=str(tmp_path)
+            since=_CF_SINCE.isoformat(), reason="regime_gate", _log_dir=str(tmp_path)
         )
         assert payload["reason"] == intent.REASON_REGIME_GATE
         assert len(payload["rows"]) == 1
@@ -1230,7 +1230,7 @@ class TestApiSurface:
 
         jsonl_yaz(tmp_path, [_cf_satir() for _ in range(5)])
         payload = await main_module.scalper_counterfactual(
-            since=None, limit=2, _log_dir=str(tmp_path)
+            since=_CF_SINCE.isoformat(), limit=2, _log_dir=str(tmp_path)
         )
         assert len(payload["rows"]) == 2
         # Özet TÜM satırları görür; `limit` yalnız ham satırları kırpar.

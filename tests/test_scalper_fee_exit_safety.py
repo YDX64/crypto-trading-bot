@@ -268,6 +268,126 @@ async def test_exact_tp2_fill_ratchets_runner_to_fixed_tp1_floor():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("direction", [Direction.LONG, Direction.SHORT])
+async def test_rounded_small_tp1_fill_activates_breakeven(direction):
+    # ETH 0.007 * 40% = 0.0028, but LOT_SIZE 0.001 submits 0.002.
+    # The old 90%-of-raw-fraction hint rejected the actual remainder 0.005.
+    client = SimpleNamespace(
+        quantize_quantity=AsyncMock(return_value=0.002),
+        get_algo_order=AsyncMock(
+            return_value={"actualOrderId": "101", "quantity": "0.002"}
+        ),
+        get_account_trades=AsyncMock(
+            return_value=[{"orderId": 101, "qty": "0.002"}]
+        ),
+    )
+    pm = SimpleNamespace(replace_stop_loss=AsyncMock(return_value=True))
+    manager = _manager(client, pm)
+    position = _sp(current_stop=99 if direction == Direction.LONG else 101)
+    position.signal.direction = direction
+    position.position.quantity = 0.007
+    position.plan.tp1_quantity = 0.0028
+    position.plan.breakeven_price = 100.12 if direction == Direction.LONG else 99.88
+
+    await manager._check_tp1("ETHUSDT", position, live_qty=0.005)
+
+    assert position.tp1_done is True
+    assert position.trailing_active is True
+    pm.replace_stop_loss.assert_awaited_once_with(
+        position.position, position.plan.breakeven_price
+    )
+    client.get_account_trades.assert_awaited_once_with(
+        "ETHUSDT", order_id=101, limit=500
+    )
+
+
+@pytest.mark.asyncio
+async def test_rounded_small_tp2_fill_activates_runner_floor():
+    # TP1/TP2 at 40%/20% submit 0.002/0.001 rather than 0.0028/0.0014.
+    client = SimpleNamespace(
+        quantize_quantity=AsyncMock(side_effect=[0.002, 0.001]),
+        get_algo_order=AsyncMock(
+            return_value={"actualOrderId": "202", "quantity": "0.001"}
+        ),
+        get_account_trades=AsyncMock(
+            return_value=[{"orderId": 202, "qty": "0.001"}]
+        ),
+    )
+    pm = SimpleNamespace(replace_stop_loss=AsyncMock(return_value=True))
+    manager = _manager(client, pm, _cfg(scalper_tp2_fraction=0.2))
+    position = _sp(current_stop=100.2, tp1_done=True)
+    position.position.quantity = 0.007
+    position.plan.tp1_quantity = 0.0028
+    position.plan.tp2_quantity = 0.0014
+
+    await manager._check_tp2("ETHUSDT", position, live_qty=0.004)
+
+    assert position.tp2_done is True
+    pm.replace_stop_loss.assert_awaited_once_with(position.position, 102.0)
+
+
+@pytest.mark.asyncio
+async def test_tp2_fill_can_protect_runner_when_tp1_order_was_rejected():
+    client = SimpleNamespace(
+        get_algo_order=AsyncMock(
+            return_value={"actualOrderId": "202", "quantity": "0.3"}
+        ),
+        get_account_trades=AsyncMock(
+            return_value=[{"orderId": 202, "qty": "0.3"}]
+        ),
+    )
+    pm = SimpleNamespace(replace_stop_loss=AsyncMock(return_value=True))
+    manager = _manager(client, pm)
+    position = _sp()
+    position.plan.tp1_algo_id = None
+
+    await manager._check_tp2("BTCUSDT", position, live_qty=0.7)
+
+    assert position.tp2_done is True
+    assert position.trailing_active is True
+    pm.replace_stop_loss.assert_awaited_once_with(position.position, 102.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("filter_result", [0.0, float("nan"), RuntimeError("filters")])
+async def test_unavailable_rounding_hint_still_requires_authoritative_tp_fill(filter_result):
+    quantize = AsyncMock(
+        side_effect=filter_result if isinstance(filter_result, Exception) else None,
+        return_value=filter_result,
+    )
+    client = SimpleNamespace(
+        quantize_quantity=quantize,
+        get_algo_order=AsyncMock(return_value={"actualOrderId": ""}),
+        get_account_trades=AsyncMock(),
+    )
+    pm = SimpleNamespace(replace_stop_loss=AsyncMock(return_value=True))
+    manager = _manager(client, pm)
+    position = _sp()
+
+    await manager._check_tp1("BTCUSDT", position, live_qty=0.99)
+
+    assert position.tp1_done is False
+    pm.replace_stop_loss.assert_not_awaited()
+    client.get_account_trades.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unchanged_position_skips_tp_rounding_and_signed_fill_queries():
+    client = SimpleNamespace(
+        quantize_quantity=AsyncMock(),
+        get_algo_order=AsyncMock(),
+    )
+    manager = _manager(client)
+    position = _sp()
+
+    await manager._check_tp1("BTCUSDT", position, live_qty=1.0)
+    await manager._check_tp2("BTCUSDT", position, live_qty=1.0)
+
+    client.quantize_quantity.assert_not_awaited()
+    client.get_algo_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_failed_initial_sl_is_exactly_ledgered_and_starts_hour_cooldown():
     now_ms = int(time.time() * 1000)
     entry_row = {

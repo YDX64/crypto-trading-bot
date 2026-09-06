@@ -438,7 +438,7 @@ class TestCliWiring:
         assert report["permutation"] is None
         # Varsayılan koşu ALTIN sayıları üretmeli (CLI yolu da parite içinde)
         assert report["overall"]["trades"] == 2
-        assert round(report["overall"]["total_pnl"], 2) == 26.77
+        assert round(report["overall"]["total_pnl"], 2) == 23.79
         assert report["overall"]["bar_max_drawdown"] > report["overall"]["max_drawdown"]
 
     @pytest.mark.asyncio

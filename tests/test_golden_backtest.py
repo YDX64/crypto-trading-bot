@@ -221,7 +221,9 @@ class TestGoldenBacktest:
         # docs/EXPERIMENTS.md "Altın backtest" notu, bu bir hata DEĞİL)
         assert len(trades) == 2
         stats = compute_stats(trades)
-        assert round(stats["total_pnl"], 2) == 26.77
+        # 2026-09-06 parity: fee-aware BE + TP2 runner floor + fill-anchored
+        # initial stop. Same fixture/trade count, old incorrect model 26.77.
+        assert round(stats["total_pnl"], 2) == 23.79
 
         breakdown = _direction_exit_counts(trades)
         assert breakdown["direction"] == {"LONG": 2}

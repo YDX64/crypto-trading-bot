@@ -220,6 +220,41 @@ def resolve_trail_mult(cfg: Any, peak_roi_pct: float) -> float:
     return base
 
 
+def fill_anchored_stop_price(
+    signal_entry: float,
+    signal_stop: float,
+    fill_price: float,
+    direction: Direction,
+    max_distance_pct: float,
+) -> float:
+    """Preserve signal stop distance at the actual fill, capped like live.
+
+    Shared by execution and the historical harness. Sizing still uses the
+    original signal distance; reanchoring happens only after the fill.
+    """
+    if signal_entry <= 0 or signal_stop <= 0 or fill_price <= 0:
+        return signal_stop
+    drift = fill_price - signal_entry
+    if drift == 0.0:
+        return signal_stop
+    adjusted = signal_stop + drift
+    if adjusted <= 0:
+        return signal_stop
+    if direction == Direction.LONG and adjusted >= fill_price:
+        return signal_stop
+    if direction == Direction.SHORT and adjusted <= fill_price:
+        return signal_stop
+    if max_distance_pct > 0:
+        distance_pct = abs(fill_price - adjusted) / fill_price * 100.0
+        if distance_pct > max_distance_pct:
+            return (
+                fill_price * (1.0 - max_distance_pct / 100.0)
+                if direction == Direction.LONG
+                else fill_price * (1.0 + max_distance_pct / 100.0)
+            )
+    return adjusted
+
+
 def fee_aware_breakeven_price(
     entry: float,
     direction: Direction,

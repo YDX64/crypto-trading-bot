@@ -53,11 +53,15 @@ from src.strategies.scalper.types import Candle
 
 #: Kayıt biçiminin sürümü. Alan eklemek/çıkarmak bunu ARTIRIR; eski satırlar
 #: raporda karışmasın diye her satır kendi sürümünü taşır.
-COUNTERFACTUAL_VERSION = 1
+COUNTERFACTUAL_VERSION = 2
 
 #: Simülasyon modelinin kimliği. Model değişirse (ör. TP2 eklenirse) BU AD
 #: değişir — eski ve yeni ölçümler aynı ortalamaya karıştırılamasın.
 MODEL_ID = "tp1_or_stop_v1"
+
+# Payoff modeli değişmedi; v1 satırlarının coverage doğrulaması yalnız ufkun
+# başını kontrol ediyordu. Yeni/eskiden çözülen satırlar ayrı okunmalıdır.
+COVERAGE_POLICY = "contiguous_path_v1"
 
 OUTCOME_TP1 = "tp1"
 OUTCOME_STOP = "stop"
@@ -348,9 +352,7 @@ def window(
 def _no_data(gap: Optional[str] = None) -> Dict[str, Any]:
     """Ölçülemeyen senaryonun kaydı — TÜM sayı alanları `None`.
 
-    `gap` NEDEN ölçülemediğini söyler (`None` = mum hiç yoktu). Bugünkü tek
-    değer `GAP_PARTIAL_WINDOW`'dur; rapor "hiç mum yoktu" ile "pencere ufku
-    kapsamıyordu"yu ayırt edebilsin diye ayrı tutulur.
+    `gap` NEDEN ölçülemediğini söyler (`None` = mum hiç yoktu).
     """
     out: Dict[str, Any] = {
         "outcome": OUTCOME_NO_DATA,
@@ -367,6 +369,13 @@ def _no_data(gap: Optional[str] = None) -> Dict[str, Any]:
 
 #: `sim.gap` — pencere VARDI ama ufkun BAŞINI kapsamıyordu (bkz. `_covers`).
 GAP_PARTIAL_WINDOW = "partial_window"
+GAP_INTERIOR = "interior_gap"
+GAP_STALE_TAIL = "stale_tail"
+GAP_INVALID_CANDLE = "invalid_candle"
+
+# Binance kapanışı bir sonraki açılıştan 1 ms öncedir; test/diğer veri
+# sağlayıcıları tam sınırı kullanabilir. Tolerans bir kayıp mumu örtemez.
+_TIME_EPSILON = 0.001001
 
 
 def _time_ordered(rows: Sequence[Any]) -> List[Any]:
@@ -394,46 +403,84 @@ def _time_ordered(rows: Sequence[Any]) -> List[Any]:
 def _bar_seconds(candles: Sequence[Any]) -> Optional[float]:
     """Mum aralığını (saniye) VERİDEN çıkar — sabit varsayılmaz.
 
-    Önce ardışık açılışların en küçük pozitif farkı; o yoksa tek bir mumun
-    `close_time - open_time` süresi kullanılır. Hiçbiri okunamıyorsa `None`.
+    Süreyi mumun kendi açılış/kapanışından çıkar. Açılışlar arasındaki farkı
+    tek başına kullanmak, seyrek veride kayıp mumları uzun bir zaman dilimi
+    sanardı. 1 ms kapsayıcı-kapanış farkı varsa gözlenen açılış aralığına oturur.
     """
     opens = [o for o in (_open_epoch(c) for c in candles or []) if o is not None]
     diffs = [b - a for a, b in zip(opens, opens[1:]) if b > a]
-    if diffs:
-        return min(diffs)
+    durations = []
     for candle in candles or []:
         opened = _open_epoch(candle)
         closed = _close_epoch(candle)
         if opened is not None and closed is not None and closed > opened:
-            return closed - opened
+            durations.append(closed - opened)
+    if not durations:
+        return None
+    step = min(durations)
+    if diffs and abs(min(diffs) - step) <= _TIME_EPSILON:
+        return min(diffs)
+    return step
+
+
+def _coverage_gap(
+    candles: Sequence[Any], start_epoch: float, end_epoch: Optional[float] = None,
+) -> Optional[str]:
+    """İstenen yol gözlenmiş mi? Baş, iç boşluklar ve isteğe bağlı son uç.
+
+    Başta niyet anını içeren yarım mum dışlandığı için en çok bir mum
+    gecikmeye izin verilir. İçeride yalnız 1 ms kapanış/açılış farkı normaldir.
+    Sonda bir TAM mum eksikse eski kapanış ufuk fiyatı sayılamaz. TP1/stop
+    için yalnız terminal muma kadarki yol yeterlidir; sonraki boşluklar o
+    kanıtlanmış ilk teması değiştiremez.
+    """
+    rows = _time_ordered(candles or [])
+    if not rows:
+        return OUTCOME_NO_DATA
+    start = _f(start_epoch)
+    if start is None:
+        return GAP_PARTIAL_WINDOW
+    step = _bar_seconds(rows)
+    if step is None or step <= 0:
+        return GAP_INVALID_CANDLE
+    previous_close = None
+    for candle in rows:
+        opened = _open_epoch(candle)
+        closed = _close_epoch(candle)
+        high = _positive(getattr(candle, "high", None))
+        low = _positive(getattr(candle, "low", None))
+        close = _positive(getattr(candle, "close", None))
+        opening = _positive(getattr(candle, "open", None))
+        if (
+            opened is None or closed is None or closed <= opened
+            or high is None or low is None or close is None or opening is None
+            or not low <= close <= high or not low <= opening <= high
+        ):
+            return GAP_INVALID_CANDLE
+        if previous_close is None:
+            if opened < start or opened - start > step + _TIME_EPSILON:
+                return GAP_PARTIAL_WINDOW
+        elif opened - previous_close > _TIME_EPSILON:
+            return GAP_INTERIOR
+        elif opened < previous_close - _TIME_EPSILON:
+            return GAP_INVALID_CANDLE
+        previous_close = closed
+    end = _f(end_epoch)
+    if end is not None:
+        # Strict '< one bar': at an exact boundary a whole absent last
+        # candle is missing data, not the usual unfinished-horizon fraction.
+        if previous_close > end + _TIME_EPSILON:
+            return GAP_INVALID_CANDLE
+        if end - previous_close >= step - 0.000001:
+            return GAP_STALE_TAIL
     return None
 
 
-def _covers(candles: Sequence[Any], start_epoch: float) -> bool:
-    """Pencere ufkun BAŞINI gerçekten kapsıyor mu?
-
-    D27 incelemesi (Y1): sembol bir süre tarama evreninden çıkarsa
-    `window()` ufkun yalnız KUYRUĞUNU döndürür ve simülasyon o kuyruğu tüm
-    ufuk sanıp `measured=True` yazardı. Probe: 20 saat önceki niyet, 12.5
-    saatlik mum penceresi → `bars: 6`, `measured: True`, `pnl_roi_pct: 0.0`.
-    Yani "ölçemedik" demesi gereken satır, kendinden emin bir sayı yazıyordu.
-
-    Ölçüt: İLK mum niyet anına EN ÇOK BİR MUM uzaklıkta açılmış olmalıdır.
-    (Niyet anını içeren yarım mum look-ahead yüzünden dışlandığı için bir
-    mumluk boşluk NORMALDİR; iki mum ve fazlası veri boşluğudur.)
-    """
-    rows = list(candles or [])
-    if not rows:
-        return False
-    first_open = _open_epoch(rows[0])
-    start = _f(start_epoch)
-    if first_open is None or start is None:
-        return False
-    step = _bar_seconds(rows)
-    if step is None or step <= 0:
-        return False
-    # Kayan nokta toleransı: `<=` sınırındaki mum KABUL edilir.
-    return (first_open - start) <= step * 1.000001
+def _covers(
+    candles: Sequence[Any], start_epoch: float, end_epoch: Optional[float] = None,
+) -> bool:
+    """Geriye uyumlu bool arayüz; ayrıntılı gerekçe `_coverage_gap`tedir."""
+    return _coverage_gap(candles, start_epoch, end_epoch) is None
 
 
 def simulate(
@@ -560,11 +607,9 @@ def resolve(
       boştur ve `no_data` olarak kapanır.
     * Pencerede hiç mum yoksa `sim` `no_data`, `measured` `False`'tur ve TÜM
       sayı alanları `None` kalır.
-    * **KISMİ pencere de `no_data`'dır** (D27 incelemesi Y1): mumlar var ama
-      ilk mum niyet anından bir mumdan fazla uzaktaysa ufkun BAŞI eksiktir.
-      O kuyruğu tüm ufuk sanıp ölçmek uydurma sayı üretir; satır
-      `sim.gap="partial_window"` ile kapatılır. Ertelemenin faydası YOKTUR:
-      mum penceresi zamanla İLERİ kayar, eksik baş geri gelmez.
+    * Başlangıç/iç boşluk/eskimiş son fiyat `no_data` üretir. Yalnız tam
+      gözlenmiş bir yolun TP1/stop teması sonraki veri eksikliğinden bağımsız
+      ölçülebilir; OPEN sonucu ufkun sonuna kadar veri gerektirir.
     """
     row = pending if isinstance(pending, dict) else {}
 
@@ -586,16 +631,18 @@ def resolve(
     horizon_rows: List[Dict[str, Any]] = []
     for hours in horizons:
         target = None if at_epoch is None else at_epoch + hours * SECONDS_PER_HOUR
-        # ALT SINIR (O3): niyet anından ÖNCE kapanmış bir mumun fiyatı bu
-        # ufkun fiyatı DEĞİLDİR — veri boşluğunda `None` yazılır, uydurulmaz.
+        horizon_candles = [] if target is None else window(candles, at_epoch, target)
+        gap = _coverage_gap(horizon_candles, at_epoch, target)
+        # Eski bir kapanış, ufkun güncel fiyatı değildir. Veri boşluğu olan
+        # ufukta sayılar null kalır; kısa ufuk tam ise ayrı ölçülebilir.
         price = (
-            None if target is None
-            else price_at(candles, target, min_epoch=at_epoch)
+            None if gap is not None
+            else price_at(horizon_candles, target, min_epoch=at_epoch)
         )
         move = _move_pct(entry, price, side)
         roi = None if (move is None or lev is None) else _round(move * lev, 6)
         horizon_rows.append(
-            {"h": hours, "price": price, "move_pct": move, "roi_pct": roi}
+            {"h": hours, "price": price, "move_pct": move, "roi_pct": roi, "gap": gap}
         )
 
     if at_epoch is None:
@@ -604,21 +651,21 @@ def resolve(
         picked = window(
             candles, at_epoch, at_epoch + horizon_h * SECONDS_PER_HOUR
         )
-    if picked and at_epoch is not None and not _covers(picked, at_epoch):
-        # KISMİ PENCERE (Y1): mumlar var ama ufkun BAŞI eksik. Bunu ölçmek,
-        # ufkun yalnız kuyruğunu tüm ufuk sanmaktır — "uydurma sayı YASAK"
-        # kuralının ihlali. Ertelemek ÇÖZMEZ (mum penceresi ileri kayar,
-        # eksik baş bir daha GERİ GELMEZ); bu yüzden satır dürüstçe
-        # `no_data` olarak KAPATILIR ve nedeni `sim.gap`te durur.
-        sim = _no_data(GAP_PARTIAL_WINDOW)
-    else:
-        sim = simulate(
-            direction=side,
-            entry_price=entry,
-            stop_price=row.get("stop_price"),
-            tp1_price=row.get("tp1_price"),
-            candles=picked,
-        )
+    sim = simulate(
+        direction=side,
+        entry_price=entry,
+        stop_price=row.get("stop_price"),
+        tp1_price=row.get("tp1_price"),
+        candles=picked,
+    )
+    end_epoch = None if at_epoch is None else at_epoch + horizon_h * SECONDS_PER_HOUR
+    full_gap = _coverage_gap(picked, at_epoch, end_epoch)
+    if picked and sim.get("outcome") != OUTCOME_NO_DATA:
+        terminal = sim.get("outcome") in (OUTCOME_TP1, OUTCOME_STOP)
+        needed = picked[:sim["bars"]] if terminal else picked
+        gap = _coverage_gap(needed, at_epoch, None if terminal else end_epoch)
+        if gap is not None:
+            sim = _no_data(gap)
     sim["horizon_h"] = horizon_h
 
     sim_move = _f(sim.get("price_move_pct"))
@@ -640,8 +687,15 @@ def resolve(
         "stop_price": _f(row.get("stop_price")),
         "tp1_price": _f(row.get("tp1_price")),
         "leverage": lev,
-        "model": _s(row.get("model")) or MODEL_ID,
-        "version": int(_f(row.get("version")) or COUNTERFACTUAL_VERSION),
+        # Stamp the implementation that actually measured the row, not a
+        # potentially older pending-row version.
+        "model": MODEL_ID,
+        "version": COUNTERFACTUAL_VERSION,
+        "coverage": {
+            "policy": COVERAGE_POLICY,
+            "complete": full_gap is None,
+            "gap": full_gap,
+        },
         "resolved_at_epoch": now,
         "horizons": horizon_rows,
         "sim": sim,
@@ -709,6 +763,29 @@ def _blank_plan_source(source: str) -> Dict[str, Any]:
     acc.pop("reason")
     acc["plan_source"] = source
     acc["label"] = PLAN_SOURCE_LABELS.get(source, "")
+    return acc
+
+
+def _measurement_key(row: Any) -> tuple:
+    """Eski JSONL satırlarının denetlenmemiş coverage'ını yeni sanma."""
+    if not isinstance(row, dict):
+        return (None, None, None)
+    sim = row.get("sim")
+    model = _s(row.get("model")) or (
+        _s(sim.get("model")) if isinstance(sim, dict) else None
+    )
+    version = _f(row.get("version"))
+    version = int(version) if version is not None else None
+    coverage = row.get("coverage")
+    policy = _s(coverage.get("policy")) if isinstance(coverage, dict) else None
+    return (model, version, policy)
+
+
+def _blank_measurement(key: tuple) -> Dict[str, Any]:
+    acc = _blank(REASON_TOTAL)
+    acc.pop("reason")
+    acc["model"], acc["version"], acc["coverage_policy"] = key
+    acc["label"] = "ölçüm modeli / kayıt sürümü / kapsama doğrulaması"
     return acc
 
 
@@ -816,6 +893,7 @@ def summarize(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     """
     groups: Dict[str, Dict[str, Any]] = {}
     plan_groups: Dict[str, Dict[str, Any]] = {}
+    measurement_groups: Dict[tuple, Dict[str, Any]] = {}
     overall = _blank(REASON_TOTAL)
     total = 0
     measured_total = 0
@@ -853,6 +931,9 @@ def summarize(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         _accumulate(bucket, outcome=outcome, measured=measured, dup=dup, roi=roi)
         plan_bucket = plan_groups.setdefault(plan_key, _blank_plan_source(plan_key))
         _accumulate(plan_bucket, outcome=outcome, measured=measured, dup=dup, roi=roi)
+        key = _measurement_key(row)
+        measurement_bucket = measurement_groups.setdefault(key, _blank_measurement(key))
+        _accumulate(measurement_bucket, outcome=outcome, measured=measured, dup=dup, roi=roi)
         _accumulate(overall, outcome=outcome, measured=measured, dup=dup, roi=roi)
 
     table = [_finalize(bucket) for bucket in groups.values()]
@@ -862,11 +943,21 @@ def summarize(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     plan_table = [_finalize(bucket) for bucket in plan_groups.values()]
     plan_table.sort(key=lambda item: (-item["n"], item["plan_source"]))
 
+    measurement_table = [_finalize(bucket) for bucket in measurement_groups.values()]
+    measurement_table.sort(key=lambda item: (
+        -item["n"], str(item["model"]), str(item["version"]), str(item["coverage_policy"]),
+    ))
+
     return {
         "total": total,
         "measured": measured_total,
         "unmeasured": total - measured_total,
         "by_reason": table,
         "by_plan_source": plan_table,
+        # Eski aggregate alanlar API uyumluluğu için korunur. Farklı model
+        # veya coverage sürümleri varsa bu havuz kâr/kapı kanıtı sayılmaz;
+        # tüketici açıkça ayrı grupları okuyabilir, eski satırlar değişmez.
+        "by_measurement": measurement_table,
+        "mixed_measurements": len(measurement_table) > 1,
         "overall": _finalize(overall),
     }

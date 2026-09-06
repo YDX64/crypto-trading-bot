@@ -201,6 +201,15 @@ temiz-ağaç kapısı artık **untracked dosyaları da** sayar (`--untracked-fil
 bir şey gerekiyorsa `backups/` altına koy (gitignore). `state/` ve `.venv*/`
 `.gitignore`'dadır ve `state/` sunucuda ayrıca `.git/info/exclude`'dadır.
 
+**D34 kurulum/ölçüm notu (6 Eyl).** `telegram` paketini ayrıca kurma: import
+alanının tek sahibi `python-telegram-bot` olmalı. Eski ortamda `telegram.Update`
+import hatası varsa çakışan `telegram` dağıtımını kaldırıp requirements'taki
+PTB sürümünü yeniden kur; bunu çalışan sunucuda sırf temizlik için yapma.
+`/health.tracked_positions` artık tüm yöneticilerin tekilleştirilmiş toplamıdır;
+`tracked_positions_by_engine` dağılımı gösterir. Counterfactual v2 için
+`by_measurement`/`mixed_measurements` alanlarına bak; eski satırlar yeniden
+hesaplanmaz. Ayrıntı: [D34 denetimi](audits/2026-09-06-d34.md).
+
 > **Container yolu (EK dağıtım).** Botu tek bir görüntüde başka sunucuya taşımak için
 > `scripts/docker_run.sh` + "Container ile çalıştırma / başka sunucuya taşıma" bölümüne
 > bakın. ⛔ supervisord ile container **AYNI ANDA ÇALIŞTIRILAMAZ** (aynı Binance hesabı,

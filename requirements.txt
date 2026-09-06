@@ -13,7 +13,6 @@ websockets>=12.0,<18.0
 
 # Telegram
 python-telegram-bot==20.7
-telegram==0.0.1
 
 # Trading (Python 3.9 compatible)
 ccxt==3.1.60
@@ -58,4 +57,3 @@ black==26.3.1
 flake8==7.0.0
 mypy==1.7.1
 pre-commit==3.6.0
-

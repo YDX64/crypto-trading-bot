@@ -61,6 +61,7 @@ from src.strategies.scalper.types import (
     ScalpSignal,
     StrategyContext,
     fee_aware_breakeven_price,
+    fill_anchored_stop_price,
     price_at_roi,
 )
 from src.trading.binance_client_improved import (
@@ -1531,46 +1532,17 @@ class ScalpExecutor:
         """
         signal_entry = float(getattr(signal, "entry_price", 0.0) or 0.0)
         structural_stop = float(getattr(signal, "stop_price", 0.0) or 0.0)
-        if signal_entry <= 0 or structural_stop <= 0 or entry_price <= 0:
-            return structural_stop
-
-        drift = entry_price - signal_entry
-        if drift == 0.0:
-            return structural_stop
-
-        adjusted = structural_stop + drift
-        if adjusted <= 0:
-            return structural_stop
-
-        # Stop, pozisyonun koruma tarafında kalmalı.
-        if direction == Direction.LONG and adjusted >= entry_price:
-            return structural_stop
-        if direction == Direction.SHORT and adjusted <= entry_price:
-            return structural_stop
-
         max_pct = float(getattr(self.cfg, "scalper_max_stop_pct", 0.0) or 0.0)
-        if max_pct > 0:
-            distance_pct = abs(entry_price - adjusted) / entry_price * 100.0
-            if distance_pct > max_pct:
-                # Tavan aşıldığında yapısal seviyeye DÖNMEK yanlış olur: büyük bir
-                # dolum kaymasından sonra o seviye girişin ters tarafında kalmış
-                # olabilir. Doğrusu stop'u risk tavanına tam oturtmaktır.
-                capped = (
-                    entry_price * (1.0 - max_pct / 100.0)
-                    if direction == Direction.LONG
-                    else entry_price * (1.0 + max_pct / 100.0)
-                )
-                self.logger.info(
-                    f"✂️ {signal.symbol}: dolum kayması telafisi risk tavanına kırpıldı "
-                    f"(%{distance_pct:.3f} -> %{max_pct:.3f}), stop={capped}"
-                )
-                return capped
-
-        self.logger.info(
-            f"🎯 {signal.symbol}: stop dolum kaymasına göre çapalandı "
-            f"{structural_stop} -> {adjusted} "
-            f"(sinyal={signal_entry}, dolum={entry_price}, kayma={drift:+.10g})"
+        adjusted = fill_anchored_stop_price(
+            signal_entry, structural_stop, entry_price, direction, max_pct
         )
+        if adjusted != structural_stop:
+            self.logger.info(
+                f"🎯 {signal.symbol}: stop dolum kaymasına göre çapalandı "
+                f"{structural_stop} -> {adjusted} "
+                f"(sinyal={signal_entry}, dolum={entry_price}, "
+                f"kayma={entry_price - signal_entry:+.10g}, tavan=%{max_pct})"
+            )
         return adjusted
 
     async def _finalize_position(

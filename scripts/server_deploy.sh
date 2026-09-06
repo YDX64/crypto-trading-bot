@@ -185,14 +185,9 @@ rollback() {
 # ── Testler (sunucu venv'i ile) ────────────────────────────────────────────
 if [ "${DEPLOY_SKIP_TESTS:-0}" != "1" ]; then
   log "testler koşuyor..."
-  # test_counterfactual_store::TestApiSurface::test_uc_* testleri asyncio.to_thread
-  # + module-init etkilesimi nedeniyle pytest izole ortaminda ölçemez; sunucu
-  # canlı log dizinini okur → total=0. Pre-existing sorun (ed80e4e'den önce de
-  # ayni sekilde basarisizdi). Testi deselect ile atla, canlı davranis etkilenmez.
-  DESELECT="--deselect=tests/test_counterfactual_store.py::TestApiSurface::test_uc_jsonl_satirlarini_ozetler"
-  DESELECT="$DESELECT --deselect=tests/test_counterfactual_store.py::TestApiSurface::test_uc_gerekce_suzgeci"
-  DESELECT="$DESELECT --deselect=tests/test_counterfactual_store.py::TestApiSurface::test_uc_limit_kirpar"
-  if ! timeout 300 "$PY" -m pytest tests -q -x -p no:cacheprovider $DESELECT >"logs/deploy-tests-$STAMP.log" 2>&1; then
+  # D34: endpoint fixtures use an explicit date window; no date-aged tests
+  # are deselected. The full isolated suite must pass before restart.
+  if ! timeout 300 "$PY" -m pytest tests -q -x -p no:cacheprovider >"logs/deploy-tests-$STAMP.log" 2>&1; then
     tail -15 "logs/deploy-tests-$STAMP.log" | tee -a "$LOG"
     rollback
   fi

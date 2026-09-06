@@ -577,9 +577,28 @@ async def root():
     }
 
 
+def _tracked_position_counts() -> Dict[str, int]:
+    """Count in-memory ownership only; health polling must not call Binance.
+
+    The legacy orchestrator does not own scalper/follower positions. Deduplicate
+    the total by symbol so overlap cannot make the shared account count twice.
+    Pending orders and disabled follower ledger orphans are not tracked positions.
+    """
+    owners = {
+        "orchestrator": set(getattr(orchestrator, "active_positions", {}) or {}),
+        "scalper": set(getattr(getattr(scalper_engine, "exits", None), "_positions", {}) or {}),
+        "follower": set(getattr(getattr(follower_engine, "exits", None), "_positions", {}) or {}),
+    }
+    return {
+        **{name: len(symbols) for name, symbols in owners.items()},
+        "total": len(set().union(*owners.values())),
+    }
+
+
 @app.get("/health")
 async def health_check():
     """Sağlık kontrolü — gerçek durumu yansıtır."""
+    position_counts = _tracked_position_counts()
     # AlgoPro takipçi halkası (D20): orchestrator/Telegram/scalper YOKTUR;
     # sağlık yalnız takipçi motorundan okunur. Scalper modunda bu dal hiç
     # çalışmaz (bugünkü davranış birebir korunur).
@@ -599,6 +618,8 @@ async def health_check():
                 "mode": "follower",
                 "follower": "running" if core_healthy else "degraded",
                 "follower_details": follower_health,
+                "tracked_positions": position_counts["follower"],
+                "tracked_positions_by_engine": {"follower": position_counts["follower"]},
                 "network": "testnet" if settings.is_testnet else "mainnet",
             },
         )
@@ -658,7 +679,10 @@ async def health_check():
         "orchestrator": "running" if orchestrator else "stopped",
         "orchestrator_details": orchestrator_health,
         "position_monitoring": "running" if monitoring_alive else "STOPPED",
-        "tracked_positions": len(orchestrator.active_positions) if orchestrator else 0,
+        "tracked_positions": position_counts["total"],
+        "tracked_positions_by_engine": {
+            name: count for name, count in position_counts.items() if name != "total"
+        },
         "network": "testnet" if settings.is_testnet else "mainnet",
         "scalper": scalper_state,
         "scalper_details": scalper_health,

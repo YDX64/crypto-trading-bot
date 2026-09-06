@@ -27,6 +27,7 @@ import json
 import os
 import time
 import uuid
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -494,6 +495,7 @@ class ScalperEngine:
             return
 
         self.logger.info("⚡ Scalper motoru başlatılıyor...")
+        self._ai_gate_stopping = False
         await self._assert_universe_survives_follower_reservation()
         self._maybe_log_shadow_mode_banner()
         self._maybe_log_market_gate_banner()
@@ -530,6 +532,9 @@ class ScalperEngine:
 
     async def stop(self) -> None:
         self.logger.info("🛑 Scalper motoru durduruluyor...")
+        # Final cancel/fill reconciliation still tracks protected positions,
+        # but must not create provider tasks after gate.aclose().
+        self._ai_gate_stopping = True
         self.running = False
         tasks = [
             task
@@ -1786,6 +1791,7 @@ class ScalperEngine:
                 f"({sp.signal.direction.value} @ {sp.position.entry_price})",
                 extra={"trade": True},
             )
+            self._ai_gate_observe_filled(sp)
 
     async def _scan_tick(self) -> None:
         # Evren taraması ve sinyal üretimi safety döngüsünden tamamen
@@ -2606,14 +2612,17 @@ class ScalperEngine:
             # yolu YUKARIDA BİTTİKTEN sonra. Senkron, O(1) bir çağrıdır:
             # yalnız sözlük kopyalar ve `asyncio.create_task` ateşler; motor
             # 0 ms bekler. Katman KAPALIYKEN (varsayılan) hiç örneklenmez.
-            self._ai_gate_observe(
-                symbol=symbol,
-                signal=sig,
-                ctx=ctx,
-                context=forensics_ctx,
-                position=sp,
-                signal_epoch=signal_epoch,
-            )
+            # A maker submission is not a rejected/no-trade outcome. Its
+            # protected fill is observed by _track_opened_positions later.
+            if sp is not None or symbol not in self.executor.pending_symbols():
+                self._ai_gate_observe(
+                    symbol=symbol,
+                    signal=sig,
+                    ctx=ctx,
+                    context=forensics_ctx,
+                    position=sp,
+                    signal_epoch=signal_epoch,
+                )
             # Sembol başına tek deneme: sinyal bulunduğu an (başarılı ya da
             # başarısız) bu sembol için tur biter.
             break
@@ -2666,17 +2675,20 @@ class ScalperEngine:
         *,
         symbol: str,
         signal: Any,
-        ctx: StrategyContext,
+        ctx: Optional[StrategyContext],
         context: Optional[Dict[str, Any]],
         position: Any,
         signal_epoch: float,
     ) -> None:
         """Motor yolundaki TEK AI çağrısı — SENKRON, O(1), fail-open.
 
-        `_entry_lock` DIŞINDADIR ve karar yolu bittikten SONRA çağrılır:
-        gölgede motorun davranışı BAYT BAYT aynıdır. Girdiler zaten kurulmuş
-        `forensics_ctx` + dolum belgesidir; YENİ REST çağrısı YOKTUR.
+        Normal entry observation runs outside `_entry_lock`. Cancel/fill
+        reconciliation may schedule this synchronous hook while holding it;
+        neither path awaits AI or performs provider IO inside the hook.
+        Inputs are the saved entry snapshot; no fresh market data is read.
         """
+        if getattr(self, "_ai_gate_stopping", False):
+            return
         gate = self._ai_gate_layer()
         if gate is None:
             return
@@ -2692,9 +2704,27 @@ class ScalperEngine:
         try:
             candles = list(getattr(ctx, "candles_5m", None) or [])
             bar_close_time_ms = (
-                int(getattr(candles[-1], "close_time", 0)) if candles else None
+                int(getattr(candles[-1], "close_time", 0))
+                if candles else context.get("bar_close_time_ms")
             )
             trade_id = getattr(position, "trade_id", None)
+            if trade_id is not None:
+                observed = getattr(self, "_ai_gate_observed_trade_ids", None)
+                if observed is None:
+                    observed = self._ai_gate_observed_trade_ids = set()
+                # Only tracked OPEN trades can validly reappear through a
+                # fill callback. Keep long-lived runners deduplicated while
+                # discarding closed IDs instead of growing for process life.
+                active_ids = {
+                    getattr(sp, "trade_id", None)
+                    for sp in getattr(self.exits, "_positions", {}).values()
+                }
+                observed.intersection_update(active_ids | {trade_id})
+                if trade_id in observed:
+                    return
+                # No await between claiming the trade and scheduling the
+                # observation: WS/REST/recovery cannot ask twice.
+                observed.add(trade_id)
             gate.observe(
                 symbol=symbol,
                 direction=getattr(signal, "direction", None),
@@ -2708,6 +2738,43 @@ class ScalperEngine:
             )
         except Exception as e:
             self._ai_gate_warn(f"observe {type(e).__name__}: {e}")
+
+    def _ai_gate_observe_filled(self, position: Any) -> None:
+        """Observe a protected delayed fill using only its original snapshot.
+
+        A restart journal may have no original forensics context. Do not
+        replace that missing historical context with today's candles or
+        wall-clock time; existing recovered positions are not replayed.
+        """
+        if self._ai_gate_mode() == "off" or getattr(self, "_ai_gate_stopping", False):
+            return
+        try:
+            entry = getattr(position, "forensics_entry", None)
+            if not isinstance(entry, dict):
+                self._ai_gate_warn("maker dolumunun özgün sinyal bağlamı yok")
+                return
+            decision_epoch = entry.get("decision_epoch")
+            bar_close_time_ms = entry.get("bar_close_time_ms")
+            if (
+                not isinstance(decision_epoch, (int, float))
+                or isinstance(decision_epoch, bool)
+                or not 0 < decision_epoch < float("inf")
+                or not isinstance(bar_close_time_ms, int)
+                or isinstance(bar_close_time_ms, bool)
+                or not 0 < bar_close_time_ms <= decision_epoch * 1000.0
+            ):
+                self._ai_gate_warn("maker dolumunun özgün mum zamanı doğrulanamadı")
+                return
+            self._ai_gate_observe(
+                symbol=position.position.symbol,
+                signal=position.signal,
+                ctx=None,
+                context=deepcopy(entry),
+                position=position,
+                signal_epoch=decision_epoch,
+            )
+        except Exception as e:
+            self._ai_gate_warn(f"maker observe {type(e).__name__}: {e}")
 
     def _ai_gate_snapshot(self) -> Dict[str, Any]:
         """`/scalper/status` bloğu — motor yolundan BAĞIMSIZ, yalnız bellek."""
@@ -2980,10 +3047,16 @@ class ScalperEngine:
             context: Dict[str, Any] = {
                 "source": "TV" if is_external else "C",
                 "signal_epoch": signal_epoch,
+                "decision_epoch": signal_epoch,
                 "signal_at": datetime.fromtimestamp(
                     signal_epoch, tz=timezone.utc
                 ).isoformat(timespec="seconds"),
                 "candle_age_sec": None if candle_age is None else round(candle_age, 1),
+                # Persist the decision candle through maker finalization;
+                # later observation must never consult a newer context.
+                "bar_close_time_ms": (
+                    int(entry_candles[-1].close_time) if entry_candles else None
+                ),
                 "indicators": fx.indicator_snapshot(ctx, self.cfg),
                 "regime": {
                     "value": getattr(ctx.regime, "value", str(ctx.regime)),

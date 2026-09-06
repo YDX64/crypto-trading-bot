@@ -605,6 +605,8 @@ class TestSummarize:
             "unmeasured": 0,
             "by_reason": [],
             "by_plan_source": [],
+            "by_measurement": [],
+            "mixed_measurements": False,
             "overall": {
                 "reason": cf.REASON_TOTAL,
                 "label": cf.REASON_TOTAL_LABEL,

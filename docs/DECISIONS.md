@@ -3295,6 +3295,57 @@ deftere yazılır. Ayrı market-data host'unda (D17) kapı AYNEN durur — orada
 "yanlış taraf" bir baz ÖLÇÜM hatası olabilir ve doğru cevap turu atlamaktır.
 
 
+### D34 — Yuvarlanmış TP dolumu, çıkış paritesi ve dürüst ölçüm · 2026-09-06
+
+**Neden.** 30 Ağu 21:03 UTC risk geri alımından 6 Eyl 21:11 UTC'ye 53 kapanış:
+net **−8.753450 USDT**, PF **0.5759**; komisyon öncesi −6.091980. İmzalı GET
+işlem dökümleri 53/53 miktarı eşleştirdi. Son 24 saatin +1.013485'i (5 işlem)
+kalıcı kâr kanıtı değil; %87'si tek BNB işleminden. Ayrıntı ve izlenebilir
+kanıt: [D34 denetimi](audits/2026-09-06-d34.md).
+
+**Değişiklikler (yeni strateji/risk ayarı YOK).**
+
+- TP1/TP2 kontrolündeki ucuz miktar ipucu artık emir gönderimindeki LOT_SIZE
+  yuvarlamasını kullanır. Örn. 0.007 ETH'nin %40'ı 0.0028→0.002 olur; eski
+  eşik gerçek TP1 dolumunu hiç sorgulamayabiliyordu. Başabaş/trailing için
+  **algo child order + gerçek account trades kanıtı yine zorunlu**. TP1
+  reddedilmişse TP2'nin gerçek dolumu runner tabanını yine koruyabilir.
+- Harness, canlıdaki ücret-dahil BE, gerçek doluma çapalanmış ilk stop ve
+  TP2 sonrası TP1 runner tabanını uygular. Stop matematiği ortak saf yardımcıya
+  çıkarıldı; canlı politika 10,750 deterministik girdide eski kodla aynı.
+  TP2 sonrası aynı mumda taban ihlali karamsar OHLC sırasıyla kapanır.
+- Maker dolumu ortak izleme yolunda AI **shadow** gözlemine ulaşır. Özgün
+  karar/mum zamanı korunur; güncel mumla geçmiş bağlam uydurulmaz. Eksik eski
+  recovery bağlamı atlanır; AI aktif moda geçirilmez ve emir yolu AI'ı beklemez.
+- Karşı-olgu v2 baş/iç boşluk/son ufuk/OHLC doğrulaması yapar; eksik veri
+  `no_data/null` olur. Kanıtlanmış erken TP1/STOP sonraki boşluktan etkilenmez.
+  `by_measurement` ve `mixed_measurements` eski/yeni kohortu ayırır. Kapasite
+  doluyken expiry'nin silinmiş kovayı yeniden canlandırma hatası giderildi.
+- `/health.tracked_positions` yalnız eski orchestrator değil tüm aktif
+  yöneticileri sayar; toplam sembole göre tekilleşir, yeni REST yok.
+- Temiz kurulumda `telegram.Update` import'unu bozan çakışan `telegram==0.0.1`
+  bağımlılığı kaldırıldı; tek sağlayıcı `python-telegram-bot`. Tarihi geçen
+  üç counterfactual test fixture'ı sabit tarih aralığıyla düzeltildi;
+  deploy artık bu testleri dışlamaz.
+
+**İnceleme.** Üç bağımsız mercek: borsa fill/recovery, eşzamanlılık/liveness,
+ölçüm/ekonomi. Çürütme turunda TP2 aynı-mum boşluğu ve geçersiz OHLC kabulü
+bulunup regresyonlarıyla kapatıldı; AI shutdown/dedup da ayrıca incelendi.
+Test ve dönem karşılaştırma sonuçları D34 denetim dosyasındadır.
+
+**Sınır.** Karşı-olgu modeli hâlâ `tp1_or_stop_v1`: ücret/kayma/TP2/trailing
+yok; gerçek A/B veya net kârlılık hakemi DEĞİL. D33'ün bu modeli tek başına
+"canlı A/B" diye yorumlayan eski metni bu sınırla okunmalıdır. Ana harness'ta
+da lot-size, emir defteri, gecikme ve stop dolum kayması yaklaşık modellenir.
+Önceki kâr sıralamaları bu parite düzeltmesinden sonra yeniden ölçülmeden
+strateji terfi gerekçesi olamaz. **MAINNET NO-GO; kâr garantisi yok.**
+
+**Geri alma.** Önceki sunucu sürümü `ea38dd2`; standart
+`scripts/deploy.sh awa ea38dd2` hattı. Env/sermaye/geçmiş defter değişmez;
+yalnız kod geri alınır. V2 karşı-olgu JSONL satırları korunur, eski/yeni
+ölçümler karıştırılmaz. Yeni maker AI bağlamı için yeni doğal dolum beklenir;
+deneme amacıyla emir açılmaz. Deploy kaydı aşağıdaki denetim dosyasına eklenir.
+
 ## Metodoloji kararları
 
 ### P1 — Harness = canlı motor (parite) · 2026-08-21
