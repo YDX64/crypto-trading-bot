@@ -3346,6 +3346,29 @@ yalnız kod geri alınır. V2 karşı-olgu JSONL satırları korunur, eski/yeni
 ölçümler karıştırılmaz. Yeni maker AI bağlamı için yeni doğal dolum beklenir;
 deneme amacıyla emir açılmaz. Deploy kaydı aşağıdaki denetim dosyasına eklenir.
 
+### D35 — Kullanıcı talebiyle %10 TESTNET marj tavanı · 2026-09-07
+
+**Kapsam:** yalnız yeni C/TV girişlerinde `SCALPER_MAX_MARGIN_PCT=0.5→10`.
+Bu %10 **teminat** demektir; %10 stop riski veya nominal değer değildir.
+Mevcut bileşik sanal kasa 905.96078637 USDT; yaklaşık 90.60 USDT hedef marj.
+Lot yuvarlaması/kısmi dolum/sermaye sınırı nedeniyle tam %10 garanti edilmez.
+Eski açık pozisyon büyütülmez. Stop/TP/trailing/kaldıraç/kapasite/günlük fren
+ve 1000-USDT tabanlı #278 kohortu değişmez; MAINNET NO-GO.
+
+**Kanıt ve sınır:** 2852 test geçti; emir/ağ göndermeyen 8 executor/harness
+boyutlama vakası eşleşti. Üç bilinen rejimde marj 20× olduğunda PnL ve bar-DD
+20×, PF/ROI/işlem sayısı aynı: daha büyük dolar kârı daha iyi strateji değildir.
+Sabit 1000 ölçeğinde aday DD %14.28/%21.01/%15.60. Bunlar OOS değildir;
+harness bileşik kasa/günlük kesici/gerçek TV akışını modellemez. Yalnız
+kullanıcının istediği TESTNET miktar deneyi, güvenli-risk veya kârlılık terfisi değil.
+
+**Risk:** mevcut %50 teminat stopu tek işlemde kasanın yaklaşık %5'ini,
+beş eşzamanlı stop yaklaşık %25'ini kaybettirebilir (+ücret/kayma).
+Günlük %1 fren gerçekleşmiş zarardan SONRA yeni girişleri durdurur;
+açık/bekleyen işlemlerin toplam stop riskini önceden ayırmaz.
+Aktivasyon, yedek, ham kanıt yolları ve yalnız marj anahtarını geri alma
+reçetesi: [D35 denetimi](audits/2026-09-07-margin-profile.md).
+
 ## Metodoloji kararları
 
 ### P1 — Harness = canlı motor (parite) · 2026-08-21

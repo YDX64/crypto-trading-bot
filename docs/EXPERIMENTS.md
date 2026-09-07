@@ -1,5 +1,11 @@
 # Deney defteri — backtest ve ölçüm kayıtları
 
+**7 Eyl 2026 — E15 miktar ölçeği:** kullanıcı talebiyle %0.5→%10 TESTNET
+marj tavanı. Altı cache-only koşuda üç bilinen rejimin PF/ROI/işlem sayısı
+değişmedi; PnL ve bar-DD 20× oldu. Sabit 1000 kasada %10 profilinin bar-DD'si
+%14.28/%21.01/%15.60. OOS, bileşik kasa veya gerçek TV replay kanıtı değil;
+daha iyi strateji iddiası YOK. [Tablo ve sınırlar](audits/2026-09-07-margin-profile.md#e15--three-known-regimes-fixed-1000-usdt-scale-comparison).
+
 **6 Eyl 2026 — E14 çıkış paritesi düzeltmesi:** ücret-dahil BE, dolum-stop
 çapası ve TP2 runner tabanı eski harness'ta eksikti. Aynı güncel ayarla
 üç bilinen pencerenin eski/yeni sonuçları ve canlı zarar denetimi
