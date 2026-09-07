@@ -31,6 +31,7 @@ from src.core.config import settings
 from src.core.logger import app_logger
 from src.core.database import init_db, close_db, get_db
 from src.core.account_lock import TradingAccountLock
+from src.core.time_utils import utc_isoformat
 from src.models.waiting_signal import WaitingSignalModel, WaitingStatus
 from src.models.scalp_trade import ScalpTradeModel
 from src.services.telegram_bot import TelegramBotService
@@ -959,10 +960,10 @@ async def get_positions():
             "is_trailing": position.is_trailing,
             "unrealized_pnl": position.unrealized_pnl,
             "pnl_percentage": position.pnl_percentage,
-            "opened_at": position.opened_at.isoformat() if position.opened_at else None,
+            "opened_at": utc_isoformat(position.opened_at),
         })
 
-    return {"count": len(positions), "positions": positions}
+    return {"count": len(positions), "positions": positions, "as_of": _utcnow_iso()}
 
 
 @app.get("/stats")
@@ -3137,8 +3138,8 @@ async def scalper_trades(
             "realized_pnl": t.realized_pnl,
             "roi_pct": t.roi_pct,
             "exit_reason": t.exit_reason,
-            "opened_at": t.opened_at.isoformat() if t.opened_at else None,
-            "closed_at": t.closed_at.isoformat() if t.closed_at else None,
+            "opened_at": utc_isoformat(t.opened_at),
+            "closed_at": utc_isoformat(t.closed_at),
             "signal_reason": t.signal_reason,
             "pnl_source": None if t.status == "SHADOW" else ScalpTracker._pnl_source(t.notes),
             # D21: panonun "adli kart" düğmesini göstermesi için yeterli olan

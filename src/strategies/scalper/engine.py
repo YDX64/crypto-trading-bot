@@ -5417,27 +5417,20 @@ class ScalperEngine:
             return {"error": f"{type(e).__name__}"}
 
     def snapshot(self) -> Dict[str, Any]:
+        from src.core.time_utils import utc_isoformat
+
         tracked = []
         # ExitManager sembol->ScalpPosition eşlemesini herkese açık bir
         # erişimci olarak sunmuyor (bkz. exits.py); bu paket-içi sıkı
-        # bağımlılık kasıtlıdır — exits.py bu amaçla DEĞİŞTİRİLMEDİ.
+        # bağımlılık kasıtlıdır. Değerleme ayrı, salt-gözlemsel bir önbellektir.
         for symbol, sp in self.exits._positions.items():
             entry = sp.position.entry_price
-            current_price = sp.position.current_price or entry
             quantity = sp.position.quantity
-            leverage = sp.position.leverage or 1
             direction = sp.signal.direction
-
-            unrealized_pnl = 0.0
-            roi_pct = 0.0
-            if entry > 0:
-                if direction.value == "LONG":
-                    unrealized_pnl = (current_price - entry) * quantity
-                    price_delta_pct = (current_price - entry) / entry * 100.0
-                else:
-                    unrealized_pnl = (entry - current_price) * quantity
-                    price_delta_pct = (entry - current_price) / entry * 100.0
-                roi_pct = price_delta_pct * leverage
+            valuation = ExitManager._empty_valuation()
+            getter = getattr(self.exits, "valuation_snapshot", None)
+            if callable(getter):
+                valuation = getter(symbol, sp)
 
             plan = getattr(sp, "plan", None)
             entry_fee_rate = getattr(plan, "entry_fee_rate", None)
@@ -5456,8 +5449,9 @@ class ScalperEngine:
                 "strategy": sp.signal.strategy,
                 "direction": direction.value,
                 "entry_price": entry,
-                "current_price": current_price,
+                "current_price": valuation.get("mark_price"),
                 "quantity": quantity,
+                **valuation,
                 "current_stoploss": sp.position.current_stoploss,
                 "tp1_done": sp.tp1_done,
                 "tp2_done": bool(getattr(sp, "tp2_done", False)),
@@ -5472,9 +5466,7 @@ class ScalperEngine:
                 "exit_fee_rate": exit_fee_rate,
                 "fee_rate_source": fee_rate_source,
                 "runner_floor_price": getattr(plan, "runner_floor_price", None),
-                "unrealized_pnl": unrealized_pnl,
-                "roi_pct": roi_pct,
-                "opened_at": sp.position.opened_at.isoformat() if sp.position.opened_at else None,
+                "opened_at": utc_isoformat(sp.position.opened_at),
             })
 
         cooldowns = self._executor_cooldown_snapshot()

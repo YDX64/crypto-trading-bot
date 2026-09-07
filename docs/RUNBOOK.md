@@ -210,6 +210,18 @@ PTB sürümünü yeniden kur; bunu çalışan sunucuda sırf temizlik için yapm
 `by_measurement`/`mixed_measurements` alanlarına bak; eski satırlar yeniden
 hesaplanmaz. Ayrıntı: [D34 denetimi](audits/2026-09-06-d34.md).
 
+**D36 açık K/Z (7 Eyl).** `/scalper/status.tracked` içinde
+`unrealized_pnl_status=ok` ise mark/kalan miktar/venue brüt PnL ölçülmüştür;
+`unobserved/stale/invalid/position_mismatch` durumunda sayı null, panoda `—`.
+`valuation_as_of` yerel signed-positionRisk gözlemi, exchange fill zamanı
+değildir; 80 sn ömürlüdür. Restart sonrası ilk safety gözlemine kadar `—`
+normaldir. Pano toplamı legacy+scalper tekilleştirilmiş açık brüt K/Z'dir;
+ücret/funding ve gerçekleşmiş kısmi çıkışlar hariçtir. Sanal sermaye yalnız
+kapanmış net PnL ile bileşiktir. API yeni UTC damgaları DB'yi değiştirmez.
+Yeni forensics gerçek fill zamanı yokken `fill_latency_sec=null`, yerel
+`fill_observed_latency_sec` ve `protection_registration_latency_sec` ayrıdır.
+AI eski/naive ufukları kabul etmez ama hâlâ shadow'dur. [D36](audits/2026-09-07-d36.md).
+
 > **Container yolu (EK dağıtım).** Botu tek bir görüntüde başka sunucuya taşımak için
 > `scripts/docker_run.sh` + "Container ile çalıştırma / başka sunucuya taşıma" bölümüne
 > bakın. ⛔ supervisord ile container **AYNI ANDA ÇALIŞTIRILAMAZ** (aynı Binance hesabı,

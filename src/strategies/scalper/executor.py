@@ -1557,6 +1557,11 @@ class ScalpExecutor:
         entry_candle_time: int,
         forensics: Optional[Dict[str, Any]] = None,
     ) -> Optional[ScalpPosition]:
+        # Observation only: fill price/quantity have been resolved, but this
+        # local clock is NOT the exchange's fill timestamp. Capture it before
+        # SL/TP/commission requests so their latency is reported separately.
+        # Keep opened_at/opened_epoch below unchanged (REAPER/lifetime policy).
+        fill_observed_epoch = time.time()
         symbol = signal.symbol
         stop_price = self._delay_adjusted_stop(
             signal=signal, direction=direction, entry_price=entry_price
@@ -1719,6 +1724,7 @@ class ScalpExecutor:
             stop_price=stop_price,
             plan=plan,
             opened_epoch=opened_epoch,
+            fill_observed_epoch=fill_observed_epoch,
         )
 
         try:
@@ -1859,6 +1865,7 @@ class ScalpExecutor:
         stop_price: float,
         plan: ExitPlan,
         opened_epoch: float,
+        fill_observed_epoch: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         """Motorun bağlamını GERÇEK dolum sayılarıyla birleştirip belge kur."""
         if not self._forensics_enabled():
@@ -1868,9 +1875,29 @@ class ScalpExecutor:
 
             context = dict(context or {})
             signal_epoch = context.pop("signal_epoch", None)
-            latency = None
-            if isinstance(signal_epoch, (int, float)):
-                latency = max(0.0, opened_epoch - float(signal_epoch))
+
+            def valid_epoch(value: Any) -> bool:
+                return (
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(value)
+                    and value > 0
+                )
+
+            observed_at = None
+            observed_latency = None
+            registration_latency = None
+            if (
+                valid_epoch(fill_observed_epoch)
+                and valid_epoch(opened_epoch)
+                and fill_observed_epoch <= opened_epoch
+            ):
+                observed_at = datetime.fromtimestamp(
+                    fill_observed_epoch, tz=timezone.utc
+                ).isoformat(timespec="milliseconds")
+                registration_latency = round(opened_epoch - fill_observed_epoch, 3)
+                if valid_epoch(signal_epoch) and signal_epoch <= fill_observed_epoch:
+                    observed_latency = round(fill_observed_epoch - signal_epoch, 3)
             entry = fx.build_entry(
                 at=datetime.fromtimestamp(opened_epoch, tz=timezone.utc).isoformat(
                     timespec="seconds"
@@ -1887,7 +1914,10 @@ class ScalpExecutor:
                 tp2_price=plan.tp2_price,
                 breakeven_price=plan.breakeven_price,
                 signal_at=context.pop("signal_at", None),
-                fill_latency_sec=latency,
+                # Neither maker nor taker forwards verified exchange fill
+                # time here. Unknown is null, not registration time (which
+                # used to manufacture stale_signal labels after slow SL/TP).
+                fill_latency_sec=None,
                 entry_mode=str(getattr(self.cfg, "scalper_entry_mode", "taker")),
                 indicators=context.pop("indicators", None),
                 regime_info=context.pop("regime", None),
@@ -1903,6 +1933,17 @@ class ScalpExecutor:
                 btc_price=context.pop("btc_price", None),
                 rr=context.pop("rr", None),
             )
+            entry.update({
+                "fill_latency_source": "unmeasured_exchange_time",
+                "fill_observed_at": observed_at,
+                "fill_observed_source": (
+                    "local_clock_before_protection" if observed_at is not None else None
+                ),
+                "fill_observed_latency_sec": observed_latency,
+                # SL + TP + fee setup until the existing registration point;
+                # not total unprotected exposure or DB commit duration.
+                "protection_registration_latency_sec": registration_latency,
+            })
             # Motorun eklediği ve build_entry'nin tanımadığı alanlar kaybolmasın.
             for key, value in context.items():
                 entry.setdefault(key, value)

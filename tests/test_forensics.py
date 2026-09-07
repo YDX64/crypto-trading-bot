@@ -1137,6 +1137,130 @@ def _exec_ctx():
     )
 
 
+class TestEntryTimingMeasurements:
+    @pytest.mark.parametrize("entry_mode", ["taker", "maker"])
+    async def test_protection_delay_is_not_exchange_fill_latency(
+        self, monkeypatch, entry_mode
+    ):
+        from src.strategies.scalper import executor as executor_module
+        from src.strategies.scalper.executor import PendingEntry
+
+        signal_epoch = 1_800_000_000.0
+        now = [signal_epoch + 20.0]
+        calls = []
+
+        class ClockDateTime(datetime):
+            @classmethod
+            def utcnow(cls):
+                return cls.fromtimestamp(now[0], tz=timezone.utc).replace(tzinfo=None)
+
+        class DelayedPm(_FakePm):
+            async def place_stop_loss_or_close(self, *args, **kwargs):
+                calls.append("stop")
+                now[0] += 7.0
+                return await super().place_stop_loss_or_close(*args, **kwargs)
+
+        class DelayedClient(_FakeClient):
+            async def place_take_profit(self, *args, **kwargs):
+                calls.append("tp")
+                now[0] += 4.0
+                return await super().place_take_profit(*args, **kwargs)
+
+        monkeypatch.setattr(executor_module, "datetime", ClockDateTime)
+        monkeypatch.setattr(
+            executor_module, "time",
+            SimpleNamespace(time=lambda: now[0], monotonic=time.monotonic),
+        )
+        tracker = _FakeTracker()
+        cfg = _ExecCfg()
+        cfg.scalper_entry_mode = entry_mode
+        executor = ScalpExecutor(
+            client=DelayedClient(), pm=DelayedPm(), tracker=tracker, cfg=cfg,
+        )
+
+        async def delayed_commission(symbol):
+            calls.append("commission")
+            now[0] += 3.0
+            return 0.0002, 0.0004, "test"
+
+        monkeypatch.setattr(executor, "_resolve_commission_rates", delayed_commission)
+        monkeypatch.setattr(executor, "_forensics_event", lambda *a, **k: None)
+        context = {
+            "signal_epoch": signal_epoch,
+            "decision_epoch": signal_epoch,
+            "bar_close_time_ms": int(signal_epoch * 1000),
+        }
+        if entry_mode == "maker":
+            pending = PendingEntry(
+                signal=_exec_signal(), order_id=111, client_order_id="awa2sc_test",
+                limit_price=100.0, quantity=1.0, created_monotonic=time.monotonic(),
+                created_at_ms=int((signal_epoch + 2.0) * 1000), phase="WORKING",
+            )
+            executor._pending["TESTUSDT"] = pending
+            executor._store_pending_forensics(pending, context)
+            result = await executor._on_pending_filled("TESTUSDT", pending, {
+                "orderId": 111, "status": "FILLED",
+                "avgPrice": "100.0", "executedQty": "1.0",
+            })
+            assert executor.pending_symbols() == set()
+        else:
+            result = await executor.try_open(
+                _exec_signal(), _exec_ctx(), forensics=context
+            )
+
+        entry = tracker.forensics_seen["entry"]
+        assert calls == ["stop", "tp", "tp", "commission"]
+        assert isinstance(result, ScalpPosition)
+        assert entry["fill_latency_sec"] is None
+        assert entry["fill_latency_source"] == "unmeasured_exchange_time"
+        assert entry["fill_observed_source"] == "local_clock_before_protection"
+        assert entry["fill_observed_latency_sec"] == 20.0
+        assert entry["protection_registration_latency_sec"] == 18.0
+        assert datetime.fromisoformat(entry["fill_observed_at"]).timestamp() == signal_epoch + 20
+        assert fx.TAG_STALE_SIGNAL not in tracker.forensics_seen["verdict"]
+        # Registration/lifetime and AI signal context keep their prior clocks.
+        assert result.opened_epoch == signal_epoch + 38.0
+        assert result.position.opened_at.replace(tzinfo=timezone.utc).timestamp() == signal_epoch + 38
+        assert datetime.fromisoformat(entry["at"]).timestamp() == signal_epoch + 38
+        assert entry["decision_epoch"] == signal_epoch
+        assert entry["bar_close_time_ms"] == int(signal_epoch * 1000)
+
+    @pytest.mark.parametrize("signal_epoch", [None, True, "1", float("nan"), float("inf"), -1, 30.0])
+    def test_invalid_or_reversed_signal_clock_is_unknown(self, signal_epoch):
+        executor = ScalpExecutor(
+            client=_FakeClient(), pm=_FakePm(), tracker=_FakeTracker(), cfg=_ExecCfg(),
+        )
+        document = executor._build_entry_forensics(
+            context={"signal_epoch": signal_epoch}, signal=_exec_signal(),
+            direction=Direction.LONG, entry_price=100.0, filled_qty=1.0,
+            leverage=20, margin_usdt=5.0, stop_price=99.5,
+            plan=SimpleNamespace(tp1_price=101.0, tp2_price=102.5, breakeven_price=100.1),
+            opened_epoch=40.0, fill_observed_epoch=20.0,
+        )
+        assert document["entry"]["fill_latency_sec"] is None
+        assert document["entry"]["fill_observed_latency_sec"] is None
+        assert document["entry"]["protection_registration_latency_sec"] == 20.0
+
+    @pytest.mark.parametrize("observed_epoch", [None, True, float("nan"), float("inf"), -1, 50.0])
+    def test_invalid_or_reversed_observation_clock_is_unknown(self, observed_epoch):
+        executor = ScalpExecutor(
+            client=_FakeClient(), pm=_FakePm(), tracker=_FakeTracker(), cfg=_ExecCfg(),
+        )
+        document = executor._build_entry_forensics(
+            context={"signal_epoch": 10.0}, signal=_exec_signal(),
+            direction=Direction.LONG, entry_price=100.0, filled_qty=1.0,
+            leverage=20, margin_usdt=5.0, stop_price=99.5,
+            plan=SimpleNamespace(tp1_price=101.0, tp2_price=102.5, breakeven_price=100.1),
+            opened_epoch=40.0, fill_observed_epoch=observed_epoch,
+        )
+        entry = document["entry"]
+        assert entry["fill_latency_sec"] is None
+        assert entry["fill_observed_at"] is None
+        assert entry["fill_observed_source"] is None
+        assert entry["fill_observed_latency_sec"] is None
+        assert entry["protection_registration_latency_sec"] is None
+
+
 class TestForensicsNeverBlocksTrading:
     async def test_entry_succeeds_when_forensics_builder_raises(self, monkeypatch):
         def _boom(**kwargs):

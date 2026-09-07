@@ -116,6 +116,18 @@ _PROTECTIVE_GATE_MARGIN_PCT = 0.05
 # Aynı sembol için kapı/çeviri uyarısı en fazla bu sıklıkta loglanır (safety
 # turu 2 sn'de bir döner — aksi halde saatte 1800 satır).
 _TRAILING_SKIP_LOG_INTERVAL_SECONDS = 60.0
+# Display-only valuation may span a full multi-position safety pass. This is
+# NOT a stop/entry decision TTL and must never feed the execution price cache.
+_POSITION_VALUATION_MAX_AGE_SECONDS = 80.0
+
+
+@dataclass(frozen=True)
+class _PositionValuation:
+    owner: ScalpPosition
+    status: str
+    observed_monotonic: Optional[float]
+    observed_at: Optional[str]
+    values: Dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -172,6 +184,7 @@ class ExitManager:
         self.data_price_fetch = data_price_fetch
         self.logger = app_logger
         self._positions: Dict[str, ScalpPosition] = {}
+        self._position_valuations: Dict[str, _PositionValuation] = {}
         # Aynı sembol için _handle_closed'a İKİ YOLDAN (safety turu ve
         # risk-olayı flatten'ı) eşzamanlı girişi engelleyen uçuş-halinde
         # kümesi. Tek event-loop'ta check+add arasında await yoktur.
@@ -242,7 +255,127 @@ class ExitManager:
 
     def track(self, sp: ScalpPosition) -> None:
         """Pozisyonu izleme listesine ekle (sembol anahtarlı)."""
-        self._positions[sp.position.symbol] = sp
+        symbol = sp.position.symbol
+        if self._positions.get(symbol) is not sp:
+            getattr(self, "_position_valuations", {}).pop(symbol, None)
+        self._positions[symbol] = sp
+
+    @staticmethod
+    def _valuation_number(value: Any) -> Optional[float]:
+        if isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return number if math.isfinite(number) else None
+
+    @staticmethod
+    def _empty_valuation(status: str = "unobserved") -> Dict[str, Any]:
+        return {
+            "unrealized_pnl_status": status,
+            "valuation_source": "binance_position_risk",
+            # Local receipt of get_position_risk (which has a bounded client
+            # cache), NOT Binance's position updateTime or an execution time.
+            "valuation_timestamp_basis": "local_position_risk_observation",
+            "valuation_as_of": None,
+            "valuation_age_seconds": None,
+            "remaining_quantity": None,
+            "mark_price": None,
+            "unrealized_pnl": None,
+            "roi_pct": None,
+        }
+
+    def _observe_position_valuation(
+        self, symbol: str, sp: ScalpPosition, row: Any, *, failed: bool = False
+    ) -> None:
+        """Best-effort telemetry must never interrupt protection decisions."""
+        if self._positions.get(symbol) is not sp:
+            return
+        try:
+            self._record_position_valuation(symbol, sp, row, failed=failed)
+        except Exception:
+            # Drop the prior value even for an unexpected malformed object;
+            # do not let display parsing block the existing order/exit path.
+            cache = getattr(self, "_position_valuations", None)
+            if not isinstance(cache, dict):
+                cache = self._position_valuations = {}
+            cache[symbol] = _PositionValuation(
+                sp, "invalid", None, None, self._empty_valuation("invalid")
+            )
+
+    def _record_position_valuation(
+        self, symbol: str, sp: ScalpPosition, row: Any, *, failed: bool = False
+    ) -> None:
+        """Observe the existing signed read; no I/O or trading-state mutation.
+
+        Malformed or failed observations replace an older good value, so a
+        broken read cannot leave apparently fresh profit on the dashboard.
+        Attribution requires the same tracked object, symbol, side and entry.
+        """
+        if self._positions.get(symbol) is not sp:
+            return  # An in-flight read belongs to a replaced/closed position.
+        values = self._empty_valuation("invalid")
+        observed = None if failed else time.monotonic()
+        observed_at = None if failed else datetime.now(timezone.utc).isoformat()
+        if not failed and isinstance(row, dict):
+            amt = self._valuation_number(row.get("positionAmt"))
+            entry = self._valuation_number(row.get("entryPrice"))
+            mark = self._valuation_number(row.get("markPrice"))
+            pnl = self._valuation_number(row.get("unRealizedProfit"))
+            known_entry = self._valuation_number(getattr(sp.position, "entry_price", None))
+            initial_qty = self._valuation_number(getattr(sp.position, "quantity", None))
+            leverage = self._valuation_number(getattr(sp.position, "leverage", None))
+            direction = getattr(sp.signal.direction, "value", sp.signal.direction)
+            valid = (
+                None not in (amt, entry, mark, pnl, known_entry, initial_qty, leverage)
+                and entry > 0 and mark > 0 and known_entry > 0
+                and initial_qty > 0 and leverage > 0
+            )
+            if valid:
+                matches = (
+                    row.get("symbol") == symbol == getattr(sp.position, "symbol", None)
+                    and ((direction == "LONG" and amt > 0) or (direction == "SHORT" and amt < 0))
+                    and math.isclose(entry, known_entry, rel_tol=1e-8, abs_tol=1e-12)
+                    and abs(amt) <= initial_qty * (1.0 + 1e-8)
+                )
+                values["unrealized_pnl_status"] = "position_mismatch"
+                if matches:
+                    roi = (mark - entry) / entry * leverage * 100.0
+                    if direction == "SHORT":
+                        roi = -roi
+                    if math.isfinite(roi):
+                        values.update(
+                            unrealized_pnl_status="ok", remaining_quantity=abs(amt),
+                            mark_price=mark, unrealized_pnl=pnl, roi_pct=roi,
+                        )
+                    else:
+                        values["unrealized_pnl_status"] = "invalid"
+        cache = getattr(self, "_position_valuations", None)
+        if not isinstance(cache, dict):
+            cache = self._position_valuations = {}
+        cache[symbol] = _PositionValuation(
+            sp, values["unrealized_pnl_status"], observed, observed_at, values
+        )
+
+    def valuation_snapshot(self, symbol: str, sp: ScalpPosition) -> Dict[str, Any]:
+        """Read-only display projection; unknown/stale never means zero PnL."""
+        row = getattr(self, "_position_valuations", {}).get(symbol)
+        if (not isinstance(row, _PositionValuation) or row.owner is not sp
+                or self._positions.get(symbol) is not sp
+                or getattr(sp, "close_recorded", False)):
+            return self._empty_valuation()
+        result = dict(row.values)
+        if row.observed_monotonic is None:
+            return result
+        age = time.monotonic() - row.observed_monotonic
+        if not math.isfinite(age) or age < 0:
+            return self._empty_valuation("invalid")
+        result.update(valuation_as_of=row.observed_at, valuation_age_seconds=round(age, 3))
+        if row.status == "ok" and age > _POSITION_VALUATION_MAX_AGE_SECONDS:
+            result.update(self._empty_valuation("stale"))
+            result.update(valuation_as_of=row.observed_at, valuation_age_seconds=round(age, 3))
+        return result
 
     def tracked_symbols(self) -> Set[str]:
         return set(self._positions.keys())
@@ -267,12 +400,14 @@ class ExitManager:
         try:
             pos_info = await self.client.get_position_risk(symbol)
         except BinanceAPIError as e:
+            self._observe_position_valuation(symbol, sp, None, failed=True)
             self.logger.error(
                 f"⚠️ {symbol}: pozisyon durumu sorgulanamadı (kod={e.code}: {e.msg}). "
                 f"İzleme sürüyor — 'bilinmiyor' 'kapandı' sayılmaz."
             )
             return
         except Exception as e:
+            self._observe_position_valuation(symbol, sp, None, failed=True)
             self.logger.error(
                 f"⚠️ {symbol}: pozisyon durumu sorgusunda beklenmeyen hata ({e}). İzleme sürüyor."
             )
@@ -289,6 +424,7 @@ class ExitManager:
             )
             return
 
+        self._observe_position_valuation(symbol, sp, pos_info)
         amt = abs(float(pos_info.get("positionAmt", 0))) if pos_info else 0.0
 
         if amt == 0:
@@ -1356,6 +1492,7 @@ class ExitManager:
             # kapasite sayacı boş slot gösterir. Yalnız KENDİ nesnesini düşür.
             if self._positions.get(symbol) is sp:
                 self._positions.pop(symbol, None)
+                getattr(self, "_position_valuations", {}).pop(symbol, None)
 
     async def _finalize_close(
         self,

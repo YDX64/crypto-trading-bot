@@ -926,6 +926,11 @@
   "use strict";
 
   var REFRESH_MS = 5000;
+  var FETCH_TIMEOUT_MS = 15000;
+  var tickInFlight = false;
+  var tickPromise = null;
+  // İzleme çevrimi + durum önbelleği toleransı; API aynı 80 sn tazeliği uygular.
+  var POSITION_FRESH_MS = 80000;
   // "Neler etkiliyor" panelinin yenilenme aralığı (ms) ve son çekim anı.
   var IMPACT_MS = 60000;
   var impactAt = 0;
@@ -991,25 +996,41 @@
     return "";
   }
 
+  // DB'nin tz'siz ISO damgaları UTC'dir. Tarayıcının yerel bölgesini
+  // varsaymak yaşları ve işlem sırasını farklı saat dilimlerinde bozardı.
+  function apiTime(iso){
+    if (typeof iso !== "string") return null;
+    var value = iso.trim().replace(" ", "T");
+    var parts = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:?\d{2})?$/i.exec(value);
+    if (!parts) return null;
+    var month = Number(parts[2]), day = Number(parts[3]);
+    var days = new Date(Date.UTC(Number(parts[1]), month, 0)).getUTCDate();
+    if (month < 1 || month > 12 || day < 1 || day > days ||
+        Number(parts[4]) > 23 || Number(parts[5]) > 59 || Number(parts[6]) > 59) return null;
+    if (!parts[7]) value += "Z";
+    var stamp = Date.parse(value);
+    return isFinite(stamp) ? stamp : null;
+  }
+
   function fmtClock(iso){
-    if (!iso) return "—";
-    var d = new Date(iso);
-    if (isNaN(d.getTime())) return "—";
+    var stamp = apiTime(iso);
+    if (stamp === null) return "—";
+    var d = new Date(stamp);
     return d.toLocaleTimeString("tr-TR", { hour12:false });
   }
 
   function fmtDateTime(iso){
-    if (!iso) return "—";
-    var d = new Date(iso);
-    if (isNaN(d.getTime())) return "—";
+    var stamp = apiTime(iso);
+    if (stamp === null) return "—";
+    var d = new Date(stamp);
     return d.toLocaleDateString("tr-TR") + " " + d.toLocaleTimeString("tr-TR", { hour12:false, hour:"2-digit", minute:"2-digit" });
   }
 
   function fmtAge(iso){
-    if (!iso) return "—";
-    var d = new Date(iso);
-    if (isNaN(d.getTime())) return "—";
-    var ms = Date.now() - d.getTime();
+    var stamp = apiTime(iso);
+    if (stamp === null) return "—";
+    var ms = Date.now() - stamp;
+    if (ms < -5000) return "—";
     if (ms < 0) ms = 0;
     var mins = Math.floor(ms / 60000);
     if (mins < 60) return mins + " dk";
@@ -1040,20 +1061,125 @@
   // fetch sarmalayıcı: ağ hatalarını (sunucuya ulaşılamıyor) HTTP durum
   // hatalarından (404/503 — endpoint henüz yok) ayırt eder.
   function fetchJSON(url){
-    return fetch(url, { cache: "no-store" }).then(function(res){
-      return res.json().then(function(data){
-        return { ok:res.ok, status:res.status, data:data, networkError:false };
+    // JSON gövdesi de zaman bütçesine dahildir. Abort'a yanıt vermeyen
+    // bir bağlantı bile Promise.all'u ve sonraki pano turunu kilitlemez.
+    return new Promise(function(resolve){
+      var controller = typeof AbortController === "function" ? new AbortController() : null;
+      var settled = false;
+      var requestTimer = setTimeout(function(){
+        finish({ok:false, status:0, data:null, networkError:true, timedOut:true});
+        if (controller) controller.abort();
+      }, FETCH_TIMEOUT_MS);
+      function finish(result){
+        if (settled) return;
+        settled = true;
+        clearTimeout(requestTimer);
+        resolve(result);
+      }
+      var options = {cache:"no-store"};
+      if (controller) options.signal = controller.signal;
+      Promise.resolve().then(function(){ return fetch(url, options); }).then(function(res){
+        return res.json().then(function(data){
+          finish({ok:res.ok, status:res.status, data:data, networkError:false});
+        }).catch(function(){
+          finish({ok:false, status:res.status, data:null, networkError:false});
+        });
       }).catch(function(){
-        return { ok:false, status:res.status, data:null, networkError:false };
+        finish({ok:false, status:0, data:null, networkError:true});
       });
-    }).catch(function(){
-      return { ok:false, status:0, data:null, networkError:true };
     });
   }
 
   function notConnected(container, msg){
     container.innerHTML = "";
     container.appendChild(el("div", "placeholder", msg || "henüz bağlı değil / veri yok"));
+  }
+
+  // Tek-sembol/tek-sahip sözleşmesi: tablo ve toplam AYNI birleşimi kullanır.
+  // Scalper'a ait satır eski orchestrator kopyasından önce gelir; iki kez
+  // toplanmaz. Eksik/bayat bir kaynak veya çelişkili kopya toplamı bilinmez
+  // yapar, kısmi toplam hiçbir zaman tam hesap toplamı gibi sunulmaz.
+  function positionSnapshot(positionsRes, scalperRes){
+    var rows = [], bySymbol = Object.create(null), complete = true;
+    function appendSource(res, key, scalper){
+      if (!res || !res.ok || !res.data || !Array.isArray(res.data[key])){
+        complete = false;
+        return;
+      }
+      var stamp = apiTime(res.data.as_of);
+      var fresh = stamp !== null && Date.now() - stamp <= POSITION_FRESH_MS && Date.now() - stamp >= -5000;
+      // /positions legacy sürümü as_of taşımaz; bu endpoint önbelleksizdir.
+      if (!scalper && res.data.as_of === undefined) fresh = true;
+      if (!fresh) complete = false;
+      var local = Object.create(null);
+      res.data[key].forEach(function(p){
+        if (!p || typeof p.symbol !== "string" || !p.symbol.trim()){
+          complete = false;
+          return;
+        }
+        var symbol = p.symbol.trim().toUpperCase();
+        if (local[symbol]){
+          if (JSON.stringify(local[symbol].raw) !== JSON.stringify(p)){
+            local[symbol].dataIssue = true;
+            local[symbol].unrealized = null;
+            local[symbol].current = null;
+            local[symbol].roi = null;
+            complete = false;
+          }
+          return;
+        }
+        var valuationOk = scalper ? p.unrealized_pnl_status === "ok" :
+          (p.unrealized_pnl_status === undefined || p.unrealized_pnl_status === "ok");
+        if (scalper){
+          var valuedAt = apiTime(p.valuation_as_of);
+          valuationOk = valuationOk && valuedAt !== null &&
+            Date.now() - valuedAt <= POSITION_FRESH_MS && Date.now() - valuedAt >= -5000;
+        }
+        var direction = scalper ? p.direction : p.side;
+        valuationOk = valuationOk && (direction === "LONG" || direction === "SHORT");
+        var known = fresh && valuationOk && isNum(p.unrealized_pnl);
+        var row = {
+          raw: p, symbol: symbol, strategy: scalper ? p.strategy : null,
+          direction: direction,
+          entry: p.entry_price,
+          current: fresh && valuationOk ? (scalper && p.mark_price !== undefined ? p.mark_price : p.current_price) : null,
+          roi: fresh && valuationOk ? (scalper ? p.roi_pct : p.pnl_percentage) : null,
+          sl: p.current_stoploss,
+          tp1: scalper && !!p.tp1_done, tp2: scalper && !!p.tp2_done,
+          trailing: !!(scalper ? p.trailing_active : p.is_trailing),
+          be: !!(scalper ? p.breakeven_active : p.is_break_even),
+          bePrice: scalper ? p.breakeven_price : null,
+          beCostPct: scalper ? p.breakeven_cost_pct : null,
+          feeAwareBe: scalper && !!p.fee_aware_breakeven,
+          runnerFloor: scalper ? p.runner_floor_price : null,
+          openedAt: p.opened_at, unrealized: known ? p.unrealized_pnl : null,
+          dataIssue: !fresh || !valuationOk
+        };
+        local[symbol] = row;
+        var existing = bySymbol[symbol];
+        if (existing){
+          if (existing.direction !== row.direction){
+            existing.dataIssue = true;
+            existing.unrealized = null;
+            existing.current = null;
+            existing.roi = null;
+            complete = false;
+          }
+          return;
+        }
+        bySymbol[symbol] = row;
+        rows.push(row);
+      });
+    }
+    appendSource(scalperRes, "tracked", true);
+    appendSource(positionsRes, "positions", false);
+    var total = 0;
+    rows.forEach(function(row){
+      if (!isNum(row.unrealized)) complete = false;
+      else total += row.unrealized;
+    });
+    complete = complete && isNum(total);
+    return {rows: rows, complete: complete, total: complete ? total : null};
   }
 
   // ---------------------------------------------------------------
@@ -1103,13 +1229,14 @@
     }
 
     // bakiye / btc fiyatı
-    var walletBalance = status && status.ok && status.data ? status.data.account.balance : null;
+    var account = status && status.ok && status.data ? status.data.account : null;
+    var walletBalance = account ? account.balance : null;
     var scalperData = scalperStatus && scalperStatus.ok && scalperStatus.data
       ? scalperStatus.data : null;
     var sizingEquity = scalperData && isNum(scalperData.sizing_equity_usdt)
       ? scalperData.sizing_equity_usdt : null;
     var usingVirtual = !!(scalperData && scalperData.virtual_capital_enabled);
-    var balance = usingVirtual && sizingEquity !== null ? sizingEquity : walletBalance;
+    var balance = usingVirtual ? sizingEquity : walletBalance;
     var balanceLabel = qs("stat-balance-label");
     var balanceEl = qs("stat-balance");
     balanceLabel.textContent = usingVirtual ? "Strateji Sermayesi" : "Bakiye";
@@ -1119,28 +1246,27 @@
         (isNum(walletBalance) ? " · TESTNET cüzdanı " + fmtNum(walletBalance, 2) + " USDT" : "")
       : "";
 
-    var btcPrice = status && status.ok && status.data ? status.data.account.btc_price : null;
+    var btcPrice = account ? account.btc_price : null;
     qs("stat-btc").textContent = isNum(btcPrice) ? "$" + fmtNum(btcPrice, 2) : "—";
 
     // toplam gerçekleşmemiş k/z (mevcut pozisyonlardan)
-    var totalUnrealized = null;
-    if (positions && positions.ok && positions.data && Array.isArray(positions.data.positions)){
-      totalUnrealized = positions.data.positions.reduce(function(sum, p){
-        return sum + (isNum(p.unrealized_pnl) ? p.unrealized_pnl : 0);
-      }, 0);
-    }
+    var totalUnrealized = positionSnapshot(positions, scalperStatus).total;
     var unrealEl = qs("stat-unrealized");
     unrealEl.textContent = totalUnrealized === null ? "—" : fmtUsdt(totalUnrealized);
+    unrealEl.title = totalUnrealized === null
+      ? "Toplam ölçülemedi: pozisyon/fiyat verisi eksik, bayat veya çelişkili"
+      : "İzlenen açık pozisyonların brüt K/Z tahmini; ücret/funding ve gerçekleşmiş kısmi çıkışlar hariç";
     unrealEl.className = "stat-value lg mono" + (totalUnrealized === null ? "" : (totalUnrealized > 0 ? " profit" : (totalUnrealized < 0 ? " loss" : "")));
 
     // günlük k/z (scalper)
     var dailyEl = qs("stat-daily");
-    if (scalperStatus && scalperStatus.ok && scalperStatus.data && isNum(scalperStatus.data.daily_pnl)){
+    if (scalperStatus && scalperStatus.ok && scalperStatus.data &&
+        scalperStatus.data.daily_pnl_source !== "unavailable" && isNum(scalperStatus.data.daily_pnl)){
       var dp = scalperStatus.data.daily_pnl;
       dailyEl.textContent = fmtUsdt(dp);
       if (scalperStatus.data.daily_pnl_source){
         dailyEl.title = "Kaynak: " + scalperStatus.data.daily_pnl_source;
-      }
+      } else dailyEl.title = "";
       dailyEl.className = "stat-value lg mono" + (dp > 0 ? " profit" : (dp < 0 ? " loss" : ""));
     } else {
       dailyEl.textContent = "—";
@@ -1230,15 +1356,23 @@
     ));
 
     // 3) Günlük zarar kesici.
-    if (s.kill_switch_active){
+    if (s.kill_switch_active === true){
       bar.appendChild(sysItem(
         "Günlük kesici", "AKTİF · 00:00 UTC'de sıfırlanır", "bad",
         "günlük net K/Z limiti aşıldı; yeni giriş yok"
       ));
+    } else if (s.kill_switch_active !== false){
+      bar.appendChild(sysItem("Günlük kesici", "bilinmiyor", "warn", "Tetiklenme verisi yok"));
     } else if (isNum(s.daily_limit_pct) && s.daily_limit_pct > 0){
-      bar.appendChild(sysItem("Günlük kesici", "kapalı (limit %" + fmtNum(s.daily_limit_pct, 1) + ")", "ok", ""));
-    } else {
+      var riskReady = s.risk_ready === true;
+      bar.appendChild(sysItem("Günlük kesici",
+        (riskReady ? "hazır · tetiklenmedi" : "yapılandırıldı · risk verisi bekleniyor") +
+        " (limit %" + fmtNum(s.daily_limit_pct, 1) + ")", riskReady ? "ok" : "warn",
+        "Kesici yapılandırması açık; tetiklenme durumu ayrı gösterilir"));
+    } else if (isNum(s.daily_limit_pct) && s.daily_limit_pct === 0){
       bar.appendChild(sysItem("Günlük kesici", "devre dışı", "off", ""));
+    } else {
+      bar.appendChild(sysItem("Günlük kesici", "bilinmiyor", "warn", "Limit verisi yok"));
     }
 
     // 4) REST ağırlığı — 418 riski buradan görülür (IP sınırı 2400/dk;
@@ -1788,78 +1922,13 @@
     var wrap = qs("positions-wrap");
     var countEl = qs("positions-count");
 
-    var positions = (positionsRes && positionsRes.ok && positionsRes.data && Array.isArray(positionsRes.data.positions))
-      ? positionsRes.data.positions : null;
-    var tracked = (scalperRes && scalperRes.ok && scalperRes.data && Array.isArray(scalperRes.data.tracked))
-      ? scalperRes.data.tracked : [];
-
-    if (positions === null && tracked.length === 0){
-      countEl.textContent = "";
-      if (positionsRes && !positionsRes.ok && positionsRes.status !== 404 && !positionsRes.networkError){
-        notConnected(wrap, "pozisyon verisi alınamadı");
-      } else {
-        notConnected(wrap);
-      }
-      return;
-    }
-
-    // scalper tracked verisini sembole göre eşle
-    var trackedBySymbol = {};
-    tracked.forEach(function(t){ trackedBySymbol[t.symbol] = t; });
-
-    var rows = [];
-    var seen = {};
-
-    (positions || []).forEach(function(p){
-      seen[p.symbol] = true;
-      var t = trackedBySymbol[p.symbol];
-      rows.push({
-        symbol: p.symbol,
-        strategy: t ? t.strategy : null,
-        direction: p.side,
-        entry: p.entry_price,
-        current: p.current_price,
-        roi: (t && isNum(t.roi_pct)) ? t.roi_pct : p.pnl_percentage,
-        sl: p.current_stoploss,
-        tp1: t ? !!t.tp1_done : false,
-        tp2: t ? !!t.tp2_done : false,
-        trailing: !!(p.is_trailing || (t && t.trailing_active)),
-        be: !!(p.is_break_even || (t && t.breakeven_active)),
-        bePrice: t ? t.breakeven_price : null,
-        beCostPct: t ? t.breakeven_cost_pct : null,
-        feeAwareBe: !!(t && t.fee_aware_breakeven),
-        runnerFloor: t ? t.runner_floor_price : null,
-        openedAt: p.opened_at || (t && t.opened_at)
-      });
-    });
-
-    // scalper'da izlenen ama /positions'ta görünmeyen (senkron dışı) satırlar
-    tracked.forEach(function(t){
-      if (seen[t.symbol]) return;
-      rows.push({
-        symbol: t.symbol,
-        strategy: t.strategy,
-        direction: t.direction,
-        entry: t.entry_price,
-        current: t.current_price,
-        roi: t.roi_pct,
-        sl: t.current_stoploss,
-        tp1: !!t.tp1_done,
-        tp2: !!t.tp2_done,
-        trailing: !!t.trailing_active,
-        be: !!t.breakeven_active,
-        bePrice: t.breakeven_price,
-        beCostPct: t.breakeven_cost_pct,
-        feeAwareBe: !!t.fee_aware_breakeven,
-        runnerFloor: t.runner_floor_price,
-        openedAt: t.opened_at
-      });
-    });
+    var snapshot = positionSnapshot(positionsRes, scalperRes);
+    var rows = snapshot.rows;
 
     countEl.textContent = rows.length ? "(" + rows.length + ")" : "";
 
     if (rows.length === 0){
-      notConnected(wrap, "Açık pozisyon yok — motor tarıyor");
+      notConnected(wrap, snapshot.complete ? "Açık pozisyon yok" : "Pozisyon verisi eksik / bayat — açık pozisyon sayısı bilinmiyor");
       return;
     }
 
@@ -1875,6 +1944,7 @@
         ? ((r.sl - r.entry) / r.entry * 100) : null;
 
       var badges = "";
+      if (r.dataIssue) badges += '<span class="cell-dim" title="Fiyat veya değerleme doğrulanamadı">VERİ BEKLENİYOR</span>';
       if (r.tp1) badges += '<span class="badge badge-tp1">TP1 ✓</span>';
       if (r.tp2) badges += '<span class="badge badge-tp2">TP2 ✓</span>';
       if (r.trailing) badges += '<span class="badge badge-trailing"><span class="dot-pulse"></span>&nbsp;TRAILING</span>';
@@ -1908,6 +1978,9 @@
     });
 
     html += '</tbody></table>';
+    if (!snapshot.complete){
+      html += '<div class="placeholder small">Eksik / bayat değerleme: toplam K/Z bilinmiyor; görünen satırlar tam liste olmayabilir.</div>';
+    }
     wrap.innerHTML = html;
   }
 
@@ -2099,8 +2172,8 @@
 
     // kronolojik sıraya diz (en eskiden en yeniye), kümülatif gerçekleşen k/z hesapla
     var sorted = trades.slice().sort(function(a,b){
-      var ta = a.closed_at ? new Date(a.closed_at).getTime() : 0;
-      var tb = b.closed_at ? new Date(b.closed_at).getTime() : 0;
+      var ta = apiTime(a.closed_at) || 0;
+      var tb = apiTime(b.closed_at) || 0;
       return ta - tb;
     });
 
@@ -2299,8 +2372,9 @@
 
     // --- 2) nasıl çıkıldı (zaman çizgisi) ---
     html += '<div class="fx-block"><h4>Nasıl çıkıldı</h4><ul class="fx-steps">';
-    html += '<li><span>Giriş ' + fmtPrice(e.fill_price || row.entry_price) + '</span>' +
-      '<span class="fx-when">' + fxClock(e.at || row.opened_at) + '</span></li>';
+    html += '<li><span>' + (e.fill_observed_at ? 'Dolum gözlemi ' : 'Giriş kaydı ') +
+      fmtPrice(e.fill_price || row.entry_price) + '</span>' +
+      '<span class="fx-when">' + fxClock(e.fill_observed_at || e.at || row.opened_at) + '</span></li>';
     html += '<li class="' + (path.tp1_done ? "" : "fx-skip") + '"><span>TP1 ' +
       (path.tp1_done ? fmtPrice(path.tp1_price) : "dolmadı") + '</span>' +
       '<span class="fx-when">' + fxClock(path.tp1_at) + '</span></li>';
@@ -2335,6 +2409,12 @@
     html += fxKv("Kayma (aleyhte)", fxNum(e.slippage_pct, 3, "%"),
       isNum(e.slippage_pct) && e.slippage_pct > 0 ? "fx-warn" : "");
     html += fxKv("Sinyal → dolum", fxNum(e.fill_latency_sec, 1, " sn"));
+    if (isNum(e.fill_observed_latency_sec)){
+      html += fxKv("Sinyal → dolum gözlemi", fxNum(e.fill_observed_latency_sec, 1, " sn"));
+    }
+    if (isNum(e.protection_registration_latency_sec)){
+      html += fxKv("Dolum gözlemi → koruma kaydı", fxNum(e.protection_registration_latency_sec, 1, " sn"));
+    }
     html += fxKv("Brüt / net K/Z",
       fmtUsdt(x.gross_pnl) + " / " + fmtUsdt(x.realized_pnl));
     // Ücret ve marj bir K/Z DEĞİLDİR: fmtUsdt'nin "+" işareti burada
@@ -2405,8 +2485,8 @@
 
     // en yeni önce göster
     var sorted = trades.slice().sort(function(a,b){
-      var ta = a.closed_at ? new Date(a.closed_at).getTime() : 0;
-      var tb = b.closed_at ? new Date(b.closed_at).getTime() : 0;
+      var ta = apiTime(a.closed_at) || 0;
+      var tb = apiTime(b.closed_at) || 0;
       return tb - ta;
     }).slice(0, 30);
 
@@ -2583,8 +2663,8 @@
     [scalperRes, statusRes].forEach(function(res){
       var raw = (res && res.ok && res.data) ? res.data.as_of : null;
       if (!raw) return;
-      var t = Date.parse(raw);
-      if (!isNaN(t)) stamps.push(t);
+      var t = apiTime(raw);
+      if (t !== null) stamps.push(t);
     });
     var when = stamps.length ? new Date(Math.min.apply(null, stamps)) : new Date();
     var suffix = stamps.length ? "" : " (istemci saati)";
@@ -2602,6 +2682,10 @@
   }
 
   function tick(){
+    // Aynı anda tek tur: eski yavaş yanıt yeni tabloyu geriye saramaz.
+    // Her istek süreli olduğundan bu kilit en geç timeout sonrası açılır.
+    if (tickInFlight) return tickPromise;
+    tickInFlight = true;
     var endpoints = [
       fetchJSON("/health"),
       fetchJSON("/api/status"),
@@ -2620,7 +2704,7 @@
       endpoints.push(fetchJSON("/scalper/forensics/summary?since=30d"));
     }
 
-    Promise.all(endpoints).then(function(results){
+    tickPromise = Promise.all(endpoints).then(function(results){
       var health = results[0];
       var status = results[1];
       var positions = results[2];
@@ -2654,7 +2738,11 @@
       // beklenmeyen bir hata olsa bile sayfa çökmesin
       console.error("dashboard tick hatası:", err);
       setConnBanner(true);
+    }).finally(function(){
+      tickInFlight = false;
+      tickPromise = null;
     });
+    return tickPromise;
   }
 
   function scheduleTick(){

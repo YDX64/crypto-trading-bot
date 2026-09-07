@@ -3369,6 +3369,29 @@ açık/bekleyen işlemlerin toplam stop riskini önceden ayırmaz.
 Aktivasyon, yedek, ham kanıt yolları ve yalnız marj anahtarını geri alma
 reçetesi: [D35 denetimi](audits/2026-09-07-margin-profile.md).
 
+### D36 — Açık zarar ve zaman ölçümünü onarma · 2026-09-07
+
+**Neden:** beş scalper pozisyonu varken üst unrealized toplamı boş legacy
+listeden `0` gösteriyordu. Kısmi TP sonrası ilk miktar/last-price, UTC-naive
+browser yaşları, dolum/koruma gecikmesi ve AI shadow zaman doğrulaması da
+ölçüm kusurlarıydı. Takılı HTTP/eski refresh paneli dondurabiliyordu.
+
+**Onarım:** tek ortak pano modeli; mevcut signed positionRisk'ten 80 sn ömürlü,
+nesne/sembol/yön/girişe bağlı mark/kalan miktar/KZ. Bilinmeyen sıfır değil
+null/`—`. API UTC projeksiyonu; doğrulanmamış fill süresi null, yerel gözlem/
+koruma-kayıt ayrı. AI TTL/ufuk tamamlanma anında doğrulanır; shadow/fail-open.
+Eski DB/etiketler, emir sırası, REAPER, sizing/stop/TP ve %10 marj değişmez.
+
+**Ekonomi/sınır:** üç D35 kapanışı +11.06552638 net; 21:17 UTC beş açık
+işlem −9.33869465 brüt. BTC −13.79864599 net signed fill/fee/funding ile tam
+eşit: gösterim kusuru bu kaybın sebebi değildir. Beş SHORT'un SL'e toplam
+brüt riski161.28114 (~%17.58 kasa), günlük %1 kesicinin önceden sınırladığı
+risk değildir. Küçük örneklem/ölçüm düzeltmesi kârlılık/MAINNET kanıtı değildir.
+
+Üç mercek + çürütme, test/yayın, kalan execution borcu ve geri alma:
+[D36 denetimi](audits/2026-09-07-d36.md). Önceki kod `bb06abcd4e55fcd37b660ff81f8af9a1184521ed`;
+env/defter sıfırlanmaz.
+
 ## Metodoloji kararları
 
 ### P1 — Harness = canlı motor (parite) · 2026-08-21
