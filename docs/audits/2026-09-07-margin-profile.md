@@ -139,6 +139,9 @@ scripts/restart_safe.sh testnet`, including ban/halt/config/health checks.
   SOL remained quantity 0.86, with no pending entries or entry blocks. Scan
   advanced to 06:33:56 UTC; all reported protection-error counts were zero.
   No natural post-change entry has yet established actual larger exchange fills.
+- Direct read-only Binance verification at 06:34:40 UTC confirmed the same
+  SOL quantity, entry, and all three native algo IDs/amounts/triggers above;
+  each protection remained NEW/reduce-only. No normal order was open for SOL.
 
 Rollback only the margin key to 0.5, preserve any later unrelated env changes,
 validate TESTNET, then use `RESTART_LABEL=d35-margin-rollback
