@@ -336,7 +336,7 @@ olduğu için otomatik olarak ayrı olur — testnet'in `logs/`'ıyla KARIŞMAZ.
 ### Pano erişimi (nginx monitor proxy) — yeni uç eklerken DİKKAT
 Kullanıcı panoyu `https://<sunucu-ip>:9443/dashboard` üzerinden görür
 (nginx `sites-available/tradingbot-monitor-ip`, HTTP Basic auth
-`/etc/nginx/.htpasswd-tradingbot-ip`, kullanıcı `efe`). Bot yalnız
+`/etc/nginx/.htpasswd-tradingbot-ip`, sahibi `efe`, ayrı izleyici `misafir`). Bot yalnız
 `127.0.0.1:9091`'e bağlıdır — proxy dışında dışarı AÇIK DEĞİLDİR.
 
 **Beyaz liste kuralı:** proxy YALNIZ sayılan salt-okuma GET uçlarını geçirir;
@@ -366,6 +366,41 @@ ya da `scripts/ledger_report.py --counterfactual`.
 Değişiklikten sonra: `nginx -t` → `systemctl reload nginx` → kimliksiz `curl -k`
 ile 401 (izinli uç) ve 404 (kontrol ucu) doğrulaması. Yedek:
 `sites-available/tradingbot-monitor-ip.bak-<tarih>`.
+
+#### Misafir hesabı (D38)
+
+Arkadaş için ana `efe` parolasını paylaşma. Ayrı `misafir` Basic Auth hesabı
+aynı panoyu **yalnız izler**; bakiye, tam işlem geçmişi, strateji parametreleri
+ve teşhisler görünür. Pano herkese açık değildir. Kontrol/emir yolları, POST
+ve `scalper/counterfactual` izinli listeye **eklenmez**. GET/HEAD Nginx'te
+salt-okuma sınırıdır; uygulamada HEAD handler olmadığı için 405 dönmesi normal.
+Gömülü takipçi kapalıyken `/follower/status` 404 de normaldir.
+
+Kod standart deploy ile sunucuda bulunduktan sonra, **yerel kanonik klonda**:
+
+```bash
+.venv/bin/python scripts/dashboard_guest.py add --output /Users/max/.codex/guest-access/tradingbot-monitor.env
+.venv/bin/python scripts/dashboard_guest.py revoke
+```
+
+İkinci komut yalnız erişimi iptal etmek içindir; eklemeden sonra otomatik
+çalıştırılmaz. Araç yalnız `awa` ve sabit monitor auth dosyasını hedefler.
+Yeni `.env` `600`, klasörü `700`; parola yalnız dosyaya/stdin'e gider, komut
+satırına/loga/Git'e yazılmaz. Sahip hesabı baytları korunur. Sunucudaki özel
+auth yedekleri `/root/tradingbot-dashboard-auth-backups` altındadır.
+Var olan misafir hesabını veya yerel dosyayı ezmez. SSH sonucu belirsizse
+yeniden eklemeye çalışma: önce kullanıcı adını ve kaydedilmiş parolayla HTTPS
+erişimini doğrula. İptal/parola yenileme açık kullanıcı talebiyle yapılır.
+Auth dosyası değişikliği Nginx veya bot restart'ı gerektirmez.
+
+Arkadaş `https://157.180.97.188:9443/dashboard` bağlantısını açıp tarayıcının
+giriş penceresine `misafir` ve özel `.env` içindeki parolayı yazar. Başka
+hesap önbelleklenmişse gizli pencere kullan. Parolayı URL'ye ekleme.
+İptal sonraki istekleri engeller, daha önce indirilmiş veriyi silemez.
+
+Paylaşmadan önce D38 JSON redaksiyonu canlıda olmalı: ham SDK hataları
+kimlik bilgisi içerebilir. Yayın kanıtı ve geri alma:
+[`audits/2026-09-09-d38-guest-access.md`](audits/2026-09-09-d38-guest-access.md).
 
 ### Gömülü takipçiyi açma (D20b — **TERCİH EDİLEN** kurulum)
 Kullanıcı kararı (2026-08-23): *"Yeni hesap yok, yeni panel yok."* AlgoPro takipçisi

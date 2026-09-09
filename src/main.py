@@ -32,6 +32,7 @@ from src.core.logger import app_logger
 from src.core.database import init_db, close_db, get_db
 from src.core.account_lock import TradingAccountLock
 from src.core.time_utils import utc_isoformat
+from src.core.monitor_redaction import redact_monitor_payload
 from src.models.waiting_signal import WaitingSignalModel, WaitingStatus
 from src.models.scalp_trade import ScalpTradeModel
 from src.services.telegram_bot import TelegramBotService
@@ -530,6 +531,18 @@ async def lifespan(app: FastAPI):
         app_logger.info("✅ Uygulama kapatıldı")
 
 
+class MonitorJSONResponse(JSONResponse):
+    """Public monitor output only; never mutate cached/engine diagnostics.
+
+    SDK errors may embed credentials (e.g. Telegram InvalidToken). Keep the
+    diagnostic message and response contract, but redact at serialization.
+    Nginx still owns authentication and its read-only route/method allowlist.
+    """
+
+    def render(self, content: Any) -> bytes:
+        return super().render(redact_monitor_payload(content, settings))
+
+
 app = FastAPI(
     title="VIP Trading Bot API",
     description="Otonom Kripto Trading Bot - Telegram Sinyalleri + AI Analiz + Trailing SL/TP",
@@ -596,7 +609,7 @@ def _tracked_position_counts() -> Dict[str, int]:
     }
 
 
-@app.get("/health")
+@app.get("/health", response_class=MonitorJSONResponse)
 async def health_check():
     """Sağlık kontrolü — gerçek durumu yansıtır."""
     position_counts = _tracked_position_counts()
@@ -610,7 +623,7 @@ async def health_check():
             else {"healthy": False, "running": False, "reason": "engine_not_created"}
         )
         core_healthy = bool(follower_health.get("healthy"))
-        return JSONResponse(
+        return MonitorJSONResponse(
             status_code=200 if core_healthy else 503,
             content={
                 "status": "healthy" if core_healthy else "degraded",
@@ -716,7 +729,7 @@ async def health_check():
     # Telegram has its own retry supervisor.  Its outage is reported as
     # degraded but does not provoke a process restart while the trading core
     # and protection loops remain healthy.
-    return JSONResponse(status_code=200 if core_healthy else 503, content=body)
+    return MonitorJSONResponse(status_code=200 if core_healthy else 503, content=body)
 
 
 # --- Pano besleme önbellekleri (D22) ---------------------------------------
@@ -785,7 +798,7 @@ def _store_status(
     return payload
 
 
-@app.get("/api/status")
+@app.get("/api/status", response_class=MonitorJSONResponse)
 async def api_status(request: Request = None):
     """Sistem durumu — Binance hataları gizlenmez.
 
@@ -939,7 +952,7 @@ async def api_status(request: Request = None):
     return _store_status(_api_status_cache, cache_key, payload)
 
 
-@app.get("/positions")
+@app.get("/positions", response_class=MonitorJSONResponse)
 async def get_positions():
     """Bot tarafından izlenen açık pozisyonlar"""
     if not orchestrator:
@@ -981,7 +994,7 @@ async def get_stats():
     }
 
 
-@app.get("/config")
+@app.get("/config", response_class=MonitorJSONResponse)
 async def get_config():
     """Konfigürasyon (gizli değer içermez)"""
     return {
@@ -2673,7 +2686,7 @@ async def follower_event(request: Request):
     }
 
 
-@app.get("/follower/status")
+@app.get("/follower/status", response_class=MonitorJSONResponse)
 async def follower_status():
     """Takipçi motorunun anlık durumu (pozisyonlar, boyutlama, son olaylar).
 
@@ -2755,7 +2768,7 @@ async def manual_signal(
 # Bekleme modu
 # ---------------------------------------------------------------------------
 
-@app.get("/waiting-mode/active")
+@app.get("/waiting-mode/active", response_class=MonitorJSONResponse)
 async def get_active_waiting_signals(db: AsyncSession = Depends(get_db)):
     """Aktif bekleyen sinyaller"""
     result = await db.execute(
@@ -2982,7 +2995,7 @@ _EMPTY_SCALPER_STATUS = {
 }
 
 
-@app.get("/scalper/status")
+@app.get("/scalper/status", response_class=MonitorJSONResponse)
 async def scalper_status(request: Request = None):
     """Scalper motorunun anlık durumu (tarama evreni, rejimler, izlenen pozisyonlar).
 
@@ -3033,7 +3046,7 @@ async def scalper_status(request: Request = None):
     )
 
 
-@app.get("/scalper/stats")
+@app.get("/scalper/stats", response_class=MonitorJSONResponse)
 async def scalper_stats(
     db: AsyncSession = Depends(get_db), strategy: Optional[str] = None
 ):
@@ -3133,7 +3146,7 @@ async def scalper_stats(
     }
 
 
-@app.get("/scalper/trades")
+@app.get("/scalper/trades", response_class=MonitorJSONResponse)
 async def scalper_trades(
     limit: int = 50, include_shadow: bool = False, db: AsyncSession = Depends(get_db)
 ):
@@ -3238,7 +3251,7 @@ def _parse_since(
     return parsed
 
 
-@app.get("/scalper/trades/{trade_id}/forensics")
+@app.get("/scalper/trades/{trade_id}/forensics", response_class=MonitorJSONResponse)
 async def scalper_trade_forensics(trade_id: int):
     """Tek bir işlemin adli kaydı (D21): neden girildi / nasıl çıkıldı.
 
@@ -3251,13 +3264,13 @@ async def scalper_trade_forensics(trade_id: int):
     return row
 
 
-@app.get("/scalper/forensics/recent")
+@app.get("/scalper/forensics/recent", response_class=MonitorJSONResponse)
 async def scalper_forensics_recent(limit: int = 50):
     """Son kapanmış işlemlerin adli kaydı (en yeni önce)."""
     return await ScalpTracker().recent_forensics(limit)
 
 
-@app.get("/scalper/forensics/summary")
+@app.get("/scalper/forensics/summary", response_class=MonitorJSONResponse)
 async def scalper_forensics_summary(
     since: Optional[str] = None,
     until: Optional[str] = None,
