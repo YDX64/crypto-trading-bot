@@ -1328,7 +1328,7 @@
       // D22: bayatlığın NEDENİ ayırt edilir — tarama duruyor mu, veri mi gelmiyor.
       var blocked = s.entries_blocked_by;
       if (gate.stale_reason === "entries_blocked"){
-        gateText = "bayat (tarama durdu)";
+        gateText = "girişler kapalı · veri yenilenmiyor";
         gateTitle = "yeni girişleri durduran: " + (BLOCK_LABELS[blocked] || blocked || "?");
       } else {
         gateText = "bayat (lider verisi yok)";
@@ -1535,7 +1535,7 @@
       var s = strategies[k];
       if (s && isNum(s.total_pnl) && s.trades > 0 && s.total_pnl > bestPnl){
         bestPnl = s.total_pnl;
-        leaderKey = allVerified ? k : null;
+        leaderKey = allVerified && s.total_pnl > 0 ? k : null;
       }
     });
 

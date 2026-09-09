@@ -15,6 +15,8 @@ engellemeye devam eder. Geçersiz income/başarısız kasa çözümü bilinmez v
 fail-closed sayılır; son iyi sayı taze veri olarak sunulmaz. Pano ana kartları
 `/scalper/stats.performance_scope` ile boyutlamadaki aynı #278 sermaye kohortunu
 gösterir; eski `combined/strategies` API kapsamları korunur.
+Yayın sonrası browser kontrolü: net negatif stratejiye lider rozeti verilmez;
+kasıtlı entry block, çökmüş tarama gibi etiketlenmez (yalnız sunum düzeltmesi).
 
 Maker journal doğrulanmış kümülatif dolumu eski poll/WS/iptal yanıtıyla küçültemez;
 miktar ve ortalama fiyat aynı dolum kanıtından gelmelidir. Bir batch'in sonraki
