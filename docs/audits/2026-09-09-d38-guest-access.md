@@ -44,8 +44,46 @@ Sadece hesap işlemi için uygulama/Nginx restart'ı gerekmez.
 - Ön kontrol: PID `2717762`, `/health` HTTP 200, `status=healthy`,
   `core_healthy=true`, `network=testnet`; `entry_halted=false`,
   `tracked=0`, `pending=0`, `kill_switch_active=true`.
-- Düzeltme testleri, yayın ve gerçek misafir erişim kanıtı uygulama sonrası
-  aşağıya eklenir. Bu bölüm tek başına hesabın açıldığını kanıtlamaz.
+- Düzeltme testleri, yayın ve gerçek misafir erişim kanıtı aşağıdadır.
+
+## Yayın ve public erişim kanıtı (2026-09-09 21:08–21:13 UTC)
+
+- Kod: `34306bb80e1666ac057dae467eb637e58e484b80`, `main` → GitHub →
+  `scripts/deploy.sh awa`. Sunucunun tam testi **3225 passed, 2 skipped**,
+  72.93 sn. Log `/opt/tradingbot-v2/logs/deploy-tests-20260909-210817.log`;
+  deploy akışı `/opt/tradingbot-v2/logs/deploy.log`.
+- Standart korumalı restart sonrası PID **354720**, health 30 sn sonra
+  doğrulandı. `supervisorctl` RUNNING ve `ps` elapsed ayrı kontrol edildi.
+  Yeni süreç `network=testnet`, `status=healthy`, `core_healthy=true`,
+  `entry_halted=false`, `tracked=0`, `kill_switch_active=true` döndürdü.
+  Günlük fren veya işlem/risk kuralları gevşetilmedi.
+- İşlem `.env` ve Nginx vhost dosyalarının önce/sonra SHA-256 karşılaştırması
+  **aynı**. Nginx reload/restart yapılmadı. Auth dosyasında tam bir misafir
+  kaydı var; misafir satırı çıkarılınca kalan baytlar eski yedekle **birebir aynı**.
+  `efe` parolası dahil diğer kayıtlar korunmuştur. Auth `640 root:www-data`.
+- Auth yedeği:
+  `/root/tradingbot-dashboard-auth-backups/htpasswd-20260909T211022150197Z-48d82e9a.bak`.
+  Yerel teslim dosyası `/Users/max/.codex/guest-access/tradingbot-monitor.env`
+  (`600 max:staff`), klasör `700`. İçeriği loga/rapora/Git'e yazılmadı.
+- Public HTTPS sertifika doğrulaması açık, `-k` yok: **28 HTTP kontrolü geçti**.
+  Kimliksiz dashboard401, yanlış misafir parolası401, 11 izleme GET'i200,
+  follower kapalı404, HEAD405; dört izleme POST'u403, signalPOST403,
+  dört diğer kontrolPOST'u404, `.env`/docs/OpenAPI/counterfactual404.
+  İstemci `limit=999999` istese de trades yanıtı **30** kayıtla sınırlı.
+  Yerel ham durum-kodu kanıtı (parola/body yok):
+  `/Users/max/TRADINGBOT/v2/output/playwright/guest-access-http-proof.json`.
+- Ayrı, geçici Playwright tarayıcısı gerçek public IP'ye **misafir** kimliğiyle
+  girdi. Parola CLI argümanına/URL'ye konmadı; auth sadece bu HTTPS origin'ine
+  gönderildi. Pano TESTNET/bakiye/işlem geçmişini yükledi; `pageErrors=[]`.
+  Güncelleme saati `23:11:22→23:12:24` ilerledi. Bir ETH geçmiş işlem satırı
+  açıldı, forensics paneli görsel olarak doğrulandı; ayrıca
+  `/scalper/trades/343/forensics` public misafir GET'i200.
+  Ekranlar yerel `output/playwright/guest-monitor-top.png` ve
+  `output/playwright/guest-monitor.png` (açık forensics). Geçici doğrulama
+  tarayıcısı kapatılır; kullanıcıya özel gerçek tarayıcı oturumları değiştirilmez.
+
+Bu kanıt salt-okunur misafir erişimine aittir; kârlılık veya MAINNET kanıtı
+değildir. Mevcut sahibin parolasını okumadan, bayt-koruma kontrolüyle doğrulandı.
 
 ## Kabul kontrolleri ve geri alma
 

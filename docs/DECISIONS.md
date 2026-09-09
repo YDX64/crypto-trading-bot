@@ -10,7 +10,7 @@ Pencereler: AYI 2026-01-23→02-13 (BTC −30%) · YATAY 2026-07-01→07-21 · B
 ### D38 — Ayrı, salt-okunur misafir pano hesabı · 2026-09-09
 
 **Talep:** kullanıcı, arkadaşının mevcut IP panosunu izlemesini istedi.
-Nginx Basic Auth dosyasına ayrı `misafir` hesabı eklenir; `efe` hesabı ve
+Nginx Basic Auth dosyasına ayrı `misafir` hesabı eklendi; `efe` hesabı ve
 parolası korunur. Pano herkese açılmaz. Misafir aynı bakiye, işlem geçmişi,
 pozisyon, strateji ayarı ve teşhis görünümünü görür; emir/ayar yetkisi yoktur.
 Mevcut GET/HEAD beyaz listesi genişletilmez; kontrol yolları ve POST engellenir.
@@ -27,6 +27,8 @@ misafir hesabı sessizce ezilmez. Hesap ekleme/iptal için bot veya Nginx
 restart'ı gerekmez; JSON maskeleme kodu standart TESTNET deploy hattından geçer.
 
 **Kanıt/geri alma:** [D38 erişim denetimi](audits/2026-09-09-d38-guest-access.md).
+Sunucuda 3225 test geçti; 28 public HTTPS kontrolü ve gerçek misafir tarayıcı
+girişi doğrulandı. İşlem `.env` ve vhost değişmedi, sahibin auth kaydı korundu.
 Geri alırken önce misafir hesabını iptal et; sonra gerekirse önceki kod
 `0d73142e05e2f7f06a9356b244dad5a90f01ff2d` standart deploy ile geri alınır.
 Hassas hata metni düzeltmesini geri alırken misafir erişimini açık bırakma.
