@@ -29,6 +29,8 @@ restart'ı gerekmez; JSON maskeleme kodu standart TESTNET deploy hattından geç
 **Kanıt/geri alma:** [D38 erişim denetimi](audits/2026-09-09-d38-guest-access.md).
 Sunucuda 3225 test geçti; 28 public HTTPS kontrolü ve gerçek misafir tarayıcı
 girişi doğrulandı. İşlem `.env` ve vhost değişmedi, sahibin auth kaydı korundu.
+Özel hesap/işlem görüntüsü içeren yerel `output/playwright/` kanıtları Git
+dışında tutulur; böylece doğrulama çıktıları temiz-ağaç deploy kapısını kilitlemez.
 Geri alırken önce misafir hesabını iptal et; sonra gerekirse önceki kod
 `0d73142e05e2f7f06a9356b244dad5a90f01ff2d` standart deploy ile geri alınır.
 Hassas hata metni düzeltmesini geri alırken misafir erişimini açık bırakma.

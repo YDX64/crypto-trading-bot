@@ -59,6 +59,8 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+# Local browser verification can contain private account/trade data.
+output/playwright/
 
 # Jupyter
 .ipynb_checkpoints
