@@ -904,10 +904,79 @@ class PositionManager:
     # ------------------------------------------------------------------
 
     async def resolve_fill(
+        self, symbol: str, entry_order: Dict[str, Any], *, strict_order_evidence: bool = False
+    ) -> tuple[float, float]:
+        """Resolve a fill; maker recovery can require coherent order evidence.
+
+        The default generic resolver is unchanged. Strict mode never joins
+        an average from one cumulative quantity to a different quantity, and
+        never substitutes account-level position data for the specific order.
+        """
+        if strict_order_evidence:
+            return await self._resolve_order_fill_strict(symbol, entry_order)
+        return await self._resolve_fill(symbol, entry_order)
+
+    async def _resolve_order_fill_strict(
         self, symbol: str, entry_order: Dict[str, Any]
     ) -> tuple[float, float]:
-        """_resolve_fill'in public sarmalayıcısı: emrin GERÇEK dolum fiyatı/miktarını döner."""
-        return await self._resolve_fill(symbol, entry_order)
+        from math import isfinite
+
+        def number(raw):
+            if isinstance(raw, bool):
+                return None
+            try:
+                value = float(raw)
+                return value if isfinite(value) and value >= 0 else None
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+        order_id = entry_order.get("orderId")
+        if isinstance(order_id, bool) or order_id is None:
+            raise ValueError("Strict fill resolution requires an order identity")
+        try:
+            order_id = int(order_id)
+            if order_id <= 0:
+                raise ValueError("non-positive identity")
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("Strict fill order identity is invalid") from error
+        client_id = entry_order.get("clientOrderId")
+        minimum_qty = number(entry_order.get("executedQty"))
+        if minimum_qty is None:
+            raise ValueError("Strict fill cumulative quantity is invalid")
+
+        def pair(response):
+            nonlocal minimum_qty
+            if (not isinstance(response, dict)
+                    or str(response.get("orderId")) != str(order_id)
+                    or response.get("symbol", symbol) != symbol
+                    or (client_id and response.get("clientOrderId")
+                        and response["clientOrderId"] != client_id)):
+                raise ValueError("Strict fill response identity mismatch")
+            quantity = number(response.get("executedQty"))
+            price = number(response.get("avgPrice"))
+            if quantity is None or quantity <= 0 or quantity < minimum_qty:
+                return None
+            minimum_qty = quantity
+            if price is None or price <= 0:
+                return None
+            return price, quantity
+
+        result = pair(entry_order)
+        if result is not None:
+            return result
+        for delay in (0.3, 0.7, 1.5):
+            await asyncio.sleep(delay)
+            try:
+                fresh = await self.binance.get_order(symbol, order_id)
+            except Exception as error:
+                self.logger.warning(f"Strict maker fill query failed ({symbol}): {type(error).__name__}")
+                break
+            result = pair(fresh)
+            if result is not None:
+                return result
+        raise BinanceAPIError(
+            503, None, f"{symbol}: coherent cumulative maker fill could not be verified"
+        )
 
     async def place_stop_loss_or_close(
         self,

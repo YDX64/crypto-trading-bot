@@ -222,6 +222,22 @@ Yeni forensics gerçek fill zamanı yokken `fill_latency_sec=null`, yerel
 `fill_observed_latency_sec` ve `protection_registration_latency_sec` ayrıdır.
 AI eski/naive ufukları kabul etmez ama hâlâ shadow'dur. [D36](audits/2026-09-07-d36.md).
 
+**D37 kasa ve maker recovery (9 Eyl).** Günlük kesici girişleri durdurur,
+kapanan işlemlerden sonra kasa güncellemesini durdurmaz. `risk_ready=false` ve
+`sizing.mode=virtual_capital_error` halinde eski kasa yerine bilinmez gösterilir.
+Ana skor kartları `performance_scope` içindeki boyutlama kohortudur; tüm geçmiş
+ayrıca etiketlenir. #278 kohortu güncel yazılım sürümüyle aynı dönem değildir.
+Sağlıklı süreç kârlı strateji anlamına gelmez.
+
+`state/scalper_entry_halt.json` içindeki `category=pending_recovery`, opsiyonel
+koruma-hatası bayrağı kapalı olsa bile restart'ta yüklenir. Bilinen kısmi dolumun
+iptali belirsizken journal korunur ve yeniden uzlaştırma denenir; diğer açık
+pozisyonların safety işi sürer. Hata sınıfı veya dosyayı silerek bypass ETME.
+Önce aynı clientOrderId/orderId için terminal durum, borsa pozisyonu, native
+koruma, DB ve journal sahipliği uzlaştırılmalı; kilit manuel inceleme gerektirir.
+Kesinti sırasında hâlâ çalışan LIMIT'in kısmi dolumuna anında koruma garantisi
+yoktur. [D37 risk ve doğrulama sınırları](audits/2026-09-09-d37.md).
+
 > **Container yolu (EK dağıtım).** Botu tek bir görüntüde başka sunucuya taşımak için
 > `scripts/docker_run.sh` + "Container ile çalıştırma / başka sunucuya taşıma" bölümüne
 > bakın. ⛔ supervisord ile container **AYNI ANDA ÇALIŞTIRILAMAZ** (aynı Binance hesabı,

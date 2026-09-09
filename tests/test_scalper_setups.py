@@ -676,7 +676,7 @@ class _FakePm:
         self.filled_qty = filled_qty
         self.calls: list[str] = []
 
-    async def resolve_fill(self, symbol, entry_order):
+    async def resolve_fill(self, symbol, entry_order, *, strict_order_evidence=False):
         self.calls.append("resolve_fill")
         return self.entry_price, self.filled_qty
 
@@ -1010,7 +1010,8 @@ class TestExecutorMakerEntry:
         )
         client.client_order_query_responses = [{
             "orderId": 777,
-            "clientOrderId": "server-copy",
+            # Omitted is supported; a different returned identity is NOT a
+            # valid reconciliation of the submitted client order id (D37).
             "status": "NEW",
             "executedQty": "0",
         }]
@@ -1243,9 +1244,9 @@ class TestExecutorPartialFillSafety:
         }]
         client.cancel_error = TimeoutError("cancel response unknown")
 
-        opened = await executor.check_pending()
+        with pytest.raises(PendingRecoveryError, match="known maker fill"):
+            await executor.check_pending()
 
-        assert opened == []
         assert executor.pending_symbols() == {"TESTUSDT"}
         assert client.cancel_calls == [555]
         assert pm.calls == []

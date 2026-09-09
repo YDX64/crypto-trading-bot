@@ -1208,7 +1208,10 @@
       var h = health.data;
       if (h.status === "healthy"){
         dot.className = "health-dot ok";
-        text.textContent = "sağlıklı";
+        var paused = scalperStatus && scalperStatus.ok && scalperStatus.data &&
+          (scalperStatus.data.kill_switch_active || scalperStatus.data.entry_halted);
+        text.textContent = paused ? "çalışıyor · yeni girişler durduruldu" : "sağlıklı";
+        text.title = "Teknik çalışma durumu; kârlılık göstergesi değildir";
       } else {
         dot.className = "health-dot warn";
         var reasons = [];
@@ -1491,23 +1494,40 @@
       return;
     }
 
-    qs("strat-updated").textContent = "";
+    var scope = stats.data.performance_scope;
+    var scoped = scope && scope.enabled === true;
+    if (scoped && (scope.kind !== "virtual_capital_cohort" || !scope.combined ||
+        !scope.strategies || !isNum(scope.start_trade_id) || !isNum(scope.base_capital_usdt) ||
+        !isNum(scope.eligible_realized_pnl))){
+      // An unavailable capital cohort is not permission to substitute a
+      // profitable-looking, unrelated all-history result.
+      renderStrategyCards(null);
+      qs("strat-updated").textContent = "Sermaye dönemi verisi ölçülemedi";
+      return;
+    }
+    qs("strat-updated").textContent = scoped
+      ? "Sermaye dönemi #" + scope.start_trade_id + " · başlangıç " + fmtNum(scope.base_capital_usdt, 2) + " USDT"
+      : "Tüm geçmiş · mevcut sermaye dönemi değildir";
 
-    var strategies = stats.data.strategies || {};
-    var combined = stats.data.combined || null;
+    var strategies = scoped ? scope.strategies : (stats.data.strategies || {});
+    var combined = scoped ? scope.combined : (stats.data.combined || null);
     var allVerified = combined && combined.trades > 0 && combined.pnl_basis === "binance_income_net";
-
+    var notes = [];
+    if (scoped){
+      notes.push("Kartlar sermaye hesabına alınan kapanmış işlemleri gösterir; açık K/Z hariçtir. " +
+        "Hariç: " + (scope.excluded_positive_fallback || 0) + " net doğrulanmamış artı/sıfır işlem, " +
+        (scope.excluded_legacy || 0) + " eski kaynaklı işlem. " +
+        "Tüm geçmiş K/Z (ayrı dönem): " + fmtUsdt(stats.data.combined && stats.data.combined.total_pnl) + ".");
+    }
     if (combined && combined.trades > 0 && !allVerified){
-      quality.textContent = "Veri kalitesi uyarısı: tarihsel K/Z net performans kanıtı değildir. " +
+      notes.push("Veri kalitesi uyarısı: bu toplamın tamamı doğrulanmış net performans kanıtı değildir. " +
         (combined.verified_trades || 0) + " işlem Binance net, " +
         (combined.fallback_trades || 0) + " işlem tahmini brüt, " +
         (combined.legacy_trades || 0) + " işlem legacy kaynaktır. " +
-        "Üst bardaki Günlük K/Z, Binance hesap income toplamıdır.";
-      quality.className = "pnl-quality show";
-    } else {
-      quality.textContent = "";
-      quality.className = "pnl-quality";
+        "Üst bardaki Günlük K/Z, Binance hesap income toplamıdır.");
     }
+    quality.textContent = notes.join(" ");
+    quality.className = notes.length ? "pnl-quality show" : "pnl-quality";
 
     var leaderKey = null;
     var bestPnl = -Infinity;
@@ -1524,7 +1544,7 @@
     });
     // D20b: gömülü AlgoPro takipçisinin defteri (AP) TOPLAM'a girmez ama
     // kendi kartında görünür — winrate/PF panoda başka hiçbir yerde yok.
-    var apStats = stats.data.AP || null;
+    var apStats = scoped ? null : (stats.data.AP || null);
     if (apStats && isNum(apStats.trades) && apStats.trades > 0){
       container.appendChild(strategyCardHtml("AP", apStats, false));
     }

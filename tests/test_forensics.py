@@ -1106,7 +1106,7 @@ class _FakeClient:
 
 
 class _FakePm:
-    async def resolve_fill(self, symbol, entry_order):
+    async def resolve_fill(self, symbol, entry_order, *, strict_order_evidence=False):
         return 100.0, 1.0
 
     async def place_stop_loss_or_close(self, symbol, sl_side, stop_price, **kw):

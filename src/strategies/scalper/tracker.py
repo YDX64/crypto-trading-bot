@@ -396,11 +396,11 @@ class ScalpTracker:
         for row in rows:
             pnl = float(row.realized_pnl or 0.0)
             source = self._pnl_source(row.notes)
-            if source == "verified":
+            if self._is_compounding_eligible(pnl, source):
                 eligible_pnl += pnl
+            if source == "verified":
                 verified_count += 1
             elif source == "fallback" and pnl < 0:
-                eligible_pnl += pnl
                 negative_fallback_count += 1
             elif source == "fallback":
                 excluded_positive_fallback += 1
@@ -474,6 +474,89 @@ class ScalpTracker:
             return 0.0
         return await self.realized_pnl_since(since, strategies=(wanted,))
 
+    @staticmethod
+    def _is_compounding_eligible(pnl: float, source: str) -> bool:
+        """One eligibility rule for position sizing and the capital scoreboard."""
+        return source == "verified" or (source == "fallback" and pnl < 0)
+
+    @classmethod
+    def _stats_for_rows(cls, rows) -> Dict[str, Any]:
+        rows = list(rows)
+        n = len(rows)
+        wins = [r for r in rows if (r.realized_pnl or 0.0) > 0]
+        losses = [r for r in rows if (r.realized_pnl or 0.0) < 0]
+        gross_profit = sum(r.realized_pnl or 0.0 for r in wins)
+        gross_loss = abs(sum(r.realized_pnl or 0.0 for r in losses))
+        source_counts = {"verified": 0, "fallback": 0, "legacy": 0}
+        for row in rows:
+            source_counts[cls._pnl_source(row.notes)] += 1
+        return {
+            "trades": n,
+            "wins": len(wins),
+            "winrate": (len(wins) / n * 100.0) if n else 0.0,
+            "total_pnl": sum(r.realized_pnl or 0.0 for r in rows),
+            "avg_roi": (sum(r.roi_pct or 0.0 for r in rows) / n) if n else 0.0,
+            "profit_factor": (
+                gross_profit / gross_loss if gross_loss > 0
+                else float("inf") if gross_profit > 0 else 0.0
+            ),
+            "verified_trades": source_counts["verified"],
+            "fallback_trades": source_counts["fallback"],
+            "legacy_trades": source_counts["legacy"],
+            "pnl_basis": cls._pnl_basis(
+                source_counts["verified"], source_counts["fallback"], source_counts["legacy"],
+            ),
+        }
+
+    @classmethod
+    def performance_scope(cls, rows, *, start_trade_id: int, base_capital_usdt: float):
+        """Summarize already scoped CLOSED/non-AP rows using sizing eligibility.
+
+        A conservative negative fallback is retained, not relabeled verified.
+        This observes the capital cohort and never rewrites the ledger.
+        """
+        from math import isfinite
+
+        eligible = []
+        counts = {"verified_count": 0, "negative_fallback_count": 0,
+                  "excluded_positive_fallback": 0, "excluded_legacy": 0}
+        for row in rows:
+            pnl = float(row.realized_pnl or 0.0)
+            source = cls._pnl_source(row.notes)
+            if cls._is_compounding_eligible(pnl, source):
+                eligible.append(row)
+            if source == "verified":
+                counts["verified_count"] += 1
+            elif source == "fallback" and pnl < 0:
+                counts["negative_fallback_count"] += 1
+            elif source == "fallback":
+                counts["excluded_positive_fallback"] += 1
+            else:
+                counts["excluded_legacy"] += 1
+
+        by_strategy = {}
+        for row in eligible:
+            by_strategy.setdefault(row.strategy, []).append(row)
+        strategies = {key: cls._stats_for_rows(group) for key, group in by_strategy.items()}
+        combined = cls._stats_for_rows(eligible)
+        combined["scope"] = "!AP"
+        for summary in [combined, *strategies.values()]:
+            for field in ("profit_factor", "total_pnl", "avg_roi"):
+                if not isfinite(summary[field]):
+                    summary[field] = None
+        pnl = combined["total_pnl"]
+        return {
+            "enabled": True,
+            "kind": "virtual_capital_cohort",
+            "start_trade_id": start_trade_id,
+            "base_capital_usdt": base_capital_usdt,
+            "eligible_realized_pnl": pnl,
+            "capital_usdt": max(0.0, base_capital_usdt + pnl) if pnl is not None else None,
+            "combined": combined,
+            "strategies": strategies,
+            **counts,
+        }
+
     async def stats(self) -> Dict[str, Dict[str, Any]]:
         """Strateji bazında kapanmış işlem istatistikleri.
 
@@ -490,41 +573,7 @@ class ScalpTracker:
         for t in trades:
             by_strategy.setdefault(t.strategy, []).append(t)
 
-        out: Dict[str, Dict[str, Any]] = {}
-        for strategy, rows in by_strategy.items():
-            n = len(rows)
-            wins = [r for r in rows if (r.realized_pnl or 0.0) > 0]
-            losses = [r for r in rows if (r.realized_pnl or 0.0) < 0]
-            total_pnl = sum(r.realized_pnl or 0.0 for r in rows)
-            avg_roi = (sum(r.roi_pct or 0.0 for r in rows) / n) if n else 0.0
-            gross_profit = sum(r.realized_pnl or 0.0 for r in wins)
-            gross_loss = abs(sum(r.realized_pnl or 0.0 for r in losses))
-            if gross_loss > 0:
-                profit_factor = gross_profit / gross_loss
-            else:
-                profit_factor = float("inf") if gross_profit > 0 else 0.0
-
-            source_counts = {"verified": 0, "fallback": 0, "legacy": 0}
-            for row in rows:
-                source_counts[self._pnl_source(row.notes)] += 1
-
-            out[strategy] = {
-                "trades": n,
-                "wins": len(wins),
-                "winrate": (len(wins) / n * 100.0) if n else 0.0,
-                "total_pnl": total_pnl,
-                "avg_roi": avg_roi,
-                "profit_factor": profit_factor,
-                "verified_trades": source_counts["verified"],
-                "fallback_trades": source_counts["fallback"],
-                "legacy_trades": source_counts["legacy"],
-                "pnl_basis": self._pnl_basis(
-                    source_counts["verified"],
-                    source_counts["fallback"],
-                    source_counts["legacy"],
-                ),
-            }
-        return out
+        return {strategy: self._stats_for_rows(rows) for strategy, rows in by_strategy.items()}
 
     async def open_trades(
         self,

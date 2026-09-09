@@ -3104,7 +3104,33 @@ async def scalper_stats(
         ),
     }
 
-    return {"strategies": strategies, "combined": combined}
+    # D37: old fields remain the all-history API. The primary dashboard may
+    # instead show the exact conservative cohort used by virtual sizing.
+    # Keep it independent of ?strategy= so a filtered old card cannot change
+    # the meaning of strategy capital (AP never belongs to this ledger).
+    performance_scope = {"enabled": False, "kind": "all_history"}
+    virtual_base = _finite_or_none(
+        getattr(settings, "scalper_virtual_capital_usdt", 0.0)
+    )
+    if virtual_base is not None and virtual_base > 0:
+        start_id = max(0, int(getattr(settings, "scalper_virtual_capital_start_trade_id", 0) or 0))
+        scope_result = await db.execute(
+            select(ScalpTradeModel).where(
+                ScalpTradeModel.status == "CLOSED",
+                ScalpTradeModel.id >= start_id,
+                ScalpTradeModel.strategy != FOLLOWER_LEDGER_STRATEGY,
+            )
+        )
+        performance_scope = ScalpTracker.performance_scope(
+            list(scope_result.scalars().all()),
+            start_trade_id=start_id,
+            base_capital_usdt=virtual_base,
+        )
+
+    return {
+        "strategies": strategies, "combined": combined,
+        "performance_scope": performance_scope,
+    }
 
 
 @app.get("/scalper/trades")

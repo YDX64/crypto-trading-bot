@@ -7,6 +7,29 @@ Pencereler: AYI 2026-01-23→02-13 (BTC −30%) · YATAY 2026-07-01→07-21 · B
 
 ## Aktif kararlar
 
+### D37 — Kısmi dolum kanıtı, kesici sonrası kasa ve doğru performans dönemi · 2026-09-09
+
+TESTNET güvenilirlik düzeltmesi; strateji veya kârlılık terfisi değildir.
+Sermaye güncellemesi günlük kesici açıkken de sürer; kesici yeni girişleri
+engellemeye devam eder. Geçersiz income/başarısız kasa çözümü bilinmez ve
+fail-closed sayılır; son iyi sayı taze veri olarak sunulmaz. Pano ana kartları
+`/scalper/stats.performance_scope` ile boyutlamadaki aynı #278 sermaye kohortunu
+gösterir; eski `combined/strategies` API kapsamları korunur.
+
+Maker journal doğrulanmış kümülatif dolumu eski poll/WS/iptal yanıtıyla küçültemez;
+miktar ve ortalama fiyat aynı dolum kanıtından gelmelidir. Bir batch'in sonraki
+öğesi hata verse de önceki korunmuş pozisyonlar motora teslim edilir.
+`PendingRecoveryError` kalıcı `category=pending_recovery` giriş kilididir ve
+opsiyonel `SCALPER_ENTRY_HALT_ENABLED=false` ile atlanmaz. İptal başarısı
+kendiliğinden bu kilidi açmaz. Safety mevcut pozisyonların çıkışlarını sürdürür.
+
+%10 teminat tavanı, %50 teminat-ROI stopu, %1 günlük gerçekleşmiş-zarar freni,
+kapasite5, TP/BE/trailing ve sinyal kuralları DEĞİŞMEDİ. Tek tam pozisyonun ilk
+stop riski yaklaşık kasanın %5'idir; günlük fren %1 azami zarar garantisi değildir.
+Son24sa net−28.37987026; DOGE−49.11378206 gerçek borsa netidir. Daha büyük
+boyut veya daha çok işlem bu asimetriyi çözmez. Kanıt, üç mercekli inceleme,
+geri alma ve kalan borçlar: [D37 denetimi](audits/2026-09-09-d37.md).
+
 ### D1 — Yalnız strateji C aktif (`SCALPER_STRATEGIES=C`) · 2026-08-19 · AKTİF
 A (trend kırılması) PF 0.35, B örneklemsiz, D (EQH/EQL) −660 ve C'yi zehirliyor (slot
 işgali). Kanıt: 14g×8 majör sweep'leri (kapı öncesi harness; yön bilgisi geçerli, mutlak

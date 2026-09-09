@@ -212,6 +212,13 @@ class PendingRecoveryError(UnprotectedPositionError):
     bu sınıfla yüzeye çıkar.
     """
 
+    def __init__(self, message: str, *, opened_positions=None):
+        super().__init__(message)
+        # A later item in a batch may fail after an earlier item already has
+        # SL/TP and a committed OPEN row. The engine must still track those
+        # exact objects once, even though the batch cannot return normally.
+        self.opened_positions = list(opened_positions or [])
+
 
 class ScalpExecutor:
     """Scalper sinyalinden güvenli, korumalı bir pozisyon açar."""
@@ -534,6 +541,11 @@ class ScalpExecutor:
     def _record_order_state(
         self, pending: PendingEntry, order: Dict[str, Any], *, phase: Optional[str] = None
     ) -> None:
+        # An exchange response may omit/regress cumulative fill fields. The
+        # journal's largest confirmed quantity is evidence, not a cache to
+        # replace with the last response. Its average belongs to that exact
+        # cumulative quantity (a larger fill without an average invalidates it).
+        order = self._reconcile_pending_order(pending, order)
         changed = False
         order_id = order.get("orderId")
         if order_id is not None and pending.order_id != int(order_id):
@@ -551,7 +563,7 @@ class ScalpExecutor:
             avg_price = max(0.0, float(order.get("avgPrice") or 0.0))
         except (TypeError, ValueError):
             avg_price = 0.0
-        if avg_price > 0 and avg_price != pending.avg_price:
+        if avg_price != pending.avg_price:
             pending.avg_price = avg_price
             changed = True
         if phase is not None and pending.phase != phase:
@@ -559,6 +571,57 @@ class ScalpExecutor:
             changed = True
         if changed:
             self._store_pending_record(pending)
+
+    def _reconcile_pending_order(
+        self, pending: PendingEntry, order: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Merge only this order's persisted cumulative execution evidence.
+
+        Status still comes from the latest observation; quantity never goes
+        backwards. This does not turn an uncertain cancellation into terminal
+        success or finalize a LIMIT whose remainder may still execute.
+        """
+        observed_id = order.get("orderId")
+        if (
+            pending.order_id is not None
+            and observed_id is not None
+            and str(observed_id) != str(pending.order_id)
+        ):
+            raise PendingRecoveryError("Maker order identity mismatch; journal retained")
+        observed_client_id = order.get("clientOrderId")
+        if observed_client_id and str(observed_client_id) != pending.client_order_id:
+            raise PendingRecoveryError("Maker client order identity mismatch; journal retained")
+        return self._merge_order_states(
+            {
+                "orderId": pending.order_id,
+                "clientOrderId": pending.client_order_id,
+                "executedQty": str(pending.executed_qty),
+                "avgPrice": str(pending.avg_price),
+            },
+            order,
+        )
+
+    @staticmethod
+    def _raise_if_known_fill_uncertain(pending: PendingEntry, detail: str) -> None:
+        if pending.executed_qty > 0:
+            # Keep the WORKING phase: the engine's halted safety path must
+            # continue cancelling/reconciling this same LIMIT. PROTECTING here
+            # would falsely imply a terminal remainder and risk late refills.
+            raise PendingRecoveryError(
+                f"{pending.signal.symbol}: known maker fill {pending.executed_qty} "
+                f"has unresolved remainder/protection ({detail}); journal retained"
+            )
+
+    @staticmethod
+    def _carry_opened_positions(error: UnprotectedPositionError, opened) -> None:
+        combined = list(opened) + list(getattr(error, "opened_positions", []) or [])
+        unique = []
+        seen = set()
+        for position in combined:
+            if id(position) not in seen:
+                unique.append(position)
+                seen.add(id(position))
+        error.opened_positions = unique
 
     def pending_symbols(self) -> Set[str]:
         """Bekleyen (henüz dolmamış) maker girişlerinin sembol kümesi.
@@ -2210,9 +2273,10 @@ class ScalpExecutor:
                 continue
             try:
                 sp = await self._check_one_pending(symbol, pending)
-            except UnprotectedPositionError:
+            except UnprotectedPositionError as error:
                 # Engine bu istisnayı global giriş latch'ine dönüştürür.
                 # Burada yutmak botun yeni pozisyon açmaya devam etmesine yol açar.
+                self._carry_opened_positions(error, opened)
                 raise
             except Exception as e:
                 self.logger.error(
@@ -2229,6 +2293,8 @@ class ScalpExecutor:
     ) -> Optional[ScalpPosition]:
         try:
             order = await self._get_pending_order(symbol, pending)
+        except UnprotectedPositionError:
+            raise
         except Exception as e:
             # Sorgu hatası: "bilinmiyor" ASLA "iptal" sayılmaz — pending
             # olduğu gibi kalır, sonraki turda tekrar denenir.
@@ -2236,6 +2302,7 @@ class ScalpExecutor:
                 f"⚠️ {symbol}: bekleyen emir sorgulanamadı ({e}), bu tur atlanıyor "
                 f"('bilinmiyor' 'iptal' sayılmaz)"
             )
+            self._raise_if_known_fill_uncertain(pending, "order query failed")
             return None
 
         return await self._process_pending_order(symbol, pending, order)
@@ -2244,6 +2311,7 @@ class ScalpExecutor:
         self, symbol: str, pending: PendingEntry, order: Dict[str, Any]
     ) -> Optional[ScalpPosition]:
         """REST sorgusu ve WS eventi için ortak, exactly-once durum makinesi."""
+        order = self._reconcile_pending_order(pending, order)
         self._record_order_state(pending, order)
 
         status = order.get("status")
@@ -2251,7 +2319,9 @@ class ScalpExecutor:
         if status == "FILLED":
             return await self._on_pending_filled(symbol, pending, order)
 
-        if status == "PARTIALLY_FILLED":
+        if status == "PARTIALLY_FILLED" or (
+            status == "NEW" and pending.executed_qty > 0
+        ):
             # Kalan miktarı bekletmek, dolan miktarı süresiz SL'siz bırakır.
             # Görülür görülmez iptal et; terminal iptal yanıtındaki
             # executedQty _on_pending_filled ile derhal korumaya alınır.
@@ -2300,6 +2370,7 @@ class ScalpExecutor:
 
         # Bilinmeyen/işlenmemiş durum — dokunma, sonraki turda tekrar bak.
         self.logger.debug(f"{symbol}: bekleyen emir durumu bilinmiyor ({status!r}), tur atlanıyor")
+        self._raise_if_known_fill_uncertain(pending, "unknown order status")
         return None
 
     async def _get_pending_order(
@@ -2307,7 +2378,8 @@ class ScalpExecutor:
     ) -> Dict[str, Any]:
         """Pending emri orderId varsa onunla, yoksa clientOrderId ile sorgula."""
         if pending.order_id is not None:
-            return await self.client.get_order(symbol, pending.order_id)
+            order = await self.client.get_order(symbol, pending.order_id)
+            return self._reconcile_pending_order(pending, order)
 
         order = await self.client.get_order_by_client_id(
             symbol, pending.client_order_id
@@ -2318,7 +2390,7 @@ class ScalpExecutor:
             self.logger.info(
                 f"♻️ {symbol}: belirsiz maker niyeti orderId={order_id} ile uzlaştırıldı"
             )
-        return order
+        return self._reconcile_pending_order(pending, order)
 
     async def _on_pending_filled(
         self, symbol: str, pending: PendingEntry, order: Dict[str, Any]
@@ -2329,6 +2401,7 @@ class ScalpExecutor:
         kaydı silinmeden ÖNCE değil, dolum bilgisi çözüldükten HEMEN sonra
         kurulur (bkz. _finalize_position).
         """
+        order = self._reconcile_pending_order(pending, order)
         if pending.phase == "DB_OPEN":
             # DB commit olmuş, yalnız journal cleanup başarısız kalmış olabilir.
             # Aynı dolumu tekrar finalize etmek çift SL/TP üretir.
@@ -2348,7 +2421,19 @@ class ScalpExecutor:
         self._record_order_state(pending, order, phase="PROTECTING")
 
         try:
-            entry_price, filled_qty = await self.pm.resolve_fill(symbol, order)
+            entry_price, filled_qty = await self.pm.resolve_fill(
+                symbol, order, strict_order_evidence=True
+            )
+            # The resolver may query again when the cumulative average is
+            # unknown. A stale secondary response must not undo execution
+            # evidence preserved above, or fabricate an average for more qty.
+            if isinstance(entry_price, bool) or isinstance(filled_qty, bool):
+                raise ValueError("invalid boolean fill resolution")
+            entry_price, filled_qty = float(entry_price), float(filled_qty)
+            if (not math.isfinite(entry_price) or entry_price <= 0
+                    or not math.isfinite(filled_qty) or filled_qty <= 0
+                    or filled_qty < pending.executed_qty):
+                raise ValueError("fill resolution invalid or below known execution")
         except UnprotectedPositionError:
             raise
         except Exception as e:
@@ -2420,8 +2505,12 @@ class ScalpExecutor:
             # atomik cleanup. Cleanup hata verirse DB_OPEN kaydı korunur ve
             # aynı dolum ikinci kez finalize edilmez.
             pending.phase = "DB_OPEN"
-            self._store_pending_record(pending)
-            self._drop_pending(symbol, pending)
+            try:
+                self._store_pending_record(pending)
+                self._drop_pending(symbol, pending)
+            except UnprotectedPositionError as error:
+                self._carry_opened_positions(error, [scalp_position])
+                raise
             return scalp_position
 
         # _finalize_position None: SL kurulamadığı için emergency close
@@ -2500,12 +2589,18 @@ class ScalpExecutor:
         if known is None:
             try:
                 known = await self._get_pending_order(symbol, pending)
+            except UnprotectedPositionError:
+                raise
             except Exception as e:
                 self.logger.warning(
                     f"⚠️ {symbol}: iptal öncesi son doğrulama sorgusu başarısız ({e}), "
                     f"bu tur atlanıyor (pending korunuyor)"
                 )
+                self._raise_if_known_fill_uncertain(pending, "pre-cancel query failed")
                 return None
+
+        known = self._reconcile_pending_order(pending, known)
+        self._record_order_state(pending, known)
 
         if known.get("status") == "FILLED":
             self.logger.info(
@@ -2529,25 +2624,33 @@ class ScalpExecutor:
                     f"⚠️ {symbol}: pending giriş iptal edilemedi (kod={e.code}: {e.msg}), "
                     f"pending korunuyor, sonraki turda tekrar denenecek"
                 )
+                self._raise_if_known_fill_uncertain(pending, "cancellation rejected")
                 return None
         except Exception as e:
             self.logger.error(
                 f"⚠️ {symbol}: pending giriş iptalinde beklenmeyen hata ({e}), pending korunuyor"
             )
+            self._raise_if_known_fill_uncertain(pending, "cancellation response unknown")
             return None
 
         if cancel_resp.get("status") == "ALREADY_GONE":
             # -2011: emir zaten yok — dolmuş/kısmen dolup iptal olmuş olabilir.
             try:
                 final_order = await self._get_pending_order(symbol, pending)
+            except UnprotectedPositionError:
+                raise
             except Exception as e:
                 self.logger.error(
                     f"🚨 {symbol}: iptal sonrası doğrulama sorgusu başarısız ({e}). Pozisyon açık "
                     f"olabilir ama pending kaydı BELİRSİZ — korunuyor, sonraki turda tekrar denenecek."
                 )
+                self._raise_if_known_fill_uncertain(pending, "post-cancel query failed")
                 return None
         else:
             final_order = self._merge_order_states(known, cancel_resp)
+
+        final_order = self._reconcile_pending_order(pending, final_order)
+        self._record_order_state(pending, final_order)
 
         status = final_order.get("status")
         executed_qty = self._executed_qty(final_order)
@@ -2574,12 +2677,18 @@ class ScalpExecutor:
         # kez daha sorgula. Bu sorgu başarısızsa pending fail-closed kalır.
         try:
             reconciled = await self._get_pending_order(symbol, pending)
+        except UnprotectedPositionError:
+            raise
         except Exception as e:
             self.logger.error(
                 f"🚨 {symbol}: iptal sonucu terminal değil ({status!r}) ve tekrar "
                 f"doğrulanamadı ({e}); pending korunuyor"
             )
+            self._raise_if_known_fill_uncertain(pending, "nonterminal cancellation query failed")
             return None
+
+        reconciled = self._reconcile_pending_order(pending, reconciled)
+        self._record_order_state(pending, reconciled)
 
         reconciled_status = reconciled.get("status")
         reconciled_qty = self._executed_qty(reconciled)
@@ -2596,6 +2705,7 @@ class ScalpExecutor:
             f"🚨 {symbol}: iptal sonrası emir hâlâ terminal değil "
             f"({reconciled_status!r}); pending korunuyor"
         )
+        self._raise_if_known_fill_uncertain(pending, "cancellation remains nonterminal")
         return None
 
     async def _cancel_pending_order(
@@ -2610,7 +2720,11 @@ class ScalpExecutor:
     @staticmethod
     def _executed_qty(order: Dict[str, Any]) -> float:
         try:
-            return max(0.0, float(order.get("executedQty") or 0.0))
+            raw = order.get("executedQty")
+            if isinstance(raw, bool):
+                return 0.0
+            quantity = float(raw or 0.0)
+            return quantity if math.isfinite(quantity) and quantity > 0 else 0.0
         except (TypeError, ValueError):
             return 0.0
 
@@ -2630,17 +2744,13 @@ class ScalpExecutor:
             if executed > max_executed:
                 max_executed = executed
                 fill_price = None
-                try:
-                    if float(state.get("avgPrice") or 0.0) > 0:
-                        fill_price = state.get("avgPrice")
-                except (TypeError, ValueError):
-                    pass
+                if (not isinstance(state.get("avgPrice"), bool)
+                        and cls._coerce_price(state.get("avgPrice")) is not None):
+                    fill_price = state.get("avgPrice")
             elif executed == max_executed:
-                try:
-                    if float(state.get("avgPrice") or 0.0) > 0:
-                        fill_price = state.get("avgPrice")
-                except (TypeError, ValueError):
-                    pass
+                if (not isinstance(state.get("avgPrice"), bool)
+                        and cls._coerce_price(state.get("avgPrice")) is not None):
+                    fill_price = state.get("avgPrice")
         merged["executedQty"] = str(max_executed)
         if fill_price is not None:
             merged["avgPrice"] = fill_price
@@ -2664,6 +2774,19 @@ class ScalpExecutor:
             return await self._recover_pending_locked()
 
     async def _recover_pending_locked(self) -> List[ScalpPosition]:
+        opened: List[ScalpPosition] = []
+        try:
+            return await self._recover_pending_records_locked(opened)
+        except UnprotectedPositionError as error:
+            # Include every recovery branch, not just order processing:
+            # later DB-OPEN/not-found/uncertain-protection journal cleanup
+            # can fail after an earlier position has already been committed.
+            self._carry_opened_positions(error, opened)
+            raise
+
+    async def _recover_pending_records_locked(
+        self, opened: List[ScalpPosition]
+    ) -> List[ScalpPosition]:
         if self._journal_error:
             raise PendingRecoveryError(
                 f"Maker pending journal bozuk/okunamıyor: {self._journal_error}"
@@ -2692,7 +2815,6 @@ class ScalpExecutor:
             if symbol:
                 open_symbols.add(str(symbol))
 
-        opened: List[ScalpPosition] = []
         unresolved: List[str] = []
         for symbol, record in list(self._journal_records.items()):
             if symbol in open_symbols:
@@ -2712,6 +2834,7 @@ class ScalpExecutor:
                 pending = self._pending.get(symbol) or self._deserialize_pending(record)
             except PendingRecoveryError as e:
                 self._journal_error = str(e)
+                self._carry_opened_positions(e, opened)
                 raise
             self._pending[symbol] = pending
 
@@ -2743,6 +2866,11 @@ class ScalpExecutor:
 
             if order is None:
                 if not_found == 3 and last_error is None:
+                    if pending.executed_qty > 0:
+                        unresolved.append(
+                            f"{symbol}: known fill absent from order lookup; journal retained"
+                        )
+                        continue
                     self.logger.warning(
                         f"♻️ {symbol}: maker intent üç sorguda kesin bulunamadı; "
                         "journal kaydı temizleniyor"
@@ -2752,7 +2880,12 @@ class ScalpExecutor:
                 unresolved.append(f"{symbol}: clientOrderId sorgusu belirsiz ({last_error})")
                 continue
 
-            self._record_order_state(pending, order)
+            try:
+                order = self._reconcile_pending_order(pending, order)
+                self._record_order_state(pending, order)
+            except UnprotectedPositionError as error:
+                unresolved.append(str(error))
+                continue
 
             # Crash, koruma kurulurken veya DB commit/cleanup arasında olmuş
             # olabilir. DB kaydı yoksa tekrar finalize etmek yerine güvenli
@@ -2788,6 +2921,7 @@ class ScalpExecutor:
                     symbol, pending, order
                 )
             except UnprotectedPositionError as e:
+                opened.extend(getattr(e, "opened_positions", []) or [])
                 unresolved.append(str(e))
                 continue
             if scalp_position is not None:
@@ -2803,7 +2937,7 @@ class ScalpExecutor:
 
         if unresolved:
             self._recovery_needed = True
-            raise PendingRecoveryError("; ".join(unresolved))
+            raise PendingRecoveryError("; ".join(unresolved), opened_positions=opened)
 
         self._recovery_needed = False
         return opened
@@ -2864,9 +2998,13 @@ class ScalpExecutor:
                     f"Maker pending journal bozuk/okunamıyor: {self._journal_error}"
                 )
             opened: List[ScalpPosition] = []
-            if self._recovery_needed:
-                opened.extend(await self._recover_pending_locked())
-            opened.extend(await self._cancel_all_pending_locked())
+            try:
+                if self._recovery_needed:
+                    opened.extend(await self._recover_pending_locked())
+                opened.extend(await self._cancel_all_pending_locked())
+            except UnprotectedPositionError as error:
+                self._carry_opened_positions(error, opened)
+                raise
             return opened
 
     async def _cancel_all_pending_locked(self) -> List[ScalpPosition]:
@@ -2876,7 +3014,8 @@ class ScalpExecutor:
                 sp = await self._cancel_pending(
                     symbol, pending, reason="cancel_all"
                 )
-            except UnprotectedPositionError:
+            except UnprotectedPositionError as error:
+                self._carry_opened_positions(error, opened)
                 raise
             except Exception as e:
                 self.logger.warning(

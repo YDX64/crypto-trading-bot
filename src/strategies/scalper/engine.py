@@ -42,7 +42,7 @@ from src.strategies.scalper.data import (
     host_of,
 )
 from src.services.tv_events import tv_events as _tv_events_singleton
-from src.strategies.scalper.executor import ScalpExecutor
+from src.strategies.scalper.executor import PendingRecoveryError, ScalpExecutor
 from src.strategies.scalper.exits import ExitManager
 from src.strategies.scalper.indicators import atr as compute_atr
 from src.strategies.scalper import intent
@@ -400,6 +400,7 @@ class ScalperEngine:
         # açılmaz. Safety döngüsü mevcut pozisyonları izlemeyi sürdürür.
         self._entry_halted: bool = False
         self._entry_halt_reason: Optional[str] = None
+        self._entry_halt_category: Optional[str] = None
         self._entry_halted_at: Optional[str] = None
         configured_halt_path = getattr(
             self.cfg, "scalper_entry_halt_path", None
@@ -575,6 +576,8 @@ class ScalperEngine:
                 opened_during_cancel, source="shutdown pending iptal yarışı"
             )
         except Exception as e:
+            if isinstance(e, UnprotectedPositionError):
+                self._record_entry_halt(e, source="shutdown cancellation")
             self.logger.warning(f"⚠️ Bekleyen maker girişleri iptal edilirken hata: {e}")
 
         self._sync_scalper_reservations()
@@ -593,20 +596,23 @@ class ScalperEngine:
 
     def _load_entry_halt(self) -> None:
         path = self._entry_halt_path
-        if not getattr(self.cfg, "scalper_entry_halt_enabled", True):
-            if path is not None and path.exists():
-                self.logger.warning(
-                    "⚠️ Entry halt devre dışı (scalper_entry_halt_enabled=false); "
-                    f"mevcut halt dosyası yok sayılıyor: {path}"
-                )
-            return
         if path is None or not path.exists():
             return
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict) or payload.get("active") is not True:
                 raise ValueError("entry halt state şeması geçersiz")
+            category = payload.get("category")
+            # Unknown execution state is an ownership/recovery invariant,
+            # not the optional ordinary protection-error halt policy.
+            if (not getattr(self.cfg, "scalper_entry_halt_enabled", True)
+                    and category != "pending_recovery"):
+                self.logger.warning(
+                    "⚠️ Optional entry halt disabled; ordinary persisted hold ignored"
+                )
+                return
             self._entry_halted = True
+            self._entry_halt_category = category
             self._entry_halt_reason = str(
                 payload.get("reason") or "persisted safety hold"
             )
@@ -619,6 +625,7 @@ class ScalperEngine:
         except Exception as e:
             # Bozuk güvenlik dosyası fail-open olamaz.
             self._entry_halted = True
+            self._entry_halt_category = "pending_recovery"
             self._entry_halt_reason = f"entry halt state okunamadı: {type(e).__name__}: {e}"
             self._entry_halted_at = _utcnow_iso()
             self.logger.critical(
@@ -640,6 +647,7 @@ class ScalperEngine:
                 "version": 1,
                 "active": True,
                 "reason": self._entry_halt_reason,
+                "category": getattr(self, "_entry_halt_category", None),
                 "halted_at": self._entry_halted_at,
             }
             with tmp_path.open("w", encoding="utf-8") as handle:
@@ -835,6 +843,8 @@ class ScalperEngine:
                     opened_during_cancel, source=source_label
                 )
             except Exception as cancel_error:
+                if isinstance(cancel_error, UnprotectedPositionError):
+                    self._record_entry_halt(cancel_error, source=source_label)
                 self.logger.error(
                     f"⚠️ risk-event: bekleyen girişler iptal edilemedi: {cancel_error}",
                     exc_info=True,
@@ -1358,6 +1368,42 @@ class ScalperEngine:
         # reconciliation yedeğinde bile exits/PNL gibi daha yavaş işlerden
         # ÖNCE ele alınır. User-data stream ayrıca aynı olayı anlık işleyecek;
         # executor kilidi iki yolun double-finalize etmesini engeller.
+        pending_error = None
+        try:
+            await self._reconcile_pending_for_safety()
+        except UnprotectedPositionError as error:
+            # Set the hold synchronously before any further await, but do
+            # not retry a slow cancellation ahead of OTHER position exits.
+            pending_error = error
+            self._record_entry_halt(error, source="pending reconciliation")
+
+        # A failed pending read must not starve already tracked protection.
+        await self.exits.step()
+        await self._apply_structure_exits()
+        # Preserve exit precedence: TV and stale profit exits before REAPER.
+        await self._apply_tv_event_exits()
+        await self._close_stale_profitable_positions()
+        await self._reap_aged_positions()
+        self._forensics_postmortem_schedule()
+        self._sync_scalper_reservations()
+        was_blocked = self._kill_switch or self._entry_halted
+        await self._update_kill_switch()
+
+        if pending_error is not None:
+            # Report an unhealthy reconciliation cycle (not a fake success).
+            # _safety_loop then invokes the normal cancellation retry path.
+            raise pending_error
+
+        if not was_blocked and (self._kill_switch or self._entry_halted):
+            async with self._entry_lock:
+                if self.executor.pending_symbols():
+                    opened_during_cancel = await self.executor.cancel_all_pending()
+                    self._track_opened_positions(
+                        opened_during_cancel, source="risk kapısı iptal yarışı"
+                    )
+
+    async def _reconcile_pending_for_safety(self) -> None:
+        """Priority pending work; caller isolates failure from live exits."""
         if self._kill_switch or self._entry_halted:
             # Entry lock, tarama döngüsünün try_open() kritik kesitiyle
             # serileştirir: tetik sonrası yeni pending eklenip iptal turunu
@@ -1375,43 +1421,6 @@ class ScalperEngine:
             self._track_opened_positions(
                 await self.executor.check_pending(), source="maker dolumu"
             )
-
-        # Artık tüm yeni dolumlar korumalı ve izleniyor: açık pozisyon çıkış
-        # yönetimi ile gerçek günlük risk kapısı bundan sonra çalışabilir.
-        await self.exits.step()
-        await self._apply_structure_exits()
-        # TV olay çıkışları (D19) — exits.step()'ten SONRA: normal SL/TP/
-        # trailing yolu her zaman önce işler, TV olayı yalnız hâlâ AÇIK olan
-        # pozisyonlara bakar. Reaper'dan ÖNCE: bir olay varsa kapanış nedeni
-        # "yaş" değil "TV_EVENT" olarak etiketlenmeli.
-        await self._apply_tv_event_exits()
-        # D30 bayat-kâr kapanışı reaper'dan ÖNCE: ikisi de TP1 görmemiş yaşlı
-        # pozisyona bakar; kârda olanı "yaş" değil "STALE_TP" kapatmalı.
-        # Backtest harness'i (`backtest.manage_position`) AYNI sırayı izler.
-        await self._close_stale_profitable_positions()
-        await self._reap_aged_positions()
-        # D21 post-mortem: TÜM çıkış/koruma işlerinden SONRA ve AYRI bir
-        # task'ta — safety turu onu BEKLEMEZ. Yavaş/5xx bir veri host'unda
-        # `get_klines` üç deneme × 15 sn boyunca askıda kalabilir; bunu tur
-        # içinde beklemek TP1→BE, trailing ve kill-switch'i geciktirir,
-        # `/health` 503'e düşer ve watchdog restart'ı davet eder
-        # (2026-08-14 dersi). Bir teşhis işi asla bir koruma işini
-        # geciktirmez.
-        self._forensics_postmortem_schedule()
-        self._sync_scalper_reservations()
-        was_blocked = self._kill_switch or self._entry_halted
-        await self._update_kill_switch()
-
-        # Kill switch bu turda yeni tetiklendiyse hâlâ NEW olan maker
-        # emirlerini aynı turda iptal et. Dolu/partial yarışları executor
-        # tarafından korunup izlemeye alınır.
-        if not was_blocked and (self._kill_switch or self._entry_halted):
-            async with self._entry_lock:
-                if self.executor.pending_symbols():
-                    opened_during_cancel = await self.executor.cancel_all_pending()
-                    self._track_opened_positions(
-                        opened_during_cancel, source="risk kapısı iptal yarışı"
-                    )
 
     async def _apply_structure_exits(self) -> None:
         """Açık pozisyonun TERSİNE CHoCH gelince stopu BE'ye çek ya da kapat.
@@ -4363,6 +4372,18 @@ class ScalperEngine:
 
     def _executor_sizing_snapshot(self) -> Dict[str, Any]:
         """Executor sermaye görünümünü geriye uyumlu ve JSON-güvenli oku."""
+        if getattr(self, "_virtual_equity_refresh_failed", False):
+            # The executor can retain a last-good snapshot after balance
+            # failure; status must not stamp that old capital as fresh.
+            return {
+                "mode": "virtual_capital_error",
+                "effective_equity": None,
+                "virtual_capital": None,
+                "eligible_realized_pnl": None,
+                "exchange_available": None,
+                "start_trade_id": getattr(self.cfg, "scalper_virtual_capital_start_trade_id", 0),
+                "updated_at": None,
+            }
         snapshotter = getattr(self.executor, "sizing_snapshot", None)
         if callable(snapshotter):
             try:
@@ -4427,15 +4448,25 @@ class ScalperEngine:
         # virtual-capital risk kapısı kendi kendini kilitlemez.
         resolver = getattr(self.executor, "get_sizing_equity", None)
         if callable(resolver):
+            from math import isfinite
+
             try:
                 resolved = await resolver()
-                if resolved is not None and float(resolved) > 0:
+                if (resolved is not None and not isinstance(resolved, bool)
+                        and isfinite(float(resolved)) and float(resolved) > 0):
                     equity = float(resolved)
                     self._virtual_equity_cache = (equity, now_monotonic)
                     self._virtual_equity_cache_close_seq = close_seq
+                    self._virtual_equity_refresh_failed = False
                     return equity
             except Exception as e:
                 self.logger.error(f"Scalper sizing equity çözülemedi: {e}")
+            # A modern resolver failure is authoritative. Falling through to
+            # last_sizing_equity would re-label pre-close capital with the new
+            # close sequence and reopen risk readiness on unverified data.
+            self._virtual_equity_cache = (None, 0.0)
+            self._virtual_equity_refresh_failed = True
+            return None
 
         sizing = self._executor_sizing_snapshot()
         candidates = (
@@ -4453,20 +4484,23 @@ class ScalperEngine:
                 return equity
         return None
 
-    async def _latch_entry_halt(
+    def _record_entry_halt(
         self, error: UnprotectedPositionError, *, source: str
-    ) -> None:
-        """Korunamayan pozisyon sinyalini process-restart'e kadar kilitle."""
-        if not getattr(self.cfg, "scalper_entry_halt_enabled", True):
+    ) -> bool:
+        """Persist an entry hold without waiting for exchange cancellation."""
+        mandatory = isinstance(error, PendingRecoveryError)
+        enabled = mandatory or getattr(self.cfg, "scalper_entry_halt_enabled", True)
+        if not enabled:
             self.logger.critical(
                 f"🚨 UnprotectedPositionError ({source}): {error}. Entry halt "
                 "DEVRE DIŞI (scalper_entry_halt_enabled=false) — yeni girişler "
                 "durdurulmadı, yalnız loglandı.",
                 extra={"trade": True},
             )
-            return
-        if not self._entry_halted:
+        elif (not self._entry_halted or
+              (mandatory and getattr(self, "_entry_halt_category", None) != "pending_recovery")):
             self._entry_halted = True
+            self._entry_halt_category = "pending_recovery" if mandatory else "protection"
             self._entry_halt_reason = f"{type(error).__name__}: {error}"
             self._entry_halted_at = _utcnow_iso()
             self.logger.critical(
@@ -4475,6 +4509,22 @@ class ScalperEngine:
                 extra={"trade": True},
             )
             self._persist_entry_halt()
+
+        # A prior symbol in the batch may already have SL/DB protection.
+        # Deliver those positions even when a later symbol failed; consume
+        # once so the outer loop/latch cannot double-count the same batch.
+        opened = getattr(error, "opened_positions", None)
+        if opened:
+            error.opened_positions = []
+            self._track_opened_positions(opened, source="partial batch recovery")
+        return bool(enabled)
+
+    async def _latch_entry_halt(
+        self, error: UnprotectedPositionError, *, source: str
+    ) -> None:
+        """Latch first, then retry pending cancellation; no implicit resume."""
+        if not self._record_entry_halt(error, source=source):
+            return
 
         # try_open ile aynı kilit: latch'ten hemen önce başlamış bir maker
         # girişi varsa tamamlanınca bu iptal turuna yakalanır.
@@ -4486,6 +4536,8 @@ class ScalperEngine:
                         opened_during_cancel, source="safety latch iptal yarışı"
                     )
                 except Exception as cancel_error:
+                    if isinstance(cancel_error, UnprotectedPositionError):
+                        self._record_entry_halt(cancel_error, source="latch cancellation")
                     self.logger.critical(
                         f"🚨 Entry safety latch aktif ancak pending girişler iptal "
                         f"edilemedi: {cancel_error}",
@@ -5256,9 +5308,6 @@ class ScalperEngine:
             except Exception:
                 self._daily_income_account = None
 
-        if self._kill_switch:
-            return  # zaten tetiklenmiş — gün UTC değişene kadar kapalı kalır
-
         virtual_capital_enabled = bool(
             float(getattr(self.cfg, "scalper_virtual_capital_usdt", 0.0) or 0.0) > 0
         )
@@ -5287,6 +5336,12 @@ class ScalperEngine:
                 return
 
         self._risk_equity_usdt = balance
+
+        # The latch blocks entries, not ledger observation. Positions may
+        # close after the daily stop: refresh sizing/capital above even then,
+        # while retaining the original breach threshold and sticky latch.
+        if self._kill_switch:
+            return
 
         # D20b (doğrulayıcı bulgusu Y9): `balance` PAYLAŞILAN cüzdandır (AP
         # kâr/zararı dahil), `pnl` ise yalnız scalper defteridir. Gömülü modda
@@ -5323,15 +5378,18 @@ class ScalperEngine:
     async def _get_account_daily_net_income(self, today: str) -> float:
         """Account-level realized PnL + commissions + funding, signed by Binance."""
 
+        from math import isfinite
+
         cached_value, cached_at, cached_day = self._daily_income_cache
         now_monotonic = time.monotonic()
+        close_seq_at_request = getattr(self.tracker, "close_seq", 0)
         if (
             cached_value is not None
             and cached_day == today
             and now_monotonic - cached_at < self._INCOME_CACHE_TTL
             # Son okumadan beri kapanış kaydedildiyse önbellek bayattır:
             # limit aşımı 120 sn TTL'i beklemeden bir sonraki turda görülür.
-            and self._income_cache_close_seq == getattr(self.tracker, "close_seq", 0)
+            and self._income_cache_close_seq == close_seq_at_request
         ):
             return cached_value
 
@@ -5355,13 +5413,23 @@ class ScalperEngine:
                 continue
             if str(row.get("incomeType") or "") not in allowed:
                 continue
+            raw_income = row.get("income")
             try:
-                net += float(row.get("income") or 0.0)
-            except (TypeError, ValueError):
-                raise RuntimeError(f"Geçersiz Binance income satırı: {row!r}")
+                if raw_income is None or isinstance(raw_income, bool):
+                    raise ValueError("missing or boolean income")
+                amount = float(raw_income)
+                if not isfinite(amount):
+                    raise ValueError("non-finite income")
+                net += amount
+                if not isfinite(net):
+                    raise ValueError("non-finite income total")
+            except (TypeError, ValueError, OverflowError):
+                raise RuntimeError("Geçersiz Binance income miktarı") from None
 
         self._daily_income_cache = (net, now_monotonic, today)
-        self._income_cache_close_seq = getattr(self.tracker, "close_seq", 0)
+        # A close during the awaited request may not belong to its snapshot.
+        # Tag with the pre-request generation so the next cycle re-reads it.
+        self._income_cache_close_seq = close_seq_at_request
         return net
 
     async def _ledger_daily_pnl(
@@ -5472,7 +5540,7 @@ class ScalperEngine:
         cooldowns = self._executor_cooldown_snapshot()
         sizing = self._executor_sizing_snapshot()
         sizing_equity = sizing.get("effective_equity")
-        if sizing_equity is None:
+        if sizing_equity is None and not getattr(self, "_virtual_equity_refresh_failed", False):
             sizing_equity = getattr(self.executor, "last_sizing_equity", None)
         configured_virtual_base = getattr(
             self.cfg, "scalper_virtual_capital_usdt", 0.0

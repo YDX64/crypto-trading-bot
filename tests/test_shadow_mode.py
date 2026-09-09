@@ -126,7 +126,7 @@ class _FakePm:
         self.filled_qty = filled_qty
         self.calls: List[str] = []
 
-    async def resolve_fill(self, symbol, entry_order):
+    async def resolve_fill(self, symbol, entry_order, *, strict_order_evidence=False):
         self.calls.append("resolve_fill")
         return self.entry_price, self.filled_qty
 
