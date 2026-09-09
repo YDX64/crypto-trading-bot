@@ -870,13 +870,18 @@ class TestHttpHealthAndStats:
             "orchestrator": 0, "scalper": 0, "follower": 0, "total": 0,
         }
 
-    async def test_scalper_stats_normalizes_infinite_profit_factors(self, monkeypatch):
+    @pytest.mark.parametrize("virtual_base", [0.0, 1000.0])
+    async def test_scalper_stats_normalizes_infinite_profit_factors(self, monkeypatch, virtual_base):
+        monkeypatch.setattr(main_module.settings, "scalper_virtual_capital_usdt", virtual_base)
+        monkeypatch.setattr(main_module.settings, "scalper_virtual_capital_start_trade_id", 278)
         tracker = SimpleNamespace(
             stats=AsyncMock(return_value={"C": {"trades": 2, "profit_factor": float("inf")}})
         )
         monkeypatch.setattr(main_module, "scalper_engine", SimpleNamespace(tracker=tracker))
 
-        row = SimpleNamespace(realized_pnl=10.0, roi_pct=2.0)
+        # Match actual ORM fields, including the optional legacy notes value.
+        # The enabled capital cohort performs a second query on server envs.
+        row = SimpleNamespace(realized_pnl=10.0, roi_pct=2.0, notes=None, strategy="C")
         result = SimpleNamespace(
             scalars=lambda: SimpleNamespace(all=lambda: [row])
         )
@@ -890,6 +895,13 @@ class TestHttpHealthAndStats:
         assert payload["combined"]["fallback_trades"] == 0
         assert payload["combined"]["legacy_trades"] == 1
         assert payload["combined"]["pnl_basis"] == "legacy_unknown"
+        if virtual_base:
+            assert payload["performance_scope"]["excluded_legacy"] == 1
+            assert payload["performance_scope"]["combined"]["trades"] == 0
+            assert db.execute.await_count == 2
+        else:
+            assert payload["performance_scope"]["enabled"] is False
+            assert db.execute.await_count == 1
         # Strict JSON encoder artık 500 üretmemeli.
         response = JSONResponse(content=payload)
         assert response.status_code == 200
