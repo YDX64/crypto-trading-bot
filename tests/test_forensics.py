@@ -410,6 +410,88 @@ class TestPostmortem:
         assert out["returned_to_entry"] is True
         assert out["tags"] == []      # kâr ettik; "gürültü stopu" değil
 
+    @pytest.mark.parametrize("reason", ["REAPER", "BE_MARKET", "TRAIL", "TRAIL_MARKET"])
+    def test_non_sl_net_loss_gets_near_entry_exit_not_noise_stop(self, reason):
+        closed_ms = 1_000_000
+        candles = [_candle(closed_ms + 60_000, high=100.5, low=99.0)]  # girişi geçti
+        out = fx.postmortem_from_candles(
+            entry=_entry(fill_price=100.0),
+            exit_=_exit(reason=reason, realized_pnl=-0.3),
+            candles=candles, closed_at_ms=closed_ms,
+        )
+        assert out["returned_to_entry"] is True
+        assert out["tags"] == [fx.TAG_NEAR_ENTRY_EXIT]
+        assert fx.TAG_NOISE_STOP not in out["tags"]
+
+    @pytest.mark.parametrize("reason", ["SL"])
+    def test_sl_family_still_gets_noise_stop(self, reason):
+        closed_ms = 1_000_000
+        out = fx.postmortem_from_candles(
+            entry=_entry(fill_price=100.0),
+            exit_=_exit(reason=reason, realized_pnl=-30.0),
+            candles=[_candle(closed_ms + 60_000, high=100.5, low=99.0)],
+            closed_at_ms=closed_ms,
+        )
+        assert out["tags"] == [fx.TAG_NOISE_STOP]
+
+    @pytest.mark.parametrize("reason", ["REAPER", "BE_MARKET", "TRAIL"])
+    def test_non_sl_without_return_or_with_profit_gets_no_tag(self, reason):
+        closed_ms = 1_000_000
+        no_return = fx.postmortem_from_candles(
+            entry=_entry(fill_price=100.0),
+            exit_=_exit(reason=reason, realized_pnl=-0.3),
+            candles=[_candle(closed_ms + 60_000, high=99.5, low=98.0)],
+            closed_at_ms=closed_ms,
+        )
+        profit = fx.postmortem_from_candles(
+            entry=_entry(fill_price=100.0),
+            exit_=_exit(reason=reason, realized_pnl=0.3),
+            candles=[_candle(closed_ms + 60_000, high=101.0, low=99.0)],
+            closed_at_ms=closed_ms,
+        )
+        assert no_return["tags"] == []
+        assert profit["tags"] == []
+
+    def test_candle_containing_the_close_is_not_counted(self):
+        """Kapanışı İÇEREN mum (open_time < closed_at) kapanış öncesi hareketi
+        sızdırır → sayılmaz; yalnız sonraki mum sayılır."""
+        closed_ms = 1_000_000
+        containing = Candle(            # [closed-30s, closed+30s] — close_time > closed
+            open_time=closed_ms - 30_000, open=100.0, high=101.0, low=99.0,
+            close=100.0, volume=1.0, close_time=closed_ms + 30_000,
+        )
+        out = fx.postmortem_from_candles(
+            entry=_entry(fill_price=100.0),
+            exit_=_exit(reason="SL", realized_pnl=-10.0),
+            candles=[containing], closed_at_ms=closed_ms,
+        )
+        assert out["candles_seen"] == 0
+        assert out["returned_to_entry"] is None
+        assert out["tags"] == []
+
+        # Sonraki (tam kapanış-sonrası) mum hâlâ sayılır; tam sınırda
+        # (open_time == closed_at_ms) dahildir.
+        after = Candle(
+            open_time=closed_ms, open=98.0, high=101.0, low=97.0,
+            close=99.0, volume=1.0, close_time=closed_ms + 60_000,
+        )
+        out2 = fx.postmortem_from_candles(
+            entry=_entry(fill_price=100.0),
+            exit_=_exit(reason="SL", realized_pnl=-10.0),
+            candles=[containing, after], closed_at_ms=closed_ms,
+        )
+        assert out2["candles_seen"] == 1
+        assert out2["tags"] == [fx.TAG_NOISE_STOP]
+
+    def test_postmortem_note_mentions_basis_caveat(self):
+        out = fx.postmortem_from_candles(
+            entry=_entry(fill_price=100.0),
+            exit_=_exit(reason="SL", realized_pnl=-10.0),
+            candles=[], closed_at_ms=1_000_000,
+        )
+        assert "±%0,05" in out["note"]
+        assert "mainnet kline" in out["note"]
+
     def test_candles_after_the_window_are_ignored(self):
         closed_ms = 1_000_000
         th = fx.VerdictThresholds(noise_window_min=1.0)
@@ -2220,6 +2302,8 @@ class TestRecoverRestoresForensics:
         assert path["restart_gap"] is True
         assert path["tp1_at"] is None and path["be_at"] is None
         assert path["trail_updates"] is None       # "0" UYDURMA olurdu
+        # Madde 6: MFE de bellekteydi → yazılan sayı yalnız bir ALT SINIR.
+        assert path["mfe_lower_bound"] is True
         # İlk stop kurtarmadaki CANLI stop değil, giriş belgesindeki gerçek.
         assert path["initial_stop"] == 97.5
         # Giriş belgesi geri geldiği için GİRİŞ etiketleri de türetilebiliyor.
@@ -2235,6 +2319,7 @@ class TestRecoverRestoresForensics:
         )
         path = doc["path"]
         assert "restart_gap" not in path
+        assert "mfe_lower_bound" not in path
         assert path["trail_updates"] == 4
         assert path["initial_stop"] == 99.0
 
@@ -2478,3 +2563,33 @@ class TestForensicsHardening:
         assert "row.fx_error" in html
         # Hatalı yanıt önbellekte KALMAZ (yeniden denenebilir).
         assert "!fxCache[id].fx_error" in html
+
+
+class TestDashboardLabelsMadde3_11_12:
+    """Pano metinleri: etiket sözlüğü motorla aynı, kapsam başlığı dürüst."""
+
+    @staticmethod
+    def _html() -> str:
+        return (REPO_ROOT / "static" / "dashboard.html").read_text(encoding="utf-8")
+
+    def test_dashboard_tag_labels_match_engine_for_noise_family(self):
+        html = self._html()
+        for tag in (fx.TAG_NOISE_STOP, fx.TAG_NEAR_ENTRY_EXIT):
+            assert f'{tag}: "{fx.TAG_LABELS[tag]}"' in html
+
+    def test_ledger_report_notes_noise_split(self):
+        module = _load_ledger_report()
+        assert "near_entry_exit" in module.NOISE_SPLIT_NOTE
+        assert module.FORENSICS_TAG_LABELS[fx.TAG_NEAR_ENTRY_EXIT] == (
+            fx.TAG_LABELS[fx.TAG_NEAR_ENTRY_EXIT]
+        )
+
+    def test_sparkline_title_states_scope(self):
+        html = self._html()
+        assert "Son 50 işlem toplamı (AP dahil)" in html
+        assert "<span>Kümülatif Gerçekleşen K/Z</span>" not in html
+
+    def test_runaway_note_depends_on_mode(self):
+        html = self._html()
+        assert "yüksek red oranı (bilgi)" in html
+        assert 'g.mode === "active"' in html

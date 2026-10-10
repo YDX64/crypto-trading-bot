@@ -248,3 +248,93 @@ class TestRecoveryRepairsMissingTpOrders:
 
         # Kurtarma BAŞARILI kalır: SL doğrulandı, TP onarımı yalnız bir ek.
         assert await manager._recover_one(_trade(quantity)) is True
+
+
+class TestRecoveryWithMultipleStops:
+    """Madde 6: takipçi de scalper'la AYNI `_pick_recovery_stop`ı kullanır.
+
+    Stop taşırken eski SL iptali başarısız olursa borsada iki stop kalır;
+    kurtarma en koruyucuyu izlemeli, fazlayı temizlemeli ve kimliği hatırlamalı.
+    """
+
+    @staticmethod
+    def _two_stops(manager, loose, tight):
+        orders = _algo_orders(loose)
+        orders.insert(
+            0,
+            {"orderType": "STOP_MARKET", "side": "SELL", "algoId": "900",
+             "triggerPrice": tight},
+        )
+        manager.client.get_open_algo_orders = AsyncMock(return_value=orders)
+
+    async def test_tighter_stop_is_tracked_and_the_loose_one_cleaned(self):
+        quantity = 12 * STEP
+        manager = _manager(live_amt=quantity, stop_price=99.0)
+        manager.pm = SimpleNamespace(_cancel_stale_stops=AsyncMock())
+        # Borsa sırası: önce SIKI (900 @99.5), sonra gevşek (500 @99.0) — ve
+        # tersi sıra da aynı sonucu vermeli (aşağıda).
+        self._two_stops(manager, loose=99.0, tight=99.5)
+
+        assert await manager._recover_one(_trade(quantity)) is True
+
+        sp = manager._positions["BTCUSDT"]
+        assert sp.position.sl_order_id == "900"
+        assert sp.position.current_stoploss == pytest.approx(99.5)
+        manager.pm._cancel_stale_stops.assert_awaited_once_with(
+            "BTCUSDT", keep_order_id="900"
+        )
+        assert manager._recovery_extra_sl_ids()[7] == ["500"]
+
+    async def test_loose_stop_first_in_exchange_order_still_loses(self):
+        quantity = 12 * STEP
+        manager = _manager(live_amt=quantity, stop_price=99.0)
+        manager.pm = SimpleNamespace(_cancel_stale_stops=AsyncMock())
+        orders = _algo_orders(99.0)  # 500 @99.0 ilk sırada
+        orders.append(
+            {"orderType": "STOP_MARKET", "side": "SELL", "algoId": "900",
+             "triggerPrice": 99.5}
+        )
+        manager.client.get_open_algo_orders = AsyncMock(return_value=orders)
+
+        assert await manager._recover_one(_trade(quantity)) is True
+
+        assert manager._positions["BTCUSDT"].position.sl_order_id == "900"
+
+    async def test_short_picks_the_lowest_trigger(self):
+        orders = [
+            {"orderType": "STOP_MARKET", "side": "BUY", "algoId": "1",
+             "triggerPrice": 101.0},
+            {"orderType": "STOP_MARKET", "side": "BUY", "algoId": "2",
+             "triggerPrice": 100.4},
+        ]
+        from src.strategies.scalper.types import Direction
+
+        assert FollowerExitManager._live_stop_order(orders, Direction.SHORT) == (
+            "2",
+            100.4,
+        )
+
+    async def test_single_stop_leaves_the_exchange_alone(self):
+        quantity = 12 * STEP
+        manager = _manager(live_amt=quantity, stop_price=99.0)
+        manager.pm = SimpleNamespace(_cancel_stale_stops=AsyncMock())
+
+        assert await manager._recover_one(_trade(quantity)) is True
+
+        manager.pm._cancel_stale_stops.assert_not_awaited()
+        assert manager._positions["BTCUSDT"].position.sl_order_id == "500"
+
+    async def test_tp1_done_with_tighter_stop_keeps_breakeven_flag(self):
+        """En koruyucu stop BE kadar sıkıysa gevşek kalıntı yüzünden bayrak
+        DÜŞMEZ (BE'yi gereksiz yere yeniden denemek yerine gerçek korumayı
+        görür)."""
+        quantity = 12 * STEP
+        manager = _manager(live_amt=quantity, stop_price=99.0, confirmed={"501"})
+        manager.pm = SimpleNamespace(_cancel_stale_stops=AsyncMock())
+        self._two_stops(manager, loose=99.0, tight=100.30)
+
+        assert await manager._recover_one(_trade(quantity)) is True
+
+        sp = manager._positions["BTCUSDT"]
+        assert sp.tp1_done is True
+        assert sp.position.current_stoploss == pytest.approx(100.30)

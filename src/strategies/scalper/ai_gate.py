@@ -1347,6 +1347,16 @@ class AiGate:
         if deny / float(window) > limit and not self._runaway:
             self._runaway = True
             self._runaway_at = _utc_iso(self._clock())
+            if self.mode != "active":
+                # Gölgede (`off|shadow`) düşürülecek bir şey YOKTUR: katman zaten
+                # hiçbir şeyi engellemez. Bayrak yalnız BİLGİ (yüksek red oranı)
+                # olarak yanar; `errors`a yazılmaz, "düşürüldü" denmez.
+                self.logger.info(
+                    f"AI kapısı: son {window} kararın {deny}'i deny "
+                    f"(> %{limit * 100:.0f}) — yüksek red oranı (bilgi; "
+                    f"mod={self.mode}, davranış değişmedi)"
+                )
+                return
             self._errors[STATUS_RUNAWAY] = self._errors.get(STATUS_RUNAWAY, 0) + 1
             self.logger.warning(
                 f"⚠️ AI kapısı KAÇAK koruması: son {window} kararın {deny}'i "

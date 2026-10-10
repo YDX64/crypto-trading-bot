@@ -635,7 +635,10 @@ class TestO7EmirKimligi:
         from src.strategies.scalper.executor import ScalpExecutor
 
         ex = self._executor()
-        ex.client = SimpleNamespace(place_take_profit=AsyncMock(return_value={}))
+        ex.client = SimpleNamespace(
+            place_take_profit=AsyncMock(return_value={}),
+            quantize_quantity=AsyncMock(side_effect=lambda _s, q: q),
+        )
         algo_id, neden = await ScalpExecutor._place_tp_safely(
             ex, "BTCUSDT", "SELL", 102.0, 1.0, "TP1"
         )
@@ -649,7 +652,8 @@ class TestO7EmirKimligi:
 
         ex = self._executor()
         ex.client = SimpleNamespace(
-            place_take_profit=AsyncMock(return_value={"algoId": "a1"})
+            place_take_profit=AsyncMock(return_value={"algoId": "a1"}),
+            quantize_quantity=AsyncMock(side_effect=lambda _s, q: q),
         )
         assert await ScalpExecutor._place_tp_safely(
             ex, "BTCUSDT", "SELL", 102.0, 1.0, "TP1"

@@ -522,7 +522,9 @@ class FollowerExitManager(ExitManager):
             )
             return False
 
-        live_stop = self._live_stop_order(algo_orders, direction)
+        live_stop = await self._pick_recovery_stop(
+            symbol, trade, algo_orders, direction
+        )
         live_sl_algo_id = live_stop[0] if live_stop is not None else None
         current_stop = live_stop[1] if live_stop is not None else None
         if current_stop is None:

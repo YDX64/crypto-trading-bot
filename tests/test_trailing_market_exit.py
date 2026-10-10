@@ -709,13 +709,13 @@ class TestTrailFamilyRecognition:
     def test_forensics_does_not_treat_winning_trail_market_as_a_stop(self):
         """Kârlı bir TRAIL_MARKET "stop yedi" (noise_stop) sayılmamalı.
 
-        Kayıplı olan (net<0) elbette sayılır — kural TRAIL ile aynıdır.
+        Kayıplı olan (net<0) `near_entry_exit` alır — kural TRAIL ile aynıdır.
         """
         from src.strategies.scalper import forensics as fx
 
         candles = [
-            SimpleNamespace(high=101.0, low=99.0, close_time=60_000),
-            SimpleNamespace(high=101.5, low=100.5, close_time=120_000),
+            SimpleNamespace(high=101.0, low=99.0, open_time=0, close_time=60_000),
+            SimpleNamespace(high=101.5, low=100.5, open_time=60_000, close_time=120_000),
         ]
         entry = {"direction": "LONG", "fill_price": 100.0}
 
@@ -733,7 +733,8 @@ class TestTrailFamilyRecognition:
             candles=candles,
             closed_at_ms=0,
         )
-        assert loser.get("tags") == [fx.TAG_NOISE_STOP]
+        # SL DIŞI net-zararlı çıkış: `noise_stop` değil `near_entry_exit`.
+        assert loser.get("tags") == [fx.TAG_NEAR_ENTRY_EXIT]
 
     def test_ledger_report_counts_market_exits_separately(self):
         import importlib.util

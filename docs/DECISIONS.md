@@ -7,6 +7,185 @@ Pencereler: AYI 2026-01-23→02-13 (BTC −30%) · YATAY 2026-07-01→07-21 · B
 
 ## Aktif kararlar
 
+### D40 — Hata avı paketi A: saat dilimi, TP sınıflaması, ölçüm etiketleri, karşı-olgu süpürmesi, rejim önbelleği, reaper dayanıklılığı, kurtarma stop seçimi · 2026-10-10 · KOD VAR — deploy bekliyor
+
+**Talep:** kullanıcı panosu (TESTNET) 169 işlemde PF 0,47 gösteriyor; "panodaki kırmızıların arkasında hata var mı"
+sorusu için 5 boyutlu, 32 ajanlı, düşmanca doğrulamalı bir hata avı koşuldu (26 bulgu → 19 ayakta, 7 çürütüldü →
+12 madde). Bu paket (A) o 12 maddenin **strateji parametresi / giriş-çıkış kuralı DEĞİŞTİRMEYEN** kısmını uygular
+(madde 1, 3, 4, 5, 6, 9a, 10, 11, 12 + `exits.py:112` yorum düzeltmesi). Kural (CLAUDE.md yasak #1): stop/boyut/TP1 ile
+kayıp küçültme YOK; harness (`backtest*.py`) DEĞİŞMEDİ. Kalan maddeler "Bilerek YAPILMAYANLAR"da.
+
+**DÜRÜST ÇERÇEVE (önce bunu oku):** bu paket PF'yi tek başına kâra ÇEVİRMEZ. Düzeltmelerin çoğu *ölçüm doğruluğu*
+(etiket, sayaç, adli kayıt) ve *dayanıklılık*dır; PF 0,47'yi üreten mekanizma bu paketin kapsamında değildir. Hata avı
+raporunun kendi bulgusu: panodaki SL ROI −%51…−%57 büyük ölçüde tasarımın sonucudur (D8 %50 stop + kayma/ücret; D37
+aynı sayıları gösterdi) ve `workingType`/baz farkı gibi mekanizmaların −86 USDT'yi açıkladığı KANITLANMADI. Canlı
+karar yolunu gerçekten değiştiren yalnız üç kalem var (aşağıda "CANLI DAVRANIŞ"); üçünün de beklenen PnL etkisi
+küçük ve ÖLÇÜLMEDİ. Bu paketten "artık kazanıyor" çıkarımı yapılmaz; "stoplar gürültüye yeniliyor, genişletelim"
+çıkarımı da yapılmaz (madde 3 etiketi tam bu yanlış okumayı önlemek için düzeltildi).
+
+**Ne** (her madde: dosya · davranış etkisi):
+
+1. **Maker dolumunda `entry_candle_time` 2 saat geriydi** — `src/strategies/scalper/executor.py` (maker dolum yolu ~2479 ve
+   taker yedek dalı ~1221): `int(datetime.utcnow().timestamp()*1000)` (naive UTC'yi yerel saat sayar; sunucu TZ'si
+   Europe/Stockholm iken tam −7 199 992 ms) → `int(time.time()*1000)`. `opened_at=utcnow()` (naive UTC, `recover()`
+   çeviriyor) ve pending şeması DOKUNULMADI. **CANLI DAVRANIŞ DEĞİŞİR:** chandelier trailing penceresi
+   (`exits.py` `c.close_time > sp.entry_candle_time`) ve `engine.py` yapı-çıkışı "olay girişten sonra mı" tazelik kapısı
+   artık dolum anından başlar (eskiden ~24 adet 5m mum önceden; SHORT'ta giriş öncesi dipler `raw_stop`'u piyasanın
+   altına çekip Binance −2021 → `_on_emergency_closed` → TRAIL_MARKET üretebiliyordu). Yalnız **maker + UTC dışı TZ**
+   kombinasyonunda fark vardır (taker ana yolu `candles_5m[-1].close_time` kullanır, etkilenmez; config varsayılanı
+   taker, `docs/audits/2026-09-06-d34.md:26` canlıda maker gözlemler). Sunucu TZ'si bu bulut oturumundan doğrulanamadı
+   (rapor Stockholm diyor).
+2. **TP1/TP2 başarısızlık sınıflaması** — `executor.py` `_place_tp_safely` + `src/trading/binance_client_improved.py`
+   `_place_conditional`: (a) clientAlgoId uzlaştırması başarısız olunca (POST ReadTimeout/5xx/−1007 sonrası sorgu −2013
+   ile tükenirse ya da kesin hata verirse) özgün istisna AYNEN yeniden fırlatılır, yalnız `algo_state_unknown=True` +
+   `client_algo_id` etiketi eklenir (yeni alt sınıf YOK; SL/BE akışı aynı); `_place_tp_safely` etiketi görünce ölü
+   duran `TP_FAIL_UNIDENTIFIED` dalına gider → `tp1_unidentified`/`tp2_unidentified` sayaçları ve CRITICAL "BELİRSİZ"
+   logu gerçekten çalışır (eskiden `rejected/error` = "KONULAMADI" sayılıyordu). (b) Göndermeden önce `quantize_quantity`
+   sonucu ≤0 ise emir/REST yok, `TP_FAIL_ZERO_QTY` ("rounded_zero"); kaba adımlı sembolde (örn. BTC) %40/%30 parça
+   sıfıra inebilir. **Motor kararı değişmez; emir davranışı değişmez** (sıfır miktarlı emir zaten `ERR_PRECISION` ile
+   gitmiyordu; yalnız sınıflama doğru). Yeni REST çağrısı YOK. Bilinen sınır: TP1 dolunca BE kurulmaması sorunu bununla
+   ÇÖZÜLMEZ; ayrıca −2013 ile tükenen durumda emir büyük olasılıkla hiç konmamıştır ama sayaç/mesaj "KABUL EDİLDİ ama
+   KİMLİĞİ OKUNAMADI" der (metin belirsiz-POST'u tam anlatmıyor; sayaç mantığı doğru) — sonraki tur metin düzeltmesi.
+3. **`noise_stop` etiketi "stop iğnesi" ölçmüyordu** — `src/strategies/scalper/forensics.py`, `static/dashboard.html`,
+   `scripts/ledger_report.py`: (a) `noise_stop` artık YALNIZ SL ailesine yazılır; SL dışı çıkışlar (REAPER, BE_MARKET,
+   TRAIL, TRAIL_MARKET) net<0 ve fiyat girişe döndüyse yeni `near_entry_exit` etiketini alır; net≥0 veya net'i bilinmeyen
+   SL dışı çıkış etiket almaz. (b) Kapanışı içeren mum artık sayılmaz (`open_time >= closed_at_ms`; `open_time` yoksa
+   eski davranış). (c) Testnet dolumu ↔ mainnet kline baz farkı (~%0,054) ÇEVRİLMEDİ, yalnız `postmortem.note`'a
+   "baz düzeltmesiz ±%0,05" yazıldı. Pano `FX_TAG_LABELS` ve `ledger_report` `FORENSICS_TAG_LABELS` motorla eşitlendi;
+   `ledger_report` çıktısına `NOISE_SPLIT_NOTE` eklendi. **Saf ölçüm; motor kararı değişmez.** ⚠ Geçmiş kayıtlar
+   YENİDEN HESAPLANMAZ (migration yok): **eski ve yeni `noise_stop` sayıları KIYASLANAMAZ** (eski küme çoğunlukla SL
+   değil, küçük zararlı REAPER/BE/TRAIL idi: panodaki 24 işlem/−86,07 USDT/ort −3,6 USDT, gerçek SL'ler −26…−39 —
+   aritmetik çıkarım, DB dağılımı doğrulanmadı). D22'deki "net<0 da noise_stop" kuralı bu madde ile EVRİLDİ.
+4. **Karşı-olgu defteri (D27) giriş taramasına bağlıydı** — `src/strategies/scalper/counterfactual_store.py`, `engine.py`,
+   `src/main.py`: yaş süpürmesi artık `_scan_tick`'in EN BAŞINDA (REST geri çekilmesinden ve `_entries_ready` kapısından
+   önce; store içinde 60 sn hız sınırı) çağrılır; `set_scan_universe()` ile motor tarama evrenini deftere bildirir
+   (boş/`None` = "bilinmiyor", hiçbir sembol evren dışı sayılmaz). Evren dışı sembolün (TV sağlama-ret satırları)
+   satırı yine KAYDEDİLİR ama kısa son kullanma alır (ufuk + 3 sa, `extra.unresolvable_symbol=True`) — 48 sa
+   boyunca 500'lük kapasiteyi işgal etmez; sembol sonradan evrene girerse normal çözülür. `/scalper/status`
+   `counterfactual` bloğuna 4 yeni sayaç: `unmeasured_gap`, `unmeasured_no_data`, `unscanned_symbol` (`expired`'in alt
+   kümesi), `unresolvable_symbol`; `resolved == measured + unmeasured_gap + unmeasured_no_data` eşitliği testle
+   sabit; `main.py` `_EMPTY_SCALPER_STATUS` literali ve parite testi birlikte güncellendi. **Saf ölçüm; REST ağırlığı
+   SIFIR; motor kararı değişmez.** Ölçüm değişikliği notu: evren dışı satırların sonradan taranıp ölçülme şansı azalır
+   (kasıtlı; `unresolvable_symbol`/`unscanned_symbol` sayaçları karşılaştırmayı mümkün kılar). Sıra garantisi notu:
+   `resolve_symbol` içindeki "GLOBAL süpürme ÇÖZÜMDEN SONRA" değişmezi artık yalnız `resolve_symbol` çağrısı içinde
+   geçerli (tur başı süpürme ayrıca koşar; 48 sa'i aşmış satır için fark pratikte ihmal edilebilir).
+5. **Restart kurtarma ölçüm kayıpları + stop seçimi** — `src/strategies/scalper/exits.py`,
+   `src/strategies/follower/exits.py`, `src/strategies/scalper/tracker.py`: (a) `restart_gap` iken
+   `forensics.path["mfe_lower_bound"]=True` (MFE/MAE restart'ta sıfırdan başlar; değer aynen kalır, yalnız "alt sınır"
+   işaretlenir — `mfe_giveback` restart'a yakalanan işlemlerde EKSİK sayar, fazla saymaz; **yeni forensics `path`
+   anahtarı**). (b) `_live_stop_order` ilk STOP yerine pozisyon yönünde EN KORUYUCU stopu seçer (LONG en yüksek, SHORT en
+   düşük tetik; eşitlikte borsa sırası). (c) `_pick_recovery_stop` (scalper + takipçi `_recover_one`): borsada >1 geçerli
+   stop varsa seçilen dışındakiler seçilen stop yerindeyken `pm._cancel_stale_stops(symbol, keep_order_id=...)` ile
+   iptal edilir (koruma boşluğu YOK; seçilen stopun kimliği yoksa temizlik atlanır). (d) Hatırlanan fazla stop kimlikleri
+   `_verified_close_ledger`'a ek SL adayı olarak geçer (kapanıştan sonra borsada stop kalmadığı için kimlikler o an
+   alınmalı). (e) `scalp_trades.sl_algo_id` artık her BAŞARILI SL taşımasında (`_apply_stop` `result.ok`) ve kurtarmada
+   canlı kimlik DB'dekinden farklıysa güncellenir (`tracker.update_sl_algo_id`, yalnız OPEN satır, idempotent; migration
+   YOK, sütun vardı). (f) `exits.py:112` yorumu düzeltildi: `workingType` GÖNDERİLMİYOR, varsayılan CONTRACT_PRICE (son
+   fiyat); kodda davranış değişmedi. **Etki:** ölçüm + nadir durumda canlı davranış — kurtarılan pozisyonun
+   `current_stop`'u artık en koruyucu stop olur (restart sonrası ilk trailing/BE kararının referansı yalnız borsada >1
+   stop varken değişir); ek REST yalnız bu nadir durumda (`get_open_algo_orders` + iptaller). `_cancel_stale_stops`
+   yön süzmeden tüm STOP/STOP_MARKET'leri (seçilen hariç) siler: one-way mod + sembol rezervasyonu altında zararsız ama
+   elle konmuş stoplar da gider. **Maliyet notu:** `sl_algo_id` yazımı stop taşıma başına bir SQLite oturumudur (hata
+   yutulur, aynı kimlik tekrar yazılmaz; periyodik yazım DEĞİL); SQLite kilidi doluysa stop-taşıma yolu o kadar bekler
+   — testnette stop taşıma gecikmesi izlenmeli. Eski kayıtlarda `sl_algo_id` bayat olabilir.
+6. **Rejim önbelleği** — `engine.py` `_get_cached_regime`: sembol başına 300 sn zaman TTL'i (`_REGIME_CACHE_TTL`, kaldırıldı)
+   → anahtar son KAPANMIŞ mumun `close_time`'ı (aynıysa eski rejim, değişince yeniden hesap; `close_time` okunamazsa
+   önbelleğe yazılmaz). **CANLI DAVRANIŞ DEĞİŞİR (harness'a YAKLAŞIR; yeni sapma yok):** rejim kapısı
+   (DOWN-LONG vb.) 15m mum sınırında en çok 5 dk daha erken döner (canlı profil `SCALPER_TF_REGIME=15m`; sapma iki yönde
+   işlerdi: kaçan DOWN-LONG ve gereksiz bloklanan geçerli giriş). Kalan bilinen P1 sapması: `data.py` 15m kline
+   TTL'i 60 sn (`_TTL_BY_INTERVAL` yanına "P1 BİLİNEN SAPMA" yorumu yazıldı; kod değişmedi).
+7. **REAPER/STALE_TP kapanış dayanıklılığı** — `engine.py` yeni `_submit_aged_close` + `_aged_close_backoff_map`:
+   `return` yalnız BAŞARILI gönderimden sonra çalışır (eskiden başarısız ilk deneme turu bitirip arkadaki yaşlı
+   pozisyonları aç bırakıyordu; scratch: 3 turda yalnız ilk sembole 3 deneme); hata dalı `continue`; tur başına en çok 2
+   başarısız deneme (`_AGED_CLOSE_MAX_FAILURES_PER_ROUND`), hata alan sembol 30 sn backoff (`_AGED_CLOSE_BACKOFF_SEC`),
+   Reaper ve STALE_TP ortak backoff haritasını paylaşır. Miktar artık `get_position_risk(force_fresh=True)` ile CANLI
+   okunur (kısmi TP sonrası bayat plan miktarı −2022 üretebilirdi; `_close_position_market` D10'da aynısını yapmıştı):
+   canlı miktar 0 → emir/damga yok, başarısızlık sayılmaz; `None`/okuma hatası/okuyucu yok → plan miktarına dönülür
+   (flat SAYILMAZ); yuvarlama 0 → emir yok, başarısızlık sayılır; damga yalnız gönderimden sonra. **Kapanış KURALI
+   (yaş, ROI eşiği) değişmez; harness etkilenmez.** Maliyet: her deneme öncesi bir tam `positionRisk` (weight 5, 1 sn
+   snapshot muafiyetini atlar); 'flat' sonucunda backoff yok (pratikte `exits.step` aynı turda flat'i işler);
+   STALE_TP varsayılan kapalıdır (D30).
+8. **AI "kaçak koruması" shadow'da** — `src/strategies/scalper/ai_gate.py` `_check_runaway`: `mode != "active"` iken
+   `_errors['ai_runaway']`'a yazılmaz ve "shadow'a düşürüldü" denmez (log INFO); bayrak (`_runaway`, `runaway_at`) bilgi
+   olarak yanmaya devam eder. `active` yolu aynı (active zaten config validator ile reddedilir). Pano mesajı moda göre
+   ayrıldı ("KAÇAK KORUMASI: katman shadow'a düşürüldü" yalnız `active`; aksi halde "yüksek red oranı (bilgi)").
+   **Saf etiket; motor kararı değişmez.** `ledger_report --ai` hata sayıları shadow'da `ai_runaway` içermez.
+9. **Pano başlığı** — `static/dashboard.html`: "Kümülatif Gerçekleşen K/Z" sparkline'ı yalnız son 50 işlemdir (AP satırları
+   dahil; `performance_scope` id≥278 AP hariç −513,95 iken pano −280,57 gösteriyordu) → başlık "Son 50 işlem toplamı
+   (AP dahil)" + kapsam tooltip'i. Yeni uç YOK. Kesici kararları sparkline'dan değil sunucu hesabından verilir.
+
+**Neden:** (1) yerel-saat/UTC karışıklığı sessiz ve deterministik bir hata; harness doğru değeri kullanıyor, canlı
+maker yolu kullanmıyordu (parite). (2–5, 8–9) kullanıcının okuduğu sayılar (noise_stop kümesi, "TP1 yok", "815
+ölçülemedi / 540 yaş sınırında düştü / 578 kuyruk dolu", "2 net doğrulanmamış", AI kaçak uyarısı) yanlış mekanizmayı
+işaret ediyordu; yanlış ölçümle verilen karar PF'yi iyileştirmez, bozar. (6) harness'a parite. (7) tek bir kalıcı
+reddedilen yaşlı pozisyon arkasındakileri aç bırakıyordu (2026-08-14 watchdog dersiyle aynı sınıf).
+
+**Kanıt:**
+- Tam test: başlangıç `3261 passed, 3 skipped` → paket sonu **`3361 passed, 3 skipped`** (+100 test; bu kayıt yazılırken
+  `.venv/bin/python -m pytest tests -q -p no:cacheprovider` yeniden koşuldu, 62,19 sn) ve
+  `.venv/bin/ruff check --select E9,F63,F7,F82 src tests scripts` temiz. Uygulayıcı koşularından birinde bir tam koşuda 1
+  test kırmızı çıktı (hangisi olduğu yakalanamadı); sonraki 7 tam koşu + bu kayıttaki koşu yeşil → zamanlama/ortam
+  bağımlı flake şüphesi, yeri DOĞRULANAMADI (teslim öncesi `-rf` ile birkaç koşu daha önerilir).
+- Eklenen testler: `tests/test_entry_candle_time_tz.py` (6; Stockholm/New_York/UTC, maker `check_pending` + taker yedek dalı;
+  düzeltme öncesi kodla 4'ü kırmızı), `tests/test_tp_failure_classification.py` (8; gerçek `_place_conditional` +
+  sahte `_request_with_retry`: ReadTimeout + −2013 → `(None, "unidentified")`, kesin red `rejected` kalır, ek
+  `openAlgoOrders` çağrısı yok, quantize→0, `order_health_snapshot` anahtar kümesi aynı; düzeltme öncesi 4'ü kırmızı),
+  `tests/test_cf_scan_dependence.py` (20; gerçek `_scan_tick`, girişler kapalıyken/REST geri çekilmesinde süpürme),
+  `tests/test_regime_cache_close_time.py` (6; gerçek `detect_regime`), `tests/test_aged_close_resilience.py` (20; mock yalnız
+  `_request_with_retry`/`get_position_risk`/`quantize_quantity` sınırında), `tests/test_scalper_pnl_recovery.py` (+20; gerçek
+  SQLite ile `update_sl_algo_id`), `tests/test_follower_recovery.py` (+5), `tests/test_forensics.py` (+ yeni etiket/mum
+  filtresi/pano sınıfı `TestDashboardLabelsMadde3_11_12`), `tests/test_ai_gate.py::TestRunaway::test_shadow_high_deny_ratio_is_info_only`.
+  Güncellenen eski beklentiler: `test_reaper_exit_label.py`, `test_trailing_market_exit.py` (net-negatif SL-dışı → `near_entry_exit`),
+  `test_counterfactual_store.py` (anahtar kümesi +4), `test_d27_review_fixes.py` (iki fixture'a `quantize_quantity`; mantık aynı).
+  Mutasyon kontrolü: kurtarma seçimi/temizlik/kalıcılaştırma/ek aday kodları kapatılınca 8 test kırmızı; süpürme çağrısı
+  çıkarılınca 2 engine testi kırmızı.
+- Hata avının scratch yeniden üretimleri (bulut oturumu, ağ yok; kalıcı dosya DEĞİL, çıktı hata avı raporundadır):
+  `bh-tp1be-r/r.py` → `bug since 36 raw_stop 103.4545 price 104.2` (SHORT stop piyasanın altında, madde 1);
+  `bh-refute/t.py` → belirsiz-POST'un `rejected/error` sınıflandığı (madde 2); `bh-olcum/probe1.py` → 1 sa tarama
+  sonrası giriş kapalıyken satır `measured=False, interior_gap`; `bh-cf/t.py` → evren dışı AVAX satırı 10. saatte
+  pending, 50. saatte expired (madde 4); reaper scratch'i → 3 turda yalnız ilk sembole 3 deneme (madde 7);
+  forensics scratch'i → REAPER −0,4 / BE_MARKET −0,2 / TRAIL −0,1 üçü de `['noise_stop']` (madde 3). Düzeltme sonrası
+  karşılıkları yukarıdaki testlerdedir.
+- **KanıtlanMAMIŞ olanlar:** canlı DB dağılımı (hangi etiket/sayaç payının hangi nedenden geldiği), sunucu TZ'si ve maker
+  oranı, 815/540/578 sayılarının nedene göre bölünmesi bu oturumdan doğrulanamadı (Binance canlı API 451, sunucuya erişim yok).
+
+**Bilerek YAPILMAYANLAR:**
+- **`workingType=MARK_PRICE` (madde 7) EKLENMEDİ.** Körlemesine eklemek harness (mum high/low = son fiyat) paritesini
+  bozar, açık pozisyonların mevcut stopları karışık davranır; 3 rejim backtest + parite testi + testnet ≥5 gün gerekir.
+  Önce kanıt (stop-out anında mark/last farkının forensics'e yazılması) — o da bu pakette YOK.
+- **Bayat-mum kapısı (madde 9b) EKLENMEDİ** → önce gözlem (`entry.candle_age_sec` etiketi) ve P1'e "bilinen sapma"; kapı canlı
+  kararı değiştirir (yasak #1/#2).
+- **Taker MARKET girişi idempotency (`newClientOrderId` + belirsizlikte uzlaştırma), `record_open` kısa retry'ı ve
+  scalper yetim-pozisyon mutabakatı (madde 2) → PAKET B.** Emir yolunu değiştirir; hata enjeksiyonlu testnet gözlemi ve
+  ayrı D-maddesi gerekir. Bu pakette giriş POST'u hâlâ kimliksiz yeniden denenebilir (çift dolum riski belgelenmiş açık).
+- **TP tetik fiyatı yuvarlaması (madde 8) EKLENMEDİ** — `quantize_protective_price` TP'yi bir tick uzağa iter (test kilitli,
+  bilinçli olabilir); ortalama etki ihmal edilebilir (ADA 0,14 ROI puanı, maks 0,32); önce niyet DECISIONS'a yazılmalı.
+- `split_three_quantities` ("kalanı son parçaya ver") politikası, ek `get_open_algo_orders` araması, migration, periyodik DB
+  yazımı, kalıcı MFE/MAE geri yükleme (relax açıkken harness paritesi sorusu doğurur), pending şemasına sinyal mumu
+  `close_time` yazma, mum çeken bağımsız karşı-olgu çözüm turu (REST ekler), `_warn_counterfactual_horizon_fit` uyarısına
+  tarama kesintisi, geçmiş forensics kayıtlarının yeniden hesabı, testnet↔mainnet baz düzeltmesi — hepsi bu turda YOK.
+- Eski stop taşımada iptal edilen SL'nin yarışta dolma ihtimali (eski kimliği de ledger adayı yapmak) kapsam dışı.
+
+**İzleme (testnet, deploy sonrası):** `TRAIL_MARKET`/−2021 sayısı (madde 1); `tp1_unidentified`/`tp1_missing`/`tp2_missing`
+(`order_health`); rejim geçişi çevresindeki girişler (madde 6); `/scalper/status` `counterfactual` yeni sayaçları;
+stop taşıma gecikmesi (SQLite yazımı); `reaper` başarısız deneme/backoff logları. Eski ve yeni `noise_stop` dönemlerini
+AYNI tabloda kıyaslama.
+
+**Denetim sonrası ek (ana oturum):** reaper/STALE_TP canlı okuması `flat` dönen sembole 10 sn kısa bekleme verir
+(`_AGED_CLOSE_FLAT_BACKOFF_SEC`; tavana sayılmaz, uzun hata backoff'u değil) — `exits.step` kapanışı işleyene kadar her
+safety turunda positionRisk (weight 5) okunmasın; mutasyonla doğrulandı (bekleme kapatılınca 4 test kırmızı). TP1
+"belirsiz" CRITICAL mesajı "kabul durumu BELİRSİZ (POST yanıtı kayıp, clientAlgoId uzlaştırılamadı)" diye düzeltildi;
+`forensics.py` ve `counterfactual_store.py` eski yorumları yeni davranışa çekildi. Tam test 3 ardışık koşuda
+**3363 passed, 3 skipped** (uygulayıcının bir kez gördüğü tekil kırmızı tekrarlanmadı — yeri doğrulanamadı).
+
+**Geri alma:** önceki commit = `1f3da26f1177a0cb8395793ff94b7565ca28c1f7` → `scripts/deploy.sh awa 1f3da26f1177a0cb8395793ff94b7565ca28c1f7`
+(ya da `backups/commit.prev-*`). **Restart GEREKİR:** `src/` değişti (tembel import'lar nedeniyle çalışan süreç eski +
+diskten sonradan yüklenen yeni modül KARIŞIR) → D39 nesnel ölçütüne göre `DEPLOY_NO_RESTART=1` KULLANILAMAZ; deploy.sh'in
+kapıları (entry-halt, 418 ban, temiz ağaç, testler, `/health`, otomatik geri alma) aynen işler. Yalnız
+`static/dashboard.html` geri alınacaksa da aynı yol (dosya commit'in parçası). DB/`.env` değişikliği YOK; yeni
+`mfe_lower_bound` yalnız JSON `path` anahtarıdır, eski sürüm onu yok sayar; `sl_algo_id` değerleri geri alma sonrası da
+geçerli kimliklerdir (yalnız daha güncel).
+
 ### D39 — Bulutta geliştirme, yerelden deploy (Claude Code bulut oturumu) · 2026-10-10 · AKTİF (motor davranışı DEĞİŞMEZ)
 
 **Talep:** kullanıcı geliştirmeyi Claude Code bulut oturumlarına taşıdı. Bulutta SSH anahtarı ve

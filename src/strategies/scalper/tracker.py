@@ -116,6 +116,24 @@ class ScalpTracker:
             )
             return trade.id
 
+    async def update_sl_algo_id(self, trade_id: int, sl_algo_id: str) -> bool:
+        """AÇIK işlemin ``sl_algo_id``sini borsadaki güncel stop kimliğine çek.
+
+        Sütun açılışta yazılır ve SL taşındıkça bayatlar; restart sırasında
+        kapanan pozisyonun SL ledger doğrulaması bu kimliği kullanır
+        (``ExitManager._record_recovery_estimate``). Yeni sütun/migration YOK.
+        Yalnız ``OPEN`` satırı değiştirir; True = satır artık bu kimliği taşıyor.
+        """
+        async with AsyncSessionLocal() as session:
+            trade = await session.get(ScalpTradeModel, int(trade_id))
+            if trade is None or trade.status != "OPEN":
+                return False
+            if trade.sl_algo_id == str(sl_algo_id):
+                return True
+            trade.sl_algo_id = str(sl_algo_id)
+            await session.commit()
+            return True
+
     async def record_shadow(
         self,
         signal: ScalpSignal,

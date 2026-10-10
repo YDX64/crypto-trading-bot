@@ -85,6 +85,14 @@ DEFAULT_MAX_AGE_H = 48.0
 #: turunda her sembol için koşmasının anlamı yok.
 SWEEP_MIN_INTERVAL_SEC = 60.0
 
+#: Tarama evreni DIŞINDAKİ bir sembolün niyeti için, en büyük ufkun ÜSTÜNE
+#: eklenen kısa son kullanma payı (sn). Bu sembol `_evaluate_symbol` içindeki
+#: çözüm kancasına hiç ulaşmaz (motor yalnız evren sembollerini tarar); 48
+#: saatlik varsayılan yaşı beklemek ölçülemeyecek satırlarla 500'lük kapasiteyi
+#: işgal eder. Satır YİNE kaydedilir (hiç kaydetmemek seçicilik ölçümünü
+#: yanlılaştırırdı) ve sembol sonradan evrene girerse normal çözülür.
+UNRESOLVABLE_GRACE_SEC = 3 * 3600.0
+
 #: Planı olmayan bir niyet için referans girişin niyet anından AZAMİ gecikmesi
 #: (sn). Giriş dilimi 5m, bağlam dilimi 15m'dir; 900 sn ikisini de bir mum +
 #: pay ile karşılar. Bundan uzak bir "ilk mum" referans giriş sayılamaz.
@@ -124,12 +132,27 @@ _candle_history: Dict[str, Dict[float, Any]] = {}
 #: Son GLOBAL yaş süpürmesinin anı (çağıranın saatiyle, saniye).
 _last_sweep_epoch: float = 0.0
 
+#: Motorun SON taradığı evren (`set_scan_universe`). `None` = henüz bilinmiyor
+#: (hiçbir sembol "evren dışı" sayılmaz — eski davranış).
+_scan_universe: Optional[frozenset] = None
+#: sembol → o sembol için `resolve_symbol`un SON çağrıldığı an (çağıranın saati).
+#: Yalnız bekleyeni olan semboller için tutulur (kova bitince bırakılır).
+_last_resolve_call: Dict[str, float] = {}
+
 _registered: int = 0
 _dedup_hits: int = 0
 _dropped_full: int = 0
 _expired: int = 0
 _resolved: int = 0
 _measured: int = 0
+#: Ölçülemeden çözülenlerin NEDENE göre ayrımı (D27/B-5): kapsama boşluğu
+#: (`sim.gap` dolu) ile veri/plan hiç yok (`sim.gap` boş) ayrı sayılır.
+_unmeasured_gap: int = 0
+_unmeasured_no_data: int = 0
+#: Yaş sınırında düşen satırlardan, kayıttan beri sembolü HİÇ taranmamış olanlar.
+_unscanned_symbol: int = 0
+#: Kayıt anında tarama evreni dışında olan satırlar (kısa son kullanma aldı).
+_unresolvable_symbol: int = 0
 _logged: int = 0
 _log_dropped: int = 0
 
@@ -209,6 +232,27 @@ def parse_horizons(raw: Any) -> Tuple[float, ...]:
     return parsed or DEFAULT_HORIZONS
 
 
+def set_scan_universe(symbols: Any) -> None:
+    """Motorun bu turda TARADIĞI sembol evrenini bildir (saf bellek, REST yok).
+
+    `register` bunu "bu sembol çözüm kancasına ulaşabilir mi?" sorusu için
+    kullanır. Boş/`None`/bozuk girdi "bilinmiyor" demektir: hiçbir sembol evren
+    dışı sayılmaz (eski davranış). ASLA istisna yükseltmez.
+    """
+    global _scan_universe
+    try:
+        if symbols is None:
+            parsed = None
+        else:
+            parsed = frozenset(
+                key for key in (cf._symbol(sym) for sym in symbols) if key
+            ) or None
+    except Exception:  # pragma: no cover - teşhis kaydı akışı ASLA kesmez
+        parsed = None
+    with _lock:
+        _scan_universe = parsed
+
+
 # --------------------------------------------------------------------------
 # Kayıt
 # --------------------------------------------------------------------------
@@ -235,6 +279,7 @@ def register(
     ASLA istisna yükseltmez.
     """
     global _pending_count, _registered, _dedup_hits, _dropped_full
+    global _unresolvable_symbol
     try:
         with _lock:
             if not _enabled:
@@ -294,6 +339,27 @@ def register(
             # Yaş süpürmesi kovayı değiştirmiş/silmiş olabilir. Eski listeyi
             # yeniden yazmak, sona ermiş kayıtları diriltir ve pending
             # sayacını gerçek kova boyutundan koparır.
+            # Evren dışı sembol (D27/B-5): motor onu hiç taramaz, dolayısıyla
+            # çözüm kancası ona ulaşmaz. SATIR YİNE KAYDEDİLİR (kaydetmemek
+            # seçicilik ölçümünü yanlılaştırır) ama kapasiteyi 48 saat işgal
+            # etmesin diye KISA bir son kullanma alır (ufuk + birkaç saat).
+            if _scan_universe is not None and key not in _scan_universe:
+                try:
+                    horizon_sec = (
+                        max(row.get("horizons_h") or _horizons or DEFAULT_HORIZONS)
+                        * cf.SECONDS_PER_HOUR
+                    )
+                    row["_expire_epoch"] = (
+                        float(row["at_epoch"]) + horizon_sec + UNRESOLVABLE_GRACE_SEC
+                    )
+                    extra = row.get("extra")
+                    if not isinstance(extra, dict):
+                        extra = {}
+                        row["extra"] = extra
+                    extra["unresolvable_symbol"] = True
+                    _unresolvable_symbol += 1
+                except (TypeError, ValueError):  # pragma: no cover - savunma
+                    row.pop("_expire_epoch", None)
             bucket = _pending.get(key) or []
             bucket.append(row)
             _pending[key] = bucket
@@ -384,7 +450,7 @@ def _sweep_expired_locked(now_epoch: Any, *, force: bool = False) -> int:
 
     Kilit ÇAĞIRAN tarafından tutulur. Döner: düşürülen satır sayısı.
     """
-    global _pending_count, _expired, _last_sweep_epoch
+    global _pending_count, _expired, _last_sweep_epoch, _unscanned_symbol
     try:
         now = float(now_epoch)
     except (TypeError, ValueError):
@@ -397,16 +463,29 @@ def _sweep_expired_locked(now_epoch: Any, *, force: bool = False) -> int:
 
     cutoff = now - _max_age_h * cf.SECONDS_PER_HOUR
     dropped = 0
+    unscanned = 0
     for key in list(_pending.keys()):
         bucket = _pending.get(key) or []
         keep = []
+        last_call = _last_resolve_call.get(key)
         for row in bucket:
             try:
                 at_epoch = float(row.get("at_epoch") or 0.0)
             except (TypeError, ValueError):
                 at_epoch = 0.0
-            if at_epoch < cutoff:
+            # Evren dışı satırın KISA son kullanması (`register`); yoksa
+            # yalnız genel yaş sınırı geçerlidir.
+            try:
+                expire_at = row.get("_expire_epoch")
+                short_expired = expire_at is not None and now >= float(expire_at)
+            except (TypeError, ValueError):
+                short_expired = False
+            if at_epoch < cutoff or short_expired:
                 dropped += 1
+                # Kayıttan beri bu sembol için ÇÖZÜM kancası hiç çalışmadıysa
+                # satır "taranmadığı için" düşmüştür (D27/B-5).
+                if last_call is None or last_call < at_epoch:
+                    unscanned += 1
                 continue
             keep.append(row)
         if keep:
@@ -414,8 +493,10 @@ def _sweep_expired_locked(now_epoch: Any, *, force: bool = False) -> int:
         else:
             _pending.pop(key, None)
             _candle_history.pop(key, None)
+            _last_resolve_call.pop(key, None)
     if dropped:
         _expired += dropped
+        _unscanned_symbol += unscanned
         _pending_count -= dropped
     return dropped
 
@@ -451,6 +532,7 @@ def resolve_symbol(
     evreninden çıkmış sembollerin kayıtları da böylece sona erer.
     """
     global _pending_count, _resolved, _measured, _logged, _log_dropped
+    global _unmeasured_gap, _unmeasured_no_data
     out: List[Dict[str, Any]] = []
     try:
         with _lock:
@@ -464,8 +546,16 @@ def resolve_symbol(
                 # Kova boş olsa bile GLOBAL süpürme koşar: bu çağrının asıl
                 # ikinci işi, tarama evreninden ÇIKMIŞ sembollerin
                 # kayıtlarını sona erdirmektir (Y2).
+                _last_resolve_call.pop(normalized_key, None)
                 _sweep_expired_locked(now_epoch)
                 return out
+
+            # D27/B-5: bu sembolün çözüm kancası ÇALIŞTI (kayıt yaş sınırında
+            # düşerse `unscanned_symbol`dan ayrılabilsin).
+            try:
+                _last_resolve_call[normalized_key] = float(now_epoch)
+            except (TypeError, ValueError):
+                pass
 
             # D28: tek taramadaki 150 mumu değil, bu bekleyen kayıt yaşarken
             # motorun ZATEN çekmiş olduğu örtüşen pencerelerin birleşimini
@@ -526,6 +616,15 @@ def resolve_symbol(
                     _resolved += 1
                     if resolved.get("measured"):
                         _measured += 1
+                    else:
+                        # Ölçülemeyen çözümü NEDENE göre ayır: kapsama
+                        # boşluğu (interior_gap/partial_window...) ile
+                        # veri/plan hiç yok.
+                        sim = resolved.get("sim")
+                        if isinstance(sim, dict) and sim.get("gap"):
+                            _unmeasured_gap += 1
+                        else:
+                            _unmeasured_no_data += 1
                     _recent.append(resolved)
                     out.append(resolved)
             finally:
@@ -540,7 +639,10 @@ def resolve_symbol(
                 else:
                     _pending.pop(key, None)
                     _candle_history.pop(normalized_key, None)
-            # GLOBAL yaş süpürmesi ÇÖZÜMDEN SONRA koşar: bu turda taranan
+                    _last_resolve_call.pop(normalized_key, None)
+            # Bu çağrı İÇİNDE global yaş süpürmesi ÇÖZÜMDEN SONRA koşar (D40:
+            # motor ayrıca `_scan_tick` başında da süpürür — sıra garantisi
+            # yalnız bu fonksiyon içinde geçerlidir): bu turda taranan
             # sembolün kayıtları önce ÖLÇÜLME şansını alır (yaşı geçmiş ama
             # mumları elde olan bir satırı sessizce düşürmek, ölçebilecekken
             # ölçmemek olurdu); geri kalan semboller burada sona erer.
@@ -591,6 +693,14 @@ def counters_snapshot() -> Dict[str, Any]:
             "expired": _expired,
             "resolved": _resolved,
             "measured": _measured,
+            # D27/B-5: ölçülemeyen çözümlerin ve düşenlerin NEDENİ.
+            # resolved == measured + unmeasured_gap + unmeasured_no_data.
+            "unmeasured_gap": _unmeasured_gap,
+            "unmeasured_no_data": _unmeasured_no_data,
+            # expired'in alt kümesi: sembolü kayıttan beri HİÇ taranmamış.
+            "unscanned_symbol": _unscanned_symbol,
+            # Kayıt anında tarama evreni dışındaki satırlar (kısa son kullanma).
+            "unresolvable_symbol": _unresolvable_symbol,
             "logged": _logged,
             "log_dropped": _log_dropped,
             "candle_buffer_symbols": len(_candle_history),
@@ -643,9 +753,17 @@ def reset() -> None:
     """YALNIZ testler için: durumu ve sayaçları sıfırla."""
     global _pending_count, _registered, _dedup_hits, _dropped_full
     global _expired, _resolved, _measured, _logged, _log_dropped
-    global _last_sweep_epoch
+    global _last_sweep_epoch, _scan_universe
+    global _unmeasured_gap, _unmeasured_no_data, _unscanned_symbol
+    global _unresolvable_symbol
     with _lock:
         _last_sweep_epoch = 0.0
+        _scan_universe = None
+        _last_resolve_call.clear()
+        _unmeasured_gap = 0
+        _unmeasured_no_data = 0
+        _unscanned_symbol = 0
+        _unresolvable_symbol = 0
         _pending.clear()
         _candle_history.clear()
         _recent.clear()

@@ -53,6 +53,7 @@ TAG_GATE_BYPASSED = "gate_bypassed"
 TAG_FEE_DOMINATED = "fee_dominated"
 TAG_MFE_GIVEBACK = "mfe_giveback"
 TAG_NOISE_STOP = "noise_stop"
+TAG_NEAR_ENTRY_EXIT = "near_entry_exit"
 
 #: Panoda rozetin altına yazılan tek satırlık Türkçe açıklama.
 TAG_LABELS: Dict[str, str] = {
@@ -64,7 +65,8 @@ TAG_LABELS: Dict[str, str] = {
     TAG_GATE_BYPASSED: "kapı açık ama ETKİN DEĞİL (fail-open) iken girildi",
     TAG_FEE_DOMINATED: "ücretler kârın yarısından fazlasını yedi",
     TAG_MFE_GIVEBACK: "kâr TP1 hedefini gördü ama zararla kapandı",
-    TAG_NOISE_STOP: "stop sonrası fiyat pencerede girişe geri döndü (gürültü)",
+    TAG_NOISE_STOP: "SL sonrası fiyat pencerede girişe geri döndü (gürültü)",
+    TAG_NEAR_ENTRY_EXIT: "SL dışı zararlı kapanış sonrası fiyat pencerede girişe döndü",
 }
 
 #: Etiketin kaydın hangi bölümünde hesaplandığı (panoda gruplama için).
@@ -78,6 +80,7 @@ TAG_STAGE: Dict[str, str] = {
     TAG_FEE_DOMINATED: "exit",
     TAG_MFE_GIVEBACK: "exit",
     TAG_NOISE_STOP: "postmortem",
+    TAG_NEAR_ENTRY_EXIT: "postmortem",
 }
 
 ALL_TAGS: tuple = tuple(TAG_LABELS.keys())
@@ -196,8 +199,9 @@ def _direction_value(direction: Any) -> str:
 # KENDİ AİLESİ olarak durur — SL ailesine katmak, ölçüm borcunu kapatmak için
 # ayırdığımız etiketi rapor katmanında yeniden karıştırırdı. Yan etki (kasıtlı):
 # postmortem'in `losing` kuralı REAPER'ı artık yalnız NET PnL negatifse kayıplı
-# sayar; ARTIDA kesilen bir pozisyonda `noise_stop` ("stop sonrası fiyat girişe
-# döndü") sorusunun zaten anlamı yoktur.
+# sayar; ARTIDA kesilen bir pozisyonda "fiyat girişe döndü mü" sorusunun zaten
+# anlamı yoktur. D40: kayıplı REAPER (ve diğer SL-dışı net<0 çıkışlar)
+# `noise_stop` DEĞİL `near_entry_exit` alır; `noise_stop` yalnız SL ailesidir.
 # D30: `STALE_TP` = bayat-kâr kapanışı (TP1 görmemiş, yaşlı, KÂRDA pozisyonun
 # reduce-only MARKET kesmesi). KENDİ AİLESİ: TP_LADDER değildir (hedefe
 # varılmadı), SL değildir (kârda kapandı). `losing` kuralı için REAPER gibi
@@ -821,9 +825,17 @@ def postmortem_from_candles(
     kararı bu alanı okumaz — okusaydı gelecekten bilgi sızardı. Kaydın
     `entry`/`exit` bölümleri bu çağrıdan ETKİLENMEZ.
 
-    `noise_stop` = stop yenildi (ya da zararla kapandı) VE pencere içinde
-    fiyat giriş seviyesine LEHTE geri döndü → çıkış, trendin değil gürültünün
-    sonucuydu.
+    `noise_stop` = SL ailesi bir stop yenildi VE pencere içinde fiyat giriş
+    seviyesine LEHTE geri döndü → çıkış, trendin değil gürültünün sonucuydu.
+    `near_entry_exit` = SL DIŞI bir çıkış (REAPER/BE_MARKET/TRAIL/…) NET
+    zararla kapandı ve fiyat girişe döndü: bu bir "stop iğnesi" değildir (çoğu
+    girişin dibinde küçük zararla kapanmış çıkıştır), ayrı sayılır.
+
+    Ölçüm sınırları: (1) kapanışı İÇEREN mum (`open_time < closed_at_ms`)
+    sayılmaz — içindeki high/low kapanıştan ÖNCEKİ hareketi sızdırırdı;
+    (2) giriş fiyatı testnet dolumu, mumlar mainnet host'undan (D17) gelir:
+    baz farkı (~%0,05) ÇEVRİLMEZ, küçük zararlı çıkışlarda etiketi
+    çevirebilir.
     """
     th = th or VerdictThresholds()
     entry = entry or {}
@@ -842,7 +854,10 @@ def postmortem_from_candles(
         "minutes_to_return": None,
         "max_favorable_pct": None,
         "tags": [],
-        "note": "kapanıştan SONRAKİ mumlar; karar yoluna GİRMEZ (look-ahead değil)",
+        "note": (
+            "kapanıştan SONRAKİ mumlar; karar yoluna GİRMEZ (look-ahead değil); "
+            "baz düzeltmesiz ±%0,05 (mainnet kline / testnet dolum)"
+        ),
     }
     if not entry_price or direction not in ("LONG", "SHORT") or window_ms <= 0:
         return out
@@ -853,6 +868,12 @@ def postmortem_from_candles(
     for candle in candles or []:
         close_time = _f(getattr(candle, "close_time", None))
         if close_time is None or close_time <= closed_at_ms or close_time > end_ms:
+            continue
+        # Kapanışı İÇEREN mum (açılışı kapanıştan önce) kapanış öncesi hareketi
+        # taşır → dışla. `open_time` yoksa (tuhaf test/veri çifti) eski
+        # davranış korunur: yalnız close_time filtresi.
+        open_time = _f(getattr(candle, "open_time", None))
+        if open_time is not None and open_time < closed_at_ms:
             continue
         seen += 1
         if direction == "LONG":
@@ -884,10 +905,13 @@ def postmortem_from_candles(
     net = _f(exit_.get("realized_pnl"))
     # D22: `TRAIL_MARKET`/`BE_MARKET` TRAIL ailesindendir (stop kararının
     # piyasa emriyle uygulanmış hâli) — "stop yedi" sayılmaz; kayıplı olup
-    # olmadığına net PnL karar verir, tıpkı TRAIL gibi.
-    losing = exit_reason_family(reason) == "SL" or (net is not None and net < 0)
-    if losing and returned_at is not None:
-        out["tags"] = [TAG_NOISE_STOP]
+    # olmadığına net PnL karar verir, tıpkı TRAIL gibi. Madde 3: SL-dışı
+    # net-zararlı çıkışlar `noise_stop` DEĞİL `near_entry_exit` etiketi alır.
+    if returned_at is not None:
+        if exit_reason_family(reason) == "SL":
+            out["tags"] = [TAG_NOISE_STOP]
+        elif net is not None and net < 0:
+            out["tags"] = [TAG_NEAR_ENTRY_EXIT]
     return out
 
 

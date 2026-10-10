@@ -1336,6 +1336,20 @@ class ImprovedBinanceClient:
             normalized["reconciled"] = True
         return normalized
 
+    @staticmethod
+    def _tag_algo_state_unknown(exc: Exception, client_algo_id: str) -> None:
+        """Belirsiz POST + başarısız uzlaştırma: emir borsada CANLI olabilir.
+
+        Yeni istisna sınıfı YOK (httpx hataları ve SL/BE akışı aynı kalır);
+        özgün istisnaya iki öznitelik eklenir, çağıran (`_place_tp_safely`)
+        bunu `unidentified` olarak sınıflar.
+        """
+        try:
+            exc.algo_state_unknown = True  # type: ignore[attr-defined]
+            exc.client_algo_id = client_algo_id  # type: ignore[attr-defined]
+        except Exception:  # __slots__ / dondurulmuş istisna — etiket opsiyonel
+            pass
+
     async def _place_conditional(
         self, symbol: str, params: Dict[str, Any], label: str
     ) -> Dict[str, Any]:
@@ -1388,12 +1402,14 @@ class ImprovedBinanceClient:
                             f"{label}: clientAlgoId sorgusu kesin hata verdi "
                             f"({client_algo_id}): {query_error}"
                         )
+                        self._tag_algo_state_unknown(post_error, client_algo_id)
                         raise post_error from query_error
             else:
                 self.logger.error(
                     f"{label}: koşullu POST sonucu belirsiz ve clientAlgoId "
                     f"uzlaştırılamadı ({client_algo_id}): {last_query_error}"
                 )
+                self._tag_algo_state_unknown(post_error, client_algo_id)
                 raise post_error from last_query_error
             reconciled = True
             normalized = self._normalized_conditional_response(
