@@ -414,7 +414,9 @@ beslenir. Önce geçici dizine yazar; her dosya katı denetimden geçer (mum say
 yok, son mum `end-1`) ve her zip'in `.CHECKSUM` sha256'sı doğrulanır — tek sorunda hata ile durur, önbelleğe HİÇBİR şey
 yazılmaz (aksi halde dosyalar tek tek `os.replace` ile taşınır: **dosya başına atomik** — bir dosya ya tam doğrulanmış
 haliyle vardır ya da yoktur; terfi ortasında G/Ç hatası olursa önbellek KISMEN güncellenmiş olabilir, eksik dosya
-backtest'te cache-miss ile gürültülü hata verir). Eksik gün/mum = hata (yama yok).
+backtest'te cache-miss ile gürültülü hata verir; `--overwrite` ile ayrıca henüz terfi edilmemiş ve önceden var olan ESKİ
+hedef dosyalar SİLİNİR — eski+yeni karışık veriyle sessiz backtest olmasın — terfi edilmiş yeni dosyalar kalır, silme
+başarısız olursa hata mesajında yazılır). Eksik gün/mum = hata (yama yok).
 
 **Kısıtlar**
 - **Arşiv gecikmesi ~1-2 gün:** günlük zip en geç dünden/evvelsi günden; pencere sonu (`--end`, dahil değil) arşivin

@@ -334,6 +334,115 @@ class TestStaleTpOrdering:
 
 
 # --------------------------------------------------------------------------
+# 2b) Damga KAPI DEĞİL — gönderim sonrası yeniden deneme (ortak backoff)
+# --------------------------------------------------------------------------
+
+class TestStampIsLabelNotGate:
+    """`stale_tp_close_at` / `reaper_close_at` yalnız ETİKETTİR. Tekrarı ortak
+    backoff engeller; bekleme dolunca pozisyon hâlâ izleniyorsa yeniden denenir,
+    flat ise emir gitmez. Damga hiç temizlenmediğinden eskiden kalıcı kilitti."""
+
+    @pytest.mark.asyncio
+    async def test_stale_tp_bekleme_icinde_tekrar_yok_dolunca_canli_miktarla_tekrar(self):
+        positions = {"AAAUSDT": _sp(age_hours=3.0, quantity=1.5)}
+        client = FakeClient(amounts={"AAAUSDT": "0.7"})
+        engine = _engine(positions, client, stale=True)
+
+        await engine._close_stale_profitable_positions()
+        assert len(client.posts) == 1
+        assert positions["AAAUSDT"].stale_tp_close_at
+
+        await engine._close_stale_profitable_positions()      # bekleme içinde
+        assert len(client.posts) == 1
+
+        engine._aged_close_backoff["AAAUSDT"] = time.monotonic() - 1.0  # bekleme doldu
+        await engine._close_stale_profitable_positions()      # hâlâ açık → tekrar
+        assert len(client.posts) == 2
+        assert client.posts[1]["quantity"] == 0.7
+        assert client.posts[1]["reduceOnly"] == "true"
+        # Etiket rolü değişmedi: damga durur.
+        assert positions["AAAUSDT"].stale_tp_close_at
+
+    @pytest.mark.asyncio
+    async def test_stale_tp_bekleme_dolunca_borsada_flat_ise_emir_yok(self):
+        positions = {"AAAUSDT": _sp(age_hours=3.0)}
+        client = FakeClient(amounts={"AAAUSDT": "1.5"})
+        engine = _engine(positions, client, stale=True)
+
+        await engine._close_stale_profitable_positions()
+        assert len(client.posts) == 1
+
+        client.amounts["AAAUSDT"] = "0"                       # borsa kapandı
+        engine._aged_close_backoff["AAAUSDT"] = time.monotonic() - 1.0
+        await engine._close_stale_profitable_positions()
+
+        assert len(client.posts) == 1, "flat → ikinci emir yok"
+        assert len(client.risk_calls) == 2, "canlı okuma yapıldı (yeniden denendi)"
+
+    @pytest.mark.asyncio
+    async def test_reaper_stale_damgali_pozisyonda_bekleme_icinde_emir_yok_dolunca_devralir(self):
+        """Reaper'ın STALE_TP damgalı pozisyonu atlama AMACI (iki rutin aynı
+        anda emir göndermesin) damgayla değil ortak backoff ile korunur."""
+        positions = {"AAAUSDT": _sp(age_hours=9.0)}
+        client = FakeClient(amounts={"AAAUSDT": "1.5"})
+        engine = _engine(positions, client, stale=True)
+
+        await engine._close_stale_profitable_positions()
+        assert len(client.posts) == 1
+        assert positions["AAAUSDT"].stale_tp_close_at
+
+        await engine._reap_aged_positions()                   # bekleme içinde
+        assert len(client.posts) == 1
+        assert positions["AAAUSDT"].reaper_close_at is None
+
+        engine._aged_close_backoff["AAAUSDT"] = time.monotonic() - 1.0
+        await engine._reap_aged_positions()                   # hâlâ açık → Reaper
+        assert len(client.posts) == 2
+        assert positions["AAAUSDT"].reaper_close_at
+
+    @pytest.mark.asyncio
+    async def test_reaper_ve_stale_ayni_turda_ayni_sembole_iki_emir_gondermez(self):
+        positions = {"AAAUSDT": _sp(age_hours=9.0)}
+        client = FakeClient()
+        engine = _engine(positions, client, stale=True)
+
+        # engine.py:1386-1387 sırası: önce STALE_TP, sonra Reaper.
+        await engine._close_stale_profitable_positions()
+        await engine._reap_aged_positions()
+        assert [p["symbol"] for p in client.posts] == ["AAAUSDT"]
+
+        # Ters sıra da aynı: Reaper gönderdiyse STALE_TP bekler.
+        positions2 = {"BBBUSDT": _sp(age_hours=9.0)}
+        client2 = FakeClient()
+        engine2 = _engine(positions2, client2, stale=True)
+        await engine2._reap_aged_positions()
+        await engine2._close_stale_profitable_positions()
+        assert [p["symbol"] for p in client2.posts] == ["BBBUSDT"]
+
+    @pytest.mark.asyncio
+    async def test_reaper_kendi_damgasindan_sonra_bekleme_dolunca_yeniden_dener(self):
+        positions = {"AAAUSDT": _sp(age_hours=9.0)}
+        client = FakeClient()
+        engine = _engine(positions, client)
+
+        await engine._reap_aged_positions()
+        assert positions["AAAUSDT"].reaper_close_at
+        engine._aged_close_backoff["AAAUSDT"] = time.monotonic() - 1.0
+        await engine._reap_aged_positions()
+        assert len(client.posts) == 2
+
+    @pytest.mark.asyncio
+    async def test_stale_tp_reaper_damgali_pozisyonda_bekleme_dolunca_yeniden_dener(self):
+        positions = {"AAAUSDT": _sp(age_hours=9.0)}
+        positions["AAAUSDT"].reaper_close_at = "2026-01-01T00:00:00+00:00"
+        client = FakeClient()
+        engine = _engine(positions, client, stale=True)
+
+        await engine._close_stale_profitable_positions()      # backoff yok → gider
+        assert len(client.posts) == 1
+
+
+# --------------------------------------------------------------------------
 # 3) Bayat miktar — canlı |positionAmt|
 # --------------------------------------------------------------------------
 

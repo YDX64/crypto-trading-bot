@@ -366,6 +366,135 @@ class TestFill:
         assert kline_cache.load(cache, *args) == good
         assert "yenilendi" in {f.status for f in report.files}
 
+    # -- terfi ortası OSError: eski sürüm hedefler geçersiz kılınır (--overwrite) --
+
+    @staticmethod
+    def _alter(cache: Path, path: Path) -> tuple:
+        """Önbellekteki dosyayı ESKİ (farklı içerikli) sürümle değiştirir; (iyi, eski, anahtar) döner."""
+        m = fv._CACHE_NAME_RE.match(path.name)
+        args = (m["symbol"], m["interval"], int(m["start"]), int(m["end"]))
+        good = kline_cache.load(cache, *args)
+        old = list(good)
+        old[0] = Candle(**{**good[0].__dict__, "close": good[0].close + 1.0})
+        kline_cache.save(cache, *args, old)
+        return good, old, args
+
+    @staticmethod
+    def _fail_nth_promotion(monkeypatch, cache: Path, n: int):
+        real_replace = os.replace
+        calls = {"n": 0}
+
+        def flaky(src, dst):
+            if Path(dst).parent == cache:        # yalnız terfi (hazırlık yazımları değil)
+                calls["n"] += 1
+                if calls["n"] == n:
+                    raise OSError(5, "Input/output error")
+            return real_replace(src, dst)
+        monkeypatch.setattr(fv.os, "replace", flaky)
+
+    def test_overwrite_mid_promotion_error_invalidates_unpromoted_old_files(self, tmp_path, monkeypatch):
+        arch = _golden_archive()
+        kw = dict(symbols=["BTCUSDT"])
+        _, cache = _fill(tmp_path, arch, **kw)
+        files = sorted(cache.glob("*.json.gz"))
+        assert len(files) == 3
+        goods = {}
+        for f in files:
+            goods[f.name] = self._alter(cache, f)
+        self._fail_nth_promotion(monkeypatch, cache, 2)
+
+        with pytest.raises(fv.PromotionError) as exc:
+            _fill(tmp_path, arch, overwrite=True, **kw)
+
+        msg = str(exc.value)
+        assert "Input/output error" in msg
+        # 1. dosya yeni sürüme terfi etti; 2. (hatalı) ve 3. eski sürümleri SİLİNDİ.
+        good1, _old1, args1 = goods[files[0].name]
+        assert kline_cache.load(cache, *args1) == good1
+        assert not files[1].exists() and not files[2].exists()
+        assert files[1].name in msg and files[2].name in msg
+        assert "geçersiz kılındı" in msg
+        assert "SİLİNEMEDİ" not in msg
+        assert [p.name for p in cache.iterdir()] == [files[0].name]   # hazırlık dizini de temiz
+
+    def test_overwrite_mid_promotion_error_keeps_unchanged_files(self, tmp_path, monkeypatch):
+        """"değişmedi" dosya arşivle aynı içeriktir: silinmez."""
+        arch = _golden_archive()
+        kw = dict(symbols=["BTCUSDT"])
+        _, cache = _fill(tmp_path, arch, **kw)
+        files = sorted(cache.glob("*.json.gz"))
+        _g, _o, _a = self._alter(cache, files[0])
+        _g, _o, _a = self._alter(cache, files[1])      # 3. dosya DEĞİŞMEDİ
+        self._fail_nth_promotion(monkeypatch, cache, 2)
+
+        with pytest.raises(fv.PromotionError) as exc:
+            _fill(tmp_path, arch, overwrite=True, **kw)
+
+        assert files[2].exists() and files[2].name not in str(exc.value)
+        assert not files[1].exists()
+
+    def test_overwrite_mid_promotion_error_reports_failed_deletion(self, tmp_path, monkeypatch):
+        arch = _golden_archive()
+        kw = dict(symbols=["BTCUSDT"])
+        _, cache = _fill(tmp_path, arch, **kw)
+        files = sorted(cache.glob("*.json.gz"))
+        for f in files:
+            self._alter(cache, f)
+        self._fail_nth_promotion(monkeypatch, cache, 2)
+        real_unlink = Path.unlink
+
+        def selective(self, *a, **k):
+            if self.name == files[2].name:
+                raise PermissionError(13, "Permission denied")
+            return real_unlink(self, *a, **k)
+        monkeypatch.setattr(Path, "unlink", selective)
+
+        with pytest.raises(fv.PromotionError) as exc:
+            _fill(tmp_path, arch, overwrite=True, **kw)
+
+        msg = str(exc.value)
+        assert "SİLİNEMEDİ" in msg and files[2].name in msg and "Permission denied" in msg
+        assert not files[1].exists() and files[2].exists()
+
+    def test_no_overwrite_mid_promotion_error_does_not_delete_anything(self, tmp_path, monkeypatch):
+        """--overwrite KAPALIYKEN davranış değişmedi: bozuk (okunamayan) mevcut
+        dosyalar "yenilendi" planlanır ama terfi hatasında SİLİNMEZ."""
+        arch = _golden_archive()
+        kw = dict(symbols=["BTCUSDT"])
+        _, cache = _fill(tmp_path, arch, **kw)
+        files = sorted(cache.glob("*.json.gz"))
+        for f in files:
+            f.write_bytes(b"not a gzip")                # load() -> None => "yenilendi"
+        self._fail_nth_promotion(monkeypatch, cache, 2)
+
+        with pytest.raises(fv.PromotionError) as exc:
+            _fill(tmp_path, arch, **kw)                 # overwrite=False
+
+        assert "geçersiz kılındı" not in str(exc.value) and "SİLİNEMEDİ" not in str(exc.value)
+        assert all(f.exists() for f in files[1:])
+        assert files[0].read_bytes() != b"not a gzip"   # 1. dosya terfi etti
+        assert files[1].read_bytes() == b"not a gzip"
+
+    def test_cli_overwrite_mid_promotion_message_and_exit_code(self, tmp_path, capsys, monkeypatch):
+        arch = _golden_archive()
+        args = ["--symbols", "BTCUSDT", "--start", _START, "--end", _END,
+                "--tf-entry", "5m", "--tf-context", "15m", "--tf-regime", "15m", "--no-market-gate",
+                "--cache-dir", str(tmp_path / "c"), "--download-cache", str(tmp_path / "d")]
+        assert fv.main(args, transport=arch) == 0
+        cache = tmp_path / "c"
+        files = sorted(cache.glob("*.json.gz"))
+        for f in files:
+            self._alter(cache, f)
+        capsys.readouterr()
+        self._fail_nth_promotion(monkeypatch, cache, 2)
+
+        rc = fv.main([*args, "--overwrite"], transport=arch)
+
+        err = capsys.readouterr().err
+        assert rc == 2
+        assert "geçersiz kılındı" in err and "KISMEN güncellenmiş olabilir" in err
+        assert not files[1].exists() and not files[2].exists() and files[0].exists()
+
     def test_golden_backtest_runs_identically_from_filled_cache(self, tmp_path, monkeypatch):
         """Doldurulan önbellek, fixture'larla AYNI golden sonucu verir (ağsız harness)."""
         import test_golden_backtest as golden

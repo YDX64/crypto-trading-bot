@@ -108,8 +108,8 @@ Ne 4→5, Ne 5→6, Ne 6→9a, Ne 7→10, Ne 8→11, Ne 9→12.
    eskiden `backoff.pop`): Reaper döngüsü `reaper_close_at` damgasına bakmadığı için bir sonraki safety turunda
    (`exits.step` kapanışı henüz uzlaştırmadan) AYNI pozisyona ikinci bir reduce-only MARKET gidebiliyordu (07fbaf4'te de
    aynıydı: damga yalnız etiket, emir tekrarı engellenmiyordu). Süre dolunca pozisyon hâlâ izleniyorsa canlı miktarla
-   yeniden denenir (takılı kalma YOK). STALE_TP'de `stale_tp_close_at` damgası zaten ikinci gönderimi engeller; aynı
-   bekleme tutarlılık için orada da konur. Miktar artık `get_position_risk(force_fresh=True)` ile CANLI
+   yeniden denenir (takılı kalma YOK). Damgalar (`stale_tp_close_at`/`reaper_close_at`) KAPI DEĞİL, yalnız etikettir; iki rutinin aynı pozisyona aynı
+   anda emir göndermesini ortak backoff önler (aşağıdaki cubic notuna bakınız). Miktar artık `get_position_risk(force_fresh=True)` ile CANLI
    okunur (kısmi TP sonrası bayat plan miktarı −2022 üretebilirdi; `_close_position_market` D10'da aynısını yapmıştı):
    canlı miktar 0 → emir/damga yok, başarısızlık sayılmaz; `None`/okuma hatası/okuyucu yok → plan miktarına dönülür
    (flat SAYILMAZ); yuvarlama 0 → emir yok, başarısızlık sayılır; damga yalnız gönderimden sonra. **Kapanış KURALI
@@ -193,7 +193,13 @@ safety turunda positionRisk (weight 5) okunmasın; mutasyonla doğrulandı (bekl
 `mae_upper_bound` (Ne 5a), `fill_klines_cache_from_vision.py` HTTP 408 yeniden denemesi + `OSError` yakalama
 (terfi öncesi "HİÇBİR dosya yazılmadı", terfi sırasında `PromotionError` → "KISMEN güncellenmiş olabilir") + "dosya
 başına atomik" ifadesi, ve üç zayıf testin sıkılaştırılması (pano dalı regex'i, `unmeasured_no_data`, iç boşluk @500).
-Tam test **3377 passed, 3 skipped**; ruff temiz.
+Sonraki tur (aynı PR): (i) STALE_TP/Reaper döngülerindeki KALICI damga kapıları kaldırıldı (damga hiç temizlenmediği için
+emir kabul edilip pozisyon açık kalırsa ne STALE_TP ne Reaper yeniden deniyordu; artık yalnız ortak backoff bekletir, süre
+dolunca canlı miktarla yeniden denenir, flat ise emir yok), ve (ii) `--overwrite` terfisi ortasında `OSError` olursa terfi
+edilmemiş ESKİ hedef dosyalar silinir (eski+yeni karışık veriyle sessiz backtest olmasın; silinemeyenler hata mesajında yazılır).
+Bilinen etiket sonucu (bilerek değiştirilmedi): STALE_TP damgalı bir pozisyonu bekleme sonrası Reaper devralıp kapatırsa
+`_infer_exit_reason` STALE_TP damgasını önce okuduğu için kapanış etiketi `STALE_TP` kalır (son emir Reaper'ınki olsa da).
+Tam test **3388 passed, 3 skipped**; ruff temiz.
 
 **Geri alma:** önceki commit = `1f3da26f1177a0cb8395793ff94b7565ca28c1f7` → `scripts/deploy.sh awa 1f3da26f1177a0cb8395793ff94b7565ca28c1f7`
 (ya da `backups/commit.prev-*`). **Restart GEREKİR:** `src/` değişti (tembel import'lar nedeniyle çalışan süreç eski +
