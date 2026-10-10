@@ -1,0 +1,244 @@
+{
+  "schema": "e17-cal-constants/1",
+  "plan": "docs/audits/2026-10-10-prereg-tf/PLAN.md §3.1 R3, R4",
+  "note": "Sabit sayilar kilide girer; CAL yeniden okunmaz. Formul yalniz kokendir (provenance). S5=5 bicak sirtidir: formul 4.48-4.84 verir, S=4 de gecerliydi (4/20=0.20 >= MIN_STOP 0.15); 5 donmus bir secimdir (PLAN R4 durustluk notu).",
+  "k": 2,
+  "S_by_entry_tf": {
+    "5m": 5,
+    "15m": 9,
+    "30m": 13,
+    "1h": 16
+  },
+  "S_by_entry_minutes": {
+    "5": 5,
+    "15": 9,
+    "30": 13,
+    "60": 16
+  },
+  "S_derived_env": {
+    "5m": {
+      "SCALPER_DYN_LEV_STOP_ATR_MULT": "2",
+      "SCALPER_FIXED_STOP_ROI_PCT": "5",
+      "SCALPER_TP1_ROI": "5",
+      "SCALPER_TP2_ROI": "10"
+    },
+    "15m": {
+      "SCALPER_DYN_LEV_STOP_ATR_MULT": "2",
+      "SCALPER_FIXED_STOP_ROI_PCT": "9",
+      "SCALPER_TP1_ROI": "9",
+      "SCALPER_TP2_ROI": "18"
+    },
+    "30m": {
+      "SCALPER_DYN_LEV_STOP_ATR_MULT": "2",
+      "SCALPER_FIXED_STOP_ROI_PCT": "13",
+      "SCALPER_TP1_ROI": "13",
+      "SCALPER_TP2_ROI": "26"
+    },
+    "1h": {
+      "SCALPER_DYN_LEV_STOP_ATR_MULT": "2",
+      "SCALPER_FIXED_STOP_ROI_PCT": "16",
+      "SCALPER_TP1_ROI": "16",
+      "SCALPER_TP2_ROI": "32"
+    }
+  },
+  "T_geometry_server": {
+    "S": 50,
+    "k": 3.0,
+    "TP1_ROI": 10,
+    "TP2_ROI": 25,
+    "note": "sunucu geometrisi: T arm'lari snapshot degerlerini aynen kullanir (override yok)"
+  },
+  "TB_rule": "bar sayisi: MAX_HOLD = 480 bar x TF; LOSS_COOLDOWN = 60 bar x TF; MAKER_FILL_TIMEOUT_CANDLES=3; STALE_TP_HOURS=0",
+  "TB_bars": {
+    "MAX_HOLD_bars": 480,
+    "LOSS_COOLDOWN_bars": 60,
+    "MAKER_FILL_TIMEOUT_CANDLES": 3,
+    "STALE_TP_HOURS": 0
+  },
+  "TB_table": {
+    "5m": {
+      "SCALPER_MAX_HOLD_HOURS": "40",
+      "SCALPER_LOSS_COOLDOWN_MINUTES": "300"
+    },
+    "15m": {
+      "SCALPER_MAX_HOLD_HOURS": "120",
+      "SCALPER_LOSS_COOLDOWN_MINUTES": "900"
+    },
+    "30m": {
+      "SCALPER_MAX_HOLD_HOURS": "240",
+      "SCALPER_LOSS_COOLDOWN_MINUTES": "1800"
+    },
+    "1h": {
+      "SCALPER_MAX_HOLD_HOURS": "480",
+      "SCALPER_LOSS_COOLDOWN_MINUTES": "3600"
+    }
+  },
+  "formula": {
+    "text": "S = min(round(20 * k * P10), floor(3 * MAX_STOP_PCT)) ; k=2 ; MAX_STOP_PCT=5.5 => cap 16 ; P10 = CAL (2026-03-01..2026-06-01) sinyal-ani ATR% (8 sembol havuzlu) onuncu yuzdelik. Mekanik: L=clamp(round(S/(k*ATR%)),3,20); stop%=S/L; TP1 (R) = TP1_ROI/S = 1.",
+    "k": 2,
+    "MAX_STOP_PCT": 5.5,
+    "S_cap": 16,
+    "MIN_STOP_PCT": 0.15,
+    "band_check": {
+      "5m": {
+        "stop_pct_min": 0.25,
+        "stop_pct_max": 1.667
+      },
+      "15m": {
+        "stop_pct_min": 0.45,
+        "stop_pct_max": 3.0
+      },
+      "30m": {
+        "stop_pct_min": 0.65,
+        "stop_pct_max": 4.333
+      },
+      "1h": {
+        "stop_pct_min": 0.8,
+        "stop_pct_max": 5.333
+      }
+    }
+  },
+  "p10_measurement_set_A": {
+    "desc": "S-arm CAL olcumleri (BG kapilari kapali), PLAN R4'te alintilanan ilk set",
+    "plan_quoted_P10_atr_pct": {
+      "5m": 0.113,
+      "15m": 0.226,
+      "30m": 0.319,
+      "1h": 0.503
+    },
+    "formula_result": {
+      "5m": {
+        "raw": 4.52,
+        "rounded": 5,
+        "S": 5
+      },
+      "15m": {
+        "raw": 9.04,
+        "rounded": 9,
+        "S": 9
+      },
+      "30m": {
+        "raw": 12.76,
+        "rounded": 13,
+        "S": 13
+      },
+      "1h": {
+        "raw": 20.12,
+        "rounded": 20,
+        "S": 16
+      }
+    },
+    "recomputed_from_files": {
+      "5m": {
+        "file": "m_S5b_BG.json",
+        "P10": 0.113,
+        "n_signal_calls": 446
+      },
+      "15m": {
+        "file": "m_S15b_BG.json",
+        "P10": 0.226,
+        "n_signal_calls": 164
+      },
+      "30m": {
+        "file": "m_S30b_BG.json",
+        "P10": 0.319,
+        "n_signal_calls": 85
+      },
+      "1h": {
+        "file": "m_S1hb_BG.json",
+        "P10": 0.503,
+        "n_signal_calls": 35
+      }
+    }
+  },
+  "p10_measurement_set_B": {
+    "desc": "T-arm CAL olcumleri (BG kapilari kapali), PLAN R4'te alintilanan ikinci bagimsiz set",
+    "plan_quoted_P10_atr_pct": {
+      "5m": 0.121,
+      "15m": 0.228,
+      "30m": 0.327,
+      "1h": 0.508
+    },
+    "formula_result": {
+      "5m": {
+        "raw": 4.84,
+        "rounded": 5,
+        "S": 5
+      },
+      "15m": {
+        "raw": 9.12,
+        "rounded": 9,
+        "S": 9
+      },
+      "30m": {
+        "raw": 13.08,
+        "rounded": 13,
+        "S": 13
+      },
+      "1h": {
+        "raw": 20.32,
+        "rounded": 20,
+        "S": 16
+      }
+    },
+    "recomputed_from_files": {
+      "5m": {
+        "file": "m_T5b_BG.json",
+        "P10": 0.121,
+        "n_signal_calls": 402
+      },
+      "15m": {
+        "file": "m_T15b_BG.json",
+        "P10": 0.228,
+        "n_signal_calls": 171
+      },
+      "30m": {
+        "file": "m_T30b_BG.json",
+        "P10": 0.327,
+        "n_signal_calls": 95
+      },
+      "1h": {
+        "file": "m_T1h_T_noreg_nogate.json",
+        "P10": 0.508,
+        "n_signal_calls": 38
+      }
+    },
+    "note_1h": "PLAN 1h=0.508 degeri m_T1h_T_noreg_nogate.json'dan gelir; m_T1hb_BG.json (BG, b-kosusu) P10=0.506 verir; iki durumda da round(20*2*P10)=20 -> 16'ya kirpilir."
+  },
+  "p10_review_measurement": {
+    "plan_quoted_P10_atr_pct": {
+      "5m": 0.112
+    },
+    "formula_result": {
+      "5m": {
+        "raw": 4.48,
+        "rounded": 4,
+        "S": 4
+      }
+    },
+    "note": "inceleme turu 5m olcumu (dosyasi arsivlenmedi); S5 yine de 5'te dondurulmustur"
+  },
+  "source": {
+    "measurement_scripts": [
+      "e17/stat/measure.py",
+      "e17/stat/atrsig.py",
+      "e17/stat/run_measure.sh"
+    ],
+    "measurement_outputs": [
+      "m_S15b_BG.json",
+      "m_S1hb_BG.json",
+      "m_S30b_BG.json",
+      "m_S5b_BG.json",
+      "m_T15b_BG.json",
+      "m_T1h_T_noreg_nogate.json",
+      "m_T30b_BG.json",
+      "m_T5b_BG.json"
+    ],
+    "variant_generator": [
+      "e17/fix/gen_variants.py",
+      "e17/fix/verify_variants2.py"
+    ],
+    "path_root": "scratchpad kokune goreli (SP); kilitte kopyalari docs/audits/2026-10-10-prereg-tf/evidence/ altindadir (script) ve evidence/ekb_bulk.tgz (m_*.json)",
+    "evidence_dir": "docs/audits/2026-10-10-prereg-tf/evidence/"
+  }
+}
