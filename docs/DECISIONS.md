@@ -20,8 +20,9 @@ sorun hesap düzeyinde olabilir, kodda doğrulanamadı) → kullanıcı kararı:
 AYNEN işler: temiz yerel ağaç, yerel HEAD == `origin/main`; sunucuda entry-halt (iki dosya), son 15 dk
 ban izi, `BOT_MODE`↔ring, temiz ağaç, `flock`, sunucu venv'inde tam test, `.env` parse, restart,
 240 sn'ye kadar katı `/health`, başarısızsa otomatik geri alma. Çalışan süreci etkilemeyen değişiklikte
-`DEPLOY_NO_RESTART=1 scripts/deploy.sh awa` — NESNEL ölçüt: yalnız değişen dosyaların hepsi `docs/`, `tests/`,
-`.claude/` ya da `*.md` ise; `src/` veya `scripts/` altında tek satır değişiklikte ASLA (tembel import'lar
+`DEPLOY_NO_RESTART=1 scripts/deploy.sh awa` — NESNEL ölçüt: **sunucu commit'i ile `origin/main` arasındaki**
+(PR diff'i değil) değişen dosyaların hepsi `docs/`, `tests/`, `.claude/`, `.github/`, `*.md` ya da
+`.gitignore`/`.dockerignore` ise (kontrol komutu RUNBOOK'ta); `src/` veya `scripts/` altında tek satır değişiklikte ASLA (tembel import'lar
 nedeniyle çalışan süreç eski + diskten sonradan yüklenen yeni modül KARIŞIR; sonraki otomatik restart da
 sağlık kapısız yeni kodu başlatır). `deploy.sh` 3-5 dk sürer: araç/pencere kesilirse ssh kopar ve yarım deploy
 kalabilir; bulut/yerel Claude oturumu komutu arka planda ya da uzun timeout ile çalıştırır, ASLA iptal etmez. **Gerçek anlamı**

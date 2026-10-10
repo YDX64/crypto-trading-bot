@@ -313,9 +313,20 @@ satırını görmelisin; görmediysen (ya da pencere kapandıysa) deploy'u TEKRA
 "Bitince doğrula" ve (d)'deki `deploy.log` komutuyla durumu önce kontrol et.
 
 **Restart'sız varyant (`DEPLOY_NO_RESTART=1`) — NESNEL ölçüt:** YALNIZ değişen dosyaların HEPSİ `docs/`,
-`tests/`, `.claude/` altında ya da `*.md` ise kullan. `src/` veya `scripts/` altında TEK satır
-değişiklik varsa ASLA kullanma ("davranışı değişmez" yargısı ölçüt değildir). Neden: kod diski yeni
-commit'e geçer ama çalışan süreç eski modüllerle sürer; `src/` içindeki fonksiyon-içi (tembel)
+`tests/`, `.claude/`, `.github/` altında, `*.md` ya da `.gitignore`/`.dockerignore` ise kullan. Ölçüt PR'ın
+diff'ine DEĞİL, **sunucudaki mevcut commit ile `origin/main` arasındaki TÜM değişikliklere** uygulanır
+(önceden main'e girip henüz deploy edilmemiş bir `src/` değişikliği de bu deploy'la diske iner). `src/`
+veya `scripts/` altında TEK satır değişiklik varsa ASLA kullanma ("davranışı değişmez" yargısı ölçüt
+değildir). Kontrol komutu — YALNIZ `RESTART'SIZ UYGUN` yazarsa restart'sız; başka her çıktıda TAM deploy
+(ssh ya da git hatası da "TAM DEPLOY YAP" der, sahte onay vermez):
+```bash
+cd /Users/max/TRADINGBOT/v2 && git fetch -q origin && \
+SERVER=$(ssh awa 'git -C /opt/tradingbot-v2 rev-parse HEAD') && FILES=$(git diff --name-only "$SERVER" origin/main) && {
+  BAD=$(printf '%s\n' "$FILES" | grep -vE '^(docs/|tests/|\.claude/|\.github/)|\.md$|^\.(git|docker)ignore$|^$')
+  if [ -z "$BAD" ]; then echo "RESTART'SIZ UYGUN"; else echo "TAM DEPLOY GEREKLİ (restart'sız OLMAZ):"; echo "$BAD"; fi
+} || echo "KONTROL BAŞARISIZ — TAM DEPLOY YAP"
+```
+Neden: kod diski yeni commit'e geçer ama çalışan süreç eski modüllerle sürer; `src/` içindeki fonksiyon-içi (tembel)
 import'lar (ör. `src/main.py` istek işleyicileri) sonradan diskten YENİ modülü yükler → eski yüklü
 modüllerle yeni dosyalar KARIŞIR, canlı işlem yolunda çalışma anı hatası çıkabilir. Ayrıca bir sonraki
 otomatik restart (supervisor autorestart, `restart_safe.sh`) sağlık/test kapısı olmadan yeni kodu başlatır.
@@ -350,7 +361,7 @@ main dalını çek ve testnet'e deploy et. Sırayla:
 2) git status ile çalışma ağacının temiz olduğunu ve HEAD'in origin/main ile aynı olduğunu kontrol et; değilse DUR ve bana söyle.
 3) entry-halt ve ban kapılarını kendin kontrol etmeye çalışma, bunları scripts/deploy.sh yapar; script RED ederse nedenini bana aktar, kapıyı atlatma.
 4) scripts/deploy.sh awa komutunu ARKA PLANDA (run_in_background) ya da timeout=600000 ile çalıştır (3-5 dk sürer; varsayılan 120 sn araç zaman aşımı komutu öldürür, ssh kopar, sunucuda yarım deploy kalır). Bitene kadar BEKLE, ASLA iptal etme/kesme. Çıktıyı tam göster; sonunda 'TAMAM: tradingbot_v2 RUNNING ...' satırını ara.
-5) Deploy bitip TAMAM satırı görüldükten sonra (ayrı bir sleep ile uzun bekleme yapma; gerekirse birkaç kısa sorguyla yokla) ssh awa 'supervisorctl status tradingbot_v2; ps -o etimes= -p $(supervisorctl pid tradingbot_v2)' ile doğrula: RUNNING mi, etimes küçük mü (yalnız DEPLOY_NO_RESTART kullandıysan etimes büyük kalması normaldir).
+5) Deploy bitip TAMAM satırı görüldükten sonra (ayrı bir sleep ile uzun bekleme yapma; gerekirse birkaç kısa sorguyla yokla) ssh awa 'supervisorctl status tradingbot_v2; ps -o etimes= -p $(supervisorctl pid tradingbot_v2)' ile doğrula: RUNNING mi, etimes küçük mü (yalnız DEPLOY_NO_RESTART kullandıysan etimes büyük kalması normaldir). DEPLOY_NO_RESTART'ı ancak sunucu commit'i ile origin/main arasındaki TÜM değişen dosyalar docs/, tests/, .claude/, .github/, *.md ya da .gitignore/.dockerignore ise kullan (RUNBOOK'taki kontrol komutu YALNIZ 'RESTART'SIZ UYGUN' yazarsa); aksi halde tam deploy.
 6) Sonucu raporla: deploy edilen commit, test sonucu, RUNNING durumu, etimes.
 Kurallar: mainnet ASLA (--ring mainnet kullanma); DEPLOY_SKIP_TESTS kullanma; çıplak supervisorctl restart yok; scp yok; logs/supervisor.log'u dökme (secret içerir).
 ```
