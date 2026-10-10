@@ -308,18 +308,23 @@ class TestFill:
         assert [p.name for p in cache.iterdir()] == []   # hazırlık dizini de temizlendi
 
     def test_verify_rejects_hole_even_when_count_matches(self, tmp_path):
-        """Mum SAYISI doğru ama içinde boşluk varsa (eksik mum + fazladan eski mum)."""
+        """Mum SAYISI doğru ama İÇİNDE boşluk varsa (eksik mum + yerine tekrar).
+
+        İlk ve son mum KORUNUR (başlangıç/bitiş sınır kontrolleri yakalayamaz);
+        500. mum silinip yerine 501. mumun kopyası konur: uzunluk aynı, ilk
+        mum start'ta, son mum end-1'de kapanır — reddin TEK nedeni iç boşluktur.
+        """
         m = fv._CACHE_NAME_RE.match("BTCUSDT_5m_1786015800000_1786320000000.json.gz")
         args = ("BTCUSDT", "5m", int(m["start"]), int(m["end"]))
         series = _fixture_series("BTCUSDT", "5m")
-        first = series[0]
-        older = Candle(first.open_time - 300_000, first.open, first.high, first.low, first.close,
-                       first.volume, first.close_time - 300_000)
-        holed = [older] + series[:500] + series[501:]
+        holed = series[:500] + [series[501]] + series[501:]
         assert len(holed) == len(series)
+        assert holed[0] == series[0] and holed[-1] == series[-1]   # sınırlar sağlam
+        assert holed[500].open_time == series[501].open_time        # iç boşluk @500
         kline_cache.save(tmp_path, *args, holed)
-        with pytest.raises(fv.VisionError, match="boşluk/kayma"):
+        with pytest.raises(fv.VisionError, match=r"boşluk/kayma — 500\. mum") as exc:
             fv.verify_cache_file(kline_cache.cache_file(tmp_path, *args))
+        assert str(series[500].open_time) in str(exc.value)         # beklenen @500
         kline_cache.save(tmp_path, *args, series)          # sağlam seri geçer
         assert fv.verify_cache_file(kline_cache.cache_file(tmp_path, *args)).candles == series
 
@@ -528,11 +533,110 @@ class TestCli:
         assert rc == 2 and "HİÇBİR dosya yazılmadı" in err
         assert list((tmp_path / "c").rglob("*.json.gz")) == []
 
+    def _cli_args(self, tmp_path):
+        return [
+            "--symbols", "BTCUSDT,ETHUSDT", "--start", _START, "--end", _END,
+            "--tf-entry", "5m", "--tf-context", "15m", "--tf-regime", "15m", "--no-market-gate",
+            "--cache-dir", str(tmp_path / "c"), "--download-cache", str(tmp_path / "d"),
+        ]
+
+    def test_cli_oserror_before_promotion_exits_2_nothing_written(self, tmp_path, capsys, monkeypatch):
+        """Terfi ÖNCESİ G/Ç hatası (hazırlık dizini/disk): traceback değil, çıkış 2
+        ve 'HİÇBİR dosya yazılmadı' (doğru mesaj)."""
+        def boom(*_a, **_k):
+            raise OSError(28, "No space left on device")
+        monkeypatch.setattr(fv.tempfile, "mkdtemp", boom)
+        rc = fv.main(self._cli_args(tmp_path), transport=_golden_archive())
+        err = capsys.readouterr().err
+        assert rc == 2
+        assert "No space left" in err and "HİÇBİR dosya yazılmadı" in err
+        assert "KISMEN" not in err
+        assert list((tmp_path / "c").rglob("*.json.gz")) == []
+
+    def test_cli_oserror_during_promotion_exits_2_with_partial_warning(self, tmp_path, capsys, monkeypatch):
+        """Terfi SIRASINDA G/Ç hatası: 'HİÇBİR dosya yazılmadı' YALAN olurdu —
+        ilk dosya taşınmış olabilir; mesaj kısmi güncellemeyi söylemeli."""
+        real_replace = os.replace
+        calls = {"n": 0}
+
+        def flaky(src, dst):
+            # Yalnız TERFİ (hedef önbellek dizinine taşıma) sayılır; hazırlık
+            # dizinindeki kline_cache.save atomik yazımları geçer.
+            if Path(dst).parent == tmp_path / "c":
+                calls["n"] += 1
+                if calls["n"] == 3:
+                    raise OSError(5, "Input/output error")
+            return real_replace(src, dst)
+        monkeypatch.setattr(fv.os, "replace", flaky)
+        rc = fv.main(self._cli_args(tmp_path), transport=_golden_archive())
+        err = capsys.readouterr().err
+        assert rc == 2
+        assert "KISMEN güncellenmiş olabilir" in err
+        assert "tek başına doğrulanmıştır" in err
+        assert "HİÇBİR dosya yazılmadı" not in err
+        # Gerçekten kısmi: 2 dosya terfi etti, her biri tam ve doğrulanabilir.
+        written = sorted((tmp_path / "c").glob("*.json.gz"))
+        assert len(written) == 2
+        for f in written:
+            fv.verify_cache_file(f)
+
     def test_cli_rejects_bad_window_and_strategy(self, tmp_path, capsys):
         base = ["--cache-dir", str(tmp_path / "c"), "--download-cache", str(tmp_path / "d")]
         assert fv.main(["--start", "2026-08-10", "--end", "2026-08-07", *base], transport=LocalArchive()) == 2
         assert fv.main(["--start", _START, "--end", _END, "--strategies", "ZZZ", *base],
                        transport=LocalArchive()) == 2
+
+
+# --------------------------------------------------------------------------
+# HttpTransport yeniden deneme sınıflaması
+# --------------------------------------------------------------------------
+
+class TestHttpRetryClassification:
+    @staticmethod
+    def _transport(monkeypatch, codes):
+        import urllib.error
+
+        seq = list(codes)
+        calls = {"n": 0}
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b"ok"
+
+        def fake_urlopen(req, timeout=None):
+            calls["n"] += 1
+            code = seq.pop(0)
+            if code == 200:
+                return _Resp()
+            raise urllib.error.HTTPError(req.full_url, code, "x", {}, None)
+
+        monkeypatch.setattr(fv.urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(fv.time, "sleep", lambda _s: None)
+        return fv.HttpTransport(timeout=1.0, retries=4, backoff=0.0), calls
+
+    @pytest.mark.parametrize("code", [408, 429, 500, 503])
+    def test_transient_codes_are_retried(self, monkeypatch, code):
+        t, calls = self._transport(monkeypatch, [code, 200])
+        assert t("https://x/y.zip") == b"ok"
+        assert calls["n"] == 2
+
+    @pytest.mark.parametrize("code", [400, 403, 410])
+    def test_permanent_4xx_not_retried(self, monkeypatch, code):
+        t, calls = self._transport(monkeypatch, [code, 200])
+        with pytest.raises(fv.VisionError):
+            t("https://x/y.zip")
+        assert calls["n"] == 1
+
+    def test_404_is_none_not_retried(self, monkeypatch):
+        t, calls = self._transport(monkeypatch, [404, 200])
+        assert t("https://x/y.zip") is None
+        assert calls["n"] == 1
 
 
 # --------------------------------------------------------------------------

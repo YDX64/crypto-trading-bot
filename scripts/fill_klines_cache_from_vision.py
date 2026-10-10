@@ -25,8 +25,11 @@ NASIL ÇALIŞIR (parite için KASITLI tasarım):
   * Önce GEÇİCİ bir hazırlık dizinine yazılır; HER dosya katı denetimden geçer
     (mum sayısı == anahtardan türeyen `needed`, her mum tam ızgarada, boşluk YOK,
     son mum `end-1`'de kapanır). Tek bir sorun -> hata ile durulur, hedef önbelleğe
-    HİÇBİR ŞEY yazılmaz. Hepsi geçerse dosyalar tek tek `os.replace` (atomik) ile
-    taşınır.
+    HİÇBİR ŞEY yazılmaz. Hepsi geçerse dosyalar tek tek `os.replace` ile taşınır:
+    atomiklik DOSYA BAŞINADIR (bir dosya ya tam doğrulanmış haliyle vardır ya da
+    yoktur); terfi TÜM dosyalar için tek işlem DEĞİLDİR. Terfi ortasında G/Ç hatası
+    olursa önbellek KISMEN güncellenmiş olabilir; eksik kalan dosya backtest'te
+    cache-miss ile gürültülü hata verir (sessiz yanlış veri YOK).
   * Her zip için `.CHECKSUM` (sha256) doğrulanır; uyuşmazlık = hata. İndirilen zip'ler
     `--download-cache` altında tutulur (tekrar indirilmez; her kullanımda sha256
     yeniden doğrulanır).
@@ -91,6 +94,13 @@ class VisionError(RuntimeError):
     """Arşiv/ağ/doğrulama hatası — çağıran durur, önbelleğe bir şey yazılmaz."""
 
 
+class PromotionError(VisionError):
+    """Terfi (hazırlık -> hedef önbellek `os.replace`) sırasında G/Ç hatası.
+
+    Önceki dosyalar yazılmış olabilir: önbellek KISMEN güncellenmiş olabilir.
+    """
+
+
 class ArchiveGapError(VisionError):
     """İstenen gün/ay arşivde yok (404) — pencere arşiv kapsamının dışında."""
 
@@ -130,8 +140,8 @@ class HttpTransport:
                     self.requests += 1
                     return None
                 last = exc
-                if exc.code < 500 and exc.code != 429:
-                    break  # kalıcı 4xx: tekrar denemenin anlamı yok
+                if exc.code < 500 and exc.code not in (408, 429):
+                    break  # kalıcı 4xx (408 Request Timeout / 429 geçicidir: yeniden denenir): tekrar denemenin anlamı yok
             except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
                 last = exc
             if attempt < self.retries - 1:
@@ -443,7 +453,7 @@ class ArchiveKlineSource:
 
 
 # --------------------------------------------------------------------------
-# Önbellek dosyası doğrulama + atomik terfi
+# Önbellek dosyası doğrulama + dosya başına atomik terfi
 # --------------------------------------------------------------------------
 
 @dataclass
@@ -562,7 +572,8 @@ async def fill_cache(
 ) -> FillReport:
     """Pencere için harness'in okuyacağı TÜM önbellek dosyalarını doldurur.
 
-    Hata -> VisionError; hedef `cache_dir`e hiçbir dosya yazılmaz.
+    Hata -> VisionError; hedef `cache_dir`e hiçbir dosya yazılmaz
+    (tek istisna: terfi sırasındaki `PromotionError` — kısmi güncelleme olabilir).
     """
     effective_days, start_ms, end_ms = backtest.resolve_backtest_window(0, start, end)
     if start_ms is None or end_ms is None:  # resolve_backtest_window start/end verildiğinde dolu döner
@@ -618,7 +629,12 @@ async def fill_cache(
 
         for sf, final, status in plan:
             if status != "değişmedi":
-                os.replace(sf.path, final)
+                try:
+                    os.replace(sf.path, final)
+                except OSError as exc:
+                    raise PromotionError(
+                        f"{final.name}: terfi sırasında G/Ç hatası ({exc!r})"
+                    ) from exc
             report.files.append(FileReport(
                 path=final, symbol=sf.symbol, interval=sf.interval, candles=len(sf.candles),
                 first_open_ms=sf.candles[0].open_time, last_close_ms=sf.candles[-1].close_time,
@@ -702,7 +718,16 @@ def main(argv: Optional[Sequence[str]] = None, transport: Optional[Transport] = 
             market_gate=gate, overwrite=args.overwrite, use_monthly=not args.no_monthly,
             log=log,
         ))
-    except (VisionError, ValueError) as exc:
+    except PromotionError as exc:
+        log(f"HATA: {exc}")
+        log(
+            "Önbellek KISMEN güncellenmiş olabilir; yazılan her dosya tek başına "
+            "doğrulanmıştır (eksik dosya backtest'te cache-miss ile gürültülü hata verir)."
+        )
+        return 2
+    except (VisionError, ValueError, OSError) as exc:
+        # OSError: terfi ÖNCESİ G/Ç (hazırlık dizini, indirme önbelleği, disk
+        # dolu...). Terfi sırasındaki OSError PromotionError'a çevrilir (yukarıda).
         log(f"HATA: {exc}")
         log("Önbelleğe HİÇBİR dosya yazılmadı.")
         return 2

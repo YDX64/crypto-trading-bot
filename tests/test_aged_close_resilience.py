@@ -175,7 +175,17 @@ class TestReaperOrdering:
         assert client.attempts == ["AAAUSDT", "AAAUSDT"]
 
     @pytest.mark.asyncio
-    async def test_basari_backoff_kaydini_temizler(self):
+    async def test_basari_uzun_hata_backoffunu_birakmaz_kisa_gonderim_beklemesi_koyar(self):
+        """Niyet (eski ad: `test_basari_backoff_kaydini_temizler`): BAŞARILI
+        gönderimden sonra önceki HATA backoff'u (uzun/bayat) kalmamalı.
+
+        Davranış değişti (cubic/PR #7): kayıt artık tamamen silinmiyor —
+        gönderimden sonra `exits.step` kapanışı uzlaştırana kadar ikinci bir
+        reduce-only MARKET gitmesin diye KISA bir gönderim-sonrası bekleme
+        (`_AGED_CLOSE_BACKOFF_SEC`) konur. Burada hata backoff'u çok uzun
+        (1 saat) kurulur: başarıdan sonra kalan süre bu uzun değer değil,
+        en çok gönderim beklemesi olmalıdır.
+        """
         positions = {"AAAUSDT": _sp()}
         client = FakeClient(fail_symbols={"AAAUSDT"})
         engine = _engine(positions, client)
@@ -183,10 +193,55 @@ class TestReaperOrdering:
         assert "AAAUSDT" in engine._aged_close_backoff
 
         client.fail_symbols.clear()
+        # Uzun bir hata backoff'u simüle et, sonra süresi dolmuş say.
         engine._aged_close_backoff["AAAUSDT"] = time.monotonic() - 1.0
         await engine._reap_aged_positions()
-        assert "AAAUSDT" not in engine._aged_close_backoff
         assert positions["AAAUSDT"].reaper_close_at
+        remaining = engine._aged_close_backoff["AAAUSDT"] - time.monotonic()
+        assert 0.0 < remaining <= engine._AGED_CLOSE_BACKOFF_SEC
+
+    @pytest.mark.asyncio
+    async def test_basari_sonrasi_ikinci_post_gitmez_ayni_ve_sonraki_tur(self):
+        """REAPER 'sent' sonrası `exits.step` uzlaştırana kadar (pozisyon hâlâ
+        izleniyor) aynı sembole ikinci reduce-only MARKET GİTMEZ."""
+        positions = {"AAAUSDT": _sp()}
+        client = FakeClient()
+        engine = _engine(positions, client)
+
+        await engine._reap_aged_positions()
+        assert [p["symbol"] for p in client.posts] == ["AAAUSDT"]
+        await engine._reap_aged_positions()  # sonraki safety turu
+        await engine._reap_aged_positions()
+        assert [p["symbol"] for p in client.posts] == ["AAAUSDT"]
+
+    @pytest.mark.asyncio
+    async def test_gonderim_beklemesi_dolunca_hala_aciksa_canli_miktarla_yeniden_gider(self):
+        """Takılı kalma YOK: bekleme dolduğunda pozisyon hâlâ izleniyorsa
+        (kapanış uzlaşmadı) canlı |positionAmt| ile yeniden denenir."""
+        positions = {"AAAUSDT": _sp(quantity=1.5)}
+        client = FakeClient(amounts={"AAAUSDT": 0.7})
+        engine = _engine(positions, client)
+
+        await engine._reap_aged_positions()
+        assert len(client.posts) == 1
+        engine._aged_close_backoff["AAAUSDT"] = time.monotonic() - 1.0  # süre doldu
+        await engine._reap_aged_positions()
+
+        assert len(client.posts) == 2
+        assert client.posts[1]["quantity"] == 0.7
+        assert client.posts[1]["reduceOnly"] == "true"
+
+    @pytest.mark.asyncio
+    async def test_gonderim_beklemesindeki_sembol_sirayi_tikamaz_siradaki_kapanir(self):
+        """Tur başına tek BAŞARILI kapanış korunur ama gönderim beklemesindeki
+        ilk sembol sonraki turda arkasındakileri aç bırakmaz."""
+        positions = _three()
+        client = FakeClient()
+        engine = _engine(positions, client)
+
+        await engine._reap_aged_positions()
+        await engine._reap_aged_positions()
+        assert [p["symbol"] for p in client.posts] == ["AAAUSDT", "BBBUSDT"]
 
     @pytest.mark.asyncio
     async def test_backoftaki_sembol_tavana_sayilmaz(self):
@@ -247,6 +302,23 @@ class TestStaleTpOrdering:
         await engine._close_stale_profitable_positions()
         # AAA/BBB backoff'ta; yalnız CCC denenir.
         assert client.attempts == ["CCCUSDT"]
+
+    @pytest.mark.asyncio
+    async def test_basari_sonrasi_ikinci_post_gitmez_ve_bekleme_konur(self):
+        """STALE_TP 'sent' sonrası aynı sembole ikinci POST gitmez; sembol
+        gönderim-sonrası beklemeye alınır (backoff haritasında kalır)."""
+        positions = {"AAAUSDT": _sp(age_hours=3.0)}
+        client = FakeClient()
+        engine = _engine(positions, client, stale=True)
+
+        await engine._close_stale_profitable_positions()
+        await engine._close_stale_profitable_positions()
+        await engine._reap_aged_positions()
+
+        assert [p["symbol"] for p in client.posts] == ["AAAUSDT"]
+        assert positions["AAAUSDT"].stale_tp_close_at
+        remaining = engine._aged_close_backoff["AAAUSDT"] - time.monotonic()
+        assert 0.0 < remaining <= engine._AGED_CLOSE_BACKOFF_SEC
 
     @pytest.mark.asyncio
     async def test_reaper_ve_stale_ayni_backoff_haritasini_paylasir(self):

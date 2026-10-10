@@ -1629,7 +1629,11 @@ class ScalperEngine:
                 # positionRisk (weight 5) okunmasın.
                 backoff[symbol] = time.monotonic() + self._AGED_CLOSE_FLAT_BACKOFF_SEC
                 continue
-            backoff.pop(symbol, None)
+            # Gönderim SONRASI bekleme (cubic/PR #7): emir borsaya gitti ama
+            # `exits.step` kapanışı henüz uzlaştırmadı; `backoff.pop` ile
+            # temizlemek bir sonraki safety turunda ikinci bir reduce-only
+            # MARKET'e yol açardı. Süre dolunca (hâlâ açıksa) yeniden denenir.
+            backoff[symbol] = time.monotonic() + self._AGED_CLOSE_BACKOFF_SEC
             try:
                 sp.stale_tp_close_at = _utcnow_iso()
             except Exception:  # pragma: no cover - test çiftleri (SimpleNamespace)
@@ -1712,7 +1716,13 @@ class ScalperEngine:
                 # positionRisk (weight 5) okunmasın.
                 backoff[symbol] = time.monotonic() + self._AGED_CLOSE_FLAT_BACKOFF_SEC
                 continue
-            backoff.pop(symbol, None)
+            # Gönderim SONRASI bekleme (cubic/PR #7): emir borsaya gitti ama
+            # `exits.step` kapanışı henüz uzlaştırmadı. Reaper döngüsü
+            # `reaper_close_at` damgasına bakmaz; `backoff.pop` bir sonraki
+            # safety turunda (≈2-8 sn) AYNI pozisyona ikinci bir reduce-only
+            # MARKET gönderirdi. Süre dolunca pozisyon hâlâ açıksa canlı
+            # miktarla yeniden denenir (takılı kalma yok).
+            backoff[symbol] = time.monotonic() + self._AGED_CLOSE_BACKOFF_SEC
             # D27/A1 — YALNIZ ETİKET: emir BORSAYA GİTTİKTEN sonra damgala.
             # Emir hata verirse (except dalı) damga KONULMAZ: kapanmayan bir
             # pozisyon "REAPER" diye etiketlenmemelidir. Damga hiçbir kapıya
