@@ -1,5 +1,11 @@
 # Deney defteri — backtest ve ölçüm kayıtları
 
+**10 Eki 2026 — E16 ön-kayıtlı çıkış deneyi: KAZANAN YOK.** İlk kez dokunulmamış
+8 pencerede (2025, UP/DOWN/FLAT) ölçüldü. Bugünkü sunucu ayarı (B0) havuz PF **0.77**,
+8 pencerenin yalnız 1'inde PF>1, her rejim grubunda zarar. 10 çıkış varyantının
+hiçbiri kâra çevirmedi (en iyi havuz PF 0.85). Üç klasik pencerede aynı B0 = PF 1.65:
+o pencereler kenarı abartıyor. Bkz. **E16** (dosya sonu).
+
 **7 Eyl 2026 — E15 miktar ölçeği:** kullanıcı talebiyle %0.5→%10 TESTNET
 marj tavanı. Altı cache-only koşuda üç bilinen rejimin PF/ROI/işlem sayısı
 değişmedi; PnL ve bar-DD 20× oldu. Sabit 1000 kasada %10 profilinin bar-DD'si
@@ -1585,3 +1591,62 @@ değişmiyor. Bu bir "kenar" değil, küçük bir fren. Kanıt disiplini gereği
 sonucunu ölçer. ADA LONG (sembol-özgü, ikisi birlikte seçim kaybı %26) alınmaz. Asıl sonuç
 değişmedi: C'nin 2026 Mar–Ağu penceresinde kalıcı kenarı yok; giriş filtreleri kaybı küçültür, kâra
 çevirmez. "Daha çok işlem" ancak yeni bilgi taşıyan sinyalle.
+
+## E16 — Ön-kayıtlı çıkış deneyi: 8 taze pencere, 11 varyant (2026-10-10) — KAZANAN YOK
+
+**Soru.** Canlı defter (31 gün, 124 işlem, PF 0.47) ve CANLI dönemin backtest'i (320 işlem, PF 0.90)
+zararda. Kayıp yapısı R:R ≈ 1:5 (stop ≈ %2.5, TP1 ≈ %0.5; başabaş WR ≈ %83). Çıkış yapısını
+(stop/TP/kaldıraç) değiştirmek C'yi kâra çevirir mi?
+
+**Yöntem (sonuç görülmeden kilitlendi).** Plan `PLAN.md` sha256 `fe9b8354…`, karar betiği
+`analyze_prereg.py` sha256 `32df0bc1…`. 11 varyantlık aile:
+- **E1–E8:** env ile stop/TP/kaldıraç.
+- **C1:** swing+ATR stop.
+- **C2:** Bollinger hedefi.
+- **C3:** sinyal gücüne göre TP. Ön-koşulu sağlanmadı: güç skoru MFE ile ilişkisiz, bu yüzden kodlanmadı.
+
+Akış şöyle:
+1. **DEV elemesi:** üç klasik pencerede havuz PF ≥ 1.0 ve işlem ≥ B0'ın yarısı.
+2. **Doğrulama:** 8 dokunulmamış 2025 penceresi (V1–V8). Rejim etiketleri performansa bakmadan BTC 1d'den donduruldu: FLAT×2, UP×2, DOWN×4; 3 pencerede ŞOK.
+3. **Kapılar G1–G8**, örneğin PF>1 pencere ≥ 6/8, havuz PF ≥ 1.15, her rejimde PF ≥ 0.9.
+4. **G9:** maliyet 2× ve 1 mum gecikme.
+5. **G10:** day-block bootstrap p-değeri + Benjamini-Hochberg q ≤ 0.10.
+
+Son sınav (CANLI dönem, tek atış) yalnız kazanan çıkarsa koşulacaktı.
+
+Taban B0 = sunucu `SCALPER_*` env'i (2026-10-10, 97a9099 dönemi). Veri: data.binance.vision (sha256). Belirlenimcilik: B0 AYI tekrar koşusu 149 / %87.2 / PF 2.03 — önceki ölçümle birebir.
+
+**Sonuç.** `DECISION.md`: **KAZANAN YOK, üretim ayarı değişmez.** BH 0/11 reddetti (en küçük p 0.976).
+
+| | İşlem | WR% | ΣPnL | Havuz PF | Medyan PF | PF>1 pencere | UP / DOWN / FLAT PF |
+|---|---|---|---|---|---|---|---|
+| **B0 (bugünkü ayar)** | 1619 | 76.0 | **−29 477** | **0.773** | 0.807 | 1/8 | 0.81 / 0.79 / 0.72 |
+| E1 (en iyi havuz PF) | 1513 | — | — | 0.849 | 0.830 | 1/8 | 0.89 / 0.90 / 0.73 |
+| E3 | 1104 | — | — | 0.825 | 0.783 | 1/8 | 0.84 / 0.87 / 0.74 |
+| C2 (Bollinger hedefi) | 1497 | — | — | 0.749 | 0.702 | 1/8 | 0.81 / 0.75 / 0.69 |
+
+Tam tablo, pencere pencere PF ve kapı gerekçeleri: `DECISION.md`, `results.csv`. C1 DEV'de elendi (havuz PF 0.78).
+
+**B0'ın 8 penceredeki çıkış kırılımı** (loglardan toplandı):
+
+| Çıkış | İşlem | ΣPnL | Ort. |
+|---|---|---|---|
+| TRAIL | 1207 | +99 550 | +82 |
+| SL | 185 | −95 090 | −514 |
+| REAPER | 224 | −33 628 | −150 |
+
+Yönler ayrı ayrı: LONG 642 işlem / −18 832; SHORT 977 işlem / −10 645.
+
+**Yorum.**
+1. **Klasik pencereler kenarı abartıyor.** Aynı B0, üç klasik pencerede havuz PF 1.65; taze 2025'te 0.77. Kayıp üç rejim grubunun hepsinde var, yani bu bir rejim talihsizliği değil. Canlı PF 0.47 ve CANLI backtest PF 0.90 bu tabloyla tutarlı. E13.3'ün hükmü ("C'nin kalıcı kenarı yok") 8 pencere daha ile güçlendi.
+2. **Çıkışı değiştirmek kaybı küçültür, kâra çevirmez.** En iyi varyant havuz PF'yi 0.77 → 0.85'e taşıyor; hiçbiri 1.0'a ulaşmıyor. Stop/TP oranı ne olursa olsun girişin kendisi ücret sonrası beklentiyi pozitif yapmıyor.
+3. **E10 ile çelişmez, sınırını gösterir.** E10 permütasyon testi "AYI penceresinde giriş şanstan ayırt edilebilir" diyordu (tek, klasik pencere). Taze verideki karşılığı zarar.
+
+**Yapılmayanlar / sınırlar.**
+- G9 (maliyet 2×, gecikme) koşulmadı: G1–G8'i geçen yoktu.
+- Son sınav koşulmadı: kazanan yoktu.
+- V1–V8 artık çıkış sorusu için **kullanılmış** pencerelerdir. Yeni bir soru (örneğin giriş sinyali) için yeni taze pencereler gerekir (2024 ve öncesi arşivde var).
+- C1/C2 kodu main'e girmedi; yama `artifacts.tgz` içinde.
+
+**Kanıt:** `docs/audits/2026-10-10-prereg-exits/` (plan, karar betiği ve testleri, koşu betikleri,
+`DECISION.md`, `results.csv`, `artifacts.tgz` = 131 backtest logu + JSON çıktılar + C1/C2 yaması).
