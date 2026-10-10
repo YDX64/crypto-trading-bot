@@ -1,7 +1,7 @@
 """analyze_prereg.py testleri (sentetik ama şemaya birebir uyan JSON'larla).
 
-Çalıştır:  /home/user/crypto-trading-bot/.venv/bin/python -m pytest \
-  /tmp/claude-0/.../scratchpad/prereg/test_analyze_prereg.py -q -p no:cacheprovider
+Çalıştır (repo kökünden):  .venv/bin/python -m pytest \
+  docs/audits/2026-10-10-prereg-exits/test_analyze_prereg.py -q -p no:cacheprovider
 """
 
 from __future__ import annotations

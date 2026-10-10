@@ -1623,7 +1623,7 @@ Taban B0 = sunucu `SCALPER_*` env'i (2026-10-10, 97a9099 dönemi). Veri: data.bi
 | **B0 (bugünkü ayar)** | 1619 | 76.0 | **−29 477** | **0.773** | 0.807 | 1/8 | 0.81 / 0.79 / 0.72 |
 | E1 (en iyi havuz PF) | 1513 | — | — | 0.849 | 0.830 | 1/8 | 0.89 / 0.90 / 0.73 |
 | E3 | 1104 | — | — | 0.825 | 0.783 | 1/8 | 0.84 / 0.87 / 0.74 |
-| C2 (Bollinger hedefi) | 1497 | — | — | 0.749 | 0.702 | 1/8 | 0.81 / 0.75 / 0.69 |
+| C2 (Bollinger hedefi + %50/%25 kısmi) | 1497 | — | — | 0.749 | 0.702 | 1/8 | 0.81 / 0.75 / 0.69 |
 
 Tam tablo, pencere pencere PF ve kapı gerekçeleri: `DECISION.md`, `results.csv`. C1 DEV'de elendi (havuz PF 0.78).
 
@@ -1634,12 +1634,14 @@ Tam tablo, pencere pencere PF ve kapı gerekçeleri: `DECISION.md`, `results.csv
 | TRAIL | 1207 | +99 550 | +82 |
 | SL | 185 | −95 090 | −514 |
 | REAPER | 224 | −33 628 | −150 |
+| EOD (pencere sonu) | 3 | −309 | −103 |
+| **Toplam** | **1619** | **−29 477** | |
 
 Yönler ayrı ayrı: LONG 642 işlem / −18 832; SHORT 977 işlem / −10 645.
 
 **Yorum.**
 1. **Klasik pencereler kenarı abartıyor.** Aynı B0, üç klasik pencerede havuz PF 1.65; taze 2025'te 0.77. Kayıp üç rejim grubunun hepsinde var, yani bu bir rejim talihsizliği değil. Canlı PF 0.47 ve CANLI backtest PF 0.90 bu tabloyla tutarlı. E13.3'ün hükmü ("C'nin kalıcı kenarı yok") 8 pencere daha ile güçlendi.
-2. **Çıkışı değiştirmek kaybı küçültür, kâra çevirmez.** En iyi varyant havuz PF'yi 0.77 → 0.85'e taşıyor; hiçbiri 1.0'a ulaşmıyor. Stop/TP oranı ne olursa olsun girişin kendisi ücret sonrası beklentiyi pozitif yapmıyor.
+2. **Denenen çıkışlar kaybı küçültür, kâra çevirmez.** En iyi varyant havuz PF'yi 0.77 → 0.85'e taşıyor; denenen 10 varyantın hiçbiri 1.0'a ulaşmıyor. Bu hüküm yalnız E16'da denenen stop/TP/kaldıraç ailesi için geçerlidir; "hiçbir çıkış kurtaramaz" demek DEĞİLDİR. Yine de geniş bir aralıkta (stop %0.5–%2.5, TP1 0.2R–1.5R, kısmi oranlar, sabit/oynaklık-ölçekli kaldıraç) hiçbir noktada kâr görülmedi; sıradaki soru girişin kendisidir.
 3. **E10 ile çelişmez, sınırını gösterir.** E10 permütasyon testi "AYI penceresinde giriş şanstan ayırt edilebilir" diyordu (tek, klasik pencere). Taze verideki karşılığı zarar.
 
 **Yapılmayanlar / sınırlar.**
@@ -1647,6 +1649,8 @@ Yönler ayrı ayrı: LONG 642 işlem / −18 832; SHORT 977 işlem / −10 645.
 - Son sınav koşulmadı: kazanan yoktu.
 - V1–V8 artık çıkış sorusu için **kullanılmış** pencerelerdir. Yeni bir soru (örneğin giriş sinyali) için yeni taze pencereler gerekir (2024 ve öncesi arşivde var).
 - C1/C2 kodu main'e girmedi; yama `artifacts.tgz` içinde.
+- **C2 saf bir "Bollinger hedefi" testi DEĞİLDİR.** Plan "C2 vs E2 yalnız TP kuralını izole eder" diyordu, ama C2 kısmi kapanış oranlarını da değiştirdi (%50/%25; E2 tabandan %40/%20 aldı). C2 = hedef + oran birleşik testidir. Hüküm (kazanan değil) bundan etkilenmez.
+- Arşivlenen betiklerin bilinen sınırları ve bu koşuyu etkilemediklerinin kanıtı: klasörün `README.md`'si.
 
 **Kanıt:** `docs/audits/2026-10-10-prereg-exits/` (plan, karar betiği ve testleri, koşu betikleri,
-`DECISION.md`, `results.csv`, `artifacts.tgz` = 131 backtest logu + JSON çıktılar + C1/C2 yaması).
+`DECISION.md`, `results.csv`, `artifacts.tgz` = 121 backtest + 9 veri doldurma logu + JSON çıktılar + C1/C2 yaması).
