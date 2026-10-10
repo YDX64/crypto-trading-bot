@@ -210,7 +210,9 @@ with LOG.open("a") as fh:
     fh.write(" ".join(body) + "\\n")
 with ENVLOG.open("a") as fh:
     fh.write(json.dumps({{"cmd": body[0], "E17_REPO": os.environ.get("E17_REPO"), "cwd": os.getcwd(),
-                         "E17_ROOT": os.environ.get("E17_ROOT"), "E17_SNAPSHOT": os.environ.get("E17_SNAPSHOT")}}) + "\\n")
+                         "E17_ROOT": os.environ.get("E17_ROOT"), "E17_SNAPSHOT": os.environ.get("E17_SNAPSHOT"),
+                         "has_dummy": bool(os.environ.get("BINANCE_API_KEY")) and bool(os.environ.get("JWT_SECRET")),
+                         "log_dir": os.environ.get("TRADINGBOT_LOG_DIR")}}) + "\\n")
 cmd = body[0]
 FAM = {{"S5", "T5", "S15", "T15", "S30", "T30", "S60", "T60"}}
 ONLY = {{"AYI": {{"B0"}}, "V1": {{"B0"}}, "h0": {{"S15"}}, "h1": {{"S15"}}, "M1": {{"R1"}}}}
@@ -1033,6 +1035,10 @@ def test_end_to_end_chain_smoke_dev_val_final(fx: Fx) -> None:
         "manifest final", "manifest runs"]
     assert calls.count("verify-lock") == 5     # 4 aşama + (duman bitmeden reddedilen) ilk run_dev: her aşama kilidi doğrular
     assert all(e["E17_REPO"] == str(fx.repo) for e in fx.analyzer_envs())
+    # Regresyon (E17 duman testi 2026-10-10): analizci Settings'i kurabilsin diye her çağrıda sahte
+    # gizliler verilir ve loglar H klonuna değil geçici dizine yazılır.
+    assert all(e["has_dummy"] for e in fx.analyzer_envs())
+    assert all(e["log_dir"] and not e["log_dir"].startswith(e["cwd"]) for e in fx.analyzer_envs())
     ledger = (fx.root / "ledger.jsonl").read_text()
     for lbl in ("SMOKE_R1_M1", "SMOKE_T60_W", "DEV_B0_Q4", "DEV_S15_ROB_TAKER", "DEV_T5_DIAG_SBO", "VAL_S15_ROB_WALL",
                 "VAL_T60", "FINAL_S15", "FINAL_B0"):

@@ -247,12 +247,18 @@ e17_prepare_arm_env() {
   e17_read_nul < "$d/env.nul"
   E17_ARM_ENV=("${E17_TMPARR[@]}")
   rm -f "$d/env.nul"
-  if [ "${#E17_DUMMY[@]}" -eq 0 ]; then       # sahte gizliler sabit: süreç başına bir kez
-    et dummy > "$d/dummy.nul" || die "dummy env okunamadı"
-    e17_read_nul < "$d/dummy.nul"
-    E17_DUMMY=("${E17_TMPARR[@]}")
-    rm -f "$d/dummy.nul"
-  fi
+  e17_load_dummy
+}
+
+# e17_load_dummy  → E17_DUMMY (sahte gizliler; sabit, süreç başına bir kez okunur)
+e17_load_dummy() {
+  [ "${#E17_DUMMY[@]}" -eq 0 ] || return 0
+  e17_tmpdir
+  local d=$E17_NEWTMP
+  et dummy > "$d/dummy.nul" || die "dummy env okunamadı"
+  e17_read_nul < "$d/dummy.nul"
+  E17_DUMMY=("${E17_TMPARR[@]}")
+  rm -f "$d/dummy.nul"
 }
 
 # e17_base_env HOMEDIR HASHSEED [net]  → E17_BASE_ENV (env -i geçiş listesi, PLAN §5.2)
@@ -286,7 +292,15 @@ e17_analyzer() {
     e17_chain "ANALYZER atlandı (E17_PRELOCK=1): $1"
     return 0
   fi
-  ( cd "$E17_CLONE" && E17_REPO="$E17_REPO_L" "$E17_PY" "$E17_ANALYZER" "$@" --root "$E17_ROOT" )
+  # Analizcinin bazı alt komutları (manifest, check-run, ...) harness modüllerini içe aktarır; bu da
+  # src.core.config.Settings'i kurar ve gizli alanları ister. H klonunda .env YOK (bilerek), bu yüzden
+  # koşularla aynı SAHTE gizliler verilir; loglar klona değil geçici dizine yazılır.
+  # (E17 duman testi 2026-10-10: `manifest smoke` ValidationError ile düşmüştü — altyapı düzeltmesi, L2.)
+  e17_load_dummy
+  e17_tmpdir
+  local logd=$E17_NEWTMP
+  ( cd "$E17_CLONE" && env "${E17_DUMMY[@]}" TRADINGBOT_LOG_DIR="$logd" E17_REPO="$E17_REPO_L" \
+      "$E17_PY" "$E17_ANALYZER" "$@" --root "$E17_ROOT" )
 }
 
 e17_verify_lock() {
