@@ -1578,8 +1578,10 @@ class ScalperEngine:
                 continue
             if getattr(sp, "trailing_active", False) or getattr(sp, "tp1_done", False):
                 continue  # TP1 görmüş / BE korumalı koşucu: tek çıkış stop/trailing
-            if getattr(sp, "stale_tp_close_at", None) or getattr(sp, "reaper_close_at", None):
-                continue  # kapanış zaten gönderildi; ledger doğrulaması bekleniyor
+            # NOT: `stale_tp_close_at`/`reaper_close_at` damgaları burada KAPI
+            # DEĞİLDİR (yalnız `_infer_exit_reason` etiketi). Gönderim sonrası
+            # tekrarı ortak backoff (aşağıda) engeller; bekleme dolunca ve
+            # pozisyon hâlâ izleniyorsa yeniden denenir (kalıcı kilit yok).
             opened = getattr(sp.position, "opened_at", None)
             if opened is None:
                 continue
@@ -1629,9 +1631,18 @@ class ScalperEngine:
                 # positionRisk (weight 5) okunmasın.
                 backoff[symbol] = time.monotonic() + self._AGED_CLOSE_FLAT_BACKOFF_SEC
                 continue
-            backoff.pop(symbol, None)
+            # Gönderim SONRASI bekleme (cubic/PR #7): emir borsaya gitti ama
+            # `exits.step` kapanışı henüz uzlaştırmadı; `backoff.pop` ile
+            # temizlemek bir sonraki safety turunda ikinci bir reduce-only
+            # MARKET'e yol açardı. Tekrarı engelleyen TEK mekanizma bu ortak
+            # backoff'tur (damga kapı değil, yalnız etiket); süre dolunca
+            # pozisyon hâlâ izleniyorsa canlı miktarla yeniden denenir.
+            backoff[symbol] = time.monotonic() + self._AGED_CLOSE_BACKOFF_SEC
             try:
                 sp.stale_tp_close_at = _utcnow_iso()
+                # Etiket SON göndereni göstersin (`_infer_exit_reason` STALE_TP'yi
+                # önce okur): karşı rutinin eski damgası temizlenir.
+                sp.reaper_close_at = None
             except Exception:  # pragma: no cover - test çiftleri (SimpleNamespace)
                 pass
             self.logger.info(
@@ -1670,11 +1681,13 @@ class ScalperEngine:
                 continue
             if getattr(sp, "trailing_active", False):
                 continue  # BE korumalı koşucu: tek çıkış stop/trailing
-            if getattr(sp, "stale_tp_close_at", None):
-                # D30: bayat-kâr kapanışı bu turda/önceki turda zaten gönderildi;
-                # aynı pozisyona ikinci bir reduce-only MARKET göndermek -2022
-                # gürültüsü ve yanlış "REAPER" damgası üretir.
-                continue
+            # D30: STALE_TP damgası burada KAPI DEĞİLDİR (kalıcı kilit olurdu:
+            # damga hiç temizlenmediğinden emir kabul edilip pozisyon açık
+            # kalırsa ne STALE_TP ne Reaper yeniden denerdi). Aynı pozisyona
+            # iki rutinin aynı anda emir göndermesini ORTAK backoff önler:
+            # STALE_TP gönderimi o sembole `_AGED_CLOSE_BACKOFF_SEC` bekleme
+            # koyar; Reaper aşağıdaki backoff kapısında bekler, süre dolunca
+            # pozisyon hâlâ açıksa canlı miktarla devralır.
             opened = getattr(sp.position, "opened_at", None)
             if opened is None:
                 continue
@@ -1712,7 +1725,13 @@ class ScalperEngine:
                 # positionRisk (weight 5) okunmasın.
                 backoff[symbol] = time.monotonic() + self._AGED_CLOSE_FLAT_BACKOFF_SEC
                 continue
-            backoff.pop(symbol, None)
+            # Gönderim SONRASI bekleme (cubic/PR #7): emir borsaya gitti ama
+            # `exits.step` kapanışı henüz uzlaştırmadı. Reaper döngüsü
+            # `reaper_close_at` damgasına bakmaz; `backoff.pop` bir sonraki
+            # safety turunda (≈2-8 sn) AYNI pozisyona ikinci bir reduce-only
+            # MARKET gönderirdi. Süre dolunca pozisyon hâlâ açıksa canlı
+            # miktarla yeniden denenir (takılı kalma yok).
+            backoff[symbol] = time.monotonic() + self._AGED_CLOSE_BACKOFF_SEC
             # D27/A1 — YALNIZ ETİKET: emir BORSAYA GİTTİKTEN sonra damgala.
             # Emir hata verirse (except dalı) damga KONULMAZ: kapanmayan bir
             # pozisyon "REAPER" diye etiketlenmemelidir. Damga hiçbir kapıya
@@ -1720,6 +1739,9 @@ class ScalperEngine:
             # çıkarımının yaş-kesmesini "SL" ile karıştırmasını engeller.
             try:
                 sp.reaper_close_at = _utcnow_iso()
+                # Etiket SON göndereni göstersin: STALE_TP damgası önce okunduğu
+                # için kalırsa Reaper'ın kapattığı pozisyon STALE_TP diye yazılırdı.
+                sp.stale_tp_close_at = None
             except Exception:  # pragma: no cover - test çiftleri (SimpleNamespace)
                 pass
             self.logger.info(

@@ -412,14 +412,18 @@ indirilmez, her kullanımda sha256 yeniden doğrulanır), `--overwrite` (mevcut 
 `gather_leader_series` fonksiyonlarını çağırır (anahtar = `kline_cache.window_start_ms`), yalnız ağ katmanı arşivden
 beslenir. Önce geçici dizine yazar; her dosya katı denetimden geçer (mum sayısı = anahtardaki `needed`, ızgarada, boşluk
 yok, son mum `end-1`) ve her zip'in `.CHECKSUM` sha256'sı doğrulanır — tek sorunda hata ile durur, önbelleğe HİÇBİR şey
-yazılmaz (aksi halde `os.replace` ile atomik terfi). Eksik gün/mum = hata (yama yok).
+yazılmaz (aksi halde dosyalar tek tek `os.replace` ile taşınır: **dosya başına atomik** — bir dosya ya tam doğrulanmış
+haliyle vardır ya da yoktur; terfi ortasında G/Ç hatası olursa önbellek KISMEN güncellenmiş olabilir, eksik dosya
+backtest'te cache-miss ile gürültülü hata verir; `--overwrite` ile ayrıca henüz terfi edilmemiş ve önceden var olan ESKİ
+hedef dosyalar SİLİNİR — eski+yeni karışık veriyle sessiz backtest olmasın — terfi edilmiş yeni dosyalar kalır, silme
+başarısız olursa hata mesajında yazılır). Eksik gün/mum = hata (yama yok).
 
 **Kısıtlar**
 - **Arşiv gecikmesi ~1-2 gün:** günlük zip en geç dünden/evvelsi günden; pencere sonu (`--end`, dahil değil) arşivin
   son günlük zip'ini aşarsa `ArchiveGapError` (404) ile durur. Aylık zip yalnız TAM ve BİTMİŞ aylar için denenir (404 → günlük).
 - **Sunucu `SCALPER_*` env'i gerekir (CLAUDE.md "Backtest DAİMA sunucu env'iyle"):** bulutta `.env`/sunucu env'i yoksa
   config varsayılanları kullanılır; bu sonuçlar **karar için GEÇERSİZDİR** (yalnız altyapı/duman testi). Karar için
-  `env $(ssh awa grep ^SCALPER_ ...)` ile aynı değerleri bulutta ver (hem doldurucuya hem backtest'e) — TF'ler ve lider
+  `env $(ssh awa grep ^SCALPER_ /opt/tradingbot-v2/.env | xargs)` ile aynı değerleri bulutta ver (hem doldurucuya hem backtest'e) — TF'ler ve lider
   kapısı farklıysa farklı anahtarlı dosyalar yazılır ve backtest cache-miss → 451 alır.
 - Gerçek bir borsa bakım boşluğu içeren pencere (fapi'de de boşluk) burada reddedilir; sessizce yamanmaz.
 - Doldurucu `.env`'deki ayarları backtest ile aynı yoldan okur: komutu repo kökünden çalıştır.

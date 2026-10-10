@@ -194,7 +194,13 @@ class TestUnscannedAndUnmeasuredCounters:
         out = store.resolve_symbol("BTCUSDT", [], BASE + 2 * HOUR)
         assert len(out) == 1 and out[0]["measured"] is False
         snap = store.counters_snapshot()
-        assert snap["unmeasured_gap"] + snap["unmeasured_no_data"] == 1
+        # Boş mum listesi = KAPSAMA boşluğu değil, veri hiç yok:
+        # `sim.gap` yoksa çözüm `unmeasured_no_data` sayacına gider
+        # (counterfactual_store.resolve_symbol). Toplam kontrolü bir sayacın
+        # diğerine kaymasını yakalayamazdı.
+        assert not (out[0].get("sim") or {}).get("gap")
+        assert snap["unmeasured_no_data"] == 1
+        assert snap["unmeasured_gap"] == 0
 
     def test_olculen_cozum_ne_gap_ne_no_data_sayar(self):
         _kaydet()
