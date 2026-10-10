@@ -18,7 +18,11 @@ cd "${CLAUDE_PROJECT_DIR:-$(pwd)}"
 VENV="$PWD/.venv"   # .gitignore'da; deploy temiz-ağaç kapısını etkilemez
 
 if ! command -v uv >/dev/null 2>&1; then
-  python3 -m pip install -q --disable-pip-version-check uv
+  # Kullanıcı dizinine kur; PEP 668 ("externally-managed") imajlarda düz kurulum
+  # reddedilirse --break-system-packages ile yeniden dene (yalnız uv, sistem paketi değil).
+  python3 -m pip install -q --disable-pip-version-check --user uv \
+    || python3 -m pip install -q --disable-pip-version-check --user --break-system-packages uv
+  export PATH="$HOME/.local/bin:$PATH"
 fi
 
 # İdempotent: venv varsa ve 3.12 ise yeniden kurma, yalnız eksik paketleri tamamla.

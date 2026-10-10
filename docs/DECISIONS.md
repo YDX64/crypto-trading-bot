@@ -7,67 +7,54 @@ Pencereler: AYI 2026-01-23→02-13 (BTC −30%) · YATAY 2026-07-01→07-21 · B
 
 ## Aktif kararlar
 
-### D39 — Buluttan elle tetiklenen deploy (GitHub Actions, yalnız TESTNET) · 2026-10-10 · KOD VAR; secret'lar kullanıcı tarafından eklenince AKTİF
+### D39 — Bulutta geliştirme, yerelden deploy (Claude Code bulut oturumu) · 2026-10-10 · AKTİF (motor davranışı DEĞİŞMEZ)
 
-**Talep:** kullanıcı geliştirmeyi Claude bulut oturumlarına taşıdı; bulutta SSH anahtarı ve
-`.env` YOK, deploy ise yalnız kullanıcının Mac'inden `scripts/deploy.sh awa` ile yapılabiliyordu.
-İstenen: buluttan/telefondan tetiklenebilen ve mevcut güvenlik kapılarını ATLAMAYAN bir yol.
+**Talep:** kullanıcı geliştirmeyi Claude Code bulut oturumlarına taşıdı. Bulutta SSH anahtarı ve
+`.env` YOK (bilinçli); deploy ise yalnız awa'ya erişebilen yerden (kullanıcının Mac'i) yapılabilir.
+Kullanıcı GitHub hesabında Actions limiti sorunu bildirdi (bu repoda CI 2026-10-10'da yine koştu;
+sorun hesap düzeyinde olabilir, kodda doğrulanamadı) → kullanıcı kararı: Actions ile deploy KULLANILMAYACAK.
 
-**Ne:** `.github/workflows/deploy.yml` ("Deploy (awa TESTNET)") — YALNIZ `workflow_dispatch`
-(`ring` ∈ {testnet, follower}, `target` = `origin/main` ya da main geçmişindeki SHA,
-`no_restart`). Runner `scripts/deploy.sh awa <hedef> --ring <halka>`'yı AYNEN çağırır
-(`DEPLOY_SKIP_TESTS=0` sabit, input yok); `deploy.sh → server_deploy.sh` hattı DEĞİŞMEDİ, tüm
-kapılar sunucuda aynen işler: entry-halt (iki dosya), son 15 dk ban izi (418/banned),
-`BOT_MODE`↔ring, temiz ağaç, `flock`, sunucu venv'inde tam test, `.env` parse, restart, 240 sn'ye
-kadar katı `/health`, başarısızsa otomatik geri alma. Workflow'un ÜSTÜNE eklediği (yerine değil):
-(1) yalnız `refs/heads/main`'den dispatch; (2) hedef main geçmişinde olmalı, `origin/main` iken
-main dispatch'ten sonra ilerlediyse güvenli durur; (3) **CI kapısı:** `commits/<sha>/check-runs?check_name=test`
-— `ci.yml`'in `test` işi (ruff + tam pytest) o SHA için `success` olmalı (geri almada da);
-(4) `environment: awa-testnet` (kullanıcı required reviewer + "yalnız main" ekleyebilir, secret'lar
-bu ortamda durur); (5) tek deploy (`concurrency`, iptal YOK); (6) deploy sonrası doğrulama
-(CLAUDE.md #6): sunucu `git rev-parse HEAD` == çözülen SHA, `supervisorctl status` RUNNING,
-`ps -o etimes=` deploy süresinden büyük değil (restart gerçekten oldu); program/dizin eşlemesi
-`server_deploy.sh` `RING_*` tablosuyla birebir.
+**Akış:** *Bulut:* dalda düzenle → tam test (`python3 -m pytest tests -q`) + ruff → main'e birleştir
+(PR/merge; Actions gerekmez). *Mac* (`/Users/max/TRADINGBOT/v2`):
+`git checkout main && git pull --ff-only && scripts/deploy.sh awa`. `deploy.sh`'in kendi kapıları
+AYNEN işler: temiz yerel ağaç, yerel HEAD == `origin/main`; sunucuda entry-halt (iki dosya), son 15 dk
+ban izi, `BOT_MODE`↔ring, temiz ağaç, `flock`, sunucu venv'inde tam test, `.env` parse, restart,
+240 sn'ye kadar katı `/health`, başarısızsa otomatik geri alma. Çalışan süreci etkilemeyen değişiklikte
+`DEPLOY_NO_RESTART=1 scripts/deploy.sh awa` — NESNEL ölçüt: yalnız değişen dosyaların hepsi `docs/`, `tests/`,
+`.claude/` ya da `*.md` ise; `src/` veya `scripts/` altında tek satır değişiklikte ASLA (tembel import'lar
+nedeniyle çalışan süreç eski + diskten sonradan yüklenen yeni modül KARIŞIR; sonraki otomatik restart da
+sağlık kapısız yeni kodu başlatır). `deploy.sh` 3-5 dk sürer: araç/pencere kesilirse ssh kopar ve yarım deploy
+kalabilir; bulut/yerel Claude oturumu komutu arka planda ya da uzun timeout ile çalıştırır, ASLA iptal etmez. **Gerçek anlamı**
+(`scripts/server_deploy.sh`'ten doğrulandı): tüm ön kapılar (entry-halt, ban, `BOT_MODE`, temiz ağaç;
+satır 80-138) ve `.env` yedeği + hedef commit'e `git checkout` (162-172) + testler (186-196) +
+`.env` parse (199) YİNE koşar; yalnız restart ve sağlık yoklaması atlanır (201: `exit 0`). Sonuçları:
+sunucudaki kod diski YENİ commit'e geçer ama çalışan süreç bellekteki ESKİ kodla sürer (bir sonraki
+restart'ta yeni kod devreye girer); atlanan restart'ın sağlık/otomatik geri alma kapısı da atlanır;
+testler KIRMIZI olursa `rollback()` (174-181) yine `supervisorctl restart` çalıştırır.
 
-**Neden otomatik push-deploy DEĞİL:** entry-halt, 418 ban penceresi ve restart zamanı insan kararıdır
-(CLAUDE.md yasak #3, D20a); her merge'de otomatik restart açık pozisyonları/ban durumunu bilmeden
-süreci düşürürdü. Elle tetikleme + isteğe bağlı ortam onayı kararı insanda tutar.
-**Neden mainnet kapsam dışı:** mainnet yalnız `vX.Y.Z` etiketi + elle `MAINNET` onayı ister
-(`docs/MAINNET_PLAN.md` §1, §5); workflow'da mainnet seçeneği YOK, guard açıkça reddeder ve
-`DEPLOY_CONFIRM` bayrağı hiç kullanılmaz.
-
-**Güvenlik:** `${{ }}` ifadeleri `run:` içinde HİÇ yok (girdi/secret yalnız step `env:` → "$VAR",
-script injection yok); secret'lar yalnız SSH kurulum adımına verilir; `StrictHostKeyChecking yes` +
-host anahtarı secret'tan (`ssh-keyscan`/TOFU yok, adı eşleşmezse net hata); ayrı parolasız ed25519
-deploy anahtarı; anahtar `if: always()` ile silinir; `permissions: contents/checks read`; ssh config
-değerleri regex ile doğrulanır (satır enjeksiyonu yok). Repo PUBLIC: fork PR'larına secret verilmez.
-
-**Motor/strateji/.env davranışı DEĞİŞMEZ.** Eklenenler: workflow, sözleşme testi, `.dockerignore`
-istisnası (`!.github/workflows/deploy.yml`, container içi `pytest` kırılmasın) ve dokümantasyon.
-Sunucuda tek seferlik değişiklik: deploy anahtarının `authorized_keys`'e eklenmesi.
 **Bulut oturumu kancası:** `.claude/hooks/session-start.sh` (+ `.claude/settings.json`) yalnız
 `CLAUDE_CODE_REMOTE=true` iken Python **3.12** venv (`.venv`, gitignore'da) kurar,
 `requirements.txt` + pyyaml + ruff yükler, `.env` yoksa `env.example`'dan üretir (CI ile aynı).
 Neden 3.12: sunucu/CI paritesi; bulut konteynerinin sistem Python'u 3.13'tür ve sabit
 pandas/numpy/pydantic pin'leri orada derlenemez (ölçüldü: pip "metadata generation" hatası).
+`.gitignore`'a `!.claude/settings.json` istisnası eklidir (dosya takip edilsin diye).
 Yerel Mac ve sunucu etkilenmez.
 
-**Sınırlama (açık):** awa SSH portu GitHub Actions runner IP aralıklarına açık olmalı; değilse yol
-ÇALIŞMAZ ("SSH kurulumu" ön uçuşu net hata verir) ve yerel `scripts/deploy.sh awa` yedek yoldur.
-Çalışan deploy iptal edilirse ssh kopar, sunucuda yarım deploy kalabilir (RUNBOOK'ta uyarı).
-**Kodda doğrulanamayan:** workflow GitHub'da HENÜZ HİÇ koşmadı (secret'lar yok); ilk gerçek koşu
-önce `no_restart=true` ile denenmeli.
+**Reddedilen alternatif:** GitHub Actions `workflow_dispatch` deploy (357d3b3'te yazıldı, 104 sözleşme
+testi; GitHub'da hiç koşmadı). Kaldırıldı: kullanıcı Actions'a güvenmek istemedi (bildirilen limit sorunu); ayrıca awa SSH portunu GitHub
+runner IP'lerine açmayı ve SSH özel anahtarını GitHub secret'ı yapmayı gerektiriyordu. Geri getirmek:
+`git show 357d3b3 -- .github/workflows/deploy.yml tests/test_deploy_workflow.py`.
 
-**Kanıt:** `tests/test_deploy_workflow.py` (104 test) — statik sözleşme (tetikleyici, ring seçenekleri,
-izinler, `run:` içinde `${{` yok, secret kapsamı, SSH sertleştirmesi, `DEPLOY_SKIP_TESTS`, adım sırası,
-`always()` temizliği, `ci.yml` `test` işi, `server_deploy.sh` ile halka eşlemesi) + adımların gerçek
-`run:` metinleri sahte `ssh`/`gh`/`deploy.sh` ve geçici git depolarıyla bash'te koşturulur (guard,
-hedef çözümü/ata kontrolü, CI kapısı, SSH kurulumu, deploy argümanları, doğrulama, temizlik).
-`python3 -m pytest tests -q` → 3329 passed, 2 skipped (66,7 sn; atlananlar bu değişiklikten bağımsız opsiyonel testler, docker duman testi dahil); `ruff check --select E9,F63,F7,F82 src tests scripts` temiz.
+**Güvenlik:** secret ve SSH anahtarı buluta GİRMEZ; bulut yalnız GitHub'a push eder, awa'ya erişemez.
+Deploy kararı (entry-halt/ban/restart zamanı) insanda kalır; mainnet yalnız etiket + elle `MAINNET`
+onayı (`docs/MAINNET_PLAN.md`), değişmedi.
 
-**Geri alma:** `.github/workflows/deploy.yml` (+ `.dockerignore` istisnası ve test dosyası) sil; GitHub'da
-`awa-testnet` ortamını/secret'ları sil; sunucuda deploy anahtarını `authorized_keys`'ten çıkar.
-Motor etkilenmez; yerel `scripts/deploy.sh` yolu hiç değişmedi.
+**Kanıt:** `python3 -m pytest tests -q` → 3225 passed, 2 skipped (55,38 sn; atlananlar opsiyonel testler, docker duman testi dahil); `ruff check --select E9,F63,F7,F82 src tests scripts` temiz.
+Motor/strateji/`.env` davranışı DEĞİŞMEDİ; silinenler: `.github/workflows/deploy.yml`,
+`tests/test_deploy_workflow.py`, `.dockerignore` deploy.yml istisnası.
+
+**Geri alma:** `.claude/` dizinini ve `.gitignore`'daki `!.claude/settings.json` istisnasını sil;
+motor etkilenmez, `scripts/deploy.sh` yolu hiç değişmedi.
 
 ### D38 — Ayrı, salt-okunur misafir pano hesabı · 2026-09-09
 

@@ -112,11 +112,10 @@ scripts/deploy.sh awa <önceki-commit>           # geri alma (backups/commit.pre
 # SUNUCUDA, yalnız .env değiştiyse (çıplak `supervisorctl restart` YASAK — D20a):
 # RESTART_LABEL=<etiket> scripts/restart_safe.sh testnet|follower|mainnet
 ```
-**Buluttan deploy (D39, yalnız TESTNET):** GitHub → Actions → **"Deploy (awa TESTNET)"** (elle `workflow_dispatch`;
-aynı `deploy.sh` + sunucu kapıları; otomatik push-deploy YOK). Bulut oturumu iş akışı: dalda geliştir → test →
-main'e merge (PR) → CI yeşil → workflow'u tetikle. **Mainnet yalnız yerelden** (`--ring mainnet` + etiket + elle onay).
-Kurulum/kullanım: `docs/RUNBOOK.md` "Buluttan deploy (GitHub Actions)". Bulut oturumunda bağımlılıklar
-`.claude/hooks/session-start.sh` ile Python 3.12 `.venv`'e kurulur (sistem Python 3.13 sabit pin'leri derleyemez).
+**Bulutta geliştirme, yerelden deploy (D39):** bulut oturumu dalda düzenler → test → main'e birleştirir; deploy
+kullanıcının Mac'inden `scripts/deploy.sh awa` ile yapılır (bulut awa'ya ERİŞEMEZ; Actions deploy'u YOK).
+Bulutta bağımlılıklar `.claude/hooks/session-start.sh` ile Python 3.12 `.venv`'e kurulur (sistem Python 3.13
+sabit pin'leri derleyemez). Ayrıntı: `docs/RUNBOOK.md` "Bulutta geliştirme, yerelden deploy", D39.
 
 Backtest DAİMA sunucu env'iyle:
 ```bash

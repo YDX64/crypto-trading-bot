@@ -51,9 +51,6 @@ scripts/.scalper_env_snapshot.txt
 # İÇİNDE `pytest tests` KIRMIZI döner ve "container içi test = deploy kapısı"
 # iddiası çöker (ölçüldü: 1 failed).
 !.github/workflows/ci.yml
-# Aynı gerekçe (D39): tests/test_deploy_workflow.py deploy.yml'i OKUR; istisna
-# olmadan container İÇİNDE `pytest tests` kırmızı döner.
-!.github/workflows/deploy.yml
 .claude/
 
 # ── Python yerel ortamı / önbellekler ───────────────────────────────────────
