@@ -1640,6 +1640,9 @@ class ScalperEngine:
             backoff[symbol] = time.monotonic() + self._AGED_CLOSE_BACKOFF_SEC
             try:
                 sp.stale_tp_close_at = _utcnow_iso()
+                # Etiket SON göndereni göstersin (`_infer_exit_reason` STALE_TP'yi
+                # önce okur): karşı rutinin eski damgası temizlenir.
+                sp.reaper_close_at = None
             except Exception:  # pragma: no cover - test çiftleri (SimpleNamespace)
                 pass
             self.logger.info(
@@ -1736,6 +1739,9 @@ class ScalperEngine:
             # çıkarımının yaş-kesmesini "SL" ile karıştırmasını engeller.
             try:
                 sp.reaper_close_at = _utcnow_iso()
+                # Etiket SON göndereni göstersin: STALE_TP damgası önce okunduğu
+                # için kalırsa Reaper'ın kapattığı pozisyon STALE_TP diye yazılırdı.
+                sp.stale_tp_close_at = None
             except Exception:  # pragma: no cover - test çiftleri (SimpleNamespace)
                 pass
             self.logger.info(

@@ -399,6 +399,23 @@ class TestStampIsLabelNotGate:
         await engine._reap_aged_positions()                   # hâlâ açık → Reaper
         assert len(client.posts) == 2
         assert positions["AAAUSDT"].reaper_close_at
+        # cubic PR #8: etiket SON göndereni göstersin — STALE_TP damgası temizlendi
+        # (aksi halde `_infer_exit_reason` STALE_TP'yi önce okuyup yanlış etiketlerdi).
+        assert positions["AAAUSDT"].stale_tp_close_at is None
+
+    @pytest.mark.asyncio
+    async def test_stale_tp_gonderimi_eski_reaper_damgasini_temizler(self):
+        positions = {"AAAUSDT": _sp(age_hours=9.0)}
+        client = FakeClient(amounts={"AAAUSDT": "1.5"})
+        engine = _engine(positions, client, stale=True)
+
+        await engine._reap_aged_positions()
+        assert positions["AAAUSDT"].reaper_close_at
+        engine._aged_close_backoff["AAAUSDT"] = time.monotonic() - 1.0
+        await engine._close_stale_profitable_positions()
+        assert len(client.posts) == 2
+        assert positions["AAAUSDT"].stale_tp_close_at
+        assert positions["AAAUSDT"].reaper_close_at is None
 
     @pytest.mark.asyncio
     async def test_reaper_ve_stale_ayni_turda_ayni_sembole_iki_emir_gondermez(self):

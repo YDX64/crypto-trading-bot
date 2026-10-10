@@ -197,9 +197,10 @@ Sonraki tur (aynı PR): (i) STALE_TP/Reaper döngülerindeki KALICI damga kapıl
 emir kabul edilip pozisyon açık kalırsa ne STALE_TP ne Reaper yeniden deniyordu; artık yalnız ortak backoff bekletir, süre
 dolunca canlı miktarla yeniden denenir, flat ise emir yok), ve (ii) `--overwrite` terfisi ortasında `OSError` olursa terfi
 edilmemiş ESKİ hedef dosyalar silinir (eski+yeni karışık veriyle sessiz backtest olmasın; silinemeyenler hata mesajında yazılır).
-Bilinen etiket sonucu (bilerek değiştirilmedi): STALE_TP damgalı bir pozisyonu bekleme sonrası Reaper devralıp kapatırsa
-`_infer_exit_reason` STALE_TP damgasını önce okuduğu için kapanış etiketi `STALE_TP` kalır (son emir Reaper'ınki olsa da).
-Tam test **3388 passed, 3 skipped**; ruff temiz.
+Etiket: başarılı gönderimde karşı rutinin damgası temizlenir (cubic PR #8 3. tur) — STALE_TP damgalı bir pozisyonu
+bekleme sonrası Reaper kapatırsa etiket artık `REAPER` olur (eskiden `_infer_exit_reason` STALE_TP'yi önce okuduğu için
+`STALE_TP` kalırdı); tersi de aynı. Yalnız etiket; karar yolu değişmez.
+Tam test **3389 passed, 3 skipped**; ruff temiz.
 
 **Geri alma:** önceki commit = `1f3da26f1177a0cb8395793ff94b7565ca28c1f7` → `scripts/deploy.sh awa 1f3da26f1177a0cb8395793ff94b7565ca28c1f7`
 (ya da `backups/commit.prev-*`). **Restart GEREKİR:** `src/` değişti (tembel import'lar nedeniyle çalışan süreç eski +
