@@ -2,7 +2,7 @@
   "code_blobs": {
     "scripts/e17/analyze_e17.py": "6dd1664b295059f6206b48fa0257861926b1ba3d8da3d9a17fc70d2b8c4d37eb",
     "scripts/e17/envtool.py": "242fe8ce7f9cff8b82fe103e4418831667b5d36fcc37ac88a3e45b474c676d74",
-    "scripts/e17/lib17.sh": "990bb109ff91877a13f15b1f9657e8b8b8c03e5839f059cec6ee00e60b95ae2a",
+    "scripts/e17/lib17.sh": "8eb25146f1d761689408d8eacb13915ab040ef0f487c98fe32de79ce1a2a7d0f",
     "scripts/e17/run_dev.sh": "cb5aead3a9dec6c6afee857a8d8a0aeb58ac13b49e71663373b8457d2017db4e",
     "scripts/e17/run_final.sh": "dcadfaa48a69bac3c227353c81aa4599888cc43cf2cf08da7671d845d1d23d60",
     "scripts/e17/run_prova.sh": "7a3e2d0b1481fa8c8ad06445e68a42f9d3e11e883f6ac2874d4b988afd684711",
@@ -37,10 +37,10 @@
     "src/strategies/scalper/types.py": "30210d17f4a0636e8eb4464a9374192c313fa070d12ae4ed84df1703864ea96a",
     "tests/test_e17_analyzer.py": "03616c45c91e418dd08559177ac1c3cbedf2d6fd1422912ff9e790896e493cf2",
     "tests/test_e17_harness.py": "c766490abb4e71251b97f05c11395c22e6dacd25c8db13783c606dd82c21dff5",
-    "tests/test_e17_scripts.py": "3780040563cd54aabbabed679fa86d6427bf783a091ec20852e01e312eb6ea92",
+    "tests/test_e17_scripts.py": "c580828b8bf391837e66a3b8707457fd333bb63d6ae89d6202f1465cfda2b36f",
     "tests/test_e17_scripts_fast.py": "a4f564ce6975368f3f0752cea7f08320152e5ce29b40602d3de30852fb741daf"
   },
-  "created_utc": "2026-10-10T18:58:40Z",
+  "created_utc": "2026-10-10T19:11:44Z",
   "earliest_bar_check": {
     "DEV:15m/1h/4h": "2024-11-20T08:00:00Z",
     "DEV:1h/4h/4h": "2024-11-20T08:00:00Z",
@@ -130,8 +130,8 @@
     "labels_frozen.json": "fe6f195cbca618fd1eb3dfaa27a41253cf9eb201ee19f802334946bd3c3ea20a",
     "variants.json": "0e7874030699f81fd8ea77f0bbe64b7a91c4373ce48f863d5954baf20ece6794"
   },
-  "h_commit": "14d3b17c53b18ef5f2eac5029f69fbff1b4119e5",
-  "h_tree": "eddc48b3af600d6a2984b9204738083f7d250307",
+  "h_commit": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a",
+  "h_tree": "d9f4f53b6ec7937c0bb12a0796e95cb625c4a0f5",
   "l_note": "L = bu LOCK.json'u içeren, uzak dala itilmiş kilit commit'i; sha LOCK_REF.json'dadır (§9.1)",
   "python_version": "3.12.3",
   "requirements_sha256": "fc9cc1c0a4b5015db7772325a835da24958c7d261dc1247a0412979d3263f8d7",
