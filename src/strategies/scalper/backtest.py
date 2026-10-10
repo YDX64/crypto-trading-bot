@@ -331,6 +331,23 @@ _WARMUP_BY_ROLE: Tuple[int, int, int] = (
 )
 
 
+def check_timeframe_roles(timeframes: Tuple[str, str, str]) -> None:
+    """E17/H3 — rol üçlüsü (entry, context, regime) tutarlılığı.
+
+    Seri sözlüğü aralık adıyla anahtarlandığından `giriş == bağlam` veya
+    `giriş == rejim` aynı anahtara iki rolün farklı ısınma pencerelerini
+    yazar ve giriş serisini SESSİZCE bozar. Reddedilir. `bağlam == rejim`
+    BİLİNÇLİDİR (30m/4h/4h, 1h/4h/4h): ikisi de aynı seriyi paylaşır, rejim
+    penceresi (en uzun) bağlamı da kapsar; reddedilmez.
+    """
+    entry, context, regime = timeframes
+    if entry == context or entry == regime:
+        raise ValueError(
+            "Zaman dilimi rolleri çakışıyor: giriş aralığı bağlam veya rejim "
+            f"ile aynı olamaz (entry, context, regime) = {tuple(timeframes)!r}"
+        )
+
+
 async def gather_symbol_data(
     fetch: FetchFn, symbol: str, days: int, end_time: Optional[int] = None,
     timeframes: Tuple[str, str, str] = ("5m", "15m", "4h"),
@@ -965,6 +982,15 @@ DIAGNOSTIC_KEYS = (
 )
 
 
+def check_same_bar_order(same_bar_order: str) -> None:
+    """Bilinmeyen `same_bar_order` değerini (yazım hatası dahil) reddet;
+    aksi halde sessizce `pessimistic` davranışı alınırdı."""
+    if same_bar_order not in SAME_BAR_ORDERS:
+        raise ValueError(
+            f"same_bar_order {SAME_BAR_ORDERS} içinden olmalı: {same_bar_order!r}"
+        )
+
+
 def new_diagnostics() -> Dict[str, int]:
     """Sıfırlanmış `--diagnostics` sayaç sözlüğü (`DIAGNOSTIC_KEYS`)."""
     return {key: 0 for key in DIAGNOSTIC_KEYS}
@@ -999,6 +1025,7 @@ def _process_candle_exits(
     TP2 henüz dolmadıysa bağımsız sabit hedef olarak aynı anda izlenir. Yine
     aynı mumda ikisi de değindiyse SL/trail ÖNCE sayılır.
     """
+    check_same_bar_order(same_bar_order)
     optimistic = same_bar_order == SAME_BAR_ORDER_OPTIMISTIC
     tp1_filled_this_bar = False
     if not pos.tp1_filled:
@@ -1236,9 +1263,11 @@ def manage_position(
 
     E17/H2 (YALNIZ ÖLÇÜM): `diag` sayaç sözlüğü ve `same_bar_order`
     `_process_candle_exits`'e geçirilir. `optimistic` iken ayrıca (iii)
-    dolum mumunda (`idx == pos.entry_idx`) SL/TP çıkış işlemesi yapılmaz
-    (pozisyon sonraki mumdan itibaren aktif); MAE/MFE, yapı/STALE_TP/REAPER
-    ve EOD adımları değişmez.
+    dolum mumunda (`idx == pos.entry_idx`) HİÇBİR çıkış adımı (SL/TP, yapı,
+    STALE_TP, REAPER) işlenmez (pozisyon sonraki mumdan itibaren aktif);
+    MAE/MFE ve EOD adımları değişmez. `fill_bar_exit` dolum mumunda kapanan
+    HER işlemi sayar (SL/TP'ye ek olarak pessimistic'te CHOCH/STALE_TP/REAPER
+    kapanışları da; EOD hariç) — "dolum barında kapanan işlem payı" budur.
 
     `structure_feed` verilirse (yalnız `SCALPER_STRUCTURE_EXIT != off`) her
     mum sonunda yapı-tabanlı çıkış kararı da uygulanır — canlı safety
@@ -1247,6 +1276,7 @@ def manage_position(
     max-hold/REAPER kesmesi. Verilmezse yalnız yapı adımı atlanır; STALE_TP
     ve REAPER cfg'deki eşikleri >0 ise yine işler.
     """
+    check_same_bar_order(same_bar_order)
     n = len(candles_5m)
     exit_idx = n - 1
 
@@ -1255,11 +1285,13 @@ def manage_position(
         _update_mae_mfe(pos, c, pos.direction, pos.leverage)
 
         if same_bar_order == SAME_BAR_ORDER_OPTIMISTIC and idx == pos.entry_idx:
-            closed = False  # (iii) dolum mumunda çıkış işlenmez
-        else:
-            closed = _process_candle_exits(
-                pos, c, pos.direction, diag=diag, same_bar_order=same_bar_order,
-            )
+            # (iii) dolum mumunda HİÇBİR çıkış adımı işlenmez (SL/TP, yapı,
+            # STALE_TP, REAPER); yalnız MAE/MFE ve equity işareti sürer.
+            _mark_equity(pos, c)
+            continue
+        closed = _process_candle_exits(
+            pos, c, pos.direction, diag=diag, same_bar_order=same_bar_order,
+        )
         if closed:
             exit_idx = idx
             _mark_equity(pos, c)
@@ -2292,10 +2324,7 @@ async def run_backtest(
     """
     if start_time_ms is None and days <= 0:
         raise ValueError("Backtest gün sayısı pozitif olmalı")
-    if same_bar_order not in SAME_BAR_ORDERS:
-        raise ValueError(
-            f"same_bar_order {SAME_BAR_ORDERS} içinden olmalı: {same_bar_order!r}"
-        )
+    check_same_bar_order(same_bar_order)
 
     strategies = get_enabled(strategy_names)
     if not strategies:
@@ -2361,6 +2390,7 @@ async def run_backtest(
     all_trades: List[BacktestTrade] = []
     try:
         timeframes = resolve_timeframes(cfg)
+        check_timeframe_roles(timeframes)
         tf_entry, tf_context, tf_regime = timeframes
 
         # D15 lider piyasa kapısı: lider serisi pencere başında BİR KEZ
@@ -2875,7 +2905,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--same-bar-order", choices=SAME_BAR_ORDERS,
-        default=SAME_BAR_ORDER_PESSIMISTIC,
+        default=None,
         help=(
             "Aynı mumda sırası bilinemeyen çıkışlar: pessimistic (varsayılan, "
             "bugünkü davranış) | optimistic (TP1 mumunda BE stopu yok, TP2 "
@@ -2911,13 +2941,20 @@ async def main_async(args: argparse.Namespace) -> None:
     missed_counter: Dict[str, int] = {}
     run_metadata: Dict[str, Any] = {}
     # E17/H2: bayraklar verilmediyse hiçbir şey kurulmaz (rapor şekli aynı).
-    same_bar_order = str(
-        getattr(args, "same_bar_order", SAME_BAR_ORDER_PESSIMISTIC)
-        or SAME_BAR_ORDER_PESSIMISTIC
-    )
+    # `--same-bar-order` argparse varsayılanı None: açıkça verilip verilmediği
+    # (pessimistic dahil) ayırt edilsin diye (sim_options yalnız bayrak varsa).
+    same_bar_flag = getattr(args, "same_bar_order", None)
+    same_bar_order = str(same_bar_flag or SAME_BAR_ORDER_PESSIMISTIC)
     diagnostics_on = bool(getattr(args, "diagnostics", False))
     diag_counter: Optional[Dict[str, int]] = new_diagnostics() if diagnostics_on else None
     permutations = max(0, int(getattr(args, "permutations", 0) or 0))
+    if permutations > 0 and same_bar_order != SAME_BAR_ORDER_PESSIMISTIC:
+        # Permütasyon turları HER ZAMAN pessimistic simüle eder; gözlenen
+        # istatistik optimistic olursa null ile karşılaştırma geçersiz olur.
+        raise ValueError(
+            "--permutations yalnız --same-bar-order pessimistic ile geçerlidir "
+            "(permütasyon yolu optimistic'i taşımaz; p-değeri geçersiz olurdu)"
+        )
     series_by_symbol: Dict[str, Dict[str, List[Candle]]] = {}
     leader_holder: List[Optional[LeaderSeries]] = []
     all_trades = await run_backtest(
@@ -2937,7 +2974,7 @@ async def main_async(args: argparse.Namespace) -> None:
         diag=diag_counter,
         same_bar_order=same_bar_order,
     )
-    if diagnostics_on or same_bar_order != SAME_BAR_ORDER_PESSIMISTIC:
+    if diagnostics_on or same_bar_flag is not None:
         run_metadata["sim_options"] = {
             "same_bar_order": same_bar_order,
             "diagnostics": diagnostics_on,

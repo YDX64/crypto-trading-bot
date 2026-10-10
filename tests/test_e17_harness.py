@@ -438,6 +438,60 @@ class TestOptimisticBranches:
         assert trade.exit_reason == "EOD" and trade.exit_idx == 1
         assert (diag["fill_bar_exit"], diag["fill_bar_total"]) == (0, 1)
 
+    def test_fill_bar_exit_counts_only_the_fill_bar_itself(self):
+        """Çıkış dolum mumundan BİR SONRAKİ mumda ise fill_bar_exit sayılmaz
+        (sınır: `exit_idx == entry_idx`, `<= entry_idx + 1` DEĞİL)."""
+        cfg = _golden_cfg()
+        candles = [
+            _c(100, 100.2, 99.8, 100, t=0),
+            _c(100, 100.5, 99.6, 100, t=1000),   # dolum mumu, sakin
+            _c(100, 100.5, 98.9, 100, t=2000),   # SL'e değer (idx 2)
+            _c(100, 100.6, 99.5, 100, t=3000),
+        ]
+        diag = new_diagnostics()
+        trade = manage_position(_pos(entry_idx=1, entry_time=1000), candles, cfg,
+                                diag=diag)
+        assert trade.exit_reason == "SL" and trade.exit_idx == 2
+        assert (diag["fill_bar_exit"], diag["fill_bar_total"]) == (0, 1)
+
+    def test_branch_iii_also_skips_stale_reaper_in_fill_bar(self):
+        """(iii) dolum mumunda REAPER/STALE_TP/yapı adımları da işlenmez;
+        pessimistic'te REAPER dolum mumunda kapatırdı."""
+        base = _golden_cfg()
+
+        class _Cfg2:
+            scalper_max_hold_hours = 0.0001  # ~0.36 sn: yaş 999 ms >= eşik
+
+            def __getattr__(self, name):
+                return getattr(base, name)
+
+        candles = [
+            _c(100, 100.2, 99.8, 100, t=0),
+            _c(100, 100.5, 99.6, 100, t=1000),
+            _c(100, 100.5, 99.6, 100, t=2000),
+            _c(100, 100.5, 99.6, 100, t=3000),
+        ]
+        d_p, d_o = new_diagnostics(), new_diagnostics()
+        t_p = manage_position(_pos(entry_idx=1, entry_time=1000), candles,
+                              _Cfg2(), diag=d_p)
+        t_o = manage_position(_pos(entry_idx=1, entry_time=1000), candles,
+                              _Cfg2(), diag=d_o,
+                              same_bar_order=SAME_BAR_ORDER_OPTIMISTIC)
+        assert t_p.exit_reason == "REAPER" and t_p.exit_idx == 1
+        assert d_p["fill_bar_exit"] == 1
+        assert t_o.exit_reason == "REAPER" and t_o.exit_idx == 2
+        assert d_o["fill_bar_exit"] == 0
+
+    def test_unknown_order_is_rejected_by_the_low_level_functions(self):
+        """Yazım hatası ('Optimistic') sessizce pessimistic olmamalı."""
+        cfg = _golden_cfg()
+        with pytest.raises(ValueError, match="same_bar_order"):
+            _process_candle_exits(_pos(), _c(100, 100.5, 99.6, 100),
+                                  Direction.LONG, same_bar_order="Optimistic")
+        with pytest.raises(ValueError, match="same_bar_order"):
+            manage_position(_pos(), _flat_candles(3), cfg,
+                            same_bar_order="optimistc")
+
     def test_run_backtest_rejects_unknown_order(self):
         import asyncio
 
@@ -451,7 +505,11 @@ class TestOptimisticBranches:
         parser = bt._build_arg_parser()
         args = parser.parse_args([])
         assert args.diagnostics is False
-        assert args.same_bar_order == "pessimistic"
+        # None = "verilmedi": açık `pessimistic` ile ayırt edilebilsin diye.
+        assert args.same_bar_order is None
+        assert parser.parse_args(
+            ["--same-bar-order", "pessimistic"]
+        ).same_bar_order == "pessimistic"
         args = parser.parse_args(["--diagnostics", "--same-bar-order", "optimistic"])
         assert args.diagnostics is True and args.same_bar_order == "optimistic"
         with pytest.raises(SystemExit):
@@ -523,6 +581,87 @@ class TestE17CliWiring:
         assert report["provenance"]["sim_options"] == {
             "same_bar_order": "optimistic", "diagnostics": False,
         }
+
+    @pytest.mark.asyncio
+    async def test_explicit_pessimistic_flag_is_recorded(
+        self, monkeypatch, tmp_path
+    ):
+        """Açık `--same-bar-order pessimistic` (tek başına) sim_options yazar;
+        verilmeyen bayraktan ayırt edilir."""
+        await bt.main_async(
+            self._args(monkeypatch, tmp_path, same_bar_order="pessimistic")
+        )
+        report = self._report(tmp_path)
+        assert "diagnostics" not in report
+        assert report["provenance"]["sim_options"] == {
+            "same_bar_order": "pessimistic", "diagnostics": False,
+        }
+        assert report["overall"]["trades"] == 2
+        assert round(report["overall"]["total_pnl"], 2) == 23.79
+
+    @pytest.mark.asyncio
+    async def test_optimistic_order_reaches_manage_position_end_to_end(
+        self, monkeypatch, tmp_path
+    ):
+        """main_async -> run_backtest -> simulate_symbol -> manage_position
+        zincirinde `same_bar_order` HER halkada taşınır (zincirin bir halkası
+        düşerse DIAG_SBO sessizce pessimistic olurdu)."""
+        seen_sim: List[str] = []
+        seen_mgr: List[str] = []
+        real_sim, real_mgr = bt.simulate_symbol, bt.manage_position
+
+        def spy_sim(*a, **kw):
+            seen_sim.append(kw.get("same_bar_order"))
+            return real_sim(*a, **kw)
+
+        def spy_mgr(*a, **kw):
+            seen_mgr.append(kw.get("same_bar_order"))
+            return real_mgr(*a, **kw)
+
+        monkeypatch.setattr(bt, "simulate_symbol", spy_sim)
+        monkeypatch.setattr(bt, "manage_position", spy_mgr)
+        await bt.main_async(
+            self._args(monkeypatch, tmp_path, same_bar_order="optimistic")
+        )
+        assert seen_sim and set(seen_sim) == {"optimistic"}
+        assert seen_mgr and set(seen_mgr) == {"optimistic"}
+        # Varsayılan koşuda ise pessimistic taşınır.
+        seen_sim.clear()
+        seen_mgr.clear()
+        await bt.main_async(self._args(monkeypatch, tmp_path))
+        assert set(seen_sim) == {"pessimistic"}
+        assert set(seen_mgr) == {"pessimistic"}
+
+    @pytest.mark.asyncio
+    async def test_optimistic_changes_results_vs_pessimistic(
+        self, monkeypatch, tmp_path
+    ):
+        """Golden fixture'da optimistic sonuçları GERÇEKTEN değiştirir
+        (bayrak kablolaması yalnız meta veri değildir)."""
+        await bt.main_async(self._args(monkeypatch, tmp_path))
+        pess = self._report(tmp_path)["overall"]
+        for p in Path(tmp_path, "logs").glob("backtest_*.json"):
+            p.unlink()
+        await bt.main_async(
+            self._args(monkeypatch, tmp_path, same_bar_order="optimistic")
+        )
+        opt = self._report(tmp_path)["overall"]
+        assert (opt["trades"], round(opt["total_pnl"], 6)) != (
+            pess["trades"], round(pess["total_pnl"], 6)
+        )
+
+    @pytest.mark.asyncio
+    async def test_permutations_with_optimistic_order_is_rejected(
+        self, monkeypatch, tmp_path
+    ):
+        """Gözlenen optimistic vs null pessimistic karşılaştırması geçersiz
+        p-değeri verirdi: reddedilir (ağ/simülasyon başlamadan)."""
+        with pytest.raises(ValueError, match="permutations"):
+            await bt.main_async(self._args(
+                monkeypatch, tmp_path, same_bar_order="optimistic",
+                permutations=2, permutation_seed=7,
+                permutation_metrics="total_pnl",
+            ))
 
     @pytest.mark.asyncio
     async def test_permutation_path_is_unaffected_by_the_flags(
@@ -691,6 +830,31 @@ class TestRoleTriplesE17:
         )
         assert ex2.calls == []
         assert again == data
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("clash", [
+        ("5m", "15m", "5m"),   # giriş == rejim
+        ("5m", "5m", "4h"),    # giriş == bağlam
+        ("15m", "15m", "15m"),
+    ], ids=["entry=regime", "entry=context", "all-equal"])
+    async def test_entry_equal_to_context_or_regime_is_rejected(self, clash):
+        """Seri sözlüğü aralıkla anahtarlandığından giriş rolünün ısınma
+        penceresi sessizce ezilirdi; `run_backtest` veri çekmeden reddeder
+        (bağlam==rejim serbest, aşağıdaki test)."""
+        from types import SimpleNamespace
+
+        cfg = SimpleNamespace(scalper_tf_entry=clash[0],
+                              scalper_tf_context=clash[1],
+                              scalper_tf_regime=clash[2])
+        with pytest.raises(ValueError, match="çakış"):
+            await bt.run_backtest(
+                days=1, symbols=["BTCUSDT"], strategy_names="C", cfg=cfg,
+                end_time_ms=_END,
+            )
+
+    def test_check_timeframe_roles_allows_context_equal_regime(self):
+        bt.check_timeframe_roles(("30m", "4h", "4h"))
+        bt.check_timeframe_roles(("1h", "4h", "4h"))
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("triple", [("30m", "4h", "4h"), ("1h", "4h", "4h")],
