@@ -192,7 +192,7 @@ def make_report(ctx: "a.Ctx", label: str, trades: List[Dict[str, Any]], *, git_s
     s_ms, e_ms = a.date_ms(start), a.date_ms(end)
     days = (e_ms - s_ms) // DAY
     cfg = {"scalper_tf_entry": v["triple"][0], "scalper_tf_context": v["triple"][1], "scalper_tf_regime": v["triple"][2],
-           "scalper_junk_key": 1}
+           "scalper_junk_key": 1, "scalper_fixed_stop_roi_pct": float(v["S_arm"])}
     for k, val in a.expected_env(ctx, info).items():
         cfg[k.lower()] = typed(val)
     stress, delay = a.expected_cost(info)
@@ -233,6 +233,11 @@ def make_report(ctx: "a.Ctx", label: str, trades: List[Dict[str, Any]], *, git_s
             cur = cur[p]
         cur.pop(parts[-1], None)
     return doc
+
+
+def write_smoke_pass(root: Path, ctx: "a.Ctx", ok: bool = True) -> None:
+    """DEV aşamasının ön koşulu: bu kilit için SMOKE.json PASS."""
+    (root / "SMOKE.json").write_text(json.dumps({"pass": ok, "l": ctx.l}), encoding="utf-8")
 
 
 def put_run(root: Path, ctx: "a.Ctx", label: str, trades: List[Dict[str, Any]], *, ledger: bool = True, log: str = "ok\n",
@@ -285,6 +290,7 @@ def build_lab(base: Path, mp: pytest.MonkeyPatch) -> Lab:
         "src/strategies/scalper/backtest.py": "# dummy\n", "src/strategies/scalper/setups.py": "# dummy\n",
         "src/core/config.py": "# dummy\n", "scripts/fill_klines_cache_from_vision.py": "# dummy\n",
         "tests/test_e17_analyzer.py": "# dummy\n", "README.md": "x\n",
+        ".gitignore": "*.json\n",       # gerçek depo .gitignore'u gibi: lock -f olmadan JSON'ları SESSİZCE atlardı
     }.items():
         p = repo / rel
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -451,14 +457,24 @@ def test_null_size_fast_1000_series_boot399_d120():
 
 
 @pytest.mark.skipif(os.environ.get("E17_SLOW") != "1", reason="tam boyut (B=19999, 600 seri): yalnız E17_SLOW=1")
-def test_null_size_full_b19999_600_series():
+def test_null_size_full_b19999_600_series(tmp_path):
+    """Lock anında BİR KEZ koşar (E17_SLOW=1); sonuç JSON olarak yazılır (E17_SLOW_OUT, yoksa tmp_path) —
+    orkestratör bu dosyayı `evidence/` altına kopyalar ve lock'tan önce hash'lenir (PLAN §5.3)."""
     rng = random.Random(77)
     rej = 0
-    for i in range(600):
-        x = [rng.gauss(0, 1.5) if rng.random() < 0.7 else 0.0 for _ in range(365)]
+    n_series, d, alpha = 600, 365, 0.05
+    for i in range(n_series):
+        x = [rng.gauss(0, 1.5) if rng.random() < 0.7 else 0.0 for _ in range(d)]
         p, _t = a.bootstrap_p(x, 7, a.seed_for("null", f"f{i}", 7), a.THRESH["BOOT_N"])
-        rej += p <= 0.05
-    assert rej / 600 <= 0.05 + 4 * (0.05 * 0.95 / 600) ** 0.5
+        rej += p <= alpha
+    limit = alpha + 4 * (alpha * (1 - alpha) / n_series) ** 0.5
+    out = Path(os.environ.get("E17_SLOW_OUT") or (tmp_path / "null_size_full.json"))
+    out.write_text(json.dumps({"test": "null_size_full_b19999_600_series", "boot_n": a.THRESH["BOOT_N"],
+                               "block": 7, "series": n_series, "days": d, "alpha": alpha, "rejections": rej,
+                               "rejection_rate": rej / n_series, "limit": limit, "pass": rej / n_series <= limit,
+                               "thresholds_sha256": a.thresholds_sha256(), "utc": a.utc_now()}, indent=2) + "\n",
+                   encoding="utf-8")
+    assert rej / n_series <= limit, (rej / n_series, str(out))
 
 
 def test_mc_error_rule_recomputes_only_when_decision_can_flip():
@@ -776,6 +792,22 @@ def _mut_cases():
     c["BAR_ORDER_OPT_PF_MIN"] = (1.10, lambda: a.bar_order_flag(1.0, 1.1499, 0.1, False), lambda: a.bar_order_flag(1.0, 1.15, 0.1, False))
     c["FEE15_PF_MIN"] = (0.99, lambda: a.fee15_flag(True, 0.9999), lambda: a.fee15_flag(True, 1.0))
     c["Z0_GROSS_PF_EDGE"] = (1.04, lambda: a.z0_reading(1.0499, 0.9).startswith("sinyalin"), lambda: a.z0_reading(1.05, 0.9).startswith("sinyalin"))
+    c["Z0_NET_PF"] = (1.1, lambda: a.z0_reading(1.2, 1.0).startswith("sinyalin"), lambda: a.z0_reading(1.2, 0.9999).startswith("sinyalin"))
+    c["TOPN_G4"] = (3, lambda: _gpass(a.rule_g4(_lab_trades(top5 + [(-0.1, "BTCUSDT", "2025-02")] * 2)), "G4b"),
+                    lambda: _gpass(a.rule_g4(_lab_trades(top5 + [(0.1, "BTCUSDT", "2025-02")] * 2)), "G4b"))
+    c["TOPN_G12"] = (3, lambda: _g12_row(_lab_trades([(1.0, "BTCUSDT", "m1")] * 5 + [(0.9, "ETHUSDT", "m2")] * 8), "G12d"),
+                     lambda: _g12_row(_lab_trades([(1.0, "BTCUSDT", "m1")] * 5 + [(0.9375, "ETHUSDT", "m2")] * 8), "G12d"))
+    c["LEV_LOW"] = (4, lambda: _gpass(_validity(_n(17) + _n(3, lev=3)), "G0c1"), lambda: _gpass(_validity(_n(18) + _n(2, lev=3)), "G0c1"))
+    c["LEV_HIGH"] = (19, lambda: _gpass(_validity(_n(9) + _n(11, lev=20)), "G0c2"), lambda: _gpass(_validity(_n(10) + _n(10, lev=20)), "G0c2"))
+    c["REGIME_UP_PCT"] = (4.9, lambda: a.regime_label(4.99) == "UP", lambda: a.regime_label(5.0) == "UP")
+    c["REGIME_DOWN_PCT"] = (-4.9, lambda: a.regime_label(-4.99) == "DOWN", lambda: a.regime_label(-5.0) == "DOWN")
+    c["REGIME_SHOCK_PCT"] = (2.0, lambda: a.build_labels(synthetic_btc())["2025-06"]["shock"],        # ret +2.4%
+                             lambda: a.build_labels(synthetic_btc())["2025-01"]["shock"])             # ret +9.4%
+    c["FEE2_MULT"] = (1.5, lambda: a.expected_cost(a.LabelInfo("x", "DEV", "S15", "ROB_FEE2", 0))[0] == 1.5,
+                      lambda: a.expected_cost(a.LabelInfo("x", "DEV", "S15", "ROB_FEE2", 0))[0] == 2.0)
+    c["FEE15_MULT"] = (1.4, lambda: a.expected_cost(a.LabelInfo("x", "DEV", "S15", "DIAG_FEE15", 0))[0] == 1.4,
+                       lambda: a.expected_cost(a.LabelInfo("x", "DEV", "S15", "DIAG_FEE15", 0))[0] == 1.5)
+    c["BULL_PNL_FRAC"] = (0.7, lambda: a.bull_check(79.9, 100.0) is True, lambda: a.bull_check(80.0, 100.0) is True)
     return c
 
 
@@ -1129,6 +1161,7 @@ def _stage_files(root: Path, ctx: "a.Ctx", label: str, trades, **kw) -> Dict[str
 def test_check_run_end_to_end_appends_ledger_manifest_and_is_idempotent(lab, lab_env, tmp_path, capsys):
     root = lab.clone_root("locked", tmp_path)
     ctx = a.verify_lock(root)
+    write_smoke_pass(root, ctx)
     _stage_files(root, ctx, "DEV_S15", gen_trades(a.WINDOWS["DEV"], 25, 9))
     (root / "sealed" / "logs" / "DEV_S15.sec").write_text("12.5\n")
     assert a.main(["check-run", "DEV_S15", "--root", str(root)]) == 0
@@ -1148,6 +1181,7 @@ def test_check_run_end_to_end_appends_ledger_manifest_and_is_idempotent(lab, lab
 def test_check_run_failure_deletes_stale_output_and_does_not_ledger(lab, lab_env, tmp_path, capsys):
     root = lab.clone_root("locked", tmp_path)
     ctx = a.verify_lock(root)
+    write_smoke_pass(root, ctx)
     _stage_files(root, ctx, "DEV_S15", gen_trades(a.WINDOWS["DEV"], 25, 9), git_sha="c" * 40)
     assert a.main(["check-run", "DEV_S15", "--root", str(root)]) == 5
     err = capsys.readouterr().err
@@ -1207,6 +1241,7 @@ def pipe(lab, tmp_path_factory):
         root = lab.base / "pipe_root"
         shutil.copytree(lab.base / "snap_locked", root)
         ctx = a.verify_lock(root)
+        write_smoke_pass(root, ctx)
         seed = [100]
 
         def add(label, n, s_arm, window, **kw):
@@ -1248,6 +1283,8 @@ def pipe(lab, tmp_path_factory):
             for ov in a.VAL_OVERLAYS:
                 q = BADQ if (arm == "T30" and ov == "ROB_WALL") else GOOD
                 add(f"VAL_{arm}_{ov}", 300, _arm_s(ctx, arm), a.WINDOWS["VAL"], **q)
+        for arm in a.DESCRIPTIVE:                               # açıklayıcılar VAL'de de koşulur (kazanamaz, yalnız rapor)
+            add(f"VAL_{arm}", 90, _arm_s(ctx, arm), a.WINDOWS["VAL"], **GOOD)
         assert a.main(["val", "--root", str(root)]) == 0
         lab.snap("validated", root)
         # --- FINAL ---
@@ -1612,3 +1649,472 @@ def test_set_windows_match_plan_constants():
     d = lambda w: (a.date_ms(w[1]) - a.date_ms(w[0])) // DAY          # noqa: E731
     assert d(a.WINDOWS["DEV"]) == 365 and d(a.WINDOWS["VAL"]) == 687 and d(a.WINDOWS["FINAL"]) == 35
     assert sum(d(q) for q in a.DEV_QUARTERS) == 365
+
+
+# ==========================================================================
+# 11) FIXER turu: gitignore'lu JSON'lar, S_arm/özet denetimi, aşama sırası, istatistik bilinen değerler, çıkış kodları
+# ==========================================================================
+def test_lock_force_adds_gitignored_json_files_into_l_commit(lab, lab_env):
+    """Depo .gitignore'u `*.json`ı yok sayar; düz `git add` LOCK.json/variants.json/... dosyalarını SESSİZCE atlardı."""
+    ref = json.loads((lab.root / "LOCK_REF.json").read_text())
+    _git(lab.repo, "check-ignore", "-q", "--no-index", f"{a.LOCKDIR_REL}/variants.json")             # gerçekten yok sayılıyor (rc 0)
+    tree = set(_git(lab.repo, "ls-tree", "-r", "--name-only", ref["l"]).splitlines())
+    lock = json.loads(subprocess.run(["git", "-C", str(lab.repo), "show", f"{ref['l']}:{a.LOCKDIR_REL}/LOCK.json"],
+                                     capture_output=True, check=True).stdout)
+    for n in [*lock["files"], "LOCK.json"]:
+        assert f"{a.LOCKDIR_REL}/{n}" in tree, n
+    assert a.main(["verify-lock", "--root", str(lab.root)]) == 0
+
+
+def test_lock_aborts_and_reverts_when_commit_lacks_a_locked_file(lab, lab_env, tmp_path, monkeypatch):
+    root = lab.clone_root("locked", tmp_path)
+    orig_l = json.loads((root / "LOCK_REF.json").read_text())["l"]
+    ref_before = (root / "LOCK_REF.json").read_text()
+    real = a.git_tree_paths
+    monkeypatch.setattr(a, "git_tree_paths",
+                        lambda rev: [p for p in real(rev) if not p.endswith("/LOCK.json")])
+    try:
+        assert a.main(["lock", "--root", str(root)]) == 5
+        assert _git(lab.repo, "rev-parse", "HEAD") == orig_l                       # commit geri alındı
+        assert (root / "LOCK_REF.json").read_text() == ref_before                  # kayıt yazılmadı, push komutu basılmadı
+    finally:
+        _git(lab.repo, "reset", "-q", "--hard", orig_l)
+
+
+def test_lock_rejects_variants_snapshot_hash_mismatch_and_accepts_match(lab, lab_env, tmp_path, capsys):
+    root = lab.clone_root("locked", tmp_path)
+    orig_l = json.loads((root / "LOCK_REF.json").read_text())["l"]
+    vp = lab.repo / a.LOCKDIR_REL / "variants.json"
+    doc = json.loads(vp.read_text())
+    try:
+        vp.write_text(json.dumps({**doc, "snapshot": {"sha256": "0" * 64}}))
+        assert a.main(["lock", "--root", str(root)]) == 5
+        assert _git(lab.repo, "rev-parse", "HEAD") == orig_l
+        vp.write_text(json.dumps({**doc, "snapshot": {"sha256": a.sha256_file(root / "server-scalper-env.txt")}}))
+        assert a.main(["lock", "--root", str(root)]) == 0
+        assert a.main(["verify-lock", "--root", str(root)]) == 0
+    finally:
+        _git(lab.repo, "reset", "-q", "--hard", orig_l)
+
+
+def test_lock_refuses_when_leak_wall_is_violated(lab, lab_env, tmp_path, monkeypatch):
+    root = lab.clone_root("locked", tmp_path)
+    head = _git(lab.repo, "rev-parse", "HEAD")
+    ref_before = (root / "LOCK_REF.json").read_text()
+    monkeypatch.setattr(a, "earliest_bar_check", lambda v: {"DEV:15m/1h/4h": "2024-11-18T00:00:00Z"})
+    assert a.main(["lock", "--root", str(root)]) == 5
+    assert _git(lab.repo, "rev-parse", "HEAD") == head and (root / "LOCK_REF.json").read_text() == ref_before
+
+
+def test_required_code_includes_fill_script_and_lock_hashes_it(lab):
+    assert a.FILL_SCRIPT_REL in a.REQUIRED_CODE
+    lock = json.loads((lab.repo / a.LOCKDIR_REL / "LOCK.json").read_text())
+    assert a.FILL_SCRIPT_REL in lock["code_blobs"]
+
+
+def test_verify_lock_working_copy_lock_json_must_equal_l_blob(lab, lab_env, tmp_path):
+    root = lab.clone_root("locked", tmp_path)
+    lp = lab.repo / a.LOCKDIR_REL / "LOCK.json"
+    orig = lp.read_text()
+    try:
+        lp.write_text(orig + " ")
+        before = _tree_listing(root)
+        assert a.main(["verify-lock", "--root", str(root)]) == 3
+        assert _tree_listing(root) == before
+        lp.unlink()
+        assert a.main(["verify-lock", "--root", str(root)]) == 3
+    finally:
+        lp.write_text(orig)
+    assert a.main(["verify-lock", "--root", str(root)]) == 0
+
+
+def test_verify_lock_detects_requirements_and_python_version_tamper(lab, lab_env, tmp_path, monkeypatch):
+    root = lab.clone_root("locked", tmp_path)
+    real = a.git_show
+    monkeypatch.setattr(a, "git_show", lambda rev, path: real(rev, path) + (b"x" if path == a.REQ_REL else b""))
+    assert a.main(["verify-lock", "--root", str(root)]) == 3
+    monkeypatch.setattr(a, "git_show", real)
+    assert a.main(["verify-lock", "--root", str(root)]) == 0
+    monkeypatch.setattr(a.platform, "python_version", lambda: "2.7.18")
+    assert a.main(["verify-lock", "--root", str(root)]) == 3
+
+
+def test_verify_lock_malformed_lock_record_is_exit_3_not_5(lab, lab_env, tmp_path, monkeypatch):
+    root = lab.clone_root("locked", tmp_path)
+
+    def boom(*_a, **_k):
+        raise KeyError("h_tree")
+
+    monkeypatch.setattr(a, "_verify_lock", boom)
+    assert a.main(["verify-lock", "--root", str(root)]) == 3
+    monkeypatch.undo()
+    (root / "LOCK_REF.json").write_text("{not json")
+    for k, v in FAST.items():
+        a.THRESH[k] = v
+    assert a.main(["verify-lock", "--root", str(root)]) == 3
+
+
+def test_remote_check_requires_l_on_origin_when_a_remote_exists(lab, lab_env, tmp_path):
+    root = lab.clone_root("locked", tmp_path)
+    l = json.loads((root / "LOCK_REF.json").read_text())["l"]
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    _git(lab.repo, "remote", "add", "origin", str(bare))
+    try:
+        assert a.main(["verify-lock", "--root", str(root)]) == 3                  # L uzağa itilmedi: kilit YOKTUR
+        a.verify_lock(root, remote=False)                                          # check-run uzak denetimini atlar
+        with pytest.raises(a.LockMismatch):
+            a.verify_lock(root)
+        _git(lab.repo, "push", "-q", "origin", f"{l}:refs/heads/main-18w3qz")
+        assert a.main(["verify-lock", "--root", str(root)]) == 0
+        _git(lab.repo, "remote", "set-url", "origin", str(tmp_path / "nonexistent.git"))     # ağ/uzak hatası: atlanır
+        assert a.main(["verify-lock", "--root", str(root)]) == 0
+    finally:
+        _git(lab.repo, "remote", "remove", "origin")
+
+
+def test_unexpected_exceptions_map_to_exit_5(monkeypatch, tmp_path):
+    def raising(exc):
+        def f(root, target):
+            raise exc
+        return f
+
+    for exc in (AssertionError("x"), IndexError("i"), RuntimeError("r"), ZeroDivisionError()):
+        monkeypatch.setitem(a.DISPATCH, "decide", raising(exc))
+        assert a.main(["decide", "--root", str(tmp_path)]) == 5
+    with pytest.raises(a.IntegrityError):
+        a.need(None, "x")
+    assert a.need(3, "x") == 3
+
+
+# --- check-report: S_arm ve sunucu özeti ---------------------------------------------------------
+@pytest.mark.parametrize("label", ["DEV_T15", "DEV_B0_Q1", "FINAL_B0", "DEV_S5G", "DEV_T30"])
+def test_check_report_verifies_s_arm_even_if_arm_env_does_not_list_it(tmp_path, label):
+    ctx = stub_ctx(tmp_path)
+    info = a.parse_label(label, ctx.variants)
+    s, e = a.run_window(ctx, info)
+    v = ctx.vid[info.variant]
+    if "SCALPER_FIXED_STOP_ROI_PCT" in v["env"]:
+        pytest.skip("yalnız env'i S'yi listelemeyen arm'lar")
+    tr = gen_trades((s, e), 12, 2, s_arm=v["S_arm"])
+    ok = make_report(ctx, label, tr)
+    assert a.check_report(ctx, info, ok, "ok") == []
+    bad = make_report(ctx, label, tr)
+    bad["provenance"]["scalper_config"]["scalper_fixed_stop_roi_pct"] = 30.0
+    assert any("scalper_fixed_stop_roi_pct" in r and "S_arm" in r for r in a.check_report(ctx, info, bad, "ok"))
+    gone = make_report(ctx, label, tr)
+    gone["provenance"]["scalper_config"].pop("scalper_fixed_stop_roi_pct")
+    assert any("scalper_fixed_stop_roi_pct yok" in r for r in a.check_report(ctx, info, gone, "ok"))
+
+
+def test_check_report_compares_unlisted_keys_against_local_snapshot(tmp_path, monkeypatch):
+    monkeypatch.delenv("E17_SNAPSHOT", raising=False)
+    (tmp_path / "server-scalper-env.txt").write_text(
+        "SCALPER_TP1_FRACTION=0.5\nSCALPER_ENTRY_MODE=maker\nSCALPER_SYMBOL_ALLOWLIST=BTCUSDT\n"
+        "SCALPER_MAKER_FEE_PCT=0.02\nSCALPER_NOT_IN_SETTINGS=1\n# yorum\n", encoding="utf-8")
+    ctx = stub_ctx(tmp_path)
+
+    def report(label, **cfg):
+        info = a.parse_label(label, ctx.variants)
+        s, e = a.run_window(ctx, info)
+        doc = make_report(ctx, label, gen_trades((s, e), 12, 2, s_arm=ctx.vid[info.variant]["S_arm"]))
+        base = {"scalper_tp1_fraction": 0.5, "scalper_entry_mode": "maker", "scalper_maker_fee_pct": 0.02}
+        doc["provenance"]["scalper_config"].update({**base, **cfg})
+        return a.check_report(ctx, info, doc, "ok")
+
+    assert report("DEV_T15") == []                                            # özetle uyumlu; allowlist/olmayan anahtar yok sayılır
+    bad = report("DEV_T15", scalper_entry_mode="taker")
+    assert any("scalper_entry_mode" in r and "özet" in r for r in bad)
+    assert not any("maker" in r for r in bad)                                  # özet DEĞERİ neden metnine sızmaz
+    assert any("scalper_tp1_fraction" in r for r in report("DEV_T15", scalper_tp1_fraction=0.7))
+    assert report("DEV_T15", scalper_symbol_allowlist="XYZ") == []           # evren CLI ile belirlenir: atlanır
+    assert report("DEV_S15_ROB_TAKER", scalper_entry_mode="taker") == []     # kaplama env'i özetin yerine geçer
+    assert report("DEV_S15_ROB_FEE2", scalper_maker_fee_pct=0.04) == []      # ücret stresinde maliyet alanları atlanır
+    assert any("scalper_maker_fee_pct" in r for r in report("DEV_S15", scalper_maker_fee_pct=0.04))
+
+
+# --- check-run: bozuk rapor, aşama sırası, duman kapısı ----------------------------------------------
+def test_check_run_malformed_report_types_fail_cleanly_and_delete_all_outputs(lab, lab_env, tmp_path, capsys):
+    root = lab.clone_root("locked", tmp_path)
+    ctx = a.verify_lock(root)
+    write_smoke_pass(root, ctx)
+    doc = _stage_files(root, ctx, "DEV_S15", gen_trades(a.WINDOWS["DEV"], 25, 9))
+    rp = root / "sealed" / "runs" / "DEV_S15.json"
+    doc["provenance"]["cost_model"]["stress_multiplier"] = None               # float(None) -> TypeError
+    rp.write_text(json.dumps(doc))
+    sec = root / "sealed" / "logs" / "DEV_S15.sec"
+    sec.write_text("99\n")
+    assert a.main(["check-run", "DEV_S15", "--root", str(root)]) == 5
+    assert "CHECK FAIL DEV_S15" in capsys.readouterr().err
+    assert not rp.exists() and not sec.exists() and not (root / "sealed" / "logs" / "DEV_S15.log").exists()
+    assert not (root / "ledger.jsonl").exists()
+
+
+def test_dev_requires_a_passing_smoke_for_this_lock(lab, lab_env, tmp_path):
+    root = lab.clone_root("locked", tmp_path)
+    ctx = a.verify_lock(root)
+    _stage_files(root, ctx, "DEV_S15", gen_trades(a.WINDOWS["DEV"], 25, 9))
+    rp = root / "sealed" / "runs" / "DEV_S15.json"
+    assert a.main(["check-run", "DEV_S15", "--root", str(root)]) == 4          # SMOKE.json yok
+    (root / "SMOKE.json").write_text(json.dumps({"pass": False, "l": ctx.l}))
+    assert a.main(["check-run", "DEV_S15", "--root", str(root)]) == 4          # FAIL
+    (root / "SMOKE.json").write_text(json.dumps({"pass": True, "l": "e" * 40}))
+    assert a.main(["check-run", "DEV_S15", "--root", str(root)]) == 4          # başka kilit için
+    assert rp.exists() and not (root / "ledger.jsonl").exists()                # ön koşul ihlali çıktıyı SİLMEZ
+    (root / "SMOKE.json").write_text("{kötü")
+    assert a.main(["dev-screen", "--root", str(root)]) == 4
+    write_smoke_pass(root, ctx)
+    assert a.main(["check-run", "DEV_S15", "--root", str(root)]) == 0
+    assert a.main(["check-run", "SMOKE_B0_AYI", "--root", str(root)]) == 5      # SMOKE koşuları ön koşulsuzdur (rapor yok -> 5)
+
+
+def _stage_and_check(root: Path, label: str) -> int:
+    ctx = a.verify_lock(root, remote=False)
+    info = a.parse_label(label, ctx.variants)
+    s, e = a.run_window(ctx, info)
+    put_run(root, ctx, label, gen_trades((s, e), 12, 3, s_arm=ctx.vid[info.variant]["S_arm"]), ledger=False)
+    return a.main(["check-run", label, "--root", str(root)])
+
+
+def test_check_run_stage_ordering_dev_overlays(pipe, lab_env, tmp_path):
+    r = pipe.clone_root("screened", tmp_path)                                  # dev-screen bitti, DEV_DECISION yok
+    assert _stage_and_check(r, "VAL_S15") == 4                                 # DEV kararı olmadan VAL yok
+    assert _stage_and_check(r, "DEV_S15_DIAG_Z0") == 4                         # teşhis DEV kararından sonra
+    assert _stage_and_check(r, "DEV_S5_ROB_FEE2") == 4                         # S5 G0-G5'i geçmedi: G6 koşusu yok
+    assert _stage_and_check(r, "DEV_S15_ROB_FEE2") == 0
+    d = pipe.clone_root("dev_decided", tmp_path / "d")                         # advanced = S15, T30; S30 FEE2'de elendi
+    assert _stage_and_check(d, "DEV_S15_DIAG_Z0") == 0
+    assert _stage_and_check(d, "DEV_S5_DIAG_FEE15") == 4                       # FEE2'yi kaçırmadı, ilerlemedi
+    assert _stage_and_check(d, "DEV_S30_DIAG_FEE15") == 0                      # FEE2'yi kaçırdı
+    assert _stage_and_check(d, "VAL_S5") == 4                                  # DEV'de ilerlemedi
+    assert _stage_and_check(d, "VAL_S15") == 0 and _stage_and_check(d, "VAL_S60") == 0 and _stage_and_check(d, "VAL_T60") == 0
+    assert _stage_and_check(d, "FINAL_B0") == 4                                # VAL kararı yok
+
+
+def test_check_run_stage_ordering_final_needs_val_winner(pipe, lab_env, tmp_path):
+    v = pipe.clone_root("validated", tmp_path)                                 # kazanan S15
+    assert _stage_and_check(v, "FINAL_T30") == 4
+    assert _stage_and_check(v, "FINAL_S15") == 0 and _stage_and_check(v, "FINAL_B0") == 0
+    nowin = pipe.clone_root("dev_decided", tmp_path / "nw")
+    (nowin / "VAL_DECISION.json").write_text(json.dumps({"_meta": {"winner": None, "status": "TAMAM"}}))
+    assert _stage_and_check(nowin, "FINAL_B0") == 4                            # kazanan yok: FINAL'e dokunulmaz
+
+
+def test_dev_screen_requires_passing_smoke(pipe, lab_env, tmp_path):
+    root = pipe.clone_root("dev_runs", tmp_path)
+    (root / "SMOKE.json").unlink()
+    assert a.main(["dev-screen", "--root", str(root)]) == 4 and not (root / "DEV_SCREEN.json").exists()
+
+
+def test_dev_screen_entries_follow_a4_value_threshold_pass_borderline(pipe, lab_env, tmp_path):
+    scr = _j(pipe.clone_root("screened", tmp_path) / "DEV_SCREEN.json")
+    for arm in a.FAMILY:
+        for g in ("G0", "G1", "G2", "G3", "G4", "G5"):
+            assert {"value", "threshold", "pass", "borderline"} <= set(scr[arm][g]), (arm, g)
+    g0 = scr["T15"]["G0"]                                                      # EOD > 8: kapıyı belirleyen satır
+    assert g0["pass"] is False and g0["limiting"] == "G0b" and g0["value"] == 9 and g0["threshold"] == 8
+
+
+# --- istatistik: bilinen değerler, bağımsız referans, eşitlik, t dağılımı ------------------------------
+def test_tstat_known_values_use_ddof_1():
+    x = [1.0, 2.0, 3.0, 4.0]
+    sd = 1.2909944487358056                                                    # statistics.stdev([1,2,3,4])
+    assert a.t_obs_of(x) == pytest.approx(2.5 / (sd / 2.0), rel=1e-12) and a.t_obs_of(x) == pytest.approx(3.872983346207417)
+    assert a._tstat(sum(x), sum(v * v for v in x), 4) == pytest.approx(3.872983346207417)
+    assert a.t_obs_of([5.0]) == 0.0 and a.t_obs_of([]) == 0.0
+    assert a.t_obs_of([2.0, 2.0, 2.0]) == INF                                  # sd = 0, ortalama > 0
+    assert a.t_obs_of([0.0, 0.0, 0.0]) == 0.0
+
+
+def _reference_bootstrap_p(x, block, seed, boot_n):
+    """Bağımsız (statistics tabanlı) referans: aynı RNG akışı, açık birleştirme + stdev(ddof=1)."""
+    import statistics as st
+    d = len(x)
+    mean = st.fmean(x)
+    xc = [v - mean for v in x]
+    t_obs = mean / (st.stdev(x) / d ** 0.5)
+    rnd = random.Random(seed).random
+    cnt = 0
+    for _ in range(boot_n):
+        s: List[float] = []
+        for _k in range(-(-d // block)):
+            st0 = int(rnd() * d)
+            s.extend(xc[(st0 + j) % d] for j in range(block))
+        s = s[:d]
+        sd = st.stdev(s)
+        t = (st.fmean(s) / (sd / d ** 0.5)) if sd > 1e-12 else 0.0
+        if t >= t_obs:
+            cnt += 1
+    return (1 + cnt) / (boot_n + 1)
+
+
+@pytest.mark.parametrize("seed,block,d", [(1, 7, 60), (2, 7, 61), (3, 28, 90), (4, 14, 45)])
+def test_bootstrap_p_matches_independent_statistics_reference(seed, block, d):
+    rng = random.Random(seed)
+    x = [rng.gauss(0.08, 1.0) if rng.random() < 0.6 else 0.0 for _ in range(d)]
+    assert a.bootstrap_p(x, block, 777 + seed, 250)[0] == pytest.approx(_reference_bootstrap_p(x, block, 777 + seed, 250), abs=1e-12)
+
+
+def test_exceedance_count_is_inclusive_of_ties(monkeypatch):
+    monkeypatch.setattr(a, "_tstat", lambda s1, s2, n: 1.25)                   # her t* == t_obs
+    p, _t = a.bootstrap_p([1.0, 2.0, 0.5, 3.0], 2, 7, 99)
+    assert p == 1.0                                                            # (1 + 99) / (99 + 1); '>' olsaydı 0.01
+
+
+def _t_cdf_by_integration(t: float, df: int, n: int = 40000) -> float:
+    import math
+    c = math.exp(math.lgamma((df + 1) / 2) - math.lgamma(df / 2)) / math.sqrt(df * math.pi)
+    f = lambda u: c * (1 + u * u / df) ** (-(df + 1) / 2)          # noqa: E731
+    h = abs(t) / n
+    acc = f(0) + f(abs(t)) + sum((4 if i % 2 else 2) * f(i * h) for i in range(1, n))
+    half = acc * h / 3.0
+    return 0.5 + math.copysign(half, t)
+
+
+@pytest.mark.parametrize("t,df", [(1.0, 1), (2.0, 10), (3.872983346207417, 3), (-1.3, 21), (0.4, 11), (0.0, 5)])
+def test_t_sf_matches_numerical_integration(t, df):
+    assert a.t_sf(t, df) == pytest.approx(1.0 - _t_cdf_by_integration(t, df), abs=1e-8)
+    assert a.t_sf(1.0, 1) == pytest.approx(0.25, abs=1e-12)                    # Cauchy: kapalı form
+    assert a.t_sf(INF, 4) == 0.0 and a.t_sf(-INF, 4) == 1.0
+
+
+def test_month_level_t_is_one_sided_t_over_full_months_only():
+    months = ["2025-01", "2025-02", "2025-03", "2025-04"]
+    ts = [_tr(1.0, month="2025-01"), _tr(2.0, month="2025-02"), _tr(3.0, month="2025-03"), _tr(4.0, month="2025-04"),
+          _tr(100.0, month="2025-05")]                                          # tam ay listesinde değil -> dışarıda
+    mt = a.month_level_t(ts, months)
+    assert mt["m"] == 4 and mt["t"] == pytest.approx(3.872983346207417) and mt["p"] == pytest.approx(0.01527, abs=2e-4)
+    assert a.month_level_t(ts, months[:2]) is None                              # < 3 tam ay
+    flat = a.month_level_t([_tr(1.0, month=m) for m in months], months)
+    assert flat["t"] == INF and flat["p"] == 0.0
+    zero = a.month_level_t([], months)                                           # işlemsiz: ortalama 0, sd 0
+    assert zero["p"] == 1.0
+
+
+def test_pf_r_caps_lossless_series_and_reports_are_finite(tmp_path):
+    assert a.pf_r([_tr(1.0)]) == a.THRESH["PF_CAP"] == 5.0 and a.pf_r([_tr(1.0), _tr(-1.0)]) == 1.0
+    ctx = stub_ctx(tmp_path)
+    s = a.Series(label="x", arm="S15", set="DEV", overlay="", s_arm=9.0, trades=[_tr(1.0, day=dt.date(2025, 3, 5))],
+                 windows=[(dt.date(2025, 1, 1), 365)], missed={}, dd_usd=10.0, risk_median=100.0)
+    rp = a.arm_report(ctx, s, {}, "dev", extra_p=False)
+    assert rp["pf"] == 5.0 and "inf" not in json.dumps(a.jsonable(rp["groups"]))
+    assert a.fmt_pf(5.0) == "5.0000+" and a.fmt_pf(4.99999) == "5.0000"
+    assert a.f4(INF) == "inf"                                                   # DD_R/Calmar sonsuzu PF gibi basılmaz
+
+
+def test_tf_trend_bull_check_and_ci_sentence():
+    assert a.tf_trend([1.0, 1.1, 1.2]) == "monoton artan" and a.tf_trend([1.2, 1.1, 1.0]) == "monoton azalan"
+    assert a.tf_trend([1.0, 1.3, 1.1]) == "monoton değil"
+    assert a.bull_check(1.0, 0.0) is None and a.bull_check(-5.0, -2.0) is None
+    reports = {"S15": {"pf_ci90": (0.8, 1.3)}, "S5": {"pf_ci90": (0.7, 1.1)}, "VAL_S30": {"pf_ci90": (0.9, 1.4)},
+               "VAL_S60": {"pf_ci90": (0.1, 9.0)}}                              # S60 aile dışı: sayılmaz
+    s = a.ci_upper_sentence(reports, "VAL-YOK")
+    assert "1.4000" in s and "VAL_S30" in s and "9.0000" not in s
+    assert a.ci_upper_sentence(reports, "KAZANAN-HARNESS") == "" and a.ci_upper_sentence({}, "DEV-YOK") == ""
+
+
+def test_val_p_refines_only_when_alpha_over_k_is_inside_the_mc_band(monkeypatch):
+    for k, v in FAST.items():
+        monkeypatch.setitem(a.THRESH, k, v)
+    calls: List[bool] = []
+
+    def fake(series, stage, block, hi=False, boot_n=None):
+        calls.append(hi)
+        return (0.011 if hi else 0.012), 1.5
+
+    monkeypatch.setattr(a, "p_for", fake)
+    p, t, refined = a.val_p(None, 7, 0.025)             # 0.012 ± 3·SE aralığı 0.025'i keser -> B=199999 ile yeniden
+    assert refined is True and p == 0.011 and calls == [False, True]
+    calls.clear()
+    p, t, refined = a.val_p(None, 7, 0.05)              # /k UYGULANMASAYDI (α=0.05) yeniden hesap olmazdı
+    assert refined is False and p == 0.012 and calls == [False]
+
+
+def test_cmd_val_passes_alpha_over_k_to_the_mc_rule(pipe, lab_env, tmp_path, monkeypatch):
+    root = pipe.clone_root("validated", tmp_path)
+    (root / "VAL_DECISION.json").unlink()
+    seen: List[tuple] = []
+    real = a.val_p
+    monkeypatch.setattr(a, "val_p", lambda ser, block, al: (seen.append((block, round(al, 6))) or real(ser, block, al)))
+    assert a.main(["val", "--root", str(root)]) == 0
+    assert seen == [(7, 0.025), (28, 0.05), (7, 0.025), (28, 0.05)]            # k = 2 arm: α/k
+
+
+def test_calmar_annualises_with_actual_window_days_not_365():
+    assert not a.rule_g13(_series(28.0, 2000.0, days=687))["pass"]             # 28·365/687/20 = 0.744 < 0.75
+    assert a.rule_g13(_series(28.0, 2000.0, days=365))["pass"]                 # aynı veri 365 günde 1.4
+    assert a.rule_g13(_series(28.6, 2000.0, days=687))["pass"]
+
+
+def test_reaper_is_not_counted_as_eod_and_g12_zero_total_fails_without_crash():
+    assert a.eod_count([_tr(1.0, reason="REAPER"), _tr(1.0, reason="EOD"), _tr(1.0, reason="TRAIL")]) == 1
+    g = a.rule_g12(_lab_trades([(1.0, "BTCUSDT", "m1"), (-1.0, "ETHUSDT", "m2")]))     # T == 0
+    assert g["pass"] is False and g["rows"][0]["note"] == "T <= 0"
+
+
+def test_g16_splits_odd_month_counts_earlier_half_smaller():
+    ms = ["2023-01", "2023-02", "2023-03"]
+    ts = _lab_trades([(1.0, "BTCUSDT", "2023-01")] * 3 + [(1.0, "BTCUSDT", "2023-02")] * 5 + [(-1.0, "BTCUSDT", "2023-03")] * 7)
+    rows = {r["gate"]: r for r in a.rule_g16(ts, ms)["rows"]}
+    assert rows["G16.1n"]["value"] == 3 and rows["G16.2n"]["value"] == 12        # 1 ay | 2 ay
+
+
+def test_median_risk_and_b0_anchor_pf_are_usd_based():
+    doc = {"trades": [{"symbol": "BTCUSDT", "direction": "LONG", "entry_time": a.date_ms("2025-02-03"),
+                       "exit_time": a.date_ms("2025-02-04"), "margin_usdt": m, "pnl": 1.0, "leverage": 10, "exit_reason": "TRAIL"}
+                      for m in (1000.0, 1000.0, 4000.0)]}
+    _trs, med = a.trades_from_report(doc, 10.0, "x")
+    assert med == 100.0                                                         # medyan, ortalama (200) DEĞİL
+    ts = [_tr(0.1, risk=100.0), _tr(-0.025, risk=400.0)]                        # pnl +10 / -10
+    assert a.b0_pf_usd(ts) == 1.0 and a.pf_r(ts) == pytest.approx(4.0)
+
+
+def test_final_anchor_uses_usd_pf_even_when_margins_differ(pipe, lab_env, tmp_path):
+    r = pipe.clone_root("validated", tmp_path)
+    ctx = a.verify_lock(r)
+    put_run(r, ctx, "FINAL_S15", gen_trades(a.WINDOWS["FINAL"], 60, 1, s_arm=9.0, **GOOD))
+    b0 = gen_trades(a.WINDOWS["FINAL"], 320, 7, s_arm=50.0)
+    for i, t in enumerate(b0):
+        t["pnl"] = 10.0 if i < 232 else -(232 * 10.0 / 0.9) / 88                # USD PF tam 0.90
+    for t in b0[-20:]:
+        t["margin_usdt"] = 5000.0                                               # R-PF ayrışır, USD-PF aynı kalır
+    put_run(r, ctx, "FINAL_B0", b0)
+    assert a.main(["final", "--root", str(r)]) == 0
+    assert _j(r / "FINAL.json")["b0_anchor"]["ok"] is True
+
+
+def test_decide_report_has_s_vs_t_trend_month_t_and_val_descriptive_block(pipe, lab_env, tmp_path):
+    root = pipe.clone_root("decided", tmp_path)
+    md = (root / "DECISION.md").read_text(encoding="utf-8")
+    assert "S – T karşılaştırması" in md and "TF eğilimi ölçekli (S)" in md and "TF eğilimi yalnız zamanlama (T)" in md
+    assert "ay düzeyinde tek-yönlü t (bilgi, M=12 tam ay)" in md and "ay düzeyinde tek-yönlü t (bilgi, M=22 tam ay)" in md
+    assert "Açıklayıcı arm'lar, VAL" in md and "VAL_S60" in md and "VAL_T60" in md
+    rows = list(csv.DictReader(open(root / "results.csv", encoding="utf-8")))
+    assert not any("inf" in (r["pf"] + r["pf_pess"] + r["pf_opt"]) for r in rows)
+    assert {"VAL_S60", "VAL_T60"} <= {r["label"] for r in rows}
+
+
+def test_no_winner_decision_states_pf_ci_upper_bound(pipe, lab_env, tmp_path):
+    root = pipe.clone_root("screened", tmp_path)
+    ctx = a.verify_lock(root)
+    for arm in ("S15", "S30", "T30"):
+        for ov in a.G6_OVERLAYS:
+            put_run(root, ctx, f"DEV_{arm}_{ov}", gen_trades(a.WINDOWS["DEV"], 250, 3, s_arm=_arm_s(ctx, arm), **BADQ))
+    assert a.main(["dev-decide", "--root", str(root)]) == 0
+    assert a.main(["decide", "--root", str(root)]) == 0
+    md = (root / "DECISION.md").read_text(encoding="utf-8")
+    assert "DEV-YOK" in md and "PF %90 GA üst sınırı" in md
+
+
+def test_val_g10b_pools_dev_and_val_down_month_trades(pipe, lab_env, tmp_path):
+    root = pipe.clone_root("validated", tmp_path)
+    ctx = a.verify_lock(root)
+    labels = a.month_labels(ctx)
+    led = a.Ledger(root)
+    dev = a.load_series(ctx, "DEV", "S15", "", led)
+    val = a.load_series(ctx, "VAL", "S15", "", led)
+    n_dev = sum(1 for t in dev.trades if labels.get(t.month) == "DOWN")
+    n_val = sum(1 for t in val.trades if labels.get(t.month) == "DOWN")
+    assert n_dev > 0 and n_val > 0
+    row = _j(root / "VAL_DECISION.json")["S15"]["G10"]["rows"][1]
+    assert row["gate"] == "G10b" and row["n"] == n_dev + n_val

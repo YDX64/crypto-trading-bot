@@ -17,7 +17,20 @@ Kullanım:  analyze_e17.py <komut> [hedef] [--root DIR]
 Yol değişkenleri (YALNIZ yol): E17_ROOT (varsayılan $HOME/e17_root), E17_REPO (depo kökü;
 varsayılan bu betiğin deposu), E17_SNAPSHOT (sunucu SCALPER_* özetinin YEREL yolu; içeriği
 asla basılmaz/kopyalanmaz, yalnız sha256'sı kilide girer; varsayılan $E17_ROOT/server-scalper-env.txt),
-E17_PUSH_BRANCH (varsayılan main-18w3qz), E17_VERIFY_REMOTE=1 (ağ varsa L'nin uzakta olduğunu da doğrular).
+E17_PUSH_BRANCH (varsayılan main-18w3qz; yalnız `lock`ın bastığı push komutu için).
+L'nin uzakta kayıtlı olduğu (§9.1) ağ varsa `git fetch origin <L>` ile her alt komutta (check-run hariç)
+doğrulanır; ağ yoksa/uzak tanımsızsa atlanır, uzak "L yok" derse exit 3. Bu bir env değişkeniyle açılıp kapanmaz.
+
+§9.1 yama usulü (patch-N) analizcide YOKTUR: DEV sonuçları varken `lock` kapalıdır (exit 4) ve analizcinin kendi
+dosyası/eşikleri değişirse exit 3 verir; yama kaydı, iki sütunlu rapor ve diferansiyel test orkestratör işidir
+(PLAN §9.1) ve ayrı, yeni bir analizci sürümü + yeni kilit referansı gerektirir (Ek A'da şeması tanımlı değildir).
+`smoke` kapısı başarısız olursa çıkış kodu 5'tir (A.3 yalnız PASS/FAIL der; kod 5 "koşu/veri bütünlüğü").
+
+Aşama sırası makinece zorlanır (exit 4): DEV check-run/dev-screen için bu kilide ait PASS'lı SMOKE.json; G6 kaplamaları
+için dev-screen'de g6_needed; DIAG kaplamaları için DEV_DECISION (DIAG_FEE15 yalnız FEE2'yi kaçıran/ilerleyen arm);
+VAL check-run için DEV_DECISION.advanced; FINAL check-run için VAL kazananı (yalnız kazanan ve B0).
+`lock`: kilitli dosyalar depo .gitignore'u `*.json`ı yok saysa da `git add -f` ile AÇIKÇA eklenir ve commit ağacında
+doğrulanır (eksikse commit geri alınır, push komutu basılmaz). Orkestratör `run/*.json`ı (Ek A.1) commit'lerken `-f` kullanmalıdır.
 
 Etiket dili (Ek A.2):  <SET>_<varyant>[_<kaplama>][_Q<n>]   SET ∈ DEV|VAL|FINAL
   ve duman koşuları  SMOKE_<varyant>_<etiket>  (etiket: AYI|V1 = S1 parite [B0], h0|h1 = S2
@@ -39,9 +52,11 @@ import os
 import platform
 import random
 import re
+import shlex
 import statistics
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -65,6 +80,19 @@ THRESH: Dict[str, Any] = {
     "PF_CAP": 5.0,              # PF = inf -> 5
     "PF_CI_LEVEL": 0.90,        # PF güven aralığı düzeyi (bilgi)
     "BORDERLINE_ABS": 0.005,    # eşiğe bu kadar yakın değer "SINIRDA" işaretlenir
+    # --- rejim etiketi kuralı (§2.3; freeze) ---
+    "REGIME_UP_PCT": 5.0,       # ay getirisi >= bu => UP
+    "REGIME_DOWN_PCT": -5.0,    # ay getirisi <= bu => DOWN
+    "REGIME_SHOCK_PCT": 6.0,    # günlük |kapanış/açılış-1| >= bu => ay "shock" (yalnız rapor)
+    # --- kaldıraç payları / yoğunlaşma / maliyet çarpanları (önceden sabit) ---
+    "LEV_LOW": 3,               # "3x payı" için kaldıraç (G0c1/G14c1)
+    "LEV_HIGH": 20,             # "20x payı" için kaldıraç (G0c2/G14c2)
+    "TOPN_G4": 5,               # G4b: en iyi N işlem hariç Σ R
+    "TOPN_G12": 5,              # G12d: en iyi N işlem / T
+    "FEE2_MULT": 2.0,           # ROB_FEE2 ücret+kayma çarpanı (check-run beklentisi)
+    "FEE15_MULT": 1.5,          # DIAG_FEE15 çarpanı
+    "BULL_PNL_FRAC": 0.8,       # CLAUDE.md kural #1: boğa PnL kaybı <= %20 => UP PnL >= 0.8 x B0
+    "Z0_NET_PF": 1.0,           # Z0 okuması: net PF bu eşiğin altındaysa "ücret yiyor"
     # --- G0 / G14 geçerlilik (bütünlük kapısı) ---
     "G0_SILENT_DROP_MAX": 0.10,
     "G0_EOD_MAX": 8,
@@ -168,7 +196,6 @@ EXPECTED_LABEL_COUNTS: Dict[str, Dict[str, int]] = {
     "DEV": {"UP": 5, "FLAT": 4, "DOWN": 3},
     "VAL": {"UP": 11, "FLAT": 6, "DOWN": 5},
 }
-REGIME_UP_PCT, REGIME_DOWN_PCT, REGIME_SHOCK_PCT = 5.0, -5.0, 6.0
 
 CANDLES_PER_DAY = {"1m": 1440, "5m": 288, "15m": 96, "30m": 48, "1h": 24, "4h": 6, "1d": 1}
 INTERVAL_MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
@@ -221,6 +248,13 @@ class StageError(E17Error):
 
 class IntegrityError(E17Error):
     code = 5
+
+
+def need(x: Any, what: str) -> Any:
+    """`assert`in yerine (python -O ile silinmez): None ise bütünlük hatası (exit 5)."""
+    if x is None:
+        raise IntegrityError(f"beklenen seri/değer yok: {what}")
+    return x
 
 
 def sha256_bytes(b: bytes) -> str:
@@ -311,8 +345,8 @@ def write_once(path: Path, text: str) -> None:
 
 
 def fmt_pf(x: float) -> str:
-    """PF 4 ondalık; inf 5'e kırpılı gösterilir."""
-    if x == INF:
+    """PF 4 ondalık; kırpma sınırına (PF_CAP) ulaşan/aşan değer "5.0000+" gösterilir (PF >= 5)."""
+    if x == INF or x >= THRESH["PF_CAP"]:
         return f"{THRESH['PF_CAP']:.4f}+"
     return f"{x:.4f}"
 
@@ -386,7 +420,7 @@ def code_paths(rev: str) -> List[str]:
     for p in git_tree_paths(rev):
         if p.startswith("src/strategies/scalper/") and p.endswith(".py"):
             out.append(p)
-        elif p in ("src/core/config.py", "scripts/fill_klines_cache_from_vision.py"):
+        elif p in ("src/core/config.py", FILL_SCRIPT_REL):
             out.append(p)
         elif p.startswith("scripts/e17/"):
             out.append(p)
@@ -395,7 +429,10 @@ def code_paths(rev: str) -> List[str]:
     return sorted(out)
 
 
-REQUIRED_CODE = ("src/strategies/scalper/backtest.py", "src/core/config.py", SELF_REL)
+FILL_SCRIPT_REL = "scripts/fill_klines_cache_from_vision.py"
+REQUIRED_CODE = ("src/strategies/scalper/backtest.py", "src/core/config.py", FILL_SCRIPT_REL, SELF_REL)
+REMOTE_TIMEOUT_S = 20
+NOT_ON_REMOTE_MARKERS = ("not our ref", "couldn't find remote ref", "no such remote ref", "unadvertised object")
 
 
 # ==========================================================================
@@ -567,8 +604,63 @@ class Ctx:
         return (date_ms(e) - date_ms(s)) // MS_PER_DAY
 
 
-def verify_lock(root: Path) -> Ctx:
-    """Her alt komutun İLK işi (`freeze`/`lock` hariç). Hiçbir şey yazmaz. Uyuşmazlık -> LockMismatch (3)."""
+def snapshot_env_lines(root: Path) -> Dict[str, str]:
+    """Yerel sunucu SCALPER_* özetinden KEY=VALUE çiftleri. İÇERİK hiçbir çıktıya yazılmaz; yalnız bellekte
+    check-run karşılaştırması için kullanılır. Dosya yoksa {} (kilit doğrulaması varlığı ayrıca zorlar)."""
+    sp = snapshot_path(root)
+    out: Dict[str, str] = {}
+    if not sp.is_file():
+        return out
+    for ln in sp.read_text(encoding="utf-8", errors="replace").splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("#") or "=" not in ln:
+            continue
+        k, v = ln.split("=", 1)
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
+        out[k.strip()] = v
+    return out
+
+
+def remote_check(l_commit: str) -> None:
+    """§9.1: ağ varsa L'nin uzakta kayıtlı olduğunu doğrular (best-effort). Yerel depoda L zaten var olduğundan düz
+    `git fetch origin <L>` ağa HİÇ gitmez (nesne yerelde: no-op) — bu yüzden L, BOŞ geçici bir bare depoya
+    `origin` URL'sinden çekilir. Uzak "not our ref" derse LockMismatch; uzak tanımsızlığı/ağ hatası/zaman aşımı
+    atlanır (kilidin kendisi yerelde zaten L blob'larından doğrulanır)."""
+    try:
+        r = subprocess.run(["git", "-C", str(REPO), "remote", "get-url", "origin"], capture_output=True,
+                           timeout=REMOTE_TIMEOUT_S)
+        if r.returncode != 0:
+            return
+        url = r.stdout.decode("utf-8", "replace").strip()
+        with tempfile.TemporaryDirectory(prefix="e17remote") as td:
+            if subprocess.run(["git", "init", "-q", "--bare", td], capture_output=True,
+                              timeout=REMOTE_TIMEOUT_S).returncode != 0:
+                return
+            f = subprocess.run(["git", "-C", td, "fetch", "--quiet", "--no-tags", "--depth=1", url, l_commit],
+                               capture_output=True, timeout=REMOTE_TIMEOUT_S)
+    except (subprocess.TimeoutExpired, OSError):
+        return
+    if f.returncode == 0:
+        return
+    err = f.stderr.decode("utf-8", "replace").lower()
+    if any(m in err for m in NOT_ON_REMOTE_MARKERS):
+        raise LockMismatch(f"L commit'i {l_commit[:12]} uzakta kayıtlı değil (push edilmedi mi?)")
+
+
+def verify_lock(root: Path, remote: bool = True) -> Ctx:
+    """Her alt komutun İLK işi (`freeze`/`lock` hariç). Hiçbir şey yazmaz. Uyuşmazlık -> LockMismatch (3).
+    LOCK.json/LOCK_REF.json'un bozuk/eksik alanları da (KeyError/ValueError/...) kilit uyuşmazlığıdır (exit 3)."""
+    try:
+        return _verify_lock(root, remote)
+    except E17Error:
+        raise
+    except (KeyError, ValueError, TypeError, AttributeError, IndexError, OSError) as exc:
+        raise LockMismatch(f"kilit kaydı okunamadı/bozuk: {type(exc).__name__}: {exc}")
+
+
+def _verify_lock(root: Path, remote: bool) -> Ctx:
     ref_p = lock_ref_path(root)
     if not ref_p.exists():
         raise LockMismatch(f"{ref_p} yok: kilit kaydı bulunmuyor (önce `lock`)")
@@ -583,6 +675,10 @@ def verify_lock(root: Path) -> Ctx:
     raw = git_show(l_commit, f"{LOCKDIR_REL}/LOCK.json")
     if sha256_bytes(raw) != want_sha:
         raise LockMismatch("L'deki LOCK.json'ın sha256'sı LOCK_REF.json kaydıyla eşleşmiyor")
+    # çalışma kopyasındaki LOCK.json de L'deki blob'la bayt-bayt aynı olmalı (§9.1: farklıysa exit 3)
+    wl = lockdir() / "LOCK.json"
+    if not wl.is_file() or sha256_file(wl) != want_sha:
+        raise LockMismatch("çalışma kopyasındaki LOCK.json, L'deki blob'dan farklı/yok")
     lock = json.loads(raw.decode("utf-8"))
     h = lock["h_commit"]
     if not _commit_exists(h):
@@ -622,12 +718,13 @@ def verify_lock(root: Path) -> Ctx:
     sp = snapshot_path(root)
     if not sp.is_file() or sha256_file(sp) != lock["snapshot_sha256"]:
         raise LockMismatch("sunucu SCALPER_* özeti (yerel) yok veya sha256'sı kilitle eşleşmiyor")
-    if os.environ.get("E17_VERIFY_REMOTE") == "1":
-        r = subprocess.run(["git", "-C", str(REPO), "fetch", "origin", l_commit], capture_output=True)
-        if r.returncode != 0:
-            raise LockMismatch(f"L commit'i uzakta doğrulanamadı: {r.stderr.decode('utf-8', 'replace')[:200]}")
     variants = json.loads(git_show(l_commit, f"{LOCKDIR_REL}/variants.json").decode("utf-8"))
+    vs_sha = (variants.get("snapshot") or {}).get("sha256")
+    if vs_sha is not None and vs_sha != lock["snapshot_sha256"]:
+        raise LockMismatch("variants.json snapshot.sha256 yerel sunucu özetinin kilitli hash'iyle eşleşmiyor")
     labels = json.loads(git_show(l_commit, f"{LOCKDIR_REL}/labels_frozen.json").decode("utf-8"))
+    if remote:
+        remote_check(l_commit)
     return Ctx(root=root, l=l_commit, h=h, lock=lock, variants=variants, labels=labels)
 
 
@@ -670,27 +767,44 @@ def cmd_lock(root: Path, target: Optional[str]) -> int:
     sp = snapshot_path(root)
     if not sp.is_file():
         raise StageError("sunucu SCALPER_* özeti yerelde yok (E17_SNAPSHOT / $E17_ROOT/server-scalper-env.txt)")
+    snap_sha = sha256_file(sp)
+    vs_sha = (variants.get("snapshot") or {}).get("sha256")
+    if vs_sha is not None and vs_sha != snap_sha:
+        raise IntegrityError("variants.json snapshot.sha256 yerel sunucu özetinin sha256'sıyla eşleşmiyor")
     doc = {
         "h_commit": h, "h_tree": git_text(["rev-parse", f"{h}^{{tree}}"]),
         "l_note": "L = bu LOCK.json'u içeren, uzak dala itilmiş kilit commit'i; sha LOCK_REF.json'dadır (§9.1)",
         "python_version": platform.python_version(),
         "requirements_sha256": sha256_bytes(git_show(h, REQ_REL)),
         "files": files, "code_blobs": blobs,
-        "snapshot_sha256": sha256_file(sp),
+        "snapshot_sha256": snap_sha,
         "thresholds_sha256": thresholds_sha256(),
         "earliest_bar_check": check,
         "created_utc": utc_now(),
     }
     lock_text = json.dumps(doc, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     (lockdir() / "LOCK.json").write_text(lock_text, encoding="utf-8")
-    git(["add", "--", LOCKDIR_REL])
+    # Depo .gitignore'u `*.json`ı yok sayar: düz `git add` LOCK.json/variants.json/... dosyalarını SESSİZCE atlar
+    # ve eksik bir kilit commit'i üretir. Bu yüzden kilitli dosyalar AÇIKÇA ve `-f` ile eklenir; eklenenler
+    # indekste ve commit ağacında DOĞRULANIR (eksikse push komutu basılmadan hata).
+    add_paths = [f"{LOCKDIR_REL}/{n}" for n in [*files, "LOCK.json"]]
+    git(["add", "-f", "--", *add_paths])
+    staged = {x for x in git(["ls-files", "-z", "--", *add_paths]).decode("utf-8").split("\0") if x}
+    absent = [x for x in add_paths if x not in staged]
+    if absent:
+        raise IntegrityError(f"kilitli dosyalar indekse girmedi (gitignore?): {absent[:4]}")
     lock_sha = sha256_bytes(lock_text.encode("utf-8"))
     ident = {"GIT_AUTHOR_NAME": "e17-lock", "GIT_AUTHOR_EMAIL": "e17-lock@localhost",
              "GIT_COMMITTER_NAME": "e17-lock", "GIT_COMMITTER_EMAIL": "e17-lock@localhost"}
     have_ident = subprocess.run(["git", "-C", str(REPO), "config", "user.email"], capture_output=True).stdout.strip()
-    git(["commit", "-q", "-m", f"E17 kilit: H={h} sha256(LOCK.json)={lock_sha}", "--", LOCKDIR_REL],
+    git(["commit", "-q", "-m", f"E17 kilit: H={h} sha256(LOCK.json)={lock_sha}", "--", *add_paths],
         env=None if have_ident else ident)
     l_commit = git_text(["rev-parse", "HEAD"])
+    in_tree = set(git_tree_paths(l_commit))
+    lost = [x for x in add_paths if x not in in_tree]
+    if lost:
+        git(["reset", "-q", "--soft", "HEAD~1"])
+        raise IntegrityError(f"kilit commit'inde eksik dosya (commit geri alındı): {lost[:4]}")
     ref_p = lock_ref_path(root)
     hist: List[Dict[str, Any]] = []
     if ref_p.exists():
@@ -703,7 +817,7 @@ def cmd_lock(root: Path, target: Optional[str]) -> int:
     branch = os.environ.get("E17_PUSH_BRANCH", "main-18w3qz")
     print(f"KİLİT OLUŞTURULDU (yerel commit): L={l_commit} H={h} sha256(LOCK.json)={lock_sha}")
     print("PUSH ORKESTRATÖRÜN İŞİDİR; itilemezse kilit YOKTUR. Komut:")
-    print(f"  git -C {REPO} push origin {l_commit}:refs/heads/{branch}")
+    print(f"  git -C {shlex.quote(str(REPO))} push origin {l_commit}:refs/heads/{shlex.quote(branch)}")
     return 0
 
 
@@ -719,7 +833,8 @@ def cmd_verify_lock(root: Path, target: Optional[str]) -> int:
 # 4. FREEZE: rejim etiketleri (§2.3) — strateji koşulmadan, yalnız BTCUSDT 1d piyasa verisinden
 # ==========================================================================
 def regime_label(ret_pct: float) -> str:
-    return "UP" if ret_pct >= REGIME_UP_PCT else ("DOWN" if ret_pct <= REGIME_DOWN_PCT else "FLAT")
+    return ("UP" if ret_pct >= THRESH["REGIME_UP_PCT"]
+            else ("DOWN" if ret_pct <= THRESH["REGIME_DOWN_PCT"] else "FLAT"))
 
 
 def load_btc_1d(cache_dir: Path) -> Dict[int, Dict[str, Any]]:
@@ -766,7 +881,7 @@ def build_labels(by_open: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
                 raise IntegrityError(f"BTC 1d: {key} için {len(miss)} gün eksik (ilk: {ms_to_iso(miss[0])})")
             cs = [by_open[t] for t in days]
             ret = (float(cs[-1]["close"]) / float(cs[0]["open"]) - 1.0) * 100.0
-            shock = any(abs(float(c["close"]) / float(c["open"]) - 1.0) * 100.0 >= REGIME_SHOCK_PCT for c in cs)
+            shock = any(abs(float(c["close"]) / float(c["open"]) - 1.0) * 100.0 >= THRESH["REGIME_SHOCK_PCT"] for c in cs)
             doc[key] = {"ret_pct": ret, "label": regime_label(ret), "shock": shock,
                         "partial": partial, "set": set_name}
             if partial:
@@ -782,8 +897,8 @@ def build_labels(by_open: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
     doc["counts"] = counts
     doc["rule"] = {
         "series": "BTCUSDT 1d, takvim ayı; getiri = son gün kapanış / ilk gün açılış - 1",
-        "UP": f">= +{REGIME_UP_PCT}%", "DOWN": f"<= {REGIME_DOWN_PCT}%", "FLAT": "aksi",
-        "shock": f"ayda herhangi günlük |kapanış/açılış-1| >= {REGIME_SHOCK_PCT}% (raporlanır, kullanılmaz)",
+        "UP": f">= +{THRESH['REGIME_UP_PCT']}%", "DOWN": f"<= {THRESH['REGIME_DOWN_PCT']}%", "FLAT": "aksi",
+        "shock": f"ayda herhangi günlük |kapanış/açılış-1| >= {THRESH['REGIME_SHOCK_PCT']}% (raporlanır, kullanılmaz)",
         "assignment": "işlem, GİRİŞ (dolum) barı open_time'ının UTC ayının etiketini alır",
         "partial_months": "kısmi ay (VAL Kasım 1-17) kendi getirisiyle etiketlenir; G10 gruplarına girer, M'ye girmez",
     }
@@ -1067,7 +1182,9 @@ def p_for(series: Series, stage: str, block: int, hi: bool = False,
 
 # --- yoğunlaşma / rejim / kaldırma fonksiyonları (G4, G5, G10, G11, G12) -----------------
 def pf_r(trades: Iterable[Tr]) -> float:
-    return pf_of([t.r for t in trades])
+    """R üzerinden PF; kayıpsız seri (inf) PF_CAP'e KIRPILIR (§5.3). Ham inf yalnız check-run çapraz
+    kontrolünde (pf_of) kullanılır; JSON/CSV/DECISION.md'ye sonlu değer girer."""
+    return cap_pf(pf_of([t.r for t in trades]))
 
 
 def sum_r(trades: Iterable[Tr]) -> float:
@@ -1330,8 +1447,16 @@ def load_series(ctx: Ctx, set_name: str, variant: str, overlay: str = "", ledger
 SILENT_KEYS = ("stop_band_low", "stop_band_high", "price_distance_zero", "qty_zero", "no_next_candle")
 DIAG_KEYS = ("tp1_fills", "sl_tp1_same_bar", "tp1_then_stop_same_bar", "tp2_then_floor_same_bar",
              "fill_bar_exit", "fill_bar_total")
-LEV_MIN, LEV_MAX = 3, 20
 FETCH_LINE = "Binance'ten çekiliyor"
+#: Sunucu özetinde olup simülasyonu ETKİLEMEYEN / CLI ile belirlenen anahtarlar (check-run özet karşılaştırması bunları atlar):
+#: evren (--symbols/--strategies ile), tarama/koruma zamanlayıcıları, sanal sermaye defteri, canlı-kanal anahtarları.
+SNAPSHOT_SKIP_KEYS = frozenset({
+    "SCALPER_MARKET_DATA_BASE_URL", "SCALPER_ENTRY_HALT_ENABLED", "SCALPER_COUNTERFACTUAL_ENABLED",
+    "SCALPER_SAFETY_INTERVAL_SECONDS", "SCALPER_SCAN_INTERVAL_SECONDS", "SCALPER_PROTECTION_FAILURE_COOLDOWN_MINUTES",
+    "SCALPER_VIRTUAL_CAPITAL_START_TRADE_ID", "SCALPER_VIRTUAL_CAPITAL_USDT", "SCALPER_TV_SYMBOL_ALLOWLIST",
+    "SCALPER_SYMBOL_ALLOWLIST", "SCALPER_TOP_N", "SCALPER_STRATEGIES"})
+#: Ücret stres kaplamalarında harness maliyet alanlarını çarpar (cost_model.stress_multiplier ayrıca doğrulanır).
+FEE_STRESS_KEYS = frozenset({"SCALPER_MAKER_FEE_PCT", "SCALPER_TAKER_FEE_PCT", "SCALPER_SLIPPAGE_RATE"})
 
 
 def values_equal(expected: str, actual: Any) -> bool:
@@ -1360,7 +1485,7 @@ def expected_env(ctx: Ctx, info: LabelInfo) -> Dict[str, str]:
 
 
 def expected_cost(info: LabelInfo) -> Tuple[float, int]:
-    stress = {"ROB_FEE2": 2.0, "DIAG_FEE15": 1.5}.get(info.overlay, 1.0)
+    stress = {"ROB_FEE2": THRESH["FEE2_MULT"], "DIAG_FEE15": THRESH["FEE15_MULT"]}.get(info.overlay, 1.0)
     delay = 1 if info.overlay == "ROB_DLY1" else 0
     return stress, delay
 
@@ -1402,6 +1527,24 @@ def check_report(ctx: Ctx, info: LabelInfo, doc: Dict[str, Any], log_text: Optio
             f.append(f"scalper_config'te {key} yok")
         elif not values_equal(want, cfg[key]):
             f.append(f"scalper_config.{key} beklenenle eşleşmiyor")
+    # --- R biriminin dayanağı: S_arm (SCALPER_FIXED_STOP_ROI_PCT) HER arm için raporda DOĞRULANIR. T arm'ları ve
+    #     B0/R1 env'inde bu anahtar listelenmez (sunucu değeri 50); yanlış/eksik özetle koşulmuş bir rapor
+    #     yanlış S_arm ile R üretirdi. ---
+    s_key = "scalper_fixed_stop_roi_pct"
+    if s_key not in cfg:
+        f.append(f"scalper_config'te {s_key} yok (R birimi doğrulanamaz)")
+    elif not values_equal(str(v["S_arm"]), cfg[s_key]):
+        f.append(f"scalper_config.{s_key} S_arm ({v['S_arm']}) ile eşleşmiyor (R birimi yanlış olurdu)")
+    # --- sunucu özeti (yerel; içerik basılmaz): variants.json'da listelenmeyen TÜM SCALPER_* anahtarları, özetteki
+    #     değerle eşit olmalı (yalnız anahtar adı raporlanır). Ücret stresinde maliyet alanları atlanır. ---
+    listed = {k.upper() for k in expected_env(ctx, info)}
+    stressed = info.overlay in ("ROB_FEE2", "DIAG_FEE15")
+    for k, want in sorted(snapshot_env_lines(ctx.root).items()):
+        ku = k.upper()
+        if ku in listed or ku in SNAPSHOT_SKIP_KEYS or (stressed and ku in FEE_STRESS_KEYS) or not ku.startswith("SCALPER_"):
+            continue
+        if ku.lower() in cfg and not values_equal(want, cfg[ku.lower()]):
+            f.append(f"scalper_config.{ku.lower()} sunucu özetiyle eşleşmiyor")
     # --- maliyet modeli / sim seçenekleri ---
     cm = prov.get("cost_model") or {}
     stress, delay = expected_cost(info)
@@ -1483,28 +1626,86 @@ def manifest_runs(root: Path, led: Ledger) -> None:
     atomic_write(root / "MANIFEST.runs.json", dump_json(rows))
 
 
+def smoke_passed(ctx: Ctx) -> bool:
+    """SMOKE.json (bu kilit L için) PASS mi? S1-S3 duman testleri DEV'den önce ENGELLEYİCİDİR (§5.2)."""
+    p = ctx.root / "SMOKE.json"
+    if not p.is_file():
+        return False
+    try:
+        doc = json.loads(p.read_text(encoding="utf-8"))
+    except ValueError:
+        return False
+    return doc.get("pass") is True and doc.get("l") == ctx.l
+
+
+def require_smoke(ctx: Ctx, what: str) -> None:
+    if not smoke_passed(ctx):
+        raise StageError(f"{what}: SMOKE.json yok/PASS değil (bu kilit için): önce duman testleri (`smoke`) geçmeli")
+
+
+def run_stage_preconditions(ctx: Ctx, info: LabelInfo) -> None:
+    """Etiketin ait olduğu aşamanın ön koşulları (PLAN §6 sıra, §9.4/§9.5). İhlal -> StageError (exit 4):
+    DEV: SMOKE PASS; G6 kaplamaları: DEV_SCREEN'de g6_needed; DIAG: DEV_DECISION (DIAG_FEE15 yalnız FEE2'yi
+    kaçıran/ilerleyen arm); VAL: DEV_DECISION.advanced (+ açıklayıcılar); FINAL: VAL kazananı (B0 ya da kazanan)."""
+    if info.set == "SMOKE":
+        return
+    root = ctx.root
+    if info.set == "DEV":
+        require_smoke(ctx, f"{info.label}")
+        if info.overlay in G6_OVERLAYS:
+            sc = _read_json_stage(root, "DEV_SCREEN.json", f"{info.label} için dev-screen gerekir")
+            if info.variant not in sc.get("_meta", {}).get("g6_needed", []):
+                raise StageError(f"{info.label}: {info.variant} G0-G5'i geçmedi; G6 kaplama koşusu yapılmaz")
+        elif info.overlay in DIAG_OVERLAYS:
+            dd = _read_json_stage(root, "DEV_DECISION.json", f"{info.label} teşhis koşusu DEV kararından sonra çalışır")
+            if info.overlay == "DIAG_FEE15":
+                fee_failed = info.variant in dd.get("g6", {}) and not dd["g6"][info.variant]["fee2"]["pass"]
+                if not (fee_failed or info.variant in dd.get("advanced", [])):
+                    raise StageError(f"{info.label}: DIAG_FEE15 yalnız FEE2'yi kaçıran veya VAL'e ilerleyen arm içindir")
+    elif info.set == "VAL":
+        dd = _read_json_stage(root, "DEV_DECISION.json", f"{info.label} için DEV kararı gerekir")
+        if not dd.get("advanced"):
+            raise StageError(f"{info.label}: DEV'de ilerleyen arm yok; VAL koşulmaz")
+        if info.variant not in dd["advanced"] and info.variant not in DESCRIPTIVE:
+            raise StageError(f"{info.label}: {info.variant} DEV'de ilerlemedi (açıklayıcı da değil); VAL koşulmaz")
+    elif info.set == "FINAL":
+        vd = _read_json_stage(root, "VAL_DECISION.json", f"{info.label} için VAL kararı gerekir")
+        win = val_winner(vd)
+        if not win:
+            raise StageError(f"{info.label}: VAL kazananı yok; FINAL'e dokunulmaz")
+        if info.variant not in (win, "B0"):
+            raise StageError(f"{info.label}: FINAL yalnız VAL kazananı ({win}) ve B0 içindir")
+
+
 def cmd_check_run(root: Path, label: Optional[str]) -> int:
     if not label:
         raise UsageError("check-run <etiket> ister")
-    ctx = verify_lock(root)
+    ctx = verify_lock(root, remote=False)
     info = parse_label(label, ctx.variants)
     led = Ledger(root)
     rf = led.run_file(label)
     lf = root / "sealed" / "logs" / f"{label}.log"
+    secf = root / "sealed" / "logs" / f"{label}.sec"
     if led.has(label):
         if rf.is_file() and sha256_file(rf) == led.entries[label]["sha256"]:
             print(f"CHECK OK {label} (zaten ledger'da)")
             return 0
         raise IntegrityError(f"{label} ledger'da farklı sha256 ile kayıtlı: tamamlanmış koşu tekrarlanmaz")
+    run_stage_preconditions(ctx, info)
     if not rf.is_file():
         raise IntegrityError(f"{rf} yok")
+    doc: Dict[str, Any] = {}
     try:
         doc = json.loads(rf.read_text(encoding="utf-8"))
         reasons = check_report(ctx, info, doc, lf.read_text(encoding="utf-8", errors="replace") if lf.is_file() else None)
     except ValueError as exc:
         reasons = [f"rapor JSON'u okunamadı: {exc}"]
+    except (TypeError, KeyError, AttributeError) as exc:      # null/yanlış tipli alan: bozuk rapor = başarısızlık
+        reasons = [f"rapor biçimi bozuk: {type(exc).__name__}: {exc}"]
+    if not reasons and not isinstance(doc.get("provenance"), dict):
+        reasons = ["provenance yok"]
     if reasons:
-        for p in (rf, lf):                       # bayat çıktı kalamaz (§5.2)
+        for p in (rf, lf, secf):                 # bayat çıktı kalamaz (§5.2); süre dosyası da silinir
             try:
                 p.unlink()
             except FileNotFoundError:
@@ -1512,7 +1713,7 @@ def cmd_check_run(root: Path, label: Optional[str]) -> int:
         print(f"CHECK FAIL {label}: " + "; ".join(reasons), file=sys.stderr)
         return IntegrityError.code
     sec = None
-    sp = root / "sealed" / "logs" / f"{label}.sec"
+    sp = secf
     if sp.is_file():
         try:
             sec = float(sp.read_text().strip())
@@ -1664,7 +1865,8 @@ def lev_shares(trades: Sequence[Tr]) -> Tuple[float, float]:
     n = len(trades)
     if not n:
         return 0.0, 0.0
-    return (sum(1 for t in trades if t.lev == LEV_MIN) / n, sum(1 for t in trades if t.lev == LEV_MAX) / n)
+    return (sum(1 for t in trades if t.lev == THRESH["LEV_LOW"]) / n,
+            sum(1 for t in trades if t.lev == THRESH["LEV_HIGH"]) / n)
 
 
 def cmd_smoke(root: Path, target: Optional[str]) -> int:
@@ -1699,6 +1901,7 @@ def cmd_smoke(root: Path, target: Optional[str]) -> int:
     res["S3"] = s3
     ok = res["S1_AYI"]["pass"] and res["S1_V1"]["pass"] and res["S2"]["pass"] and all(v["pass"] for v in s3.values())
     res["pass"] = ok
+    res["l"] = ctx.l
     atomic_write(root / "SMOKE.json", dump_json(res))
     print(f"S1 B0 AYI: {'PASS' if res['S1_AYI']['pass'] else 'FAIL'}; S1 B0 V1: {'PASS' if res['S1_V1']['pass'] else 'FAIL'}; "
           f"S2 belirlenimcilik: {'PASS' if same else 'FAIL'}; S3 konfigürasyon: {'PASS' if all(v['pass'] for v in s3.values()) else 'FAIL'}")
@@ -1710,9 +1913,23 @@ def cmd_smoke(root: Path, target: Optional[str]) -> int:
 # ==========================================================================
 # 11. KAPILAR (§8) — her kural tek bir saf fonksiyon; eşikler THRESH'ten ÇAĞRI ANINDA okunur
 # ==========================================================================
+def limiting_row(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Birleşik kapıyı belirleyen satır: ilk KALAN satır; hepsi geçtiyse ilk SINIRDA satır; yoksa ilk satır."""
+    for r in rows:
+        if not r["pass"]:
+            return r
+    for r in rows:
+        if r["borderline"]:
+            return r
+    return rows[0]
+
+
 def entry(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Birleşik kapı girdisi: tüm alt satırlar geçerse geçer."""
-    return {"pass": all(r["pass"] for r in rows), "borderline": any(r["borderline"] for r in rows), "rows": rows}
+    """Birleşik kapı girdisi (Ek A.4 biçimi: {value, threshold, pass, borderline} + alt satırlar).
+    Tüm alt satırlar geçerse geçer; value/threshold/op/limiting = kapıyı belirleyen satırdan."""
+    lim = limiting_row(rows)
+    return {"value": lim["value"], "threshold": lim["threshold"], "op": lim["op"], "limiting": lim["gate"],
+            "pass": all(r["pass"] for r in rows), "borderline": any(r["borderline"] for r in rows), "rows": rows}
 
 
 def gate_ok(g: Any) -> bool:
@@ -1782,11 +1999,11 @@ def rule_g3(q: float) -> Dict[str, Any]:
 def rule_g4(trades: Sequence[Tr]) -> Dict[str, Any]:
     bm = best_month(trades)
     pf_x = pf_excluding_month(trades, bm)
-    s_x = sum_excluding_top(trades, 5)
+    s_x = sum_excluding_top(trades, int(THRESH["TOPN_G4"]))
     return entry([
         row("G4a", f"PF, en iyi ay ({bm}) hariç", pf_x, THRESH["G4_PF_EX_MONTH_MIN"],
             pf_x >= THRESH["G4_PF_EX_MONTH_MIN"]),
-        row("G4b", "Σ R, en iyi 5 işlem hariç", s_x, THRESH["G4_SUMR_EX_TOP5_MIN"],
+        row("G4b", f"Σ R, en iyi {int(THRESH['TOPN_G4'])} işlem hariç", s_x, THRESH["G4_SUMR_EX_TOP5_MIN"],
             s_x > THRESH["G4_SUMR_EX_TOP5_MIN"], ">")])
 
 
@@ -1875,7 +2092,8 @@ def rule_g12(trades: Sequence[Tr]) -> Dict[str, Any]:
     mon = group_sums(trades, lambda t: t.month)
     bs, bm = best_symbol(trades), best_month(trades)
     top1 = top_trades(trades, 1)
-    top5 = sum(t.r for t in top_trades(trades, 5))
+    topn = int(THRESH["TOPN_G12"])
+    top5 = sum(t.r for t in top_trades(trades, topn))
     loo = loo_symbol_pfs(trades)
     worst_loo_sym = min(loo, key=lambda s: (loo[s], s)) if loo else None
     pf_xs, pf_xm = pf_excluding_symbol(trades, bs), pf_excluding_month(trades, bm)
@@ -1886,7 +2104,7 @@ def rule_g12(trades: Sequence[Tr]) -> Dict[str, Any]:
             mon[bm] / total <= THRESH["G12_BEST_MONTH_SHARE_MAX"], "<="),
         row("G12c", "en iyi işlem / T", top1[0].r / total, THRESH["G12_BEST_TRADE_SHARE_MAX"],
             top1[0].r / total <= THRESH["G12_BEST_TRADE_SHARE_MAX"], "<="),
-        row("G12d", "en iyi 5 işlem / T", top5 / total, THRESH["G12_BEST5_SHARE_MAX"],
+        row("G12d", f"en iyi {topn} işlem / T", top5 / total, THRESH["G12_BEST5_SHARE_MAX"],
             top5 / total <= THRESH["G12_BEST5_SHARE_MAX"], "<="),
         row("G12e", "PF, en iyi sembol hariç", pf_xs, THRESH["G12_PF_EX_SYMBOL_MIN"], pf_xs >= THRESH["G12_PF_EX_SYMBOL_MIN"]),
         row("G12f", "PF, en iyi ay hariç", pf_xm, THRESH["G12_PF_EX_MONTH_MIN"], pf_xm >= THRESH["G12_PF_EX_MONTH_MIN"]),
@@ -1955,6 +2173,11 @@ def rule_g17(n: int, pf: float, dd_r: float, sum_r_: float) -> Dict[str, Any]:
     return r
 
 
+def b0_pf_usd(trades: Sequence[Tr]) -> float:
+    """FINAL B0 çapası E16'nın USD PnL PF'idir (R-PF DEĞİL; marj farklıysa ikisi ayrışır). Kırpılmaz."""
+    return pf_of([t.pnl for t in trades])
+
+
 def b0_anchor(n: int, pf: float) -> Dict[str, Any]:
     """B0 FINAL çapası: 320 işlem birebir ve 0.895 <= PF < 0.905 (iki hanede 0.90)."""
     ok = n == THRESH["B0_ANCHOR_TRADES"] and THRESH["B0_ANCHOR_PF_LO"] <= pf < THRESH["B0_ANCHOR_PF_HI"]
@@ -2007,6 +2230,7 @@ def cmd_dev_screen(root: Path, target: Optional[str]) -> int:
     ctx = verify_lock(root)
     if (root / "DEV_DECISION.json").exists():
         raise StageError("DEV_DECISION.json yazıldı: dev-screen artık çalıştırılamaz")
+    require_smoke(ctx, "dev-screen")
     led = Ledger(root)
     led.assert_clean()
     missing = [lb for lb in dev_required_labels() if not led.has(lb)]
@@ -2019,8 +2243,7 @@ def cmd_dev_screen(root: Path, target: Optional[str]) -> int:
     ps: List[float] = []
     tobs: Dict[str, float] = {}
     for a in FAMILY:
-        s = series[a]
-        assert s is not None
+        s = need(series[a], f"DEV_{a}")
         g0 = entry(rule_validity("G0", s.trades, s.missed, is_scaled(ctx, a), dev=True))
         g1 = rule_g1(s.n)
         ok = gate_ok(g0) and gate_ok(g1)
@@ -2099,8 +2322,7 @@ def cmd_dev_decide(root: Path, target: Optional[str]) -> int:
         pf = {}
         sums = {}
         for ov in G6_OVERLAYS:
-            s = load_series(ctx, "DEV", a, ov, led)       # eksikse StageError (4)
-            assert s is not None
+            s = need(load_series(ctx, "DEV", a, ov, led), f"DEV_{a}_{ov}")       # eksikse StageError (4)
             pf[ov], sums[ov] = pf_r(s.trades), sum_r(s.trades)
         g = rule_g6(pf["ROB_FEE2"], sums["ROB_DLY1"], pf["ROB_TAKER"])
         g6[a] = {"fee2": g["rows"][0], "dly1": g["rows"][1], "taker": g["rows"][2], "pass": g["pass"]}
@@ -2128,7 +2350,7 @@ def cmd_dev_decide(root: Path, target: Optional[str]) -> int:
 # 13. TEŞHİS (karar vermez): Z0 brüt-vs-net, PF [kötümser, iyimser], FEE1.5 etiketi, BAR-ORDER-BELİRSİZ
 # ==========================================================================
 def z0_reading(gross_pf: float, net_pf: float) -> str:
-    if gross_pf >= THRESH["Z0_GROSS_PF_EDGE"] and net_pf < 1.0:
+    if gross_pf >= THRESH["Z0_GROSS_PF_EDGE"] and net_pf < THRESH["Z0_NET_PF"]:
         return "sinyalin ham kenarı var, ücret yiyor"
     if gross_pf < THRESH["Z0_GROSS_PF_EDGE"]:
         return "ücretten önce de kenar yok"
@@ -2161,7 +2383,9 @@ def cmd_diag(root: Path, target: Optional[str]) -> int:
         base = load_series(ctx, "DEV", a, "", led)
         z0 = load_series(ctx, "DEV", a, "DIAG_Z0", led)
         sbo = load_series(ctx, "DEV", a, "DIAG_SBO", led)
-        assert base and z0 and sbo
+        need(base, f"DEV_{a}")
+        need(z0, f"DEV_{a}_DIAG_Z0")
+        need(sbo, f"DEV_{a}_DIAG_SBO")
         pf_net, pf_opt, pf_z0 = pf_r(base.trades), pf_r(sbo.trades), pf_r(z0.trades)
         g6a_fail = a in dd["g6"] and not dd["g6"][a]["fee2"]["pass"]
         need15 = g6a_fail or a in dd["advanced"]
@@ -2205,6 +2429,14 @@ def best_by_t(cands: Sequence[str], t_obs: Dict[str, float], tf_min: Dict[str, i
     return sorted(cands, key=lambda a: (-t_obs[a], -tf_min[a], list(FAMILY).index(a)))[0]
 
 
+def val_p(series: Series, block: int, alpha_over_k: float) -> Tuple[float, float, bool]:
+    """VAL p-değeri + Monte-Carlo hata kuralı: karar eşiği α/k (Bonferroni) p ± 3·SE içinde dönebiliyorsa
+    p, B=BOOT_N_HI ile (`…|hi` tohumu) yeniden hesaplanır. Döner (p, t_obs, yeniden_hesaplandı_mı)."""
+    p, t = p_for(series, "val", block)
+    p, refined = refine_p(p, lambda q: q <= alpha_over_k, lambda: p_for(series, "val", block, hi=True)[0])
+    return p, t, refined
+
+
 def cmd_val(root: Path, target: Optional[str]) -> int:
     if target:
         raise UsageError("val hedef almaz")
@@ -2236,11 +2468,12 @@ def cmd_val(root: Path, target: Optional[str]) -> int:
         base = load_series(ctx, "VAL", a, "", led)
         dev = load_series(ctx, "DEV", a, "", led)
         ov = {o: load_series(ctx, "VAL", a, o, led) for o in VAL_OVERLAYS}
-        assert base and dev and all(ov.values())
-        p7, t = p_for(base, "val", THRESH["BLOCK_PRIMARY"])
-        p28, _ = p_for(base, "val", THRESH["BLOCK_SECONDARY"])
-        p7, r7 = refine_p(p7, lambda p: p <= a7, lambda: p_for(base, "val", THRESH["BLOCK_PRIMARY"], hi=True)[0])
-        p28, r28 = refine_p(p28, lambda p: p <= a28, lambda: p_for(base, "val", THRESH["BLOCK_SECONDARY"], hi=True)[0])
+        need(base, f"VAL_{a}")
+        need(dev, f"DEV_{a}")
+        for o, ser in ov.items():
+            need(ser, f"VAL_{a}_{o}")
+        p7, t, r7 = val_p(base, THRESH["BLOCK_PRIMARY"], a7)
+        p28, _t28, r28 = val_p(base, THRESH["BLOCK_SECONDARY"], a28)
         t_obs[a] = t
         pf = pf_r(base.trades)
         gates = {
@@ -2292,8 +2525,9 @@ def cmd_final(root: Path, target: Optional[str]) -> int:
     led.assert_clean()
     b0 = load_series(ctx, "FINAL", "B0", "", led)
     arm = load_series(ctx, "FINAL", winner, "", led)
-    assert b0 and arm
-    anchor = b0_anchor(b0.n, pf_of([t.pnl for t in b0.trades]))      # E16 PF'i USD PnL üzerindendi
+    need(b0, "FINAL_B0")
+    need(arm, f"FINAL_{winner}")
+    anchor = b0_anchor(b0.n, b0_pf_usd(b0.trades))      # E16 PF'i USD PnL üzerindendi
     pf = pf_r(arm.trades)
     g17 = rule_g17(arm.n, pf, dd_r_of(arm), sum_r(arm.trades))
     outcome = final_outcome(anchor["ok"], g17["status"])
@@ -2319,9 +2553,113 @@ def md_table(headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> str:
 
 
 def f4(x: Any) -> str:
+    """4 ondalık; PF dışı büyüklükte (DD_R, Calmar) sonsuz "inf" basılır. PF'ler pf_r'de zaten kırpılıdır."""
     if isinstance(x, float):
-        return fmt_pf(x) if x == INF else f"{x:.4f}"
+        return "inf" if x == INF else (f"{x:.4f}" if x == x else "nan")
     return str(x)
+
+
+def _betacf(a_: float, b_: float, x: float) -> float:
+    """Eksik beta fonksiyonu için sürekli kesir (Lentz; Numerical Recipes betacf)."""
+    tiny = 1e-300
+    qab, qap, qam = a_ + b_, a_ + 1.0, a_ - 1.0
+    c, d = 1.0, 1.0 - qab * x / qap
+    d = 1.0 / (d if abs(d) > tiny else tiny)
+    h = d
+    for m in range(1, 300):
+        m2 = 2 * m
+        aa = m * (b_ - m) * x / ((qam + m2) * (a_ + m2))
+        d = 1.0 + aa * d
+        d = 1.0 / (d if abs(d) > tiny else tiny)
+        c = 1.0 + aa / c
+        c = c if abs(c) > tiny else tiny
+        h *= d * c
+        aa = -(a_ + m) * (qab + m) * x / ((a_ + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        d = 1.0 / (d if abs(d) > tiny else tiny)
+        c = 1.0 + aa / c
+        c = c if abs(c) > tiny else tiny
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < 1e-14:
+            break
+    return h
+
+
+def _betai(a_: float, b_: float, x: float) -> float:
+    """Düzgeleştirilmiş eksik beta I_x(a, b)."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    bt = math.exp(math.lgamma(a_ + b_) - math.lgamma(a_) - math.lgamma(b_) + a_ * math.log(x) + b_ * math.log1p(-x))
+    if x < (a_ + 1.0) / (a_ + b_ + 2.0):
+        return bt * _betacf(a_, b_, x) / a_
+    return 1.0 - bt * _betacf(b_, a_, 1.0 - x) / b_
+
+
+def t_sf(t: float, df: int) -> float:
+    """Student t üst kuyruk olasılığı P(T >= t), df serbestlik derecesi (tek-yönlü p)."""
+    if t == INF:
+        return 0.0
+    if t == -INF:
+        return 1.0
+    tail = 0.5 * _betai(df / 2.0, 0.5, df / (df + t * t))
+    return tail if t > 0 else 1.0 - tail
+
+
+def month_level_t(trades: Sequence[Tr], full_months: Sequence[str]) -> Optional[Dict[str, Any]]:
+    """BİLGİ (§7.2, karar vermez): tam ayların giriş-ayı Σ R'si üzerinde tek-yönlü tek-örneklem t testi
+    (12 DEV / 22 VAL gözlemi). 3'ten az tam ay -> None. Gözlem bağımsızlığı varsayar (ay etkisi için kaba bir bakış)."""
+    m = len(full_months)
+    if m < 3:
+        return None
+    sums = group_sums(trades, lambda t: t.month)
+    x = [sums.get(k, 0.0) for k in full_months]
+    mean = sum(x) / m
+    sd = statistics.stdev(x)
+    if sd <= 0.0:
+        t = 0.0 if mean == 0.0 else math.copysign(INF, mean)
+    else:
+        t = mean / (sd / math.sqrt(m))
+    return {"m": m, "t": t, "p": t_sf(t, m - 1) if sd > 0.0 else (1.0 if mean <= 0.0 else 0.0)}
+
+
+def tf_trend(values: Sequence[float]) -> str:
+    """Üç TF (5m -> 15m -> 30m) üzerinde PF eğilimi etiketi (yalnız rapor)."""
+    d = [b - a_ for a_, b in zip(values, values[1:])]
+    if all(x > 0 for x in d):
+        return "monoton artan"
+    if all(x < 0 for x in d):
+        return "monoton azalan"
+    return "monoton değil"
+
+
+def bull_check(up_pnl: float, b0_up_pnl: float) -> Optional[bool]:
+    """CLAUDE.md kural #1 (boğa): UP-ayı USD PnL >= BULL_PNL_FRAC x B0'ın UP PnL'i. B0 UP PnL <= 0 -> madde boş (None)."""
+    if b0_up_pnl <= 0:
+        return None
+    return up_pnl >= THRESH["BULL_PNL_FRAC"] * b0_up_pnl
+
+
+NO_WINNER_LABELS = ("DEV-YOK", "VAL-YOK", "FINAL-VETO")
+
+
+def ci_upper_sentence(reports: Dict[str, Dict[str, Any]], label: str) -> str:
+    """Kazanan YOK sonuçlarında "güç sınırı" cümlesi: DEV/VAL arm'larının PF %90 GA üst sınırlarının en büyüğü."""
+    if label not in NO_WINNER_LABELS:
+        return ""
+    best: Optional[Tuple[float, str]] = None
+    for key, rp in reports.items():
+        base = key[4:] if key.startswith("VAL_") else key
+        ci = rp.get("pf_ci90")
+        if base in FAMILY and ci:
+            if best is None or ci[1] > best[0]:
+                best = (float(ci[1]), key)
+    if best is None:
+        return ""
+    return (f"PF %90 GA üst sınırı: aile arm'ları arasında en yükseği {best[0]:.4f} ({best[1]}); bu veriyle bunun üstünde bir "
+            f"gerçek PF savunulamaz (kenar yokluğunun kanıtı değil, güç sınırıdır).")
 
 
 def arm_report(ctx: Ctx, s: Series, labels: Dict[str, str], stage: str, extra_p: bool = True) -> Dict[str, Any]:
@@ -2361,6 +2699,11 @@ def arm_report(ctx: Ctx, s: Series, labels: Dict[str, str], stage: str, extra_p:
         d["p14_info"] = bootstrap_p(x, THRESH["BLOCK_INFO"], seed_for(stage, s.arm, 14))[0]
         pos, neg = daily_pos_neg(ts, s.windows)
         d["pf_ci90"] = pf_confidence(pos, neg, THRESH["BLOCK_PRIMARY"], seed_for(stage, s.arm, 7) ^ 1)
+        try:
+            fm = full_months_of(ctx.window(s.set))
+        except KeyError:
+            fm = []
+        d["month_t"] = month_level_t(ts, fm)
     return d
 
 
@@ -2396,9 +2739,9 @@ def results_rows(ctx: Ctx, led: Ledger) -> List[Dict[str, Any]]:
             "label": label, "variant": info.variant, "overlay": info.overlay, "set": info.set,
             "quarter": info.quarter or "", "trades": n,
             "wr": f"{(sum(1 for t in s.trades if t.pnl > 0) / n * 100.0) if n else 0.0:.4f}",
-            "pf": "inf" if pf == INF else f"{pf:.6f}",
-            "pf_pess": "inf" if pf_pess == INF else (f"{pf_pess:.6f}" if pf_pess != "" else ""),
-            "pf_opt": "inf" if pf_opt == INF else (f"{pf_opt:.6f}" if pf_opt != "" else ""),
+            "pf": f"{pf:.6f}",
+            "pf_pess": f"{pf_pess:.6f}" if pf_pess != "" else "",
+            "pf_opt": f"{pf_opt:.6f}" if pf_opt != "" else "",
             "net_r": f"{sum_r(s.trades):.6f}", "total_pnl_usd": f"{sum(t.pnl for t in s.trades):.4f}",
             "bar_max_dd_usd": f"{s.dd_usd:.4f}", "dd_r": f"{dd_r_of(s):.6f}" if dd_r_of(s) != INF else "inf",
             "s_arm": f"{s.s_arm:g}"})
@@ -2443,8 +2786,7 @@ def render_decision(ctx: Ctx, root: Path, label: str, note: str, docs: Dict[str,
     rows = []
     reports: Dict[str, Dict[str, Any]] = {}
     for a in FAMILY:
-        s = load_series(ctx, "DEV", a, "", led)
-        assert s is not None
+        s = need(load_series(ctx, "DEV", a, "", led), f"DEV_{a}")
         rp = arm_report(ctx, s, labels, "dev")
         reports[a] = rp
         sc = screen.get(a, {})
@@ -2472,6 +2814,19 @@ def render_decision(ctx: Ctx, root: Path, label: str, note: str, docs: Dict[str,
             for kx in ("fee2", "dly1", "taker"):
                 L.append("- " + fmt_row(dd["g6"][a][kx]))
         L.append("")
+    # --- S-vs-T ve TF eğilimi (yalnız rapor; karar vermez) ---
+    L.append("### S – T karşılaştırması ve TF eğilimi (yalnız rapor; karar vermez; PF 5'te kırpılı)")
+    cmp_rows = []
+    for tf in ("5", "15", "30"):
+        rs_, rt_ = reports[f"S{tf}"], reports[f"T{tf}"]
+        cmp_rows.append([f"{tf}m", f4(rs_["pf"]), f4(rt_["pf"]), f"{rs_['pf'] - rt_['pf']:+.4f}",
+                         f"{rs_['net_r']:.2f}", f"{rt_['net_r']:.2f}"])
+    L.append(md_table(["giriş TF", "PF S", "PF T", "PF S−T", "ΣR S", "ΣR T"], cmp_rows))
+    L.append("")
+    for fam, nm in (("S", "ölçekli (S)"), ("T", "yalnız zamanlama (T)")):
+        vals = [reports[f"{fam}{tf}"]["pf"] for tf in ("5", "15", "30")]
+        L.append(f"- TF eğilimi {nm}: PF 5m→15m→30m = " + " → ".join(f4(v) for v in vals) + f" ({tf_trend(vals)})")
+    L.append("")
     # --- açıklayıcı ve referanslar ---
     L.append("## Açıklayıcı (S60/T60) ve referanslar (B0, R1, S5G, T5G)")
     rows = []
@@ -2500,16 +2855,17 @@ def render_decision(ctx: Ctx, root: Path, label: str, note: str, docs: Dict[str,
     # --- CLAUDE.md yasak #1 satırları ---
     L.append("## CLAUDE.md kural #1 satırları")
     for a in dd["advanced"]:
-        s = load_series(ctx, "DEV", a, "", led)
-        assert s is not None
+        s = need(load_series(ctx, "DEV", a, "", led), f"DEV_{a}")
         grp = reports[a]["groups"] if a in reports else group_table(s.trades, labels)
         b0s = load_series(ctx, "DEV", "B0", "", led, required=False)
         up = lambda ser: sum(t.pnl for t in ser.trades if labels.get(t.month) == "UP")        # noqa: E731
         bull = ""
         if b0s is not None:
             b0_up = up(b0s)
-            bull = ("B0 UP PnL ≤ 0: madde boş" if b0_up <= 0 else
-                    f"UP-ayı USD PnL {up(s):.2f} vs 0.8 × B0 {0.8 * b0_up:.2f} → {'GEÇTİ' if up(s) >= 0.8 * b0_up else 'KALDI'}")
+            chk = bull_check(up(s), b0_up)
+            bull = ("B0 UP PnL ≤ 0: madde boş" if chk is None else
+                    f"UP-ayı USD PnL {up(s):.2f} vs {THRESH['BULL_PNL_FRAC']:g} × B0 "
+                    f"{THRESH['BULL_PNL_FRAC'] * b0_up:.2f} → {'GEÇTİ' if chk else 'KALDI'}")
         L.append(f"- {a}: DEV DOWN PF {f4(grp['DOWN']['pf'])} (n={grp['DOWN']['n']}); boğa maddesi: {bull or 'B0 yok'}")
         if "val" in docs and a in docs["val"]:
             g10 = docs["val"][a]["G10"]["rows"][1]
@@ -2525,9 +2881,22 @@ def render_decision(ctx: Ctx, root: Path, label: str, note: str, docs: Dict[str,
             for g in ("G7", "G8", "G9", "G10", "G11", "G12", "G13", "G14", "G15", "G16"):
                 for r in (vd[a][g]["rows"] if "rows" in vd[a][g] else [vd[a][g]]):
                     L.append("- " + fmt_row(r))
-            s = load_series(ctx, "VAL", a, "", led)
-            assert s is not None
+            s = need(load_series(ctx, "VAL", a, "", led), f"VAL_{a}")
             reports["VAL_" + a] = arm_report(ctx, s, labels, "val")
+            L.append("")
+        drows = []
+        for a in DESCRIPTIVE:
+            sd_ = load_series(ctx, "VAL", a, "", led, required=False)
+            if sd_ is None:
+                continue
+            rp = arm_report(ctx, sd_, labels, "val")
+            reports["VAL_" + a] = rp
+            ci = rp.get("pf_ci90")
+            drows.append([a, rp["n"], f4(rp["pf"]), f"{rp['net_r']:.2f}", f"{rp['pnl_usd']:.2f}",
+                          f"[{f4(ci[0])}, {f4(ci[1])}]" if ci else "—"])
+        if drows:
+            L.append("**Açıklayıcı arm'lar, VAL (yalnız rapor; kazanamaz, YETERSİZ GÜÇ):**")
+            L.append(md_table(["arm", "N", "PF", "ΣR", "PnL USD", "PF %90 GA"], drows))
             L.append("")
     if "final" in docs:
         fd = docs["final"]
@@ -2556,7 +2925,13 @@ def render_decision(ctx: Ctx, root: Path, label: str, note: str, docs: Dict[str,
                           [[m, v["label"], v["n"], f"{v['sum_r']:.3f}", f4(v["pf"])] for m, v in rp["months"].items()]))
         if "p7" in rp:
             L.append(f"- p(b=7)={f4(rp['p7'])} p(b=28)={f4(rp['p28'])} p(b=14, bilgi)={f4(rp['p14_info'])} t={f4(rp['t_obs'])}")
+        mt = rp.get("month_t")
+        if mt:
+            L.append(f"- ay düzeyinde tek-yönlü t (bilgi, M={mt['m']} tam ay): t={f4(mt['t'])} p={f4(mt['p'])}")
         L.append("")
+    ci_s = ci_upper_sentence(reports, label)
+    if ci_s:
+        L.append(f"_Güç notu:_ {ci_s}")
     L.append(f"_Önceden yazılmış cümle:_ {SENTENCES.get(label, NO_WINNER_SENTENCE)}")
     return "\n".join(L) + "\n"
 
@@ -2608,7 +2983,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except E17Error as exc:
         print(f"HATA[{exc.code}] {ns.stage}: {exc}", file=sys.stderr)
         return exc.code
-    except (KeyError, ValueError, TypeError, OSError) as exc:      # bozuk girdi = veri bütünlüğü
+    except Exception as exc:        # noqa: BLE001 — bozuk girdi/beklenmeyen hata = veri bütünlüğü (çıkış 0/2/3/4/5 dışı yok)
         print(f"HATA[5] {ns.stage}: {type(exc).__name__}: {exc}", file=sys.stderr)
         return IntegrityError.code
 
