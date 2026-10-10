@@ -1,0 +1,333 @@
+name: Deploy (awa TESTNET)
+
+# Buluttan/telefondan ELLE tetiklenen deploy (D39, docs/RUNBOOK.md "Buluttan deploy
+# (GitHub Actions)"). YALNIZ `workflow_dispatch`: otomatik push-deploy BİLİNÇLİ YOK —
+# entry-halt, 418 ban ve restart kararları insan kararıdır (CLAUDE.md yasak #3, D20a).
+#
+# Bu workflow yeni bir deploy mantığı KURMAZ: mevcut `scripts/deploy.sh`'i AYNEN
+# çağırır; deploy.sh → server_deploy.sh hattındaki TÜM kapılar sunucuda aynen işler
+# (entry-halt, 15 dk ban izi, BOT_MODE↔ring, temiz ağaç, flock, sunucu venv'inde tam
+# test, .env parse, restart, 240 sn katı /health, başarısızsa otomatik geri alma).
+# Buraya yalnız ÜSTÜNE eklenen kapılar var: yalnız main'den, ring ∈ {testnet,
+# follower}, hedef main geçmişinde, CI yeşil, ortam onayı, deploy sonrası doğrulama.
+#
+# MAINNET bu workflow'dan deploy EDİLEMEZ (seçenek yok, guard açıkça reddeder):
+# yalnız yerelden `scripts/deploy.sh awa vX.Y.Z --ring mainnet` + etiket + elle onay.
+#
+# GÜVENLİK: `${{ ... }}` ifadeleri `run:` metnine ASLA gömülmez (script injection) —
+# hepsi step `env:` üzerinden geçer ve kabukta "$VAR" olarak kullanılır.
+# (`run-name` bir kabuk değil, yalnız Actions listesindeki başlıktır.)
+# Sözleşme testi: tests/test_deploy_workflow.py
+
+run-name: "Deploy awa · ring=${{ inputs.ring }} · hedef=${{ inputs.target }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      ring:
+        description: "Halka (yalnız TESTNET): testnet = scalper /opt/tradingbot-v2, follower = AlgoPro takipçi /opt/tradingbot-ap. Mainnet SEÇENEĞİ YOK."
+        type: choice
+        options:
+          - testnet
+          - follower
+        default: testnet
+        required: true
+      target:
+        description: "origin/main (varsayılan) ya da GERİ ALMA için main geçmişindeki commit SHA (7-40 hane, küçük harf)"
+        type: string
+        default: origin/main
+        required: true
+      no_restart:
+        description: "Yalnız kodu güncelle, süreci yeniden BAŞLATMA (DEPLOY_NO_RESTART=1; dokümantasyon/harness değişikliği)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  checks: read
+
+# Aynı anda TEK deploy (iki halka dahil): deploy.sh'in sunucudaki flock'u ikinciyi zaten
+# reddeder; burada sıraya alınır. Çalışan deploy ASLA iptal edilmez (ssh ortada kopar →
+# sunucuda yarım deploy kalabilir).
+concurrency:
+  group: deploy-awa
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Kullanıcı GitHub'da bu ortama required reviewer + "yalnız main" kuralı ekleyebilir;
+    # secret'lar da bu ORTAMA konursa onay verilmeden okunamaz.
+    environment: awa-testnet
+    steps:
+      # a) Guard — hiçbir şeye dokunmadan önce reddet.
+      - name: Guard (yalnız main · yalnız testnet|follower · hedef biçimi)
+        env:
+          RING: ${{ inputs.ring }}
+          TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=Deploy reddedildi::$*"; exit 1; }
+
+          # Reddedilen değeri ASLA ham basma (satır başı `::` = workflow komutu enjeksiyonu).
+          safe() { printf '%s' "$1" | tr -c 'A-Za-z0-9._/@^~:-' '?' | cut -c1-64; }
+
+          if [ "${GITHUB_REF:-}" != "refs/heads/main" ]; then
+            fail "yalnız main dalından tetiklenir (GITHUB_REF='$(safe "${GITHUB_REF:-}")'). Önce PR'ı main'e birleştir; workflow'u 'Use workflow from: main' ile çalıştır."
+          fi
+
+          case "$RING" in
+            testnet|follower) ;;
+            mainnet)
+              fail "mainnet bu workflow'dan deploy EDİLEMEZ — mainnet yalnız yerelden: scripts/deploy.sh awa vX.Y.Z --ring mainnet (etiket + elle 'MAINNET' onayı; docs/MAINNET_PLAN.md)." ;;
+            *)
+              fail "geçersiz ring '$(safe "$RING")' (yalnız testnet|follower)." ;;
+          esac
+
+          TARGET_RE='^(origin/main|[0-9a-f]{7,40})$'
+          if ! [[ "$TARGET" =~ $TARGET_RE ]]; then
+            fail "geçersiz hedef '$(safe "$TARGET")' — 'origin/main' ya da main geçmişindeki küçük harfli commit SHA (7-40 hane) olmalı."
+          fi
+          echo "guard geçti: ring=$RING hedef=$TARGET"
+
+      # b) Tam geçmiş: SHA'nın main'in atası olduğu kontrol edilecek.
+      - name: Checkout (tam geçmiş)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # c) Hedef SHA'yı çöz (origin/main → dispatch edilen main SHA'sı).
+      - name: Hedef SHA'yı çöz
+        id: resolve
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=Hedef reddedildi::$*"; exit 1; }
+
+          git fetch -q origin
+
+          if [ "$TARGET" = "origin/main" ]; then
+            SHA="$(git rev-parse HEAD)"
+            REMOTE_SHA="$(git rev-parse origin/main)"
+            if [ "$SHA" != "$REMOTE_SHA" ]; then
+              fail "main tetiklendikten sonra ilerledi (dispatch ${SHA:0:12} ≠ origin/main ${REMOTE_SHA:0:12}) — güvenli durdurma (deploy.sh de aynı kapıyı uygular). Workflow'u yeniden tetikle."
+            fi
+            DEPLOY_REF="origin/main"
+          else
+            SHA="$(git rev-parse --verify "$TARGET^{commit}")" \
+              || fail "hedef commit bulunamadı veya belirsiz (kısa SHA çok kısa olabilir)."
+            if ! git merge-base --is-ancestor "$SHA" origin/main; then
+              fail "commit ${SHA:0:12} main geçmişinde DEĞİL — yalnız main'e birleşmiş commit'ler deploy edilir."
+            fi
+            # Belirsizlik kalmasın: sunucuya KISA değil, çözülmüş TAM SHA gider.
+            DEPLOY_REF="$SHA"
+          fi
+
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "deploy_ref=$DEPLOY_REF" >> "$GITHUB_OUTPUT"
+          echo "çözülen SHA: $SHA (deploy.sh hedefi: $DEPLOY_REF)"
+          echo "commit: $(git log -1 --format=%s "$SHA" | cut -c1-100)"
+
+      # d) CI kapısı: ci.yml'in `test` işi (ruff + tam pytest) bu SHA için YEŞİL olmalı.
+      #    Geri almada da geçerli. (Varsayılan filter=latest: yeniden koşturulmuşsa SON koşu.)
+      - name: CI kapısı (ci.yml → test işi success)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=CI yeşil değil::$*"; exit 1; }
+
+          RUNS="$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs?check_name=test&per_page=100" \
+            --jq '.check_runs[] | select(.app.slug == "github-actions") | "\(.status)/\(.conclusion // "none")"')" \
+            || fail "check-runs sorgulanamadı (GITHUB_TOKEN 'checks: read' izni / ağ)."
+
+          if [ -z "$RUNS" ]; then
+            fail "CI bulunamadı: ${SHA:0:12} için 'test' check-run'ı yok (CI hiç koşmadı mı? main'e push sonrası Actions → CI'ın bitmesini bekle)."
+          fi
+          if printf '%s\n' "$RUNS" | grep -qx 'completed/success'; then
+            echo "CI yeşil: ${SHA:0:12} için 'test' işi success"
+          else
+            echo "bulunan 'test' koşuları (durum/sonuç):"
+            printf '%s\n' "$RUNS"
+            fail "CI yeşil değil: ${SHA:0:12} için 'test' işi success değil (bitmemiş olabilir — bitince yeniden tetikle)."
+          fi
+
+      # e) SSH kurulumu. Host anahtarı secret'tan DOĞRULANIR — ssh-keyscan/TOFU YOK.
+      - name: SSH kurulumu (anahtar + known_hosts + config)
+        env:
+          AWA_SSH_HOST: ${{ secrets.AWA_SSH_HOST }}
+          AWA_SSH_USER: ${{ secrets.AWA_SSH_USER }}
+          AWA_SSH_PORT: ${{ secrets.AWA_SSH_PORT }}
+          AWA_SSH_PRIVATE_KEY: ${{ secrets.AWA_SSH_PRIVATE_KEY }}
+          AWA_SSH_KNOWN_HOSTS: ${{ secrets.AWA_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          umask 077
+          fail() { echo "::error title=SSH kurulumu::$*"; exit 1; }
+
+          # Eksik secret'ın ADI söylenir, DEĞERİ asla yazdırılmaz.
+          MISSING=""
+          for NAME in AWA_SSH_HOST AWA_SSH_USER AWA_SSH_PRIVATE_KEY AWA_SSH_KNOWN_HOSTS; do
+            if [ -z "${!NAME:-}" ]; then MISSING="$MISSING $NAME"; fi
+          done
+          if [ -n "$MISSING" ]; then
+            fail "eksik GitHub secret:$MISSING — Settings → Secrets and variables → Actions (ya da Environment 'awa-testnet'); docs/RUNBOOK.md 'Buluttan deploy'."
+          fi
+
+          # ssh config'e yazılacak değerler: satır sonu/boşluk ile config enjeksiyonu YOK.
+          PORT="${AWA_SSH_PORT:-22}"
+          PORT_RE='^[0-9]{1,5}$'
+          HOST_RE='^[A-Za-z0-9]([A-Za-z0-9.:-]*[A-Za-z0-9])?$'
+          USER_RE='^[A-Za-z_][A-Za-z0-9_.-]*$'
+          [[ "$PORT" =~ $PORT_RE ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] \
+            || fail "AWA_SSH_PORT 1-65535 arası bir sayı olmalı (boş bırakılırsa 22)."
+          [[ "$AWA_SSH_HOST" =~ $HOST_RE ]] || fail "AWA_SSH_HOST geçersiz karakter içeriyor (yalnız ana makine adı/IP)."
+          [[ "$AWA_SSH_USER" =~ $USER_RE ]] || fail "AWA_SSH_USER geçersiz karakter içeriyor."
+
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+
+          printf '%s\n' "$AWA_SSH_PRIVATE_KEY" > "$HOME/.ssh/id_deploy"
+          chmod 600 "$HOME/.ssh/id_deploy"
+          ssh-keygen -y -f "$HOME/.ssh/id_deploy" </dev/null >/dev/null 2>&1 \
+            || fail "AWA_SSH_PRIVATE_KEY geçerli bir özel anahtar değil (parolasız ed25519 beklenir; satır sonları bozulmamış olmalı)."
+
+          printf '%s\n' "$AWA_SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          if [ "$PORT" = "22" ]; then LOOKUP="$AWA_SSH_HOST"; else LOOKUP="[$AWA_SSH_HOST]:$PORT"; fi
+          ssh-keygen -F "$LOOKUP" -f "$HOME/.ssh/known_hosts" >/dev/null \
+            || fail "AWA_SSH_KNOWN_HOSTS içinde AWA_SSH_HOST (port $PORT) için kayıt yok — kullanıcının DOĞRULADIĞI sunucu anahtarı satırı eklenmeli (port 22 dışında '[host]:port' biçimi); docs/RUNBOOK.md 'Buluttan deploy'."
+
+          {
+            echo "Host awa"
+            echo "  HostName $AWA_SSH_HOST"
+            echo "  User $AWA_SSH_USER"
+            echo "  Port $PORT"
+            echo "  IdentityFile $HOME/.ssh/id_deploy"
+            echo "  IdentitiesOnly yes"
+            echo "  StrictHostKeyChecking yes"
+            echo "  UserKnownHostsFile $HOME/.ssh/known_hosts"
+            echo "  BatchMode yes"
+            echo "  PasswordAuthentication no"
+            echo "  ForwardAgent no"
+            echo "  ConnectTimeout 20"
+            # Testler/sağlık yoklaması sessiz dakikalar sürer; NAT bağlantıyı düşürmesin.
+            echo "  ServerAliveInterval 30"
+            echo "  ServerAliveCountMax 10"
+          } > "$HOME/.ssh/config"
+          chmod 600 "$HOME/.ssh/config"
+
+          # Ön uçuş: IP izni / anahtar / host anahtarı sorunu deploy'dan ÖNCE net görünsün.
+          ssh awa true \
+            || fail "awa'ya SSH bağlanamadı — sunucu SSH portu GitHub Actions IP'lerine açık mı? deploy anahtarı authorized_keys'te mi? known_hosts eşleşiyor mu? (docs/RUNBOOK.md 'Buluttan deploy')."
+          echo "SSH ön uçuşu geçti"
+
+      # f) Deploy — mevcut script AYNEN; testler HER ZAMAN koşar (DEPLOY_SKIP_TESTS=0).
+      - name: Deploy (scripts/deploy.sh — tüm kapılar sunucuda)
+        id: deploy
+        env:
+          RING: ${{ inputs.ring }}
+          NO_RESTART: ${{ inputs.no_restart }}
+          DEPLOY_REF: ${{ steps.resolve.outputs.deploy_ref }}
+        run: |
+          set -euo pipefail
+          if [ "$NO_RESTART" = "true" ]; then NO_RESTART_FLAG=1; else NO_RESTART_FLAG=0; fi
+          echo "started=$(date +%s)" >> "$GITHUB_OUTPUT"
+          echo "→ ring=$RING hedef=$DEPLOY_REF no_restart=$NO_RESTART_FLAG"
+          DEPLOY_NO_RESTART="$NO_RESTART_FLAG" DEPLOY_SKIP_TESTS=0 bash scripts/deploy.sh awa "$DEPLOY_REF" --ring "$RING"
+
+      # g) Doğrulama (CLAUDE.md yasak #6): "çalışıyor" demeden önce kanıt.
+      - name: Doğrulama (sunucu HEAD · supervisord RUNNING · süreç yaşı)
+        env:
+          RING: ${{ inputs.ring }}
+          NO_RESTART: ${{ inputs.no_restart }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+          DEPLOY_STARTED: ${{ steps.deploy.outputs.started }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=Doğrulama başarısız::$*"; exit 1; }
+
+          # Halka → dizin/program (scripts/server_deploy.sh RING_* tablosuyla AYNI).
+          case "$RING" in
+            testnet)  PROGRAM="tradingbot_v2"; REPO_DIR="/opt/tradingbot-v2" ;;
+            follower) PROGRAM="tradingbot_ap"; REPO_DIR="/opt/tradingbot-ap" ;;
+            *) fail "geçersiz ring (yalnız testnet|follower)." ;;
+          esac
+
+          SERVER_SHA="$(ssh awa "git -C $REPO_DIR rev-parse HEAD" | tr -d '[:space:]')"
+          SHA_RE='^[0-9a-f]{40}$'
+          [[ "$SERVER_SHA" =~ $SHA_RE ]] || fail "sunucu HEAD okunamadı ($REPO_DIR)."
+          echo "sunucu HEAD: $SERVER_SHA"
+          echo "beklenen   : $SHA"
+          if [ "$SERVER_SHA" != "$SHA" ]; then
+            fail "sunucu HEAD (${SERVER_SHA:0:12}) çözülen SHA (${SHA:0:12}) ile AYNI DEĞİL — deploy uygulanmamış ya da main bu sırada ilerlemiş olabilir; sunucuda logs/deploy.log'a bak."
+          fi
+
+          {
+            echo "- sunucu HEAD: \`${SERVER_SHA:0:12}\` = çözülen SHA"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$NO_RESTART" = "true" ]; then
+            echo "restart İSTENMEDİ (no_restart): süreç doğrulaması atlandı; yalnız kod HEAD'i doğrulandı."
+            echo "- restart istenmedi (no_restart): süreç yaşı doğrulanmadı" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          STATUS="$(ssh awa "supervisorctl status $PROGRAM" 2>&1)" || true
+          echo "$STATUS"
+          printf '%s\n' "$STATUS" | grep -q RUNNING \
+            || fail "$PROGRAM RUNNING değil — sunucuda 'supervisorctl status $PROGRAM' ve logs/deploy.log'a bak."
+
+          ETIMES="$(ssh awa "ps -o etimes= -p \$(supervisorctl pid $PROGRAM)" | tr -d '[:space:]')"
+          NUM_RE='^[0-9]+$'
+          [[ "$ETIMES" =~ $NUM_RE ]] || fail "süreç yaşı (etimes) okunamadı."
+          echo "$PROGRAM süreç yaşı (etimes): ${ETIMES} sn"
+
+          # Restart gerçekten bu deploy sırasında mı oldu? Süreç yaşı, deploy'un başından
+          # bu yana geçen süreyi aşamaz (+5 sn ssh gecikmesi payı).
+          [[ "$DEPLOY_STARTED" =~ $NUM_RE ]] || fail "deploy başlangıç damgası okunamadı."
+          ELAPSED=$(( $(date +%s) - DEPLOY_STARTED ))
+          if [ "$ETIMES" -gt $(( ELAPSED + 5 )) ]; then
+            fail "$PROGRAM süreci deploy'dan ÖNCE başlamış görünüyor (etimes=${ETIMES}s > deploy süresi ${ELAPSED}s) — restart gerçekleşmemiş olabilir."
+          fi
+          echo "- $PROGRAM RUNNING, süreç yaşı ${ETIMES} sn (deploy süresi ${ELAPSED} sn)" >> "$GITHUB_STEP_SUMMARY"
+
+      # h) Temizlik: özel anahtar runner'da KALMAZ (hata olsa da).
+      - name: Anahtar temizliği
+        if: always()
+        run: |
+          rm -f ~/.ssh/id_deploy ~/.ssh/config
+
+      # i) Özet — secret YOK.
+      - name: Özet
+        if: always()
+        env:
+          RING: ${{ inputs.ring }}
+          TARGET: ${{ inputs.target }}
+          NO_RESTART: ${{ inputs.no_restart }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+          JOB_STATUS: ${{ job.status }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          SAFE_TARGET="$(printf '%s' "$TARGET" | tr -c 'A-Za-z0-9._/@^~:-' '?' | cut -c1-64)"
+          SAFE_ACTOR="$(printf '%s' "$ACTOR" | tr -c 'A-Za-z0-9_-' '?' | cut -c1-40)"
+          {
+            echo "### Deploy (awa TESTNET)"
+            echo ""
+            echo "| Alan | Değer |"
+            echo "|---|---|"
+            echo "| Sonuç | **${JOB_STATUS:-?}** |"
+            echo "| Halka | \`${RING:-?}\` |"
+            echo "| Hedef (girilen) | \`${SAFE_TARGET:-?}\` |"
+            echo "| Çözülen SHA | \`${SHA:-—}\` |"
+            echo "| no_restart | \`${NO_RESTART:-?}\` |"
+            echo "| Tetikleyen | \`${SAFE_ACTOR:-?}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

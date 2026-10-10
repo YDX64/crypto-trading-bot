@@ -1,7 +1,7 @@
 ---
 tags: [isletme, deploy, geri-alma, restart]
-guncelleme: 2026-08-24
-kaynak: docs/RUNBOOK.md "Deploy ve geri alma" (satir 100-215), scripts/deploy.sh, scripts/restart_safe.sh
+guncelleme: 2026-10-10
+kaynak: docs/RUNBOOK.md "Deploy ve geri alma" (satir 100-215) + "Buluttan deploy (GitHub Actions)", scripts/deploy.sh, scripts/restart_safe.sh, .github/workflows/deploy.yml
 ---
 # Deploy ve geri alma
 
@@ -26,6 +26,21 @@ yerel HEAD == `origin/main` · `RING` ile `.env`'deki `BOT_MODE` uyumlu.
 
 Geri alma mantigi **UC halkada ORTAKTIR** (`scripts/server_deploy.sh`);
 her halka kendi `backups/commit.prev-<tarih>`ine doner.
+
+## Buluttan deploy (D39, yalniz TESTNET)
+
+Bulut oturumlarinda SSH/`.env` yok → GitHub Actions **"Deploy (awa TESTNET)"**
+(`.github/workflows/deploy.yml`, yalniz elle `workflow_dispatch`). Ayni
+`scripts/deploy.sh` hatti; sunucu kapilari (entry-halt, ban izi, `BOT_MODE`↔ring,
+testler, otomatik geri alma) aynen calisir. Ustune: yalniz `main` · yalniz
+`testnet`/`follower` · hedef main gecmisinde · CI `test` yesil · `awa-testnet`
+ortam onayi · deploy sonrasi dogrulama (HEAD, RUNNING, `etimes`).
+
+- Is akisi: dalda gelistir → test → PR ile main → CI yesil → workflow'u tetikle.
+- Geri alma: `target=<onceki SHA>`. **Otomatik push-deploy YOK; mainnet YALNIZ yerelden.**
+- Kurulum (5 secret + ortam + deploy anahtari) ve sinirlama (awa SSH portu GitHub IP'lerine
+  acik olmali; degilse yerel `deploy.sh` yedek yol): `docs/RUNBOOK.md` "Buluttan deploy".
+- Karar: `docs/DECISIONS.md` D39.
 
 ## `.env` degisikligi = AYRI bir adim
 
@@ -74,5 +89,6 @@ cp env.example .env                 # .env yoksa (CI de boyle yapar)
 4. Ayni oturumda iki halkayi birden degistirmek.
 5. Container ile supervisord'u ayni anda calistirmak
    ([[40-isletme/halka-yonetimi]]).
+6. Mainnet'i GitHub Actions'tan deploy etmek (D39: yalniz yerelden, etiket + elle onay).
 
 ILGILI: [[40-isletme/halka-yonetimi]] · [[20-kararlar/mainnet-plani]] · [[10-mimari/guvenlik-kilitleri]] · [[90-ai-icin/dogrulama-receteleri]]

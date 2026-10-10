@@ -286,6 +286,82 @@ Restart'ı kanıtla: `ps -o etimes= -p $(supervisorctl pid tradingbot_v2)` küç
 script'i bu yüzden 240 sn'ye kadar yoklar (`HEALTH_TIMEOUT`). 2026-08-21'de 30 sn'lik sabit bekleme
 yanlış alarmla otomatik geri alma tetikledi — mekanizma doğru çalıştı, eşik düzeltildi.
 
+### Buluttan deploy (GitHub Actions)
+**D39 · yalnız TESTNET halkaları (`testnet`, `follower`) · ELLE tetiklenir.** Geliştirme Claude
+bulut oturumlarında yapılır (bulutta SSH/`.env` YOK); deploy için Mac'e dönmek gerekmesin diye
+`.github/workflows/deploy.yml` ("**Deploy (awa TESTNET)**") vardır. Yeni bir deploy mantığı
+DEĞİLDİR: runner `scripts/deploy.sh awa <hedef> --ring <halka>`'yı AYNEN çağırır; entry-halt,
+15 dk ban izi, `BOT_MODE`↔ring, temiz ağaç, `flock`, sunucuda tam test (`DEPLOY_SKIP_TESTS`
+HER ZAMAN 0, input yok), `.env` parse, restart, 240 sn katı `/health` ve başarısızsa otomatik
+geri alma sunucuda aynen işler. Workflow'un ÜSTÜNE eklediği: yalnız `main`'den dispatch ·
+mainnet seçeneği YOK (reddedilir) · hedef main geçmişinde · CI `test` işi o SHA için yeşil ·
+`awa-testnet` ortam onayı · deploy sonrası doğrulama (sunucu HEAD == SHA, `RUNNING`, süreç
+yaşı). **Otomatik push-deploy YOKTUR** (bilinçli: entry-halt/ban/restart kararı insanındır).
+**Mainnet YALNIZ yerelden:** `scripts/deploy.sh awa vX.Y.Z --ring mainnet` + etiket + elle onay.
+
+**Tek seferlik kurulum (kullanıcı yapar):**
+1. Mac'inde AYRI, parolasız bir deploy anahtarı üret (runner parola giremez; başka yerde kullanma):
+   ```bash
+   ssh-keygen -t ed25519 -f ~/.ssh/awa_gha_deploy -N '' -C 'gha-deploy-awa'
+   ```
+2. `~/.ssh/awa_gha_deploy.pub` satırını awa'daki **deploy kullanıcısının** (bugün `deploy.sh`'in
+   `ssh awa` ile bağlandığı; `supervisorctl` + `/opt/tradingbot-*` yetkili kullanıcı)
+   `~/.ssh/authorized_keys` dosyasına ekle; başına `no-agent-forwarding,no-port-forwarding,no-X11-forwarding `
+   önerilir. (`from=` IP kısıtı pratik değil: GitHub runner aralıkları geniş ve değişken.)
+3. **Sunucu host anahtarını KENDİN doğrula** (workflow `ssh-keyscan`/ilk-bağlantı-güven KULLANMAZ):
+   ```bash
+   ssh-keyscan -p <port> -t ed25519 <host> | tee /tmp/awa_hostkey | ssh-keygen -lf -   # kendi makinenden
+   ssh awa 'ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub'                           # zaten güvendiğin oturumdan
+   # iki parmak izi AYNIYSA /tmp/awa_hostkey içeriği = AWA_SSH_KNOWN_HOSTS
+   ```
+   Port 22 dışında satır `[host]:port ssh-ed25519 AAAA…` biçimindedir (`ssh-keyscan -p` kendisi üretir);
+   satırdaki ad `AWA_SSH_HOST` ile BİREBİR aynı olmalı (IP ≠ alan adı).
+4. GitHub → **Settings → Environments → New environment → `awa-testnet`**: *Required reviewers* = sen
+   (tek yönetici isen *Prevent self-review* KAPALI kalmalı), *Deployment branches* = yalnız `main`.
+5. Beş secret'ı **bu ortama** ekle (*Environment secrets*): ortam onayı verilmeden okunamazlar
+   (repo düzeyine koyarsan yazma yetkili her workflow okuyabilir). Değerleri sohbete/commit'e/log'a YAZMA.
+
+   | Secret | İçerik |
+   |---|---|
+   | `AWA_SSH_HOST` | sunucu adı/IP (yalnız harf, rakam, `.`, `:`, `-`) |
+   | `AWA_SSH_USER` | deploy kullanıcısı |
+   | `AWA_SSH_PORT` | *(opsiyonel, varsayılan 22)* |
+   | `AWA_SSH_PRIVATE_KEY` | `~/.ssh/awa_gha_deploy` dosyasının TAMAMI (`BEGIN…`/`END…` satırları dahil) |
+   | `AWA_SSH_KNOWN_HOSTS` | 3. adımda doğrulanmış satır(lar) |
+6. **Ağ şartı:** awa'nın SSH portu GitHub Actions runner IP'lerine açık olmalı. Değilse "SSH kurulumu"
+   adımının ön uçuşu net hata verir ve yol ÇALIŞMAZ; yedek yol yerel `scripts/deploy.sh awa` (değişmedi).
+
+**Kullanım:** GitHub → **Actions → "Deploy (awa TESTNET)" → Run workflow** → *Use workflow from: `main`* →
+`ring` (testnet | follower), `target` (`origin/main` ya da geri alma SHA'sı), `no_restart` → Run; ortam
+onayı bekliyorsa onayla. Komut satırı: `gh workflow run deploy.yml --ref main -f ring=testnet -f target=origin/main`.
+Claude bulut oturumunda kullanıcı AÇIKÇA isterse oturum aynı workflow'u GitHub bağlayıcısıyla tetikler
+(kendi kendine tetiklemez). **Bulut iş akışı:** dalda geliştir → `python3 -m pytest tests -q` → PR → main'e
+birleştir → CI (`test`) yeşil → workflow'u tetikle. Dokümantasyon/harness değişikliğinde `no_restart=true`.
+Run özeti (Summary): halka, çözülen SHA, sunucu HEAD, `RUNNING` ve süreç yaşı (`etimes`) — CLAUDE.md #6
+workflow'un içindedir; şüphede elle: `ssh awa 'supervisorctl status tradingbot_v2; ps -o etimes= -p $(supervisorctl pid tradingbot_v2)'`.
+
+**Geri alma:** aynı workflow, `target=<önceki SHA>` (7-40 hane; `git log origin/main` ya da sunucuda
+`backups/commit.prev-<tarih>`). SHA main geçmişinde olmalı; CI kapısı geri almada da geçerlidir (CI hiç
+koşmamış çok eski commit için yerel `scripts/deploy.sh awa <sha>`). Başarısız deploy'da sunucu zaten kendi
+kendine önceki sürüme döner (ortak mantık).
+
+**Güvenlik notları:** repo PUBLIC → fork PR'larına secret verilmez; `workflow_dispatch` yalnız yazma
+yetkililerce tetiklenir ve ortam kuralı (yalnız `main` + onay) deploy.yml'i değiştirip secret okuyan bir dalı
+engeller. Girdiler `run:` içine gömülmez (script injection yok); `StrictHostKeyChecking yes`, host anahtarı
+secret'tan; özel anahtar iş sonunda silinir. Erişim logu (`logs/supervisor.log`) secret içerir — workflow onu
+ASLA okumaz/dökmez. Çalışan deploy'u **İPTAL ETME** (ssh ortada kopar; sunucuda yarım deploy kalabilir):
+`ssh awa 'tail -30 /opt/tradingbot-v2/logs/deploy.log'` ile sonucu doğrula (takipçi: `/opt/tradingbot-ap`).
+
+| Belirti | Anlamı / çözüm |
+|---|---|
+| `main tetiklendikten sonra ilerledi` | araya yeni commit girdi (deploy.sh de aynı kapıyı uygular); yeniden tetikle |
+| `CI yeşil değil / CI bulunamadı` | Actions → CI bitmedi/kırmızı; düzelt ya da bekle (kapıyı atlatan seçenek YOK) |
+| `eksik GitHub secret: …` | yalnız ADI söylenir; 5. adımdaki tabloya bak |
+| `awa'ya SSH bağlanamadı` | IP izni (6. adım) / anahtar `authorized_keys`'te mi / known_hosts adı eşleşiyor mu |
+| deploy.sh: `entry-halt aktif` / `ban izi` | SUNUCU kapısı çalıştı, süreç DOKUNULMADI; nedeni çöz (CLAUDE.md #3) |
+| deploy.sh: testler kırmızı → `GERİ ALINIYOR` | sunucu otomatik döndü; `logs/deploy-tests-*.log` |
+| `Doğrulama başarısız` | HEAD ≠ SHA / `RUNNING` değil / süreç deploy'dan önce başlamış: `logs/deploy.log` |
+
 ### Mainnet halkası
 Durum: pipeline hazır, dizin/program HENÜZ YOK (`/opt/tradingbot-main` bir insan tarafından
 kurulmadan mainnet deploy'u çalışmaz — bkz. `docs/MAINNET_PLAN.md` §1, §5). `scripts/deploy.sh`

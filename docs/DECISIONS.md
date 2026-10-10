@@ -7,6 +7,68 @@ Pencereler: AYI 2026-01-23→02-13 (BTC −30%) · YATAY 2026-07-01→07-21 · B
 
 ## Aktif kararlar
 
+### D39 — Buluttan elle tetiklenen deploy (GitHub Actions, yalnız TESTNET) · 2026-10-10 · KOD VAR; secret'lar kullanıcı tarafından eklenince AKTİF
+
+**Talep:** kullanıcı geliştirmeyi Claude bulut oturumlarına taşıdı; bulutta SSH anahtarı ve
+`.env` YOK, deploy ise yalnız kullanıcının Mac'inden `scripts/deploy.sh awa` ile yapılabiliyordu.
+İstenen: buluttan/telefondan tetiklenebilen ve mevcut güvenlik kapılarını ATLAMAYAN bir yol.
+
+**Ne:** `.github/workflows/deploy.yml` ("Deploy (awa TESTNET)") — YALNIZ `workflow_dispatch`
+(`ring` ∈ {testnet, follower}, `target` = `origin/main` ya da main geçmişindeki SHA,
+`no_restart`). Runner `scripts/deploy.sh awa <hedef> --ring <halka>`'yı AYNEN çağırır
+(`DEPLOY_SKIP_TESTS=0` sabit, input yok); `deploy.sh → server_deploy.sh` hattı DEĞİŞMEDİ, tüm
+kapılar sunucuda aynen işler: entry-halt (iki dosya), son 15 dk ban izi (418/banned),
+`BOT_MODE`↔ring, temiz ağaç, `flock`, sunucu venv'inde tam test, `.env` parse, restart, 240 sn'ye
+kadar katı `/health`, başarısızsa otomatik geri alma. Workflow'un ÜSTÜNE eklediği (yerine değil):
+(1) yalnız `refs/heads/main`'den dispatch; (2) hedef main geçmişinde olmalı, `origin/main` iken
+main dispatch'ten sonra ilerlediyse güvenli durur; (3) **CI kapısı:** `commits/<sha>/check-runs?check_name=test`
+— `ci.yml`'in `test` işi (ruff + tam pytest) o SHA için `success` olmalı (geri almada da);
+(4) `environment: awa-testnet` (kullanıcı required reviewer + "yalnız main" ekleyebilir, secret'lar
+bu ortamda durur); (5) tek deploy (`concurrency`, iptal YOK); (6) deploy sonrası doğrulama
+(CLAUDE.md #6): sunucu `git rev-parse HEAD` == çözülen SHA, `supervisorctl status` RUNNING,
+`ps -o etimes=` deploy süresinden büyük değil (restart gerçekten oldu); program/dizin eşlemesi
+`server_deploy.sh` `RING_*` tablosuyla birebir.
+
+**Neden otomatik push-deploy DEĞİL:** entry-halt, 418 ban penceresi ve restart zamanı insan kararıdır
+(CLAUDE.md yasak #3, D20a); her merge'de otomatik restart açık pozisyonları/ban durumunu bilmeden
+süreci düşürürdü. Elle tetikleme + isteğe bağlı ortam onayı kararı insanda tutar.
+**Neden mainnet kapsam dışı:** mainnet yalnız `vX.Y.Z` etiketi + elle `MAINNET` onayı ister
+(`docs/MAINNET_PLAN.md` §1, §5); workflow'da mainnet seçeneği YOK, guard açıkça reddeder ve
+`DEPLOY_CONFIRM` bayrağı hiç kullanılmaz.
+
+**Güvenlik:** `${{ }}` ifadeleri `run:` içinde HİÇ yok (girdi/secret yalnız step `env:` → "$VAR",
+script injection yok); secret'lar yalnız SSH kurulum adımına verilir; `StrictHostKeyChecking yes` +
+host anahtarı secret'tan (`ssh-keyscan`/TOFU yok, adı eşleşmezse net hata); ayrı parolasız ed25519
+deploy anahtarı; anahtar `if: always()` ile silinir; `permissions: contents/checks read`; ssh config
+değerleri regex ile doğrulanır (satır enjeksiyonu yok). Repo PUBLIC: fork PR'larına secret verilmez.
+
+**Motor/strateji/.env davranışı DEĞİŞMEZ.** Eklenenler: workflow, sözleşme testi, `.dockerignore`
+istisnası (`!.github/workflows/deploy.yml`, container içi `pytest` kırılmasın) ve dokümantasyon.
+Sunucuda tek seferlik değişiklik: deploy anahtarının `authorized_keys`'e eklenmesi.
+**Bulut oturumu kancası:** `.claude/hooks/session-start.sh` (+ `.claude/settings.json`) yalnız
+`CLAUDE_CODE_REMOTE=true` iken Python **3.12** venv (`.venv`, gitignore'da) kurar,
+`requirements.txt` + pyyaml + ruff yükler, `.env` yoksa `env.example`'dan üretir (CI ile aynı).
+Neden 3.12: sunucu/CI paritesi; bulut konteynerinin sistem Python'u 3.13'tür ve sabit
+pandas/numpy/pydantic pin'leri orada derlenemez (ölçüldü: pip "metadata generation" hatası).
+Yerel Mac ve sunucu etkilenmez.
+
+**Sınırlama (açık):** awa SSH portu GitHub Actions runner IP aralıklarına açık olmalı; değilse yol
+ÇALIŞMAZ ("SSH kurulumu" ön uçuşu net hata verir) ve yerel `scripts/deploy.sh awa` yedek yoldur.
+Çalışan deploy iptal edilirse ssh kopar, sunucuda yarım deploy kalabilir (RUNBOOK'ta uyarı).
+**Kodda doğrulanamayan:** workflow GitHub'da HENÜZ HİÇ koşmadı (secret'lar yok); ilk gerçek koşu
+önce `no_restart=true` ile denenmeli.
+
+**Kanıt:** `tests/test_deploy_workflow.py` (104 test) — statik sözleşme (tetikleyici, ring seçenekleri,
+izinler, `run:` içinde `${{` yok, secret kapsamı, SSH sertleştirmesi, `DEPLOY_SKIP_TESTS`, adım sırası,
+`always()` temizliği, `ci.yml` `test` işi, `server_deploy.sh` ile halka eşlemesi) + adımların gerçek
+`run:` metinleri sahte `ssh`/`gh`/`deploy.sh` ve geçici git depolarıyla bash'te koşturulur (guard,
+hedef çözümü/ata kontrolü, CI kapısı, SSH kurulumu, deploy argümanları, doğrulama, temizlik).
+`python3 -m pytest tests -q` → 3329 passed, 2 skipped (66,7 sn; atlananlar bu değişiklikten bağımsız opsiyonel testler, docker duman testi dahil); `ruff check --select E9,F63,F7,F82 src tests scripts` temiz.
+
+**Geri alma:** `.github/workflows/deploy.yml` (+ `.dockerignore` istisnası ve test dosyası) sil; GitHub'da
+`awa-testnet` ortamını/secret'ları sil; sunucuda deploy anahtarını `authorized_keys`'ten çıkar.
+Motor etkilenmez; yerel `scripts/deploy.sh` yolu hiç değişmedi.
+
 ### D38 — Ayrı, salt-okunur misafir pano hesabı · 2026-09-09
 
 **Talep:** kullanıcı, arkadaşının mevcut IP panosunu izlemesini istedi.

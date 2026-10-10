@@ -112,6 +112,12 @@ scripts/deploy.sh awa <önceki-commit>           # geri alma (backups/commit.pre
 # SUNUCUDA, yalnız .env değiştiyse (çıplak `supervisorctl restart` YASAK — D20a):
 # RESTART_LABEL=<etiket> scripts/restart_safe.sh testnet|follower|mainnet
 ```
+**Buluttan deploy (D39, yalnız TESTNET):** GitHub → Actions → **"Deploy (awa TESTNET)"** (elle `workflow_dispatch`;
+aynı `deploy.sh` + sunucu kapıları; otomatik push-deploy YOK). Bulut oturumu iş akışı: dalda geliştir → test →
+main'e merge (PR) → CI yeşil → workflow'u tetikle. **Mainnet yalnız yerelden** (`--ring mainnet` + etiket + elle onay).
+Kurulum/kullanım: `docs/RUNBOOK.md` "Buluttan deploy (GitHub Actions)". Bulut oturumunda bağımlılıklar
+`.claude/hooks/session-start.sh` ile Python 3.12 `.venv`'e kurulur (sistem Python 3.13 sabit pin'leri derleyemez).
+
 Backtest DAİMA sunucu env'iyle:
 ```bash
 env $(ssh awa grep ^SCALPER_ /opt/tradingbot-v2/.env | xargs) python3 -m src.strategies.scalper.backtest \
