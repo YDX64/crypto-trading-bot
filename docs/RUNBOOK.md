@@ -320,12 +320,14 @@ veya `scripts/` altında TEK satır değişiklik varsa ASLA kullanma ("davranı�
 değildir). Kontrol komutu — YALNIZ `RESTART'SIZ UYGUN` yazarsa restart'sız; başka her çıktıda TAM deploy
 (ssh ya da git hatası da "TAM DEPLOY YAP" der, sahte onay vermez):
 ```bash
-cd /Users/max/TRADINGBOT/v2 && git fetch -q origin && \
-SERVER=$(ssh awa 'git -C /opt/tradingbot-v2 rev-parse HEAD') && FILES=$(git diff --name-only "$SERVER" origin/main) && {
+cd /Users/max/TRADINGBOT/v2 && git fetch -q origin && DIR=/opt/tradingbot-v2 && \
+SERVER=$(ssh awa "git -C $DIR rev-parse HEAD") && FILES=$(git diff --no-renames --name-only "$SERVER" origin/main) && {
   BAD=$(printf '%s\n' "$FILES" | grep -vE '^(docs/|tests/|\.claude/|\.github/)|\.md$|^\.(git|docker)ignore$|^$')
   if [ -z "$BAD" ]; then echo "RESTART'SIZ UYGUN"; else echo "TAM DEPLOY GEREKLİ (restart'sız OLMAZ):"; echo "$BAD"; fi
 } || echo "KONTROL BAŞARISIZ — TAM DEPLOY YAP"
 ```
+`DIR` deploy edilecek HALKANIN sunucu dizinidir: scalper `/opt/tradingbot-v2`; takipçi (`--ring follower`)
+için başta `DIR=/opt/tradingbot-ap` yaz. `--no-renames`: taşınan bir `src/` dosyasının ESKİ yolu da listelenir.
 Neden: kod diski yeni commit'e geçer ama çalışan süreç eski modüllerle sürer; `src/` içindeki fonksiyon-içi (tembel)
 import'lar (ör. `src/main.py` istek işleyicileri) sonradan diskten YENİ modülü yükler → eski yüklü
 modüllerle yeni dosyalar KARIŞIR, canlı işlem yolunda çalışma anı hatası çıkabilir. Ayrıca bir sonraki
