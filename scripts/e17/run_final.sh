@@ -8,6 +8,7 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib17.sh
 source "$HERE/lib17.sh"
 
+e17_forbid_prelock
 e17_init
 e17_verify_lock
 
@@ -34,3 +35,4 @@ run_bt FINAL_B0 B0 "$FS" "$FE"
 e17_phase "FINAL karar"
 e17_analyzer final
 e17_analyzer decide
+e17_manifest runs

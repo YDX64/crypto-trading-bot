@@ -9,13 +9,14 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib17.sh
 source "$HERE/lib17.sh"
 
+e17_forbid_prelock
 e17_init
 e17_verify_lock
 
 DECISION="$E17_ROOT/DEV_DECISION.json"
 e17_require_file "$DECISION" "önce run_dev.sh bitmeli (dev-decide)"
 [ ! -f "$E17_ROOT/FINAL.json" ] || die "FINAL.json zaten var: VAL sonrası aşamaya geri dönülmez"
-e17_lines et advanced "$DECISION"
+e17_lines et advanced "$DECISION" --variants "$E17_VARIANTS"     # aile dışı id (B0, S5G, R1, T60 ...) reddedilir
 ADV=(${E17_TMPARR[@]+"${E17_TMPARR[@]}"})
 [ "${#ADV[@]}" -gt 0 ] || die "DEV'de ilerleyen arm yok: VAL başlamaz (VAL verisi indirilmez)"
 [ "${#ADV[@]}" -le 2 ] || die "ilerleyen arm sayısı 2'yi aşıyor (${#ADV[@]})"
@@ -64,12 +65,19 @@ while :; do
   read -r gsym gint gdate <<< "$LAST"
   SHIFTS=$((SHIFTS + 1))
   [ "$SHIFTS" -le 6 ] || die "VAL-YAPILAMADI: 6 kaydırma yetmedi"
-  if et val-cut --variants "$E17_VARIANTS" --root "$E17_ROOT" --repo "${E17_WINDOW_REPO:-$E17_CLONE}" --python "$E17_PY" \
-       --gap-date "$gdate" --gap-interval "$gint" --gap-source "$gsym $gint" --triples "${TRIPLES%;}"; then
+  CUTRC=0
+  et val-cut --variants "$E17_VARIANTS" --root "$E17_ROOT" --repo "${E17_WINDOW_REPO:-$E17_CLONE}" --python "$E17_PY" \
+     --gap-date "$gdate" --gap-interval "$gint" --gap-source "$gsym $gint" --triples "${TRIPLES%;}" || CUTRC=$?
+  if [ "$CUTRC" -eq 0 ]; then
     e17_chain "VAL penceresi kesildi: boşluk $gsym $gint $gdate (VAL_WINDOW_CUT.json)"
-  else
+  elif [ "$CUTRC" -eq 4 ]; then
+    # envtool yalnız GERÇEK VAL-YAPILAMADI'da 4 döner (kalan < 365 gün / 6 aylık kaydırma yetmedi).
     e17_chain "VAL-YAPILAMADI: boşluk $gsym $gint $gdate"
     die "VAL-YAPILAMADI (VAL_WINDOW_CUT.json); FINAL'e dokunulmaz"
+  else
+    # Araç çökmesi / zaman aşımı: kurtarılabilir altyapı hatası, terminal etiket YAZILMAZ.
+    e17_chain "VAL kesme hesabı altyapı hatası rc=$CUTRC (boşluk $gsym $gint $gdate); VAL-YAPILAMADI DEĞİL"
+    die "VAL pencere kesme hesabı başarısız (rc=$CUTRC): altyapı hatası, düzeltip yeniden başlatın"
   fi
 done
 e17_manifest VAL
@@ -87,3 +95,4 @@ done
 
 e17_phase "VAL karar"
 e17_analyzer val
+e17_manifest runs

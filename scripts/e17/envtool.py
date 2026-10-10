@@ -202,14 +202,18 @@ def _arm_id(x: Any) -> Optional[str]:
     return None
 
 
-def _passed(rec: Any) -> Optional[bool]:
+def _strict_pass(rec: Any, what: str) -> bool:
+    """Bir hüküm kaydı: bool veya {pass|ok|passed: bool}. Başka HER ŞEY ToolError (sessiz düşme YOK:
+    analizci şeması kayarsa hangi koşuların yapılacağı sessizce değişirdi)."""
     if isinstance(rec, bool):
         return rec
     if isinstance(rec, dict):
         for k in ("pass", "ok", "passed"):
             if k in rec:
-                return bool(rec[k])
-    return None
+                if isinstance(rec[k], bool):
+                    return rec[k]
+                raise ToolError(f"{what}: '{k}' bool değil ({type(rec[k]).__name__})")
+    raise ToolError(f"{what}: tanınmayan hüküm biçimi ({type(rec).__name__})")
 
 
 def family_ids(variants: Dict[str, Any]) -> List[str]:
@@ -217,9 +221,19 @@ def family_ids(variants: Dict[str, Any]) -> List[str]:
 
 
 def screen_arms(variants: Dict[str, Any], screen: Dict[str, Any]) -> List[str]:
-    """G6 koşusu gereken aile arm'ları: DEV_SCREEN.json `g6_arms` listesi varsa o,
-    yoksa G0..G5'in HEPSİ `pass` olan arm'lar (aile sırasıyla)."""
+    """G6 koşusu gereken aile arm'ları. YETKİLİ kaynak analizcinin `_meta.g6_needed` listesidir
+    (G0..G5'i yeniden hesaplamak, analizciye ek koşul eklenirse sessizce ayrışırdı). `_meta` yoksa
+    (eski/elle biçim) `g6_arms` listesi, o da yoksa G0..G5'in HEPSİ `pass` olan arm'lar (SIKI okuma)."""
     fam = family_ids(variants)
+    meta = screen.get("_meta")
+    if isinstance(meta, dict) and "g6_needed" in meta:
+        need = meta["g6_needed"]
+        if not isinstance(need, list) or not all(isinstance(a, str) for a in need):
+            raise ToolError("DEV_SCREEN.json _meta.g6_needed arm adı listesi değil")
+        bad = [a for a in need if a not in fam]
+        if bad:
+            raise ToolError(f"DEV_SCREEN.json g6_needed aile dışı arm içeriyor: {bad}")
+        return [a for a in fam if a in need]
     if isinstance(screen.get("g6_arms"), list):
         got = [a for a in (_arm_id(x) for x in screen["g6_arms"]) if a]
         return [a for a in fam if a in got]
@@ -228,37 +242,73 @@ def screen_arms(variants: Dict[str, Any], screen: Dict[str, Any]) -> List[str]:
         rec = screen.get(arm)
         if not isinstance(rec, dict):
             continue
-        gates = [rec.get(f"G{i}") for i in range(6)]
-        if all(_passed(g) is True for g in gates):
+        if all(_strict_pass(rec.get(f"G{i}"), f"DEV_SCREEN.{arm}.G{i}") for i in range(6)):
             out.append(arm)
     return out
 
 
-def advanced_arms(decision: Dict[str, Any]) -> List[str]:
+def advanced_arms(decision: Dict[str, Any], variants: Optional[Dict[str, Any]] = None) -> List[str]:
     adv = decision.get("advanced", [])
     if not isinstance(adv, list):
         raise ToolError("DEV_DECISION.json `advanced` liste değil")
-    return [a for a in (_arm_id(x) for x in adv) if a]
+    out = []
+    for x in adv:
+        a = _arm_id(x)
+        if not a:
+            raise ToolError("DEV_DECISION.json `advanced` girdisi arm adı değil")
+        out.append(a)
+    if variants is not None:
+        fam = family_ids(variants)
+        bad = [a for a in out if a not in fam]
+        if bad:
+            raise ToolError(f"DEV_DECISION.json advanced aile üyesi değil: {bad} (VAL yalnız aile arm'larını koşar)")
+    return out
 
 
 def fee2_failed_arms(decision: Dict[str, Any]) -> List[str]:
     out = []
     for arm, rec in (decision.get("g6") or {}).items():
-        f = rec.get("fee2") if isinstance(rec, dict) else None
-        if _passed(f) is False:
+        if not isinstance(rec, dict) or "fee2" not in rec:
+            raise ToolError(f"DEV_DECISION.json g6.{arm}.fee2 yok")
+        if not _strict_pass(rec["fee2"], f"DEV_DECISION.g6.{arm}.fee2"):
             out.append(arm)
     return out
 
 
 def val_winners(decision: Dict[str, Any]) -> List[str]:
+    """VAL kazananı: analizcinin `_meta.winner`'ı (str|None) yetkilidir; yoksa üst düzey `winner`
+    (str) ya da arm başına `winner: bool`. `winner` bool/str dışıysa ToolError."""
+    meta = decision.get("_meta")
+    if isinstance(meta, dict) and "winner" in meta:
+        w = meta["winner"]
+        if w is None:
+            return []
+        if isinstance(w, str) and w:
+            return [w]
+        raise ToolError("VAL_DECISION.json _meta.winner str/None değil")
     top = decision.get("winner")
     if isinstance(top, str) and top:
         return [top]
     out = []
     for arm, rec in decision.items():
-        if isinstance(rec, dict) and rec.get("winner") is True:
+        if arm.startswith("_") or not isinstance(rec, dict) or "winner" not in rec:
+            continue
+        if not isinstance(rec["winner"], bool):
+            raise ToolError(f"VAL_DECISION.json {arm}.winner bool değil ({type(rec['winner']).__name__})")
+        if rec["winner"]:
             out.append(arm)
     return out
+
+
+def cache_fingerprint(d: str | Path) -> str:
+    """Önbellek dizini parmak izi (ad, bayt, mtime_ns): backtest sırasında yazıldı mı?"""
+    root = Path(d)
+    h = hashlib.sha256()
+    for p in sorted(root.rglob("*")):
+        if p.is_file():
+            st = p.stat()
+            h.update(f"{p.relative_to(root).as_posix()}\0{st.st_size}\0{st.st_mtime_ns}\n".encode("utf-8"))
+    return h.hexdigest()
 
 
 # --------------------------------------------------------------------------
@@ -352,13 +402,23 @@ def add_months(d: date, n: int) -> date:
 # --------------------------------------------------------------------------
 
 GAP_RE = re.compile(
-    r"([A-Z0-9]+)-([0-9a-z]+)-(\d{4}-\d{2}-\d{2})\.zip arşivde YOK"
+    r"([A-Z0-9]+)-([0-9a-z]+)-(\d{4}-\d{2})(?:-(\d{2}))?\.zip(?:\.CHECKSUM)?(?![\w/])"
 )
 
 
 def parse_gaps(text: str) -> List[Tuple[str, str, str]]:
-    """Doldurucu günlüğünden (symbol, interval, YYYY-MM-DD) boşlukları çıkarır."""
-    return sorted(set(GAP_RE.findall(text)), key=lambda t: t[2])
+    """Doldurucu günlüğünden (symbol, interval, YYYY-MM-DD) boşlukları çıkarır (PLAN §9.5:
+    `ArchiveGapError` = zip 404 VE doğrulama hataları: CHECKSUM UYUŞMUYOR, bozuk zip, CHECKSUM 404).
+    Yalnız hata satırlarına bakılır (`HATA:` / `arşivde YOK`); salt ağ hatası (`İndirilemedi`) boşluk
+    DEĞİLDİR (altyapı), aylık zip adı ayın 1'i sayılır."""
+    found = set()
+    for line in text.splitlines():
+        if "İndirilemedi" in line:
+            continue
+        if "arşivde YOK" in line or line.lstrip().startswith("HATA:"):
+            for sym, iv, ym, day in GAP_RE.findall(line):
+                found.add((sym, iv, f"{ym}-{day or '01'}"))
+    return sorted(found, key=lambda t: (t[2], t[0], t[1]))
 
 
 def compute_val_cut(
@@ -465,6 +525,7 @@ def build_parser() -> argparse.ArgumentParser:
     add("cli", overlays=True)
     add("triple", True, True, True)
     add("gate", True, True, True)
+    add("arm", True, True, True)
     sp = add("ids")
     sp.add_argument("--group", default="all", choices=["family", "descriptive", "references", "all"])
     sp = add("window")
@@ -477,8 +538,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("key")
     sp = add("screen-arms")
     sp.add_argument("file")
-    for name in ("advanced", "fee2-failed", "winner"):
+    for name in ("fee2-failed", "winner"):
         add(name, with_common=False).add_argument("file")
+    sp = add("advanced", with_common=False)
+    sp.add_argument("file")
+    sp.add_argument("--variants", default=None, help="verilirse her arm aile üyesi olmalı")
+    sp = add("cache-fp", with_common=False)
+    sp.add_argument("dir")
     sp = add("guard", with_common=False)
     sp.add_argument("--lock", required=True)
     sp.add_argument("--variants", required=True)
@@ -523,7 +589,10 @@ def _run(a: argparse.Namespace) -> int:
         sys.stdout.write((cur if isinstance(cur, str) else json.dumps(cur)) + "\n")
         return 0
     if cmd == "advanced":
-        _lines(advanced_arms(load_json(a.file)))
+        _lines(advanced_arms(load_json(a.file), load_variants(a.variants) if a.variants else None))
+        return 0
+    if cmd == "cache-fp":
+        print(cache_fingerprint(a.dir))
         return 0
     if cmd == "fee2-failed":
         _lines(fee2_failed_arms(load_json(a.file)))
@@ -567,7 +636,7 @@ def _run(a: argparse.Namespace) -> int:
             rec = load_json(cut)
             if rec.get("status") == "VAL-YAPILAMADI":
                 raise ToolError("VAL-YAPILAMADI (VAL_WINDOW_CUT.json): VAL koşulamaz")
-            s = str(rec.get("val_start") or s)
+            s = str(rec.get("start") or rec.get("val_start") or s)
         print(f"{s} {e}")
         return 0
     if cmd == "screen-arms":
@@ -584,6 +653,8 @@ def _run(a: argparse.Namespace) -> int:
         rec = {
             "schema": "e17-val-window-cut/1", "status": res["status"],
             "original": [orig, e0], "val_start": res.get("val_start"), "val_end": e0,
+            # Analizci (Ctx.window) `start` anahtarını okur; yapılamadıysa özgün başlangıç (hiçbir şey koşmaz).
+            "start": res.get("val_start") or orig, "end": e0,
             "shift_months": res.get("shift_months"), "gap_date": a.gap_date,
             "gap_source": a.gap_source, "reason": res.get("reason"),
             "utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -605,6 +676,10 @@ def _run(a: argparse.Namespace) -> int:
         return 0
     if cmd == "gate":
         print("1" if gate_on(env) else "0")
+        return 0
+    if cmd == "arm":
+        # tek süreçte: "giriş bağlam rejim kapı" (üçlü doğrulaması + kapı çözümü)
+        print(" ".join(resolve_triple(variants, env, a.variant)) + " " + ("1" if gate_on(env) else "0"))
         return 0
     raise ToolError(f"bilinmeyen alt komut: {cmd}")
 

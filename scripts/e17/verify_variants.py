@@ -261,8 +261,17 @@ def check_settings(
     python: Optional[str],
 ) -> Dict[str, Dict[str, Any]]:
     cases = build_cases(variants, snapshot)
-    payload = {"cases": [{"label": c["label"], "env": c["env"]} for c in cases],
-               "keys": list(STRICT_KEYS)}
+    # Sorgulanan alanlar = STRICT_KEYS ∪ variants.json'daki HER override anahtarı (varyant, referans,
+    # kaplama): yazım hatası / plan dışı fazladan anahtar Settings'te alan olarak bulunamazsa FAIL.
+    override_attrs = {k.lower() for v in ET.all_variants(variants) for k in v.get("env", {})}
+    override_attrs |= {k.lower() for o in variants.get("overlays", []) for k in o.get("env", {})}
+    keys = sorted(set(STRICT_KEYS) | override_attrs)
+    # Plan (§3.1) override kümesi = STRICT_KEYS: dışındaki her anahtar (yazım hatası YA DA plan dışı
+    # fazladan override, örn. SCALPER_MAX_POSITIONS) kilit öncesi hata sayılır.
+    extra = sorted(k.upper() for k in override_attrs - set(STRICT_KEYS))
+    rep.check(not extra, "variants.json override anahtarları planlı kümede (STRICT_KEYS)",
+              "planda olmayan: " + ",".join(extra))
+    payload = {"cases": [{"label": c["label"], "env": c["env"]} for c in cases], "keys": keys}
     results = ET.run_repo_child(SETTINGS_CODE, repo, {}, payload, python)
     by_label = {r["label"]: r for r in results}
     for c in cases:
@@ -278,10 +287,10 @@ def check_settings(
         bad = []
         for k, exp in expected.items():
             attr = k.lower()
-            if attr not in vals:
-                # STRICT_KEYS dışı bir override: ayrıca sorgulanmaz, adı raporla
-                continue
-            if vals[attr] == "<<MISSING>>" or not values_equal(vals[attr], exp):
+            # Her override anahtarı sorgulanır (yukarıda); eksik alan = yazım hatası/plan dışı anahtar.
+            if attr not in vals or vals[attr] == "<<MISSING>>":
+                bad.append(f"{k}(Settings alanı değil)")
+            elif not values_equal(vals[attr], exp):
                 bad.append(k)
         if bad:
             rep.fail(f"Settings({c['label']}) çözülmüş değerler", "uyuşmayan anahtarlar: " + ",".join(bad))
@@ -353,8 +362,10 @@ def check_earliest(
         want = PLAN_EARLIEST.get(triple, {}).get(set_name)
         if want is None:
             continue
-        rep.check(got == want, f"PLAN §2.1: {'/'.join(triple)} {set_name} en erken bar == {want}",
-                  f"hesaplanan {got}")
+        # PLAN §2.1 tablosu 4h-rejimli üçlülerin FINAL'i için 07-22 yazar; tablodaki değer backtest'in
+        # KENDİ fonksiyonlarıyla 07-23'tür (yukarıdaki not). Ad planı değil, kilitli beklentiyi anar.
+        rep.check(got == want, f"kilitli en erken bar (backtest fonksiyonlarıyla): "
+                  f"{'/'.join(triple)} {set_name} == {want}", f"hesaplanan {got}")
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:

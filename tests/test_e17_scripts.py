@@ -15,8 +15,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -33,6 +36,8 @@ import verify_variants as VV  # noqa: E402
 PINNED = "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,BNBUSDT,ADAUSDT,LTCUSDT"
 SECRET_MARK = "0.02137"      # snapshot'a konan ayırt edici değer: hiçbir çıktıda görünmemeli
 PNL_MARK = "999.99"          # sahte backtest'in stdout'a bastığı "PnL"
+E17_SMOKE_LABELS = ("SMOKE_B0_AYI SMOKE_B0_V1 SMOKE_S15_h0 SMOKE_S15_h1 SMOKE_S5_W SMOKE_T5_W SMOKE_S15_W "
+                    "SMOKE_T15_W SMOKE_S30_W SMOKE_T30_W SMOKE_S60_W SMOKE_T60_W SMOKE_R1_M1")
 
 SNAPSHOT_LINES = [
     "# sahte sunucu snapshot'ı",
@@ -138,6 +143,10 @@ CNT.write_text(str(n))
 cwd = os.getcwd()
 listing = sorted(os.listdir(cwd))
 print(ctl.get("stdout", "TOPLAM 1 islem PnL +{pnl} PF 9.99"))
+if ctl.get("cache_write"):
+    a = sys.argv[1:]
+    cd = pathlib.Path(a[a.index("--cache-dir") + 1])
+    (cd / "POISON_BTCUSDT_5m.json.gz").write_text("ağdan çekildi")
 if n <= ctl.get("fail_first", 0):
     sys.exit(1)
 if ctl.get("write_report", True):
@@ -154,10 +163,21 @@ ctl = json.loads(CTL.read_text()) if CTL.exists() else {{}}
 a = sys.argv[1:]
 sym = a[a.index("--symbols") + 1]; start = a[a.index("--start") + 1]
 (REC / (str(os.getpid()) + ".json")).write_text(json.dumps({{"argv": a, "env": dict(os.environ)}}))
-gap = ctl.get("gap")
-if gap and start < gap["before"] and gap["symbol"] in sym.split(","):
-    print("HATA: %s-%s-%s.zip arşivde YOK (404). pencereyi daraltın." % (gap["symbol"], gap["interval"], gap["date"]), file=sys.stderr)
-    sys.exit(2)
+if ctl.get("fill_writes_cache"):
+    (pathlib.Path(a[a.index("--cache-dir") + 1]) / ("F_%s.json.gz" % os.getpid())).write_text("x")
+gaps = list(ctl.get("gaps", []))
+if ctl.get("gap"):
+    gaps.append(ctl["gap"])
+for gap in gaps:
+    if start < gap["before"] and gap["symbol"] in sym.split(","):
+        kind = gap.get("kind", "404")
+        if kind == "checksum":
+            print("HATA: CHECKSUM UYUŞMUYOR %s-%s-%s.zip: beklenen aa, hesaplanan bb" % (gap["symbol"], gap["interval"], gap["date"]), file=sys.stderr)
+        elif kind == "network":
+            print("HATA: İndirilemedi: https://x/%s/%s/%s-%s-%s.zip (URLError)" % (gap["symbol"], gap["interval"], gap["symbol"], gap["interval"], gap["date"]), file=sys.stderr)
+        else:
+            print("HATA: %s-%s-%s.zip arşivde YOK (404). pencereyi daraltın." % (gap["symbol"], gap["interval"], gap["date"]), file=sys.stderr)
+        sys.exit(2)
 once = ctl.get("fill_fail_once")
 if once and once in sym.split(","):
     mk = REC / ("once_" + once)
@@ -168,21 +188,51 @@ if ctl.get("fill_fail_always") and ctl["fill_fail_always"] in sym.split(","):
 print("OZET: 0 dosya")
 '''
 
+# Gerçek analizcinin KOMUT/ETİKET dilbilgisini taklit eder (parse_label, manifest hedefleri, LOCK_REF'i
+# E17_REPO'dan değil çağıran ortamdan görmesi): uyuşmayan çağrı rc=2 (UsageError) ile reddedilir.
 ANALYZER_STUB = '''\
-import json, pathlib, sys
-CTL = pathlib.Path({ctl!r}); LOG = pathlib.Path({alog!r})
+import json, os, pathlib, re, sys
+CTL = pathlib.Path({ctl!r}); LOG = pathlib.Path({alog!r}); ENVLOG = pathlib.Path({elog!r})
 ctl = json.loads(CTL.read_text()) if CTL.exists() else {{}}
 a = sys.argv[1:]
 root = pathlib.Path(a[a.index("--root") + 1]); body = a[:a.index("--root")]
 with LOG.open("a") as fh:
     fh.write(" ".join(body) + "\\n")
+with ENVLOG.open("a") as fh:
+    fh.write(json.dumps({{"cmd": body[0], "E17_REPO": os.environ.get("E17_REPO"), "cwd": os.getcwd(),
+                         "E17_ROOT": os.environ.get("E17_ROOT"), "E17_SNAPSHOT": os.environ.get("E17_SNAPSHOT")}}) + "\\n")
 cmd = body[0]
+FAM = {{"S5", "T5", "S15", "T15", "S30", "T30", "S60", "T60"}}
+ONLY = {{"AYI": {{"B0"}}, "V1": {{"B0"}}, "h0": {{"S15"}}, "h1": {{"S15"}}, "M1": {{"R1"}}}}
+
+
+def label_ok(label):
+    m = re.fullmatch(r"(DEV|VAL|FINAL|SMOKE)_(.+)", label)
+    if not m:
+        return False
+    if m.group(1) != "SMOKE":
+        return True
+    mm = re.fullmatch(r"(B0|R1|[ST]\\d+)_(AYI|V1|h0|h1|W|M1)", m.group(2))
+    if not mm:
+        return False
+    v, tag = mm.groups()
+    return v in FAM if tag == "W" else v in ONLY[tag]
+
+
+if cmd == "manifest" and body[1:] and body[1] not in ("smoke", "dev", "val", "final", "runs"):
+    print("UsageError: manifest hedefi", file=sys.stderr); sys.exit(2)
 if cmd == "check-run":
+    if not label_ok(body[1]):
+        print("UsageError: etiket", file=sys.stderr); sys.exit(2)
     if body[1] in ctl.get("check_fail", []):
         print("FAIL"); sys.exit(1)
     with (root / "ledger.jsonl").open("a") as fh:
-        fh.write(json.dumps({{"etiket": body[1]}}) + "\\n")
+        fh.write(json.dumps({{"label": body[1]}}) + "\\n")
     print("PASS"); sys.exit(0)
+if cmd == "smoke":
+    ok = ctl.get("smoke_pass", True)
+    (root / "SMOKE.json").write_text(json.dumps({{"pass": ok}}))
+    sys.exit(0 if ok else 5)
 for key, fname in (("screen", "DEV_SCREEN.json"), ("decision", "DEV_DECISION.json"), ("vdecision", "VAL_DECISION.json")):
     want = {{"dev-screen": "screen", "dev-decide": "decision", "val": "vdecision"}}.get(cmd)
     if want == key and key in ctl:
@@ -190,39 +240,71 @@ for key, fname in (("screen", "DEV_SCREEN.json"), ("decision", "DEV_DECISION.jso
 sys.exit(ctl.get("analyzer_rc", {{}}).get(cmd, 0))
 '''
 
+PLAN_REL = "docs/audits/2026-10-10-prereg-tf"
+
 
 def git(args: List[str], cwd: Path, env: Dict[str, str]) -> str:
     return subprocess.run(["git", *args], cwd=cwd, env=env, check=True, capture_output=True, text=True).stdout.strip()
 
 
-class Fx:
-    """Bir testin tüm dosya düzeni (sahte kök, snapshot, variants, H klonu, sahte komutlar)."""
+def copy_scripts(dst: Path) -> None:
+    """Gerçek betik dosyalarını (analizci HARİÇ: onun yerine sahte) hedef dizine kopyalar."""
+    dst.mkdir(parents=True, exist_ok=True)
+    for f in E17.iterdir():
+        if f.is_file() and f.name != "analyze_e17.py":
+            shutil.copy2(f, dst / f.name)
 
-    def __init__(self, tmp: Path, variants: Optional[Dict[str, Any]] = None) -> None:
+
+class Fx:
+    """Bir testin tüm dosya düzeni: sahte DEPO (betik kopyaları + lockdir), sahte kök, snapshot, variants,
+    sahte H klonu (betik kopyaları + sahte backtest/doldurucu/analizci). Varsayılan: KİLİT SONRASI kip
+    (LOCK_REF.json analizcinin gerçek biçiminde {l,h,lock_sha256,...}); prelock=True kilit öncesi duman."""
+
+    def __init__(self, tmp: Path, variants: Optional[Dict[str, Any]] = None, prelock: bool = False) -> None:
         self.tmp = tmp
+        self.prelock = prelock
         self.root = tmp / "e17_root"
         self.home = tmp / "home"
         self.home.mkdir()
         self.snapshot = tmp / "snap.env"
         self.snapshot.write_text("\n".join(SNAPSHOT_LINES) + "\n")
         self.variants_path = tmp / "variants.json"
-        self.variants = variants or make_variants(ET.sha256_file(self.snapshot))
-        self.variants_path.write_text(json.dumps(self.variants))
         self.ctl = tmp / "ctl.json"
         self.counter = tmp / "counter.txt"
         self.fills = tmp / "fills"
         self.alog = tmp / "analyzer.log"
+        self.elog = tmp / "analyzer_env.log"
         self.clone = tmp / "clone"
+        self.repo = tmp / "repo"
+        self.e17dir = self.repo / "scripts" / "e17"
+        self.lib = self.e17dir / "lib17.sh"
+        self.lockjson = self.repo / PLAN_REL / "LOCK.json"
         self.genv = {"PATH": os.environ["PATH"], "HOME": str(self.home), "GIT_CONFIG_NOSYSTEM": "1",
                      "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                      "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        copy_scripts(self.e17dir)
         self.h = self.build_clone()
+        self.write_variants(variants or make_variants(ET.sha256_file(self.snapshot)))
+        if not prelock:
+            self.write_root_json("LOCK_REF.json", {
+                "l": "a" * 40, "h": self.h, "lock_sha256": "b" * 64,
+                "lock_path": f"{PLAN_REL}/LOCK.json", "pushed": False, "history": []})
         self.set_ctl()
+
+    def write_variants(self, v: Dict[str, Any]) -> None:
+        """variants.json'u yazar ve sahte LOCK.json'daki hash'i tutarlı tutar (kilit ön-kontrolü)."""
+        self.variants = v
+        self.variants_path.write_text(json.dumps(v))
+        self.lockjson.parent.mkdir(parents=True, exist_ok=True)
+        self.lockjson.write_text(json.dumps({
+            "files": {f"{PLAN_REL}/variants.json": ET.sha256_file(self.variants_path)},
+            "snapshot_sha256": ET.sha256_file(self.snapshot)}))
 
     def build_clone(self) -> str:
         c = self.clone
-        for rel in ("src/strategies/scalper", "scripts/e17"):
+        for rel in ("src/strategies/scalper",):
             (c / rel).mkdir(parents=True)
+        copy_scripts(c / "scripts" / "e17")
         for pkg in ("src", "src/strategies", "src/strategies/scalper"):
             (c / pkg / "__init__.py").write_text("")
         (c / "src/strategies/scalper/backtest.py").write_text(
@@ -230,7 +312,7 @@ class Fx:
         (c / "scripts/fill_klines_cache_from_vision.py").write_text(
             FILL_STUB.format(ctl=str(self.ctl), fills=str(self.fills)))
         (c / "scripts/e17/analyze_e17.py").write_text(
-            ANALYZER_STUB.format(ctl=str(self.ctl), alog=str(self.alog)))
+            ANALYZER_STUB.format(ctl=str(self.ctl), alog=str(self.alog), elog=str(self.elog)))
         (c / ".gitignore").write_text("__pycache__/\nlogs/\n")
         git(["init", "-q"], c, self.genv)
         git(["add", "-A"], c, self.genv)
@@ -243,20 +325,21 @@ class Fx:
     def env(self, **extra: str) -> Dict[str, str]:
         e = {"PATH": os.environ["PATH"], "HOME": str(self.home), "E17_ROOT": str(self.root),
              "E17_SNAPSHOT": str(self.snapshot), "E17_VARIANTS": str(self.variants_path),
-             "E17_PY": sys.executable, "E17_PRELOCK": "1", "E17_H_COMMIT": self.h,
-             "E17_CLONE_DIR": str(self.clone), "HTTPS_PROXY": "http://proxy.invalid:3128",
-             "SOME_AMBIENT_VAR": "must-not-leak"}
+             "E17_PY": sys.executable, "E17_CLONE_DIR": str(self.clone),
+             "HTTPS_PROXY": "http://proxy.invalid:3128", "SOME_AMBIENT_VAR": "must-not-leak"}
+        if self.prelock:
+            e.update({"E17_PRELOCK": "1", "E17_H_COMMIT": self.h})
         e.update(extra)
         return e
 
     def run_script(self, body: str, **extra: str) -> subprocess.CompletedProcess:
-        script = f'source "{LIB}"\ne17_init\n{body}\n'
+        script = f'source "{self.lib}"\ne17_init\n{body}\n'
         return subprocess.run(["bash", "-c", script], env=self.env(**extra), capture_output=True,
                               text=True, timeout=300)
 
-    def run_file(self, name: str, **extra: str) -> subprocess.CompletedProcess:
-        return subprocess.run(["bash", str(E17 / name)], env=self.env(**extra), capture_output=True,
-                              text=True, timeout=600)
+    def run_file(self, name: str, *args: str, **extra: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["bash", str(self.e17dir / name), *args], env=self.env(**extra),
+                              capture_output=True, text=True, timeout=600)
 
     def report(self, label: str) -> Dict[str, Any]:
         return json.loads((self.root / "sealed" / "runs" / f"{label}.json").read_text())
@@ -266,6 +349,9 @@ class Fx:
 
     def analyzer_calls(self) -> List[str]:
         return self.alog.read_text().splitlines() if self.alog.exists() else []
+
+    def analyzer_envs(self) -> List[Dict[str, Any]]:
+        return [json.loads(ln) for ln in self.elog.read_text().splitlines()] if self.elog.exists() else []
 
     def fill_records(self) -> List[Dict[str, Any]]:
         if not self.fills.exists():
@@ -277,9 +363,28 @@ class Fx:
         (self.root / name).write_text(json.dumps(data))
 
 
+def _unlock_tree(path: Path) -> None:
+    """Önbellek salt-okunur yapıldığı için pytest temizliği öncesi yazma iznini geri ver."""
+    for p in [path, *path.rglob("*")]:
+        try:
+            p.chmod(p.stat().st_mode | 0o700)
+        except OSError:
+            pass
+
+
 @pytest.fixture
-def fx(tmp_path: Path) -> Fx:
-    return Fx(tmp_path)
+def fx(tmp_path: Path):
+    f = Fx(tmp_path)
+    yield f
+    _unlock_tree(tmp_path)
+
+
+@pytest.fixture
+def fxp(tmp_path: Path):
+    """Kilit öncesi duman kipi (E17_PRELOCK=1)."""
+    f = Fx(tmp_path, prelock=True)
+    yield f
+    _unlock_tree(tmp_path)
 
 
 def assert_silent(proc: subprocess.CompletedProcess, fx: Optional["Fx"] = None) -> None:
@@ -292,12 +397,12 @@ def assert_silent(proc: subprocess.CompletedProcess, fx: Optional["Fx"] = None) 
 
 
 ALLOWED_LINE = re.compile(
-    r"^(BT OK \S+ \d+|BT SKIP \S+|CHECK OK \S+|FILL OK \S+ \d+|PHASE .*|G6 arm sayisi: \d+|DRY .*)$")
+    r"^(BT OK \S+ \d+|BT SKIP \S+|CHECK (OK|SKIP) \S+|FILL OK \S+ \d+|PHASE .*|G6 arm sayisi: \d+|DRY .*)$")
 
 
 # ── Sözdizimi / sıkı kip ─────────────────────────────────────────────────────
 
-SCRIPTS = ["lib17.sh", "run_smoke.sh", "run_dev.sh", "run_val.sh", "run_final.sh"]
+SCRIPTS = ["lib17.sh", "run_smoke.sh", "run_dev.sh", "run_val.sh", "run_final.sh", "run_prova.sh"]
 
 
 @pytest.mark.parametrize("name", SCRIPTS)
@@ -471,7 +576,7 @@ def test_run_bt_rejects_role_key_collisions(tmp_path: Path, env_patch: Dict[str,
     probe = Fx(tmp_path / "probe") if (tmp_path / "probe").mkdir() is None else None
     v = probe.variants
     v["family"][0]["env"].update(env_patch)
-    probe.variants_path.write_text(json.dumps(v))
+    probe.write_variants(v)
     proc = probe.run_script('run_bt DEV_S5 S5 2025-01-01 2026-01-01')
     assert proc.returncode == 97
     assert probe.calls() == 0, "çakışan üçlüyle backtest ÇALIŞMAMALI"
@@ -484,13 +589,13 @@ def test_run_bt_rejects_cli_with_tf_flags_or_unpinned_symbols(tmp_path: Path) ->
     (tmp_path / "a").mkdir()
     a = Fx(tmp_path / "a")
     a.variants["common_cli"] = ["--strategies", "C", "--symbols", "ETHUSDT,BTCUSDT", "--diagnostics"]
-    a.variants_path.write_text(json.dumps(a.variants))
+    a.write_variants(a.variants)
     assert a.run_script('run_bt DEV_S5 S5 2025-01-01 2026-01-01').returncode == 97
     assert a.calls() == 0
     (tmp_path / "b").mkdir()
     b = Fx(tmp_path / "b")
     b.variants["common_cli"] = b.variants["common_cli"] + ["--tf-entry", "5m"]
-    b.variants_path.write_text(json.dumps(b.variants))
+    b.write_variants(b.variants)
     assert b.run_script('run_bt DEV_S5 S5 2025-01-01 2026-01-01').returncode == 97
     assert b.calls() == 0
 
@@ -507,7 +612,7 @@ def test_run_bt_rejects_dirty_or_wrong_clone(fx: Fx) -> None:
 def test_clone_is_created_from_repo_at_h_when_no_clone_dir(fx: Fx) -> None:
     env = fx.env(E17_REPO=str(fx.clone))
     del env["E17_CLONE_DIR"]
-    script = f'source "{LIB}"\ne17_init\nrun_bt DEV_S5 S5 2025-01-01 2026-01-01\n'
+    script = f'source "{fx.lib}"\ne17_init\nrun_bt DEV_S5 S5 2025-01-01 2026-01-01\n'
     proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
     new_clone = fx.root / "clone_H"
@@ -516,50 +621,101 @@ def test_clone_is_created_from_repo_at_h_when_no_clone_dir(fx: Fx) -> None:
 
 
 def test_lock_ref_required_without_prelock(fx: Fx) -> None:
-    proc = fx.run_script('echo x', E17_PRELOCK="0")
+    (fx.root / "LOCK_REF.json").unlink()
+    proc = fx.run_script('echo x')
     assert proc.returncode == 97 and "LOCK_REF" in proc.stderr
-    fx.write_root_json("LOCK_REF.json", {"h_commit": "f" * 40})
-    # E17_H_COMMIT ile LOCK_REF çelişirse reddedilir (LOCK.json ön-kontrolü de ayrıca şart)
-    proc = fx.run_script('echo x', E17_PRELOCK="0")
-    assert proc.returncode == 97
+    # Analizcinin GERÇEK LOCK_REF biçimi: {l, h, lock_sha256, lock_path, pushed, history}
+    fx.write_root_json("LOCK_REF.json", {"l": "a" * 40, "h": fx.h, "lock_sha256": "b" * 64,
+                                         "lock_path": "x", "pushed": False, "history": []})
+    assert fx.run_script('echo x').returncode == 0
+    # eski/elle biçim: `h_commit` yedeği
+    fx.write_root_json("LOCK_REF.json", {"h_commit": fx.h})
+    assert fx.run_script('echo x').returncode == 0
+    # E17_H_COMMIT ile LOCK_REF çelişirse reddedilir
+    proc = fx.run_script('echo x', E17_H_COMMIT="f" * 40)
+    assert proc.returncode == 97 and "çelişiyor" in proc.stderr
+    fx.write_root_json("LOCK_REF.json", {"h": "f" * 40})
+    assert fx.run_script('echo x').returncode == 97          # klon HEAD'i H değil
 
 
-def test_post_lock_path_checks_lock_json_and_calls_verify_lock(fx: Fx, tmp_path: Path) -> None:
-    lock = tmp_path / "LOCK.json"
-    good = {"files": {"docs/audits/x/variants.json": ET.sha256_file(fx.variants_path)},
-            "snapshot_sha256": ET.sha256_file(fx.snapshot)}
-    lock.write_text(json.dumps(good))
-    fx.write_root_json("LOCK_REF.json", {"h_commit": fx.h, "clone_dir": str(fx.clone)})
-    lock_env = fx.env(E17_PRELOCK="0", E17_LOCK_JSON=str(lock))
-    del lock_env["E17_H_COMMIT"], lock_env["E17_CLONE_DIR"]            # LOCK_REF'ten gelmeli
-    script = f'source "{LIB}"\ne17_init\ne17_verify_lock\nrun_bt DEV_S5 S5 2025-01-01 2026-01-01\n'
-    proc = subprocess.run(["bash", "-c", script], env=lock_env, capture_output=True, text=True)
+def test_post_lock_path_checks_lock_json_and_calls_verify_lock(fx: Fx) -> None:
+    script = f'source "{fx.lib}"\ne17_init\ne17_verify_lock\nrun_bt DEV_S5 S5 2025-01-01 2026-01-01\n'
+    env = fx.env()
+    proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
     assert fx.analyzer_calls()[0] == "verify-lock" and fx.report("DEV_S5")["env"]["PYTHONPATH"] == str(fx.clone)
-    # kilitli hash'ten sapma (variants.json değişti) -> başlamaz
+    # Analizci H klonundan çalışır ve depo kökü olarak L'yi taşıyan checkout'u (E17_REPO) görür:
+    # H klonunda lockdir/L YOKTUR.
+    e = fx.analyzer_envs()[0]
+    assert e["E17_REPO"] == str(fx.repo) and e["cwd"] == str(fx.clone)
+    assert e["E17_ROOT"] == str(fx.root) and e["E17_SNAPSHOT"] == str(fx.snapshot)
+    # E17_REPO açıkça verilirse o geçer
+    other = fx.tmp / "other_repo"
+    other.mkdir()
+    proc = subprocess.run(["bash", "-c", script], env=fx.env(E17_REPO=str(other)), capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert fx.analyzer_envs()[-1]['E17_REPO'] == str(other)
+    # kilitli hash'ten sapma (variants.json değişti, LOCK.json eski) -> başlamaz
     fx.variants["snapshot"]["note"] = "edited"
     fx.variants_path.write_text(json.dumps(fx.variants))
-    proc = subprocess.run(["bash", "-c", script], env=lock_env, capture_output=True, text=True)
+    proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
     assert proc.returncode == 97 and "kilit ön-kontrolü" in proc.stderr
     # analizci verify-lock başarısızsa zincir başlamaz
-    lock.write_text(json.dumps({"files": {"v/variants.json": ET.sha256_file(fx.variants_path)},
-                                "snapshot_sha256": ET.sha256_file(fx.snapshot)}))
+    fx.write_variants(fx.variants)
     fx.set_ctl(analyzer_rc={"verify-lock": 3})
     fx.counter.unlink()
-    proc = subprocess.run(["bash", "-c", script], env=lock_env, capture_output=True, text=True)
+    proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
     assert proc.returncode == 97 and "verify-lock" in proc.stderr and fx.calls() == 0
 
 
+def test_post_lock_rejects_unaudited_overrides(fx: Fx) -> None:
+    for var in ("E17_ANALYZER", "E17_LOCK_JSON"):
+        proc = fx.run_script("echo x", **{var: str(fx.lockjson)})
+        assert proc.returncode == 97 and var in proc.stderr, var
+    # kilit öncesi duman kipinde serbesttir
+    assert fx.run_script("echo x", E17_PRELOCK="1", E17_H_COMMIT=fx.h, E17_LOCK_JSON="/x").returncode == 0
+
+
+def test_script_working_copy_must_match_h_clone(fx: Fx) -> None:
+    (fx.e17dir / "run_smoke.sh").write_text((fx.e17dir / "run_smoke.sh").read_text() + "\n# kilit sonrası düzenleme\n")
+    proc = fx.run_script('run_bt DEV_S5 S5 2025-01-01 2026-01-01')
+    assert proc.returncode == 97 and "H klonundan farklı" in proc.stderr and "run_smoke.sh" in proc.stderr
+    assert fx.calls() == 0
+
+
 def test_chain_lock_rejects_concurrent_chain_and_recovers_stale(fx: Fx) -> None:
-    lockdir = fx.root / ".chain.lock"
-    lockdir.mkdir(parents=True)
-    (lockdir / "pid").write_text(str(os.getpid()))                      # yaşayan süreç
+    lock = fx.root / ".chain.lock"
+    fx.root.mkdir(parents=True, exist_ok=True)
+    os.symlink(str(os.getpid()), lock)                                  # yaşayan süreç (atomik sembolik bağ)
     proc = fx.run_script("echo x")
     assert proc.returncode == 97 and "başka bir E17 zinciri" in proc.stderr
-    (lockdir / "pid").write_text("999999")                              # ölü süreç -> devral
+    assert os.readlink(lock) == str(os.getpid()), "başkasının kilidi silinmemeli"
+    lock.unlink()
+    os.symlink("999999", lock)                                          # ölü süreç -> devral
     proc = fx.run_script("echo x")
     assert proc.returncode == 0 and "STALE LOCK" in (fx.root / "CHAIN.log").read_text()
-    assert not lockdir.exists(), "çıkışta kilit bırakılmalı"
+    assert not lock.is_symlink() and not lock.exists(), "çıkışta kilit bırakılmalı"
+    # eski biçim (pid dosyasız dizin) kalıntısı yarış yaratmaz: devralınır
+    lock.mkdir()
+    assert fx.run_script("echo x").returncode == 0 and not lock.exists()
+
+
+def test_sigterm_kills_background_workers_and_releases_lock(fx: Fx) -> None:
+    pidfile = fx.tmp / "child.pid"
+    script = f'source "{fx.lib}"\ne17_init\nsleep 31 &\necho $! > "{pidfile}"\nwait\n'
+    proc = subprocess.Popen(["bash", "-c", script], env=fx.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    for _ in range(100):
+        if pidfile.exists() and pidfile.read_text().strip():
+            break
+        time.sleep(0.1)
+    child = int(pidfile.read_text().strip())
+    assert (fx.root / ".chain.lock").is_symlink()
+    proc.send_signal(signal.SIGTERM)
+    assert proc.wait(timeout=20) == 143
+    time.sleep(0.3)
+    with pytest.raises(ProcessLookupError):
+        os.kill(child, 0)
+    assert not (fx.root / ".chain.lock").exists(), "SIGTERM sonrası kilit bırakılmalı"
 
 
 # ── Doldurma ─────────────────────────────────────────────────────────────────
@@ -625,21 +781,31 @@ def labels(proc: subprocess.CompletedProcess) -> List[str]:
 def test_run_smoke_dry_run_plan(fx: Fx) -> None:
     proc = fx.run_file("run_smoke.sh", E17_DRY_RUN="1")
     assert proc.returncode == 0, proc.stderr
+    # etiket dilbilgisi analizcinin parse_label'ı ile aynı: SMOKE_<arm>_W, SMOKE_R1_M1
     assert labels(proc) == ["SMOKE_B0_AYI", "SMOKE_B0_V1", "SMOKE_S15_h0", "SMOKE_S15_h1",
-                            "SMOKE_S5", "SMOKE_T5", "SMOKE_S15", "SMOKE_T15", "SMOKE_S30", "SMOKE_T30",
-                            "SMOKE_S60", "SMOKE_T60", "SMOKE_R1"]
+                            "SMOKE_S5_W", "SMOKE_T5_W", "SMOKE_S15_W", "SMOKE_T15_W", "SMOKE_S30_W", "SMOKE_T30_W",
+                            "SMOKE_S60_W", "SMOKE_T60_W", "SMOKE_R1_M1"]
     bt = {ln.split()[2]: ln for ln in dry_lines(proc, "BT")}
     assert "window=2026-01-23..2026-02-13" in bt["SMOKE_B0_AYI"] and "window=2025-01-06..2025-01-27" in bt["SMOKE_B0_V1"]
     assert "hashseed=1" in bt["SMOKE_S15_h1"] and "hashseed=0" in bt["SMOKE_S15_h0"]
-    assert "window=2026-04-01..2026-04-08" in bt["SMOKE_R1"] and "triple=1m/5m/15m" in bt["SMOKE_R1"]
+    assert "window=2026-04-01..2026-04-08" in bt["SMOKE_R1_M1"] and "triple=1m/5m/15m" in bt["SMOKE_R1_M1"]
     fills = dry_lines(proc, "FILL")
     gate_fills = {ln.split()[2] for ln in fills if "gate=1" in ln}
     assert gate_fills == {"SMOKE_B0_AYI", "SMOKE_B0_V1"}          # lider yalnız B0'da
-    an = [ln for ln in proc.stdout.splitlines() if ln.startswith("DRY ANALYZER")]
-    assert an[0] == "DRY ANALYZER manifest SMOKE" or an[0].endswith("manifest SMOKE")
-    assert an[-1] == "DRY ANALYZER smoke"
+    an = [ln.replace("DRY ANALYZER ", "") for ln in proc.stdout.splitlines() if ln.startswith("DRY ANALYZER")]
+    assert an == ["verify-lock", "manifest smoke", "smoke", "manifest runs"]   # küçük harf hedef
     assert fx.calls() == 0 and not fx.fill_records()               # kuru mod hiçbir şey çalıştırmaz
     assert_silent(proc)
+
+
+def test_dry_run_prints_full_argv_and_env_key_names(fx: Fx) -> None:
+    proc = fx.run_script('run_bt DEV_S15_ROB_FEE2 S15 2025-01-01 2026-01-01 ROB_FEE2', E17_DRY_RUN="1")
+    assert proc.returncode == 0, proc.stderr
+    argv = next(ln for ln in proc.stdout.splitlines() if ln.startswith("DRY ARGV "))
+    assert f"--start 2025-01-01 --end 2026-01-01 --cache-dir {fx.root}/cache" in argv and "--fee-stress" in argv
+    env = next(ln for ln in proc.stdout.splitlines() if ln.startswith("DRY ENV "))
+    assert "keys=PATH,HOME,PYTHONPATH,PYTHONHASHSEED,TRADINGBOT_LOG_DIR,dummy(8)" in env
+    assert SECRET_MARK not in proc.stdout
 
 
 def dev_fixture(fx: Fx) -> None:
@@ -647,7 +813,8 @@ def dev_fixture(fx: Fx) -> None:
     bad = dict(gates)
     bad["G2"] = {"value": 1, "threshold": 1, "pass": False}
     fx.write_root_json("DEV_SCREEN.json", {"S15": gates, "T30": gates, "S5": bad, "T5": bad,
-                                           "T15": bad, "S30": bad, "NOT_AN_ARM": gates})
+                                           "T15": bad, "S30": bad, "NOT_AN_ARM": gates,
+                                           "_meta": {"g6_needed": ["S15", "T30"]}})
     fx.write_root_json("DEV_DECISION.json", {
         "g6": {"S15": {"fee2": {"pass": True}, "dly1": {"pass": True}, "taker": {"pass": True}},
                "T30": {"fee2": {"pass": False}, "dly1": {"pass": True}, "taker": {"pass": True}}},
@@ -670,7 +837,7 @@ def test_run_dev_dry_run_order_matches_plan(fx: Fx) -> None:
     assert sorted(got[24:]) == sorted(diag) and got[24:36] == diag[:12]
     # sıra: doldurma -> manifest -> koşular -> dev-screen -> dev-decide -> diag
     an = [ln for ln in proc.stdout.splitlines() if ln.startswith("DRY ANALYZER")]
-    assert [a.replace("DRY ANALYZER ", "") for a in an] == ["manifest DEV", "dev-screen", "dev-decide", "diag"]
+    assert [a.replace("DRY ANALYZER ", "") for a in an] == ["verify-lock", "manifest dev", "dev-screen", "dev-decide", "diag", "manifest runs"]
     bt = {ln.split()[2]: ln for ln in dry_lines(proc, "BT")}
     assert "window=2025-04-01..2025-07-01" in bt["DEV_B0_Q2"] and "window=2025-01-01..2026-01-01" in bt["DEV_S5"]
     assert "overlays=ROB_FEE2" in bt["DEV_S15_ROB_FEE2"]
@@ -688,13 +855,58 @@ def test_run_dev_dry_run_order_matches_plan(fx: Fx) -> None:
     assert_silent(proc)
 
 
+def smoke_done(fx: Fx, passed: bool = True) -> None:
+    """Duman testini bitmiş say: 13 etiket ledger'da + analizci hükmü."""
+    fx.root.mkdir(parents=True, exist_ok=True)
+    with (fx.root / "ledger.jsonl").open("a") as fh:
+        for lbl in E17_SMOKE_LABELS.split():
+            fh.write(json.dumps({"label": lbl}) + "\n")
+    fx.write_root_json("SMOKE.json", {"pass": passed})
+
+
 def test_run_dev_refuses_without_finished_smoke(fx: Fx) -> None:
-    fx.write_root_json("LOCK_REF.json", {"h_commit": fx.h})
-    proc = fx.run_script('echo x', E17_PRELOCK="1")
-    assert proc.returncode == 0
     proc = fx.run_file("run_dev.sh")
     assert proc.returncode == 97 and "duman testi tamamlanmadı" in proc.stderr
     assert fx.calls() == 0 and not fx.fill_records()
+    # 13 koşunun biri eksik (örn. S3 arm'ı): yine reddedilir
+    smoke_done(fx)
+    lines = (fx.root / "ledger.jsonl").read_text().splitlines()
+    (fx.root / "ledger.jsonl").write_text("\n".join(ln for ln in lines if "SMOKE_T30_W" not in ln) + "\n")
+    proc = fx.run_file("run_dev.sh")
+    assert proc.returncode == 97 and "SMOKE_T30_W" in proc.stderr and fx.calls() == 0
+
+
+def test_run_dev_refuses_when_smoke_verdict_failed(fx: Fx) -> None:
+    smoke_done(fx, passed=False)           # check-run geçti (ledger dolu) AMA analizci smoke hükmü FAIL
+    proc = fx.run_file("run_dev.sh")
+    assert proc.returncode == 97 and "GEÇMEDİ" in proc.stderr
+    assert fx.calls() == 0 and not fx.fill_records()
+    (fx.root / "SMOKE.json").unlink()
+    proc = fx.run_file("run_dev.sh")
+    assert proc.returncode == 97 and "SMOKE.json" in proc.stderr
+
+
+def test_smoke_script_reports_failed_verdict_and_run_dev_then_refuses(fx: Fx) -> None:
+    fx.set_ctl(smoke_pass=False)
+    proc = fx.run_file("run_smoke.sh")
+    assert proc.returncode == 97                         # analizci smoke rc!=0 -> zincir durur
+    assert json.loads((fx.root / "SMOKE.json").read_text()) == {"pass": False}
+    proc = fx.run_file("run_dev.sh")
+    assert proc.returncode == 97 and "GEÇMEDİ" in proc.stderr
+
+
+def test_prelock_refused_by_dev_val_final_but_allowed_for_smoke_and_prova(fxp: Fx) -> None:
+    for name in ("run_dev.sh", "run_val.sh", "run_final.sh"):
+        proc = fxp.run_file(name, E17_DRY_RUN="0")
+        assert proc.returncode == 97 and "PRELOCK" in proc.stderr, name
+    assert fxp.calls() == 0 and not fxp.fill_records() and not fxp.analyzer_calls()
+    # smoke PRELOCK'ta çalışır: analizci HİÇ çağrılmaz, check-run atlanır, ledger yazılmaz
+    proc = fxp.run_file("run_smoke.sh")
+    assert proc.returncode == 0, proc.stderr
+    assert fxp.analyzer_calls() == [] and not (fxp.root / "ledger.jsonl").exists()
+    assert "CHECK SKIP SMOKE_B0_AYI" in proc.stdout and "CHECK OK" not in proc.stdout
+    assert fxp.report("SMOKE_R1_M1")["argv"][0] == "--strategies"
+    assert not (fxp.root / "LOCK_REF.json").exists()
 
 
 def test_run_val_refuses_without_dev_decision_or_advanced_arm(fx: Fx) -> None:
@@ -720,13 +932,31 @@ def test_run_val_dry_run_plan_and_window_cut(fx: Fx) -> None:
     assert all("window=2023-01-01..2024-11-18" in ln for ln in fills.values())
     assert all("gate=0" in ln for ln in fills.values())
     an = [ln.replace("DRY ANALYZER ", "") for ln in proc.stdout.splitlines() if ln.startswith("DRY ANALYZER")]
-    assert an == ["manifest VAL", "val"]
-    # §9.5: kesilmiş VAL başlangıcı otomatik kullanılır
-    fx.write_root_json("VAL_WINDOW_CUT.json", {"status": "CUT", "val_start": "2023-04-01", "val_end": "2024-11-18"})
+    assert an == ["verify-lock", "manifest val", "val", "manifest runs"]
+    # §9.5: kesilmiş VAL başlangıcı otomatik kullanılır (analizcinin okuduğu anahtar: `start`)
+    fx.write_root_json("VAL_WINDOW_CUT.json", {"status": "CUT", "start": "2023-04-01", "val_start": "2023-04-01",
+                                               "val_end": "2024-11-18"})
     proc = fx.run_file("run_val.sh", E17_DRY_RUN="1")
     assert "window=2023-04-01..2024-11-18" in dry_lines(proc, "BT")[0]
+    fx.write_root_json("VAL_WINDOW_CUT.json", {"status": "CUT", "val_start": "2023-05-01"})   # eski biçim yedeği
+    assert "window=2023-05-01..2024-11-18" in dry_lines(fx.run_file("run_val.sh", E17_DRY_RUN="1"), "BT")[0]
     fx.write_root_json("VAL_WINDOW_CUT.json", {"status": "VAL-YAPILAMADI", "val_start": None})
     assert fx.run_file("run_val.sh", E17_DRY_RUN="1").returncode == 97
+
+
+def test_run_val_refuses_non_family_advanced_ids(fx: Fx) -> None:
+    for bad in ("B0", "S5G", "R1", "T60", "NOPE"):
+        fx.write_root_json("DEV_DECISION.json", {"advanced": [bad]})
+        proc = fx.run_file("run_val.sh", E17_DRY_RUN="1")
+        assert proc.returncode == 97 and "aile üyesi değil" in proc.stderr, bad
+        assert not dry_lines(proc, "FILL") and not dry_lines(proc, "BT"), bad
+
+
+def test_run_val_refuses_after_final_json(fx: Fx) -> None:
+    fx.write_root_json("DEV_DECISION.json", {"advanced": ["S15"]})
+    fx.write_root_json("FINAL.json", {})
+    proc = fx.run_file("run_val.sh", E17_DRY_RUN="1")
+    assert proc.returncode == 97 and "FINAL.json" in proc.stderr and not dry_lines(proc, "FILL")
 
 
 def test_run_val_dedupes_triples_for_shared_timeframe(fx: Fx) -> None:
@@ -745,13 +975,17 @@ def test_run_final_refuses_without_unique_val_winner(fx: Fx) -> None:
     assert fx.run_file("run_final.sh", E17_DRY_RUN="1").returncode == 97
     fx.write_root_json("VAL_DECISION.json", {"S60": {"winner": True}})
     assert fx.run_file("run_final.sh", E17_DRY_RUN="1").returncode == 97        # aile dışı
-    fx.write_root_json("VAL_DECISION.json", {"S15": {"winner": True}})
+    # analizcinin gerçek biçimi: _meta.winner (None = kazanan yok)
+    fx.write_root_json("VAL_DECISION.json", {"S15": {"winner": False}, "_meta": {"winner": None}})
+    assert fx.run_file("run_final.sh", E17_DRY_RUN="1").returncode == 97
+    fx.write_root_json("VAL_DECISION.json", {"S15": {"winner": True}, "_meta": {"winner": "S15"}})
     fx.write_root_json("FINAL.json", {})
     assert fx.run_file("run_final.sh", E17_DRY_RUN="1").returncode == 97        # tek atış
 
 
 def test_run_final_dry_run_plan(fx: Fx) -> None:
-    fx.write_root_json("VAL_DECISION.json", {"S15": {"winner": True}, "T15": {"winner": False}})
+    fx.write_root_json("VAL_DECISION.json", {"S15": {"winner": True}, "T15": {"winner": False},
+                                             "_meta": {"winner": "S15", "status": "TAMAM"}})
     proc = fx.run_file("run_final.sh", E17_DRY_RUN="1")
     assert proc.returncode == 0, proc.stderr
     assert labels(proc) == ["FINAL_S15", "FINAL_B0"]
@@ -759,16 +993,17 @@ def test_run_final_dry_run_plan(fx: Fx) -> None:
     assert "gate=0" in fills["FINAL_S15"] and "gate=1" in fills["FINAL_B0"]
     assert all("window=2026-09-03..2026-10-08" in ln for ln in fills.values())
     an = [ln.replace("DRY ANALYZER ", "") for ln in proc.stdout.splitlines() if ln.startswith("DRY ANALYZER")]
-    assert an == ["manifest FINAL", "final", "decide"]
+    assert an == ["verify-lock", "manifest final", "final", "decide", "manifest runs"]
 
 
 # ── Uçtan uca (sahte komutlarla, kuru mod DEĞİL): aşama kapıları ve ledger ──
 
 def test_end_to_end_chain_smoke_dev_val_final(fx: Fx) -> None:
+    """Kilit SONRASI kip, analizcinin gerçek LOCK_REF/aşama-dosyası biçimleriyle, uçtan uca."""
     gates = {f"G{i}": {"pass": True} for i in range(6)}
-    fx.set_ctl(screen={"S15": gates},
+    fx.set_ctl(screen={"S15": gates, "_meta": {"g6_needed": ["S15"]}},
                decision={"g6": {"S15": {"fee2": {"pass": True}}}, "advanced": ["S15"], "k": 1},
-               vdecision={"S15": {"winner": True}})
+               vdecision={"S15": {"winner": True}, "_meta": {"winner": "S15", "status": "TAMAM"}})
     # DEV, duman bitmeden başlamaz
     assert fx.run_file("run_dev.sh").returncode == 97
     for script in ("run_smoke.sh", "run_dev.sh", "run_val.sh", "run_final.sh"):
@@ -778,11 +1013,18 @@ def test_end_to_end_chain_smoke_dev_val_final(fx: Fx) -> None:
         for ln in proc.stdout.splitlines():
             assert ALLOWED_LINE.match(ln), (script, ln)
     calls = fx.analyzer_calls()
-    order = [c.split()[0] for c in calls if c.split()[0] != "check-run"]
-    assert order == ["manifest", "smoke", "manifest", "dev-screen", "dev-decide", "diag",
-                     "manifest", "val", "manifest", "final", "decide"]
+    order = [c.split()[0] for c in calls if c.split()[0] not in ("check-run", "verify-lock")]
+    assert order == ["manifest", "smoke", "manifest",
+                     "manifest", "dev-screen", "dev-decide", "diag", "manifest",
+                     "manifest", "val", "manifest",
+                     "manifest", "final", "decide", "manifest"]
+    assert [c for c in calls if c.startswith("manifest")] == [
+        "manifest smoke", "manifest runs", "manifest dev", "manifest runs", "manifest val", "manifest runs",
+        "manifest final", "manifest runs"]
+    assert calls.count("verify-lock") == 5     # 4 aşama + (duman bitmeden reddedilen) ilk run_dev: her aşama kilidi doğrular
+    assert all(e["E17_REPO"] == str(fx.repo) for e in fx.analyzer_envs())
     ledger = (fx.root / "ledger.jsonl").read_text()
-    for lbl in ("SMOKE_R1", "DEV_B0_Q4", "DEV_S15_ROB_TAKER", "DEV_T5_DIAG_SBO", "VAL_S15_ROB_WALL",
+    for lbl in ("SMOKE_R1_M1", "SMOKE_T60_W", "DEV_B0_Q4", "DEV_S15_ROB_TAKER", "DEV_T5_DIAG_SBO", "VAL_S15_ROB_WALL",
                 "VAL_T60", "FINAL_S15", "FINAL_B0"):
         assert f'"{lbl}"' in ledger
     # tüm raporlar mühürlü (0400)
@@ -803,9 +1045,61 @@ def test_val_gap_rule_cuts_window_on_persistent_archive_gap(fx: Fx) -> None:
     # 5m/30m/1h ısınması 10.4 gün: 2023-03-10 boşluğunu ancak 2023-04-01 başlangıcı dışarıda bırakır
     assert cut["status"] == "CUT" and cut["val_start"] == "2023-04-01" and cut["shift_months"] == 3
     assert cut["gap_date"] == "2023-03-10" and cut["val_end"] == "2024-11-18"
+    # analizcinin (Ctx.window) okuduğu anahtar
+    assert cut["start"] == "2023-04-01" and cut["end"] == "2024-11-18"
     assert "VAL penceresi kesildi" in (fx.root / "CHAIN.log").read_text()
     argv = fx.report("VAL_S5")["argv"]
     assert argv[argv.index("--start") + 1] == "2023-04-01"
+
+
+def test_val_gap_rule_uses_latest_gap_in_one_step(fx: Fx) -> None:
+    fx.set_ctl(gaps=[{"symbol": "BTCUSDT", "interval": "5m", "date": "2023-02-01", "before": "2023-03-01"},
+                     {"symbol": "ETHUSDT", "interval": "5m", "date": "2023-03-10", "before": "2023-04-01"}])
+    fx.write_root_json("DEV_DECISION.json", {"advanced": ["S5"]})
+    proc = fx.run_file("run_val.sh", E17_WINDOW_REPO=str(REPO_ROOT), E17_FILL_FALLBACK_WORKERS="8")
+    assert proc.returncode == 0, proc.stderr
+    chain = (fx.root / "CHAIN.log").read_text()
+    assert chain.count("VAL penceresi kesildi") == 1, "en SON boşluk seçilmeli (tek adımda 2023-04-01)"
+    assert "boşluk ETHUSDT 5m 2023-03-10" in chain
+    assert json.loads((fx.root / "VAL_WINDOW_CUT.json").read_text())["start"] == "2023-04-01"
+
+
+def test_val_gap_rule_handles_checksum_failure_but_not_network_errors(fx: Fx) -> None:
+    fx.set_ctl(gap={"symbol": "BTCUSDT", "interval": "5m", "date": "2023-03-10", "before": "2023-04-01",
+                    "kind": "checksum"})
+    fx.write_root_json("DEV_DECISION.json", {"advanced": ["S5"]})
+    proc = fx.run_file("run_val.sh", E17_WINDOW_REPO=str(REPO_ROOT), E17_FILL_FALLBACK_WORKERS="8")
+    assert proc.returncode == 0, proc.stderr          # kalıcı doğrulama hatası da PLAN §9.5 boşluğudur
+    assert json.loads((fx.root / "VAL_WINDOW_CUT.json").read_text())["start"] == "2023-04-01"
+    # ağ hatası (İndirilemedi) boşluk DEĞİL: pencere kaymaz, zincir durur
+    other = fx.tmp / "net"
+    other.mkdir()
+    nx = Fx(other)
+    nx.set_ctl(gap={"symbol": "BTCUSDT", "interval": "5m", "date": "2023-03-10", "before": "2099-01-01",
+                    "kind": "network"})
+    nx.write_root_json("DEV_DECISION.json", {"advanced": ["S5"]})
+    proc = nx.run_file("run_val.sh", E17_WINDOW_REPO=str(REPO_ROOT), E17_FILL_FALLBACK_WORKERS="8")
+    assert proc.returncode == 97 and not (nx.root / "VAL_WINDOW_CUT.json").exists()
+
+
+def test_val_transient_fill_failure_retries_once_without_cutting(fx: Fx) -> None:
+    fx.set_ctl(fill_fail_once="SOLUSDT")
+    fx.write_root_json("DEV_DECISION.json", {"advanced": ["S5"]})
+    proc = fx.run_file("run_val.sh", E17_FILL_FALLBACK_WORKERS="8")
+    assert proc.returncode == 0, proc.stderr
+    chain = (fx.root / "CHAIN.log").read_text()
+    assert "1 kez yeniden deneniyor" in chain and "VAL penceresi kesildi" not in chain
+    assert not (fx.root / "VAL_WINDOW_CUT.json").exists()
+
+
+def test_val_cut_infrastructure_failure_is_not_val_yapilamadi(fx: Fx) -> None:
+    fx.set_ctl(gap={"symbol": "BTCUSDT", "interval": "5m", "date": "2023-03-10", "before": "2099-01-01"})
+    fx.write_root_json("DEV_DECISION.json", {"advanced": ["S5"]})
+    proc = fx.run_file("run_val.sh", E17_WINDOW_REPO=str(fx.tmp / "yok"), E17_FILL_FALLBACK_WORKERS="8")
+    assert proc.returncode == 97 and "altyapı hatası" in proc.stderr
+    chain = (fx.root / "CHAIN.log").read_text()
+    assert "VAL-YAPILAMADI:" not in chain, "terminal etiket yalnız gerçek VAL-YAPILAMADI'da yazılır"
+    assert not (fx.root / "VAL_WINDOW_CUT.json").exists()
 
 
 def test_val_gap_rule_gives_up_when_gap_cannot_be_excluded(fx: Fx) -> None:
@@ -857,11 +1151,38 @@ def test_envtool_stage_file_parsers(fx: Fx) -> None:
     gates = {f"G{i}": {"pass": True} for i in range(6)}
     screen = {"S5": gates, "T5": {**gates, "G3": {"pass": False}}, "S60": gates}
     assert ET.screen_arms(fx.variants, screen) == ["S5"]                  # açıklayıcı/başarısız hariç
+    # G5 tek başına başarısızsa da elenir
+    assert ET.screen_arms(fx.variants, {"S5": {**gates, "G5": {"pass": False}}}) == []
     assert ET.screen_arms(fx.variants, {"g6_arms": ["T30", "S5", "X"]}) == ["S5", "T30"]
+    # YETKİLİ kaynak: analizcinin _meta.g6_needed'ı (G0..G5'i yeniden hesaplamaz)
+    assert ET.screen_arms(fx.variants, {"S5": {**gates, "G2": {"pass": False}},
+                                        "_meta": {"g6_needed": ["T30", "S15"]}}) == ["S15", "T30"]
+    with pytest.raises(ET.ToolError):
+        ET.screen_arms(fx.variants, {"_meta": {"g6_needed": ["S60"]}})            # açıklayıcı aile dışı
     assert ET.advanced_arms({"advanced": ["S5", {"arm": "T5"}]}) == ["S5", "T5"]
+    with pytest.raises(ET.ToolError):
+        ET.advanced_arms({"advanced": ["B0"]}, fx.variants)                       # aile üyesi değil
     assert ET.fee2_failed_arms({"g6": {"S5": {"fee2": {"pass": False}}, "T5": {"fee2": True}}}) == ["S5"]
     assert ET.val_winners({"S5": {"winner": True}, "T5": {"winner": False}}) == ["S5"]
     assert ET.val_winners({"winner": "T15"}) == ["T15"]
+    assert ET.val_winners({"S5": {"winner": False}, "_meta": {"winner": None}}) == []
+    assert ET.val_winners({"S5": {"winner": False}, "_meta": {"winner": "S5"}}) == ["S5"]
+
+
+def test_envtool_stage_file_parsers_fail_loudly_on_schema_drift(fx: Fx) -> None:
+    # tanınmayan hüküm biçimi sessizce "geçmedi/atla" sayılmaz: ToolError
+    with pytest.raises(ET.ToolError):
+        ET.screen_arms(fx.variants, {"S5": {f"G{i}": {"status": "PASS"} for i in range(6)}})
+    with pytest.raises(ET.ToolError):
+        ET.screen_arms(fx.variants, {"S5": {f"G{i}": {"pass": "yes"} for i in range(6)}})
+    with pytest.raises(ET.ToolError):
+        ET.fee2_failed_arms({"g6": {"S5": {"fee2": 0.97}}})                       # sayısal fee2
+    with pytest.raises(ET.ToolError):
+        ET.fee2_failed_arms({"g6": {"S5": {"dly1": {"pass": True}}}})            # fee2 yok
+    with pytest.raises(ET.ToolError):
+        ET.val_winners({"S15": {"winner": "true"}})                               # dizge winner
+    with pytest.raises(ET.ToolError):
+        ET.val_winners({"_meta": {"winner": 3}})
 
 
 def test_envtool_parse_gaps_and_val_cut_arithmetic() -> None:
@@ -874,6 +1195,31 @@ def test_envtool_parse_gaps_and_val_cut_arithmetic() -> None:
     assert r["val_start"] == "2023-05-01"            # 41.7 gün ısınma: nisan başı yetmez
     r = ET.compute_val_cut(REPO_ROOT, v, "2023-01-01", "2024-11-18", [["5m", "30m", "1h"]], "2024-05-01")
     assert r["status"] == "VAL-YAPILAMADI"
+    # boşluk, en erken barın bulunduğu GÜNÜN içinde (2023-03-21 14:00 sonrası): o günün zip'i de gerekli
+    # -> 2023-04-01 yetmez (gün sonu hesabı), mayıs başı gerekir
+    r = ET.compute_val_cut(REPO_ROOT, v, "2023-01-01", "2024-11-18", [["5m", "30m", "1h"]], "2023-03-21")
+    assert r["val_start"] == "2023-05-01"
+    # 6 aylık kaydırma sınırı: boşluk her adayın ısınma penceresinin içindeyse yapılamadı
+    r = ET.compute_val_cut(REPO_ROOT, v, "2023-01-01", "2024-11-18", [["5m", "30m", "1h"]], "2023-07-15",
+                           max_shift_months=2)
+    assert r["status"] == "VAL-YAPILAMADI"
+
+
+def test_envtool_parse_gaps_validation_errors_and_network_noise() -> None:
+    text = (
+        "HATA: CHECKSUM UYUŞMUYOR SOLUSDT-5m-2023-02-02.zip: beklenen aa, hesaplanan bb\n"
+        "HATA: SOLUSDT-5m-2023-02-03.zip: bozuk zip (BadZipFile)\n"
+        "HATA: CHECKSUM dosyası yok (404): https://x/klines/BTCUSDT/1h/BTCUSDT-1h-2023-02-04.zip.CHECKSUM — d\n"
+        "HATA: İndirilemedi: https://x/klines/BTCUSDT/1h/BTCUSDT-1h-2023-02-05.zip ('timeout')\n"
+        "  ! indirme önbelleği bozuk, yeniden indirilecek: BTCUSDT-1h-2023-02-06.zip\n"
+        "  + indirildi BTCUSDT-1h-2023-02-07.zip (123 bayt)\n"
+        "HATA: ETHUSDT-5m-2023-03.zip: aylık dosya bozuk\n")
+    got = ET.parse_gaps(text)
+    assert ("SOLUSDT", "5m", "2023-02-02") in got and ("SOLUSDT", "5m", "2023-02-03") in got
+    assert ("BTCUSDT", "1h", "2023-02-04") in got and ("ETHUSDT", "5m", "2023-03-01") in got
+    dates = {d for _s, _i, d in got}
+    assert "2023-02-05" not in dates and "2023-02-06" not in dates and "2023-02-07" not in dates
+    assert [d for _s, _i, d in got] == sorted(d for _s, _i, d in got)
 
 
 def test_val_cut_only_counts_triples_reading_the_gap_interval() -> None:
@@ -916,7 +1262,7 @@ def test_verify_variants_passes_on_consistent_fake_snapshot(fx: Fx) -> None:
     assert out.count("Settings(") >= 12 + 8 * 7
     assert "Settings(S15+ROB_WALL)" in out and "SCALPER_ENTRY_BLOCK_WEEKDAYS_UTC" not in out
     assert "stop bandı [0.250,1.667]" in out                                    # S5: 5/20 .. 5/3
-    assert "PLAN §2.1: 5m/30m/1h DEV en erken bar == 2024-12-21 14:00" in out
+    assert "kilitli en erken bar (backtest fonksiyonlarıyla): 5m/30m/1h DEV == 2024-12-21 14:00" in out
     assert "sızıntı duvarı" in out and "2024-11-20 08:00" in out
 
 
@@ -988,3 +1334,116 @@ def test_verify_variants_on_real_inputs() -> None:  # pragma: no cover - yerel d
          "--variants", os.environ["E17_REAL_VARIANTS"], "--repo", str(REPO_ROOT), "--quiet"],
         capture_output=True, text=True, timeout=600)
     assert proc.returncode == 0, proc.stdout[-3000:]
+
+
+# ── Önbellek koruması (backtest yalnız OKUR) ─────────────────────────────────
+
+def test_backtest_writing_to_cache_is_detected_and_stops_chain(fx: Fx) -> None:
+    fx.set_ctl(cache_write=True)
+    proc = fx.run_script('run_bt DEV_S5 S5 2025-01-01 2026-01-01\necho NOT-REACHED')
+    assert proc.returncode == 97 and "NOT-REACHED" not in proc.stdout
+    assert "BT FAIL DEV_S5" in proc.stdout
+    assert "önbellek backtest sırasında DEĞİŞTİ" in (fx.root / "CHAIN.log").read_text()
+    assert not (fx.root / "ledger.jsonl").exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root dosya izinlerini aşar; parmak izi koruması yukarıda test edildi")
+def test_cache_is_readonly_during_backtests_and_writable_only_for_fills(fx: Fx) -> None:
+    fx.set_ctl(fill_writes_cache=True)
+    proc = fx.run_script('fill_or_die A S5 2025-01-01 2026-01-01\nfill_or_die B S15 2025-01-01 2026-01-01')
+    assert proc.returncode == 0, proc.stderr          # ikinci doldurma salt-okunur önbelleği yeniden açabilir
+    cache = fx.root / "cache"
+    assert len(list(cache.glob("F_*.json.gz"))) >= 16
+    assert not os.access(cache, os.W_OK), "doldurma bitince önbellek salt-okunur olmalı"
+    assert all(not os.access(p, os.W_OK) for p in cache.glob("F_*"))
+    fx.set_ctl(cache_write=True)
+    proc = fx.run_script('run_bt DEV_S5 S5 2025-01-01 2026-01-01')
+    assert proc.returncode == 97                      # yazma denemesi PermissionError ile de durur
+    assert not (cache / "POISON_BTCUSDT_5m.json.gz").exists()
+
+
+# ── Etiket / komut dilbilgisi: GERÇEK analizciyle (paralel bileşen birleşince) ───
+
+ANALYZER_REAL = E17 / "analyze_e17.py"
+
+
+@pytest.mark.skipif(not ANALYZER_REAL.exists(), reason="analyze_e17.py bu dalda yok (paralel bileşen)")
+def test_labels_and_commands_match_real_analyzer_grammar(fx: Fx) -> None:
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("analyze_e17_real", ANALYZER_REAL)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["analyze_e17_real"] = mod
+    spec.loader.exec_module(mod)
+    dev_fixture(fx)
+    fx.write_root_json("VAL_DECISION.json", {"S15": {"winner": True}, "_meta": {"winner": "S15"}})
+    seen_labels: List[str] = []
+    stages: List[List[str]] = []
+    for name in ("run_smoke.sh", "run_dev.sh", "run_val.sh", "run_final.sh"):
+        proc = fx.run_file(name, E17_DRY_RUN="1")
+        assert proc.returncode == 0, (name, proc.stderr)
+        seen_labels += labels(proc)
+        stages += [ln.replace("DRY ANALYZER ", "").split() for ln in proc.stdout.splitlines()
+                   if ln.startswith("DRY ANALYZER")]
+    assert len(set(seen_labels)) >= 55
+    for lbl in set(seen_labels):
+        mod.parse_label(lbl, fx.variants)              # UsageError => etiket dilbilgisi uyuşmuyor
+    for st in stages:
+        assert st[0] in mod.STAGES, st
+        if st[0] == "manifest":
+            assert st[1] in ("smoke", "dev", "val", "final", "runs"), st
+    for lbl in E17_SMOKE_LABELS.split():
+        mod.parse_label(lbl, fx.variants)
+
+
+# ── run_prova.sh (P0 doldurma provası) ───────────────────────────────────────
+
+def test_run_prova_fills_only_inside_cal_window(fxp: Fx) -> None:
+    proc = fxp.run_file("run_prova.sh", "S15")
+    assert proc.returncode == 0, proc.stderr
+    assert "FILL OK PROVA_S15" in proc.stdout and len(fxp.fill_records()) == 8        # 8 işçilik prova
+    starts = {r["argv"][r["argv"].index("--start") + 1] for r in fxp.fill_records()}
+    ends = {r["argv"][r["argv"].index("--end") + 1] for r in fxp.fill_records()}
+    assert starts == {"2026-04-01"} and ends == {"2026-05-01"}
+    assert fxp.calls() == 0 and fxp.analyzer_calls() == []
+    n = len(fxp.fill_records())
+    for bad in (("2025-01-01", "2026-01-01"), ("2023-01-01", "2023-02-01"), ("2026-09-03", "2026-10-08"),
+                ("2026-03-01", "2026-06-02"), ("2026-05-01", "2026-04-01"), ("x", "y")):
+        proc = fxp.run_file("run_prova.sh", "S15", *bad)
+        assert proc.returncode == 97, bad
+    assert len(fxp.fill_records()) == n, "CAL dışı pencerede hiçbir şey indirilmemeli"
+
+
+# ── verify_variants: planlı olmayan override anahtarları ─────────────────────
+
+def test_verify_variants_flags_typo_and_unplanned_override_keys(fx: Fx) -> None:
+    proc = mutate(fx, lambda v: v["family"][0]["env"].update({"SCALPER_FIXED_STOP_ROI_PCTX": "7"}))
+    assert proc.returncode == 1
+    assert "[FAIL] variants.json override anahtarları planlı kümede" in proc.stdout
+    assert "SCALPER_FIXED_STOP_ROI_PCTX" in proc.stdout and "Settings alanı değil" in proc.stdout
+    (fx.tmp / "y").mkdir()
+    fx2 = Fx(fx.tmp / "y")
+    proc = mutate(fx2, lambda v: v["family"][3]["env"].update({"SCALPER_MAX_POSITIONS": "9"}))
+    assert proc.returncode == 1 and "planda olmayan: SCALPER_MAX_POSITIONS" in proc.stdout
+    (fx.tmp / "z").mkdir()
+    fx3 = Fx(fx.tmp / "z")
+    proc = mutate(fx3, lambda v: v["overlays"][0]["env"].update({"SCALPER_TYPO_KEY": "1"}))
+    assert proc.returncode == 1 and "SCALPER_TYPO_KEY" in proc.stdout
+
+
+# ── Mutasyon avında hayatta kalan davranışlar ────────────────────────────────
+
+def test_run_bt_rejects_invalid_label_characters(fx: Fx) -> None:
+    for bad in ("DEV S5", "DEV/S5", "DEV-S5", "../x", ""):
+        proc = fx.run_script(f'run_bt "{bad}" S5 2025-01-01 2026-01-01')
+        assert proc.returncode == 97 and "geçersiz koşu etiketi" in proc.stderr, bad
+    assert fx.calls() == 0
+
+
+def test_run_bt_role_collision_detected_even_when_variants_triple_is_consistent(tmp_path: Path) -> None:
+    probe = Fx(tmp_path)
+    v = probe.variants
+    v["family"][0]["env"]["SCALPER_TF_CONTEXT"] = "5m"
+    v["family"][0]["triple"] = ["5m", "5m", "1h"]          # triple de çakışık: yalnız çakışma kontrolü yakalar
+    probe.write_variants(v)
+    proc = probe.run_script('run_bt DEV_S5 S5 2025-01-01 2026-01-01')
+    assert proc.returncode == 97 and "ROL ÇAKIŞMASI" in proc.stderr and probe.calls() == 0

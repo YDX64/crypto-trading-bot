@@ -7,15 +7,12 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib17.sh
 source "$HERE/lib17.sh"
 
+e17_forbid_prelock
 e17_init
 e17_verify_lock
 
-# Duman testleri bitmeden DEV başlamaz (PLAN §5.2 "engelleyici").
-if [ "$E17_DRY_RUN" != 1 ]; then
-  for lbl in SMOKE_B0_AYI SMOKE_B0_V1 SMOKE_S15_h0 SMOKE_S15_h1 SMOKE_R1; do
-    e17_in_ledger "$lbl" || die "duman testi tamamlanmadı ($lbl ledger'da yok): önce run_smoke.sh"
-  done
-fi
+# Duman testleri bitmeden DEV başlamaz (PLAN §5.2 "engelleyici"): 13 koşu ledger'da + smoke hükmü PASS.
+if [ "$E17_DRY_RUN" != 1 ]; then e17_require_smoke; fi
 
 e17_window DEV
 DEV_S=$E17_WS
@@ -77,7 +74,7 @@ FEE15=()
 if [ -f "$DECISION" ]; then
   e17_lines et fee2-failed "$DECISION"
   FEE15=(${E17_TMPARR[@]+"${E17_TMPARR[@]}"})
-  e17_lines et advanced "$DECISION"
+  e17_lines et advanced "$DECISION" --variants "$E17_VARIANTS"
   for arm in ${E17_TMPARR[@]+"${E17_TMPARR[@]}"}; do
     case " ${FEE15[*]-} " in *" $arm "*) ;; *) FEE15+=("$arm") ;; esac
   done
@@ -91,4 +88,5 @@ for arm in ${FEE15[@]+"${FEE15[@]}"}; do
   run_bt "DEV_${arm}_DIAG_FEE15" "$arm" "$DEV_S" "$DEV_E" DIAG_FEE15
 done
 e17_analyzer diag
+e17_manifest runs
 e17_phase "DEV tamam"

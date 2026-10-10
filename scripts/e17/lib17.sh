@@ -2,8 +2,10 @@
 # E17 koşu kitaplığı (PLAN §4, §5.2, §6, Ek A) — `source` edilir, tek başına çalışmaz.
 #
 # Sıkı kip: hata = tüm zincir exit 97 ile durur (hata yutan kuyruk komutu YOK; E16'da hata yalnız
-# loglanıyordu). Konsola YALNIZ 'BT OK|FAIL|SKIP', 'CHECK OK|FAIL', 'FILL OK|FAIL',
-# 'PHASE ...' ve 'DRY ...' yazılır: hiçbir PnL/PF/işlem sayısı yankılanmaz (mühür).
+# loglanıyordu). Konsola YALNIZ 'BT OK|FAIL|SKIP', 'CHECK OK|FAIL|SKIP', 'FILL OK|FAIL',
+# 'PHASE ...', 'G6 arm sayisi: N' ve 'DRY ...' yazılır: hiçbir PnL/PF/işlem sayısı yankılanmaz (mühür).
+# (PLAN §5.2 yalnız 'BT OK|FAIL' der; diğerleri kabul edilen üst kümedir, sonuç taşımaz — yalnız aşama
+# durumu / arm adı. CHECK satırını analizci değil bu sarmalayıcı basar.)
 # Sunucu snapshot'ının (E17_SNAPSHOT) içeriği HİÇBİR YERE yazılmaz; ERR tuzağı
 # BASH_COMMAND'ı BİLEREK basmaz (env -i satırı snapshot değerlerini taşır).
 #
@@ -12,11 +14,20 @@
 #   E17_ROOT       varsayılan $HOME/e17_root (cache/ dl/ sealed/ ledger.jsonl ...)
 #   E17_VARIANTS   varsayılan <depo>/docs/audits/2026-10-10-prereg-tf/variants.json
 #   E17_PY         python yolu (varsayılan <depo>/.venv/bin/python, yoksa python3)
-#   E17_PRELOCK=1  kilit öncesi duman: LOCK_REF.json/LOCK.json aranmaz, E17_H_COMMIT şart
-#   E17_H_COMMIT   H commit'i (LOCK_REF.json `h_commit` ile çelişirse hata)
+#   E17_PRELOCK=1  kilit öncesi duman (YALNIZ run_smoke.sh / run_prova.sh): LOCK_REF.json/LOCK.json
+#                  aranmaz, analizci HİÇ çağrılmaz (check-run/manifest/smoke atlanır), E17_H_COMMIT şart.
+#                  run_dev/val/final bunu REDDEDER (kilitsiz koşu yok, PLAN §9.1).
+#   E17_H_COMMIT   H commit'i (LOCK_REF.json `h` / `h_commit` ile çelişirse hata)
 #   E17_CLONE_DIR  hazır H klonu (yoksa E17_ROOT/clone_H, E17_REPO'dan klonlanır)
-#   E17_ANALYZER   analizci yolu (varsayılan <klon>/scripts/e17/analyze_e17.py)
+#   E17_REPO       kilit commit'i L'yi (LOCK.json, lockdir) taşıyan depo; varsayılan: bu betiklerin deposu.
+#                  Analizciye E17_REPO olarak geçer (analizci L'yi ve lockdir'i orada arar); H klonunda
+#                  L YOKTUR (L, H'den sonra gelir).
+#   E17_ANALYZER   (yalnız E17_PRELOCK=1) analizci yolu; kilit sonrası REDDEDİLİR (varsayılan:
+#                  <klon>/scripts/e17/analyze_e17.py). E17_LOCK_JSON da öyle.
 #   E17_WINDOW_REPO  (yalnız test) VAL boşluk hesabı için depo kökü (varsayılan: H klonu)
+#
+# Kod bütünlüğü: betiklerin çalışma kopyası (scripts/e17/*) H klonundaki kopyalarla bayt bayt AYNI olmalı
+# (e17_ensure_clone); aksi halde kilit sonrası bir düzenleme sessizce davranışı değiştirirdi.
 #   E17_FILL_WORKERS (8) / E17_FILL_FALLBACK_WORKERS (4)  doldurma işçileri
 #   E17_BT_ATTEMPTS (2)  altyapı yeniden denemesi (yalnız rapor üretilmediyse)
 #   E17_DRY_RUN=1  komutları çalıştırmadan 'DRY ...' satırları olarak yazdır
@@ -34,7 +45,8 @@ E17_DUMMY=()
 E17_BASE_ENV=()
 E17_TMPARR=()
 E17_CLONE_OK=0
-E17_LOCKDIR=""
+E17_LOCKLINK=""
+E17_REPO_L=""
 
 # ── Hata / günlük ───────────────────────────────────────────────────────────
 
@@ -54,11 +66,24 @@ e17_cleanup() {
   for d in ${E17_CLEAN[@]+"${E17_CLEAN[@]}"}; do
     if [ -n "$d" ]; then rm -rf "$d"; fi
   done
-  if [ -n "$E17_LOCKDIR" ]; then rm -rf "$E17_LOCKDIR"; fi
+  if [ -n "$E17_LOCKLINK" ] && [ "$(readlink "$E17_LOCKLINK" 2>/dev/null)" = "$$" ]; then
+    rm -f "$E17_LOCKLINK"
+  fi
+}
+
+# SIGTERM/SIGINT/SIGHUP: arka plandaki işçileri (doldurma, backtest) öldür, sonra çık (EXIT tuzağı kilidi bırakır).
+e17_on_term() {
+  local p
+  trap '' TERM INT HUP
+  for p in $(jobs -p); do
+    if kill "$p" 2>/dev/null; then :; fi
+  done
+  exit 143
 }
 
 trap 'e17_on_err $? $LINENO "${FUNCNAME[0]:-ana}"' ERR
 trap e17_cleanup EXIT
+trap e17_on_term TERM INT HUP
 
 e17_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
@@ -113,6 +138,13 @@ e17_init() {
   chmod 700 "$E17_ROOT/sealed"
   touch "$E17_ROOT/CHAIN.log"
 
+  # Kilit sonrası (PRELOCK değil) denetimsiz yol/komut geçersiz kılmaları REDDEDİLİR.
+  if [ "${E17_PRELOCK:-0}" != 1 ]; then
+    [ -z "${E17_ANALYZER:-}" ] || die "E17_ANALYZER kilit sonrası kullanılamaz (yalnız E17_PRELOCK=1)"
+    [ -z "${E17_LOCK_JSON:-}" ] || die "E17_LOCK_JSON kilit sonrası kullanılamaz (yalnız E17_PRELOCK=1)"
+  fi
+  # Analizcinin depo kökü: L'yi ve lockdir'i taşıyan checkout (H klonunda L yoktur).
+  E17_REPO_L=${E17_REPO:-$E17_REPO_ROOT}
   E17_CLONE=${E17_CLONE_DIR:-$E17_ROOT/clone_H}
   if [ "$E17_DRY_RUN" = 1 ]; then
     E17_H=${E17_H_COMMIT:-DRYRUN}
@@ -129,7 +161,9 @@ e17_init() {
 e17_resolve_h() {
   local ref="$E17_ROOT/LOCK_REF.json" from_ref=""
   if [ -f "$ref" ]; then
-    from_ref=$(et json-get "$ref" h_commit) || from_ref=""
+    # Analizcinin `lock` yazdığı anahtar `h`; eski/elle yazılan kayıtlar için `h_commit` yedeği.
+    from_ref=$(et json-get "$ref" h) || from_ref=""
+    if [ -z "$from_ref" ]; then from_ref=$(et json-get "$ref" h_commit) || from_ref=""; fi
   fi
   if [ -z "${E17_CLONE_DIR:-}" ] && [ -f "$ref" ]; then
     # LOCK_REF.json isteğe bağlı `clone_dir` taşıyabilir (H klonunun yolu).
@@ -141,10 +175,10 @@ e17_resolve_h() {
     [ -n "${E17_H_COMMIT:-}" ] || die "E17_PRELOCK=1 için E17_H_COMMIT gerekli"
     E17_H=$E17_H_COMMIT
   else
-    [ -n "$from_ref" ] || die "LOCK_REF.json (h_commit) yok: kilit olmadan koşu yok (kilit öncesi duman için E17_PRELOCK=1)"
+    [ -n "$from_ref" ] || die "LOCK_REF.json (h) yok: kilit olmadan koşu yok (kilit öncesi duman için E17_PRELOCK=1)"
     E17_H=$from_ref
     if [ -n "${E17_H_COMMIT:-}" ] && [ "$E17_H_COMMIT" != "$from_ref" ]; then
-      die "E17_H_COMMIT, LOCK_REF.json h_commit ile çelişiyor"
+      die "E17_H_COMMIT, LOCK_REF.json h ile çelişiyor"
     fi
   fi
   [[ $E17_H =~ ^[0-9a-f]{40}$ ]] || die "H commit'i 40 haneli sha değil"
@@ -159,18 +193,19 @@ e17_lock_guard() {
 }
 
 e17_take_lock() {
-  local d="$E17_ROOT/.chain.lock" pid
-  if ! mkdir "$d" 2>/dev/null; then
-    pid=$(cat "$d/pid" 2>/dev/null) || pid=""
+  # Sembolik bağ = atomik oluşturma + içerik (pid) tek adımda: mkdir+pid dosyası yarışı yok.
+  local lk="$E17_ROOT/.chain.lock" pid
+  if [ -d "$lk" ] && [ ! -L "$lk" ]; then rm -rf "$lk"; fi     # eski biçim (dizin) kalıntısı
+  if ! ln -s "$$" "$lk" 2>/dev/null; then
+    pid=$(readlink "$lk" 2>/dev/null) || pid=""
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       die "başka bir E17 zinciri çalışıyor (pid $pid)"
     fi
     e17_chain "STALE LOCK devralındı (pid ${pid:-?})"
-    rm -rf "$d"
-    mkdir "$d" || die "zincir kilidi alınamadı"
+    rm -f "$lk"
+    ln -s "$$" "$lk" 2>/dev/null || die "zincir kilidi alınamadı (başka zincir yarıştı)"
   fi
-  printf '%s\n' "$$" > "$d/pid"
-  E17_LOCKDIR=$d
+  E17_LOCKLINK=$lk
 }
 
 e17_ensure_clone() {
@@ -185,6 +220,13 @@ e17_ensure_clone() {
   head=$(git -C "$E17_CLONE" rev-parse HEAD) || die "klon HEAD okunamadı"
   [ "$head" = "$E17_H" ] || die "klon HEAD'i H değil"
   [ -z "$(git -C "$E17_CLONE" status --porcelain)" ] || die "H klonu kirli (untracked/değişmiş dosya)"
+  # Çalıştırılan betik kodu (çalışma kopyası) H'dekiyle AYNI olmalı (PLAN §5.3: scripts/e17/* H blob'ları).
+  local f
+  for f in "$E17_SCRIPTS_DIR"/*; do
+    [ -f "$f" ] || continue
+    cmp -s "$f" "$E17_CLONE/scripts/e17/$(basename "$f")" \
+      || die "betik çalışma kopyası H klonundan farklı: scripts/e17/$(basename "$f")"
+  done
   E17_CLONE_OK=1
 }
 
@@ -193,10 +235,11 @@ e17_ensure_clone() {
 # e17_prepare_arm_env ARM [--overlay X ...]  → E17_ARM_ENV, E17_DUMMY (+ rol doğrulaması)
 e17_prepare_arm_env() {
   local arm=$1; shift
-  E17_TRIPLE=$(et triple --variants "$E17_VARIANTS" --snapshot "$E17_SNAPSHOT" --variant "$arm" "$@") \
-    || die "rol/TF üçlüsü doğrulaması başarısız: $arm"
-  E17_GATE=$(et gate --variants "$E17_VARIANTS" --snapshot "$E17_SNAPSHOT" --variant "$arm" "$@") \
-    || die "kapı çözümü başarısız: $arm"
+  local info
+  info=$(et arm --variants "$E17_VARIANTS" --snapshot "$E17_SNAPSHOT" --variant "$arm" "$@") \
+    || die "rol/TF üçlüsü / kapı doğrulaması başarısız: $arm"
+  E17_TRIPLE=${info% *}
+  E17_GATE=${info##* }
   e17_tmpdir
   local d=$E17_NEWTMP
   ( umask 077; et env --variants "$E17_VARIANTS" --snapshot "$E17_SNAPSHOT" --variant "$arm" "$@" > "$d/env.nul" ) \
@@ -204,10 +247,12 @@ e17_prepare_arm_env() {
   e17_read_nul < "$d/env.nul"
   E17_ARM_ENV=("${E17_TMPARR[@]}")
   rm -f "$d/env.nul"
-  et dummy > "$d/dummy.nul" || die "dummy env okunamadı"
-  e17_read_nul < "$d/dummy.nul"
-  E17_DUMMY=("${E17_TMPARR[@]}")
-  rm -f "$d/dummy.nul"
+  if [ "${#E17_DUMMY[@]}" -eq 0 ]; then       # sahte gizliler sabit: süreç başına bir kez
+    et dummy > "$d/dummy.nul" || die "dummy env okunamadı"
+    e17_read_nul < "$d/dummy.nul"
+    E17_DUMMY=("${E17_TMPARR[@]}")
+    rm -f "$d/dummy.nul"
+  fi
 }
 
 # e17_base_env HOMEDIR HASHSEED [net]  → E17_BASE_ENV (env -i geçiş listesi, PLAN §5.2)
@@ -233,9 +278,15 @@ e17_base_env() {
 # ── Analizci ────────────────────────────────────────────────────────────────
 
 # e17_analyzer ALTKOMUT [ARGS...]  → `python scripts/e17/analyze_e17.py <komut> ... --root E17_ROOT`
+#   H klonundan çalışır (analizci kendi blob'unu H ile karşılaştırır); depo kökü olarak L'yi taşıyan
+#   checkout'u (E17_REPO) görür. PRELOCK'ta (kilit yok) analizci HİÇ çağrılmaz.
 e17_analyzer() {
   if [ "$E17_DRY_RUN" = 1 ]; then e17_dry "ANALYZER $*"; return 0; fi
-  ( cd "$E17_CLONE" && "$E17_PY" "$E17_ANALYZER" "$@" --root "$E17_ROOT" )
+  if [ "${E17_PRELOCK:-0}" = 1 ]; then
+    e17_chain "ANALYZER atlandı (E17_PRELOCK=1): $1"
+    return 0
+  fi
+  ( cd "$E17_CLONE" && E17_REPO="$E17_REPO_L" "$E17_PY" "$E17_ANALYZER" "$@" --root "$E17_ROOT" )
 }
 
 e17_verify_lock() {
@@ -243,17 +294,51 @@ e17_verify_lock() {
   e17_analyzer verify-lock || die "verify-lock başarısız (kilit uyuşmazlığı)"
 }
 
+# Kilit sonrası aşamalar PRELOCK kabul etmez (yalnız run_smoke.sh / run_prova.sh).
+e17_forbid_prelock() {
+  [ "${E17_PRELOCK:-0}" != 1 ] || die "E17_PRELOCK=1 yalnız run_smoke.sh/run_prova.sh için: kilitsiz DEV/VAL/FINAL koşusu yok"
+}
+
+# DEV'e geçiş kapısı (PLAN §5.2 "engelleyici"): 13 duman koşusunun HEPSİ ledger'da VE analizcinin
+# `smoke` hükmü (SMOKE.json pass) true. Koşuların varlığı yetmez: ledger yalnız check-run'dan geçişi gösterir.
+E17_SMOKE_LABELS="SMOKE_B0_AYI SMOKE_B0_V1 SMOKE_S15_h0 SMOKE_S15_h1 SMOKE_S5_W SMOKE_T5_W SMOKE_S15_W SMOKE_T15_W SMOKE_S30_W SMOKE_T30_W SMOKE_S60_W SMOKE_T60_W SMOKE_R1_M1"
+
+e17_require_smoke() {
+  local lbl v
+  for lbl in $E17_SMOKE_LABELS; do
+    e17_in_ledger "$lbl" || die "duman testi tamamlanmadı ($lbl ledger'da yok): önce run_smoke.sh"
+  done
+  e17_require_file "$E17_ROOT/SMOKE.json" "analizci smoke hükmü: önce run_smoke.sh"
+  v=$(et json-get "$E17_ROOT/SMOKE.json" pass) || v=""
+  [ "$v" = true ] || die "duman testi GEÇMEDİ (SMOKE.json pass != true): DEV başlamaz"
+}
+
+# e17_manifest SET → analizci `manifest <smoke|dev|val|final|runs>` (küçük harf)
 e17_manifest() {
-  e17_analyzer manifest "$1" || die "manifest $1 başarısız"
+  local t
+  t=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  e17_analyzer manifest "$t" || die "manifest $t başarısız"
 }
 
 e17_in_ledger() {
   [ -f "$E17_ROOT/ledger.jsonl" ] && grep -Fq "\"$1\"" "$E17_ROOT/ledger.jsonl"
 }
 
+# ── Önbellek koruması (PLAN §4.8, §5.2: backtest yalnız OKUR; ıska = iptal) ──────────
+
+# Backtest öncesi önbelleği salt-okunur yap (yazan süreç PermissionError alır); doldurucu için yeniden aç.
+e17_cache_ro() { chmod -R a-w "$E17_ROOT/cache"; }
+e17_cache_rw() { chmod -R u+w "$E17_ROOT/cache"; }
+
 e17_check_run() {
   local label=$1 chk="$E17_ROOT/sealed/logs/$1.check.log" rc
   if [ "$E17_DRY_RUN" = 1 ]; then e17_dry "ANALYZER check-run $label"; return 0; fi
+  if [ "${E17_PRELOCK:-0}" = 1 ]; then
+    # Kilit yok: analizcinin check-run'ı kilidi doğrulamadan çalışmaz. Rapor mühürlü kalır, ledger'a GİRMEZ.
+    e17_chain "CHECK atlandı (E17_PRELOCK=1) $label"
+    printf 'CHECK SKIP %s\n' "$label"
+    return 0
+  fi
   if e17_analyzer check-run "$label" > "$chk" 2>&1; then
     printf 'CHECK OK %s\n' "$label"
   else
@@ -297,21 +382,31 @@ run_bt() {
 
   if [ "$E17_DRY_RUN" = 1 ]; then
     e17_dry "BT $label arm=$arm window=$start..$end overlays=${overlays[*]-} triple=${E17_TRIPLE// //} hashseed=$hs cli=${cli[*]}"
+    e17_dry "ARGV $label python -m src.strategies.scalper.backtest ${cli[*]} --start $start --end $end --cache-dir $E17_ROOT/cache"
+    e17_dry "ENV $label env -i keys=PATH,HOME,PYTHONPATH,PYTHONHASHSEED,TRADINGBOT_LOG_DIR,dummy(${#E17_DUMMY[@]}),arm(${#E17_ARM_ENV[@]})"
     return 0
   fi
   e17_ensure_clone
 
   mkdir "$d/home"
   e17_base_env "$d/home" "$hs"
-  local attempt=1 max=${E17_BT_ATTEMPTS:-2} rc n report f t0=$SECONDS
+  local attempt=1 max=${E17_BT_ATTEMPTS:-2} rc n report f t0=$SECONDS pid fp0 fp1
+  e17_cache_ro
+  fp0=$(et cache-fp "$E17_ROOT/cache") || die "önbellek parmak izi alınamadı"
   while :; do
     rm -rf "$d/cwd"
     mkdir "$d/cwd"
-    if ( cd "$d/cwd" && exec env -i "${E17_BASE_ENV[@]}" "$E17_PY" -m src.strategies.scalper.backtest \
-          "${cli[@]}" --start "$start" --end "$end" --cache-dir "$E17_ROOT/cache" ) > "$logf" 2>&1; then
-      rc=0
-    else
-      rc=$?
+    # Arka planda + wait: SIGTERM geldiğinde e17_on_term çocuğu hemen öldürebilsin.
+    ( cd "$d/cwd" && exec env -i "${E17_BASE_ENV[@]}" "$E17_PY" -m src.strategies.scalper.backtest \
+        "${cli[@]}" --start "$start" --end "$end" --cache-dir "$E17_ROOT/cache" ) > "$logf" 2>&1 &
+    pid=$!
+    if wait "$pid"; then rc=0; else rc=$?; fi
+    fp1=$(et cache-fp "$E17_ROOT/cache") || die "önbellek parmak izi alınamadı"
+    if [ "$fp0" != "$fp1" ]; then
+      # Backtest önbelleğe YAZDI (ıska -> ağdan çekim): doğrulanmamış veri; zincir durur.
+      e17_chain "FAIL $label önbellek backtest sırasında DEĞİŞTİ (ağdan çekim?); günlük: $logf"
+      printf 'BT FAIL %s\n' "$label"
+      exit 97
     fi
     n=0
     report=""
@@ -399,7 +494,9 @@ fill_window() {
   e17_ensure_clone
   local t0=$SECONDS
   rm -f "$E17_ROOT/fill_logs/$tag".w*.log
+  e17_cache_rw
   if _e17_fill_pass "$tag" "$start" "$end" "$nw" "$gateflag"; then
+    e17_cache_ro
     printf 'FILL OK %s %s\n' "$tag" "$((SECONDS - t0))"
     return 0
   fi
@@ -407,10 +504,12 @@ fill_window() {
     e17_chain "FILL RETRY $tag işçi $nw -> $fb"
     rm -f "$E17_ROOT/fill_logs/$tag".w*.log
     if _e17_fill_pass "$tag" "$start" "$end" "$fb" "$gateflag"; then
+      e17_cache_ro
       printf 'FILL OK %s %s\n' "$tag" "$((SECONDS - t0))"
       return 0
     fi
   fi
+  e17_cache_ro
   e17_chain "FILL FAIL $tag ($start..$end; günlükler: $E17_ROOT/fill_logs/$tag.w*.log)"
   printf 'FILL FAIL %s\n' "$tag"
   return 1
