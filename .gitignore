@@ -77,6 +77,8 @@ docker-compose.override.yml
 *.json
 # autoresearch aday listesi kod ile birlikte commit'lenir (uretim ciktisi degil)
 !scripts/autoresearch_candidates.json
+# Claude Code bulut oturumu kancası kaydı (D39; secret içermez)
+!.claude/settings.json
 
 # .env yedekleri (anahtar icerir)
 .env.bak*

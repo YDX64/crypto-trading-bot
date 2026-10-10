@@ -7,6 +7,56 @@ Pencereler: AYI 2026-01-23→02-13 (BTC −30%) · YATAY 2026-07-01→07-21 · B
 
 ## Aktif kararlar
 
+### D39 — Bulutta geliştirme, yerelden deploy (Claude Code bulut oturumu) · 2026-10-10 · AKTİF (motor davranışı DEĞİŞMEZ)
+
+**Talep:** kullanıcı geliştirmeyi Claude Code bulut oturumlarına taşıdı. Bulutta SSH anahtarı ve
+`.env` YOK (bilinçli); deploy ise yalnız awa'ya erişebilen yerden (kullanıcının Mac'i) yapılabilir.
+Kullanıcı GitHub hesabında Actions limiti sorunu bildirdi (bu repoda CI 2026-10-10'da yine koştu;
+sorun hesap düzeyinde olabilir, kodda doğrulanamadı) → kullanıcı kararı: Actions ile deploy KULLANILMAYACAK.
+
+**Akış:** *Bulut:* dalda düzenle → tam test (`python3 -m pytest tests -q`) + ruff → main'e birleştir
+(PR/merge; Actions gerekmez). *Mac* (`/Users/max/TRADINGBOT/v2`):
+`git checkout main && git pull --ff-only && scripts/deploy.sh awa`. `deploy.sh`'in kendi kapıları
+AYNEN işler: temiz yerel ağaç, yerel HEAD == `origin/main`; sunucuda entry-halt (iki dosya), son 15 dk
+ban izi, `BOT_MODE`↔ring, temiz ağaç, `flock`, sunucu venv'inde tam test, `.env` parse, restart,
+240 sn'ye kadar katı `/health`, başarısızsa otomatik geri alma. Çalışan süreci etkilemeyen değişiklikte
+`DEPLOY_NO_RESTART=1 scripts/deploy.sh awa` — NESNEL ölçüt: **sunucu commit'i ile `origin/main` arasındaki**
+(PR diff'i değil) değişen dosyaların hepsi `docs/`, `tests/`, `.claude/`, `.github/`, `*.md` ya da
+`.gitignore`/`.dockerignore` ise (kontrol komutu RUNBOOK'ta); `src/` veya `scripts/` altında tek satır değişiklikte ASLA (tembel import'lar
+nedeniyle çalışan süreç eski + diskten sonradan yüklenen yeni modül KARIŞIR; sonraki otomatik restart da
+sağlık kapısız yeni kodu başlatır). `deploy.sh` 3-5 dk sürer: araç/pencere kesilirse ssh kopar ve yarım deploy
+kalabilir; bulut/yerel Claude oturumu komutu arka planda ya da uzun timeout ile çalıştırır, ASLA iptal etmez. **Gerçek anlamı**
+(`scripts/server_deploy.sh`'ten doğrulandı): tüm ön kapılar (entry-halt, ban, `BOT_MODE`, temiz ağaç;
+satır 80-138) ve `.env` yedeği + hedef commit'e `git checkout` (162-172) + testler (186-196) +
+`.env` parse (199) YİNE koşar; yalnız restart ve sağlık yoklaması atlanır (201: `exit 0`). Sonuçları:
+sunucudaki kod diski YENİ commit'e geçer ama çalışan süreç bellekteki ESKİ kodla sürer (bir sonraki
+restart'ta yeni kod devreye girer); atlanan restart'ın sağlık/otomatik geri alma kapısı da atlanır;
+testler KIRMIZI olursa `rollback()` (174-181) yine `supervisorctl restart` çalıştırır.
+
+**Bulut oturumu kancası:** `.claude/hooks/session-start.sh` (+ `.claude/settings.json`) yalnız
+`CLAUDE_CODE_REMOTE=true` iken Python **3.12** venv (`.venv`, gitignore'da) kurar,
+`requirements.txt` + pyyaml + ruff yükler, `.env` yoksa `env.example`'dan üretir (CI ile aynı).
+Neden 3.12: sunucu/CI paritesi; bulut konteynerinin sistem Python'u 3.13'tür ve sabit
+pandas/numpy/pydantic pin'leri orada derlenemez (ölçüldü: pip "metadata generation" hatası).
+`.gitignore`'a `!.claude/settings.json` istisnası eklidir (dosya takip edilsin diye).
+Yerel Mac ve sunucu etkilenmez.
+
+**Reddedilen alternatif:** GitHub Actions `workflow_dispatch` deploy (357d3b3'te yazıldı, 104 sözleşme
+testi; GitHub'da hiç koşmadı). Kaldırıldı: kullanıcı Actions'a güvenmek istemedi (bildirilen limit sorunu); ayrıca awa SSH portunu GitHub
+runner IP'lerine açmayı ve SSH özel anahtarını GitHub secret'ı yapmayı gerektiriyordu. Geri getirmek:
+`git show 357d3b3 -- .github/workflows/deploy.yml tests/test_deploy_workflow.py`.
+
+**Güvenlik:** secret ve SSH anahtarı buluta GİRMEZ; bulut yalnız GitHub'a push eder, awa'ya erişemez.
+Deploy kararı (entry-halt/ban/restart zamanı) insanda kalır; mainnet yalnız etiket + elle `MAINNET`
+onayı (`docs/MAINNET_PLAN.md`), değişmedi.
+
+**Kanıt:** `python3 -m pytest tests -q` → 3225 passed, 2 skipped (55,38 sn; atlananlar opsiyonel testler, docker duman testi dahil); `ruff check --select E9,F63,F7,F82 src tests scripts` temiz.
+Motor/strateji/`.env` davranışı DEĞİŞMEDİ; silinenler: `.github/workflows/deploy.yml`,
+`tests/test_deploy_workflow.py`, `.dockerignore` deploy.yml istisnası.
+
+**Geri alma:** `.claude/` dizinini ve `.gitignore`'daki `!.claude/settings.json` istisnasını sil;
+motor etkilenmez, `scripts/deploy.sh` yolu hiç değişmedi.
+
 ### D38 — Ayrı, salt-okunur misafir pano hesabı · 2026-09-09
 
 **Talep:** kullanıcı, arkadaşının mevcut IP panosunu izlemesini istedi.

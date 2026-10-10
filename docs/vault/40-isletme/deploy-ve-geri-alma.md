@@ -1,7 +1,7 @@
 ---
 tags: [isletme, deploy, geri-alma, restart]
-guncelleme: 2026-08-24
-kaynak: docs/RUNBOOK.md "Deploy ve geri alma" (satir 100-215), scripts/deploy.sh, scripts/restart_safe.sh
+guncelleme: 2026-10-10
+kaynak: docs/RUNBOOK.md "Deploy ve geri alma" (satir 100-215) + "Bulutta geliştirme, yerelden deploy (D39)", scripts/deploy.sh, scripts/restart_safe.sh
 ---
 # Deploy ve geri alma
 
@@ -26,6 +26,24 @@ yerel HEAD == `origin/main` · `RING` ile `.env`'deki `BOT_MODE` uyumlu.
 
 Geri alma mantigi **UC halkada ORTAKTIR** (`scripts/server_deploy.sh`);
 her halka kendi `backups/commit.prev-<tarih>`ine doner.
+
+## Bulutta gelistirme, yerelden deploy (D39)
+
+Gelistirme Claude Code bulut oturumunda yapilir; bulut awa'ya/Mac'e ERISEMEZ
+(SSH anahtari ve `.env` yok — bilincli). GitHub Actions deploy'u YOK (kullanici karari).
+
+- Bulut: dalda duzenle → tam test + ruff → main'e birlestir (PR/merge).
+- Mac: `cd /Users/max/TRADINGBOT/v2 && git checkout main && git pull --ff-only && scripts/deploy.sh awa`
+  (kapilar ayni: temiz agac, HEAD == `origin/main`, sunucuda entry-halt / ban izi / `BOT_MODE`↔ring /
+  testler / 240 sn saglik / otomatik geri alma).
+- `DEPLOY_NO_RESTART=1` YALNIZ sunucu commit'i ile `origin/main` arasindaki (PR diff'i degil) degisen
+  dosyalarin hepsi `docs/`, `tests/`, `.claude/`, `.github/`, `*.md` ya da `.gitignore`/`.dockerignore` ise;
+  `src/` veya `scripts/` altinda tek satir degisiklikte ASLA (kod diske iner, surec ESKI modullerle surer,
+  tembel import'lar yeni modulu sonradan yukler → karisik surum). Bu varyantta `etimes` BUYUK kalmasi normaldir.
+- `deploy.sh` 3-5 dk surer: pencereyi kapatma / Ctrl+C yapma / araci zaman asimina ugratma (ssh kopar, yarim
+  deploy kalir); Claude oturumunda arka planda ya da `timeout=600000` ile calistir. Basari: `TAMAM: ... RUNNING`.
+- Sonra restart'i kanitla (asagida). Adim adim reçete + yerel Claude Code'a yapistirilacak hazir mesaj:
+  `docs/RUNBOOK.md` "Bulutta gelistirme, yerelden deploy". Karar: `docs/DECISIONS.md` D39.
 
 ## `.env` degisikligi = AYRI bir adim
 
