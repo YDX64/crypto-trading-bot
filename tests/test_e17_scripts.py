@@ -25,6 +25,16 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
+# Bu dosya ~160 sn sürer (gerçek bash zincirleri, git klonları). Sunucu deploy
+# kapısı tüm paketi `timeout 300` ile koşar (scripts/server_deploy.sh); canlı
+# deploy'u araştırma araçlarının testleriyle süre sınırına itmemek için bu
+# dosya YALNIZ `E17_SCRIPTS_TESTS=1` ile koşar. E17 kilidinden önce zorunludur
+# (PLAN §6 P0). Her zaman koşan hızlı sözdizimi kontrolü: test_e17_scripts_fast.py.
+pytestmark = pytest.mark.skipif(
+    os.environ.get("E17_SCRIPTS_TESTS") != "1",
+    reason="E17 koşu betiği testleri yavaş (~160 sn); E17_SCRIPTS_TESTS=1 ile koşulur",
+)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 E17 = REPO_ROOT / "scripts" / "e17"
 LIB = E17 / "lib17.sh"
