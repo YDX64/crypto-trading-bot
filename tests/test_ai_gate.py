@@ -852,6 +852,25 @@ class TestRunaway:
         assert gate.should_block(events[-1]["ai"]) is False
         assert snapshot["errors"][ag.STATUS_RUNAWAY] == 1
 
+    async def test_shadow_high_deny_ratio_is_info_only(self, events):
+        """Madde 11: shadow'da düşürülecek bir şey yok → `errors`a yazılmaz,
+        efektif mod değişmez; bayrak yalnız bilgi olarak yanar."""
+        cfg = _Cfg(scalper_ai_gate_mode="shadow", scalper_ai_gate_deny_window=4,
+                   scalper_ai_gate_deny_ratio_limit=0.6)
+        gate = _gate(cfg, provider=_FakeProvider(_verdict_json("deny")))
+
+        for trade_id in range(1, 5):
+            await _observe(gate, trade_id=trade_id,
+                           context={**_ctx_document(), "open_positions": trade_id})
+
+        snapshot = gate.snapshot()
+        assert snapshot["runaway"] is True                  # bilgi bayrağı
+        assert snapshot["runaway_at"] is not None
+        assert snapshot["mode"] == "shadow"
+        assert gate.effective_mode == "shadow"
+        assert ag.STATUS_RUNAWAY not in snapshot["errors"]  # hata SAYILMAZ
+        assert gate.should_block(events[-1]["ai"]) is False
+
     async def test_mixed_decisions_do_not_trigger_runaway(self, events):
         cfg = _Cfg(scalper_ai_gate_deny_window=4, scalper_ai_gate_deny_ratio_limit=0.6)
         provider = _FakeProvider([

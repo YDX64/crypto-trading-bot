@@ -16,7 +16,7 @@ import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from src.core.logger import app_logger
 from src.models.position import PositionModel, PositionStatus, PositionSide
@@ -109,9 +109,13 @@ _TRADING_PRICE_MAX_AGE_SECONDS = 30.0
 # medyan sapma %0.054 — %2 tavanı normal işletmede asla bağlamaz.
 _MAX_PRICE_BASIS_PCT = 2.0
 # Koruma-tarafı kapısı payı (yüzde): stop, güncel fiyattan en az bu kadar uzak
-# ve DOĞRU tarafta olmalı. Binance koşullu emri MARK fiyatına göre tetikler;
-# `get_current_price` son işlem fiyatını verir — aradaki tipik baz bu payın
-# altındadır. `should_update` eşiğiyle (±%0.05) aynı büyüklükte tutuldu.
+# ve DOĞRU tarafta olmalı. Koşullu emre `workingType` GÖNDERİLMİYOR; Binance
+# varsayılanı CONTRACT_PRICE (SON işlem fiyatı) geçerlidir ve
+# `get_current_price` de son işlem fiyatını verir — yani kapı ile tetik aynı
+# fiyat türünü kullanır, aradaki tipik fark yalnız tazelik/kitap sapmasıdır ve
+# bu payın altındadır. `should_update` eşiğiyle (±%0.05) aynı büyüklükte
+# tutuldu. (Davranış değişmez; yalnız yorum düzeltildi — eski metin MARK
+# fiyatını söylüyordu, kodda doğrulanamadı.)
 _PROTECTIVE_GATE_MARGIN_PCT = 0.05
 # Aynı sembol için kapı/çeviri uyarısı en fazla bu sıklıkta loglanır (safety
 # turu 2 sn'de bir döner — aksi halde saatte 1800 satır).
@@ -934,11 +938,30 @@ class ExitManager:
         structured = getattr(self.pm, "replace_stop_loss_result", None)
         if callable(structured):
             result = await structured(position, new_stop)
-            if isinstance(result, StopReplaceResult):
-                return result
-            return StopReplaceResult(bool(result), "replaced" if result else "unknown")
-        ok = bool(await self.pm.replace_stop_loss(position, new_stop))
-        return StopReplaceResult(ok, "replaced" if ok else "unknown")
+            if not isinstance(result, StopReplaceResult):
+                result = StopReplaceResult(
+                    bool(result), "replaced" if result else "unknown"
+                )
+        else:
+            ok = bool(await self.pm.replace_stop_loss(position, new_stop))
+            result = StopReplaceResult(ok, "replaced" if ok else "unknown")
+        if result.ok:
+            # Stop gerçekten taşındı: `pm` yeni kimliği `position.sl_order_id`ye
+            # yazdı. Restart sırasında kapanan pozisyonun SL ledger'ı için
+            # defterdeki kimliği güncel tut (bkz. `_persist_sl_algo_id`).
+            try:
+                sp = getattr(self, "_positions", {}).get(
+                    getattr(position, "symbol", None)
+                )
+                if sp is not None and sp.position is position:
+                    await self._persist_sl_algo_id(
+                        getattr(sp, "trade_id", None),
+                        getattr(position, "sl_order_id", None),
+                    )
+            except Exception:  # pragma: no cover - savunma
+                # Ölçüm yazımı stop taşıma sonucunu ASLA bozmamalı.
+                pass
+        return result
 
     async def _update_trailing(self, symbol: str, sp: ScalpPosition) -> None:
         if self._market_data_down_reason is not None:
@@ -1527,6 +1550,9 @@ class ExitManager:
             tp3_algo_id=getattr(sp.plan, "tp3_algo_id", None),
             trailing_active=sp.trailing_active,
             entry_fee_rate=float(getattr(sp.plan, "entry_fee_rate", 0.0) or 0.0),
+            extra_sl_order_ids=tuple(
+                self._recovery_extra_sl_ids().get(getattr(sp, "trade_id", None), ())
+            ),
         )
 
         market_close_price: Optional[float] = None
@@ -1853,6 +1879,13 @@ class ExitManager:
                 # uydurmadır. Bilinmeyen = `null`, ve `restart_gap` bunun
                 # nedenini söyler (D21-R3, bulgu 2).
                 path["restart_gap"] = True
+                # MFE/MAE de YALNIZ bellekteydi (`_recover_one` bunları 0'dan
+                # kurar; DB'ye kapanışta yazılır). `mfe_roi_pct` yine de bir
+                # sayı olarak yazılır — bu bayrak onun yalnız ALT SINIR
+                # olduğunu söyler (gerçek tepe restart öncesinde olmuş
+                # olabilir; `mfe_giveback` gibi etiketler EKSİK sayar, fazla
+                # saymaz). Değer uydurulmaz, periyodik DB yazımı eklenmez.
+                path["mfe_lower_bound"] = True
                 if not path["trail_updates"]:
                     path["trail_updates"] = None
                 # `plan.initial_stop` kurtarmada CANLI stop ile kurulur, ilk
@@ -1998,6 +2031,7 @@ class ExitManager:
         trailing_active: bool,
         entry_fee_rate: float,
         tp3_algo_id: Optional[str] = None,
+        extra_sl_order_ids: Sequence[str] = (),
     ) -> Optional[_CloseLedger]:
         """Kapanışı borsa userTrades satırlarıyla doğrula.
 
@@ -2034,6 +2068,9 @@ class ExitManager:
             ("TP1", tp1_algo_id),
             ("TP2", tp2_algo_id),
             ("TP3", tp3_algo_id),
+            # Kurtarmada borsada görülen EK stoplar (iptali başarısız olmuş
+            # olabilir): dolmamışlarsa `actualOrderId` boştur ve atlanırlar.
+            *(("SL", extra) for extra in (extra_sl_order_ids or ())),
         ):
             if not raw_id:
                 continue
@@ -2485,17 +2522,17 @@ class ExitManager:
             pass
 
     @staticmethod
-    def _live_stop_order(
+    def _live_stop_orders(
         algo_orders: List[Dict[str, Any]],
         direction: Direction,
-    ) -> Optional[Tuple[Optional[str], float]]:
-        """Açık algo emirlerinden pozisyon yönünü gerçekten koruyan STOP'u bul.
+    ) -> List[Tuple[Optional[str], float]]:
+        """Pozisyon yönünü koruyan TÜM geçerli STOP'ları (algo_id, tetik) döner.
 
-        ``(algo_id, tetik_fiyatı)`` döner; algo_id (veya orderId alias'ı)
-        yanıtta yoksa ``None`` olur — çağıran bu durumda DB'deki son bilinen
-        kimliğe düşer.
+        Sıra, borsanın döndürdüğü sıradır. algo_id (veya orderId alias'ı)
+        yanıtta yoksa ``None`` olur.
         """
         expected_side = "SELL" if direction == Direction.LONG else "BUY"
+        found: List[Tuple[Optional[str], float]] = []
         for order in algo_orders or []:
             order_type = order.get("orderType") or order.get("type")
             if order_type not in ("STOP_MARKET", "STOP"):
@@ -2513,8 +2550,38 @@ class ExitManager:
                 if algo_id in (None, ""):
                     algo_id = order.get("orderId")
                 algo_id_str = str(algo_id) if algo_id not in (None, "") else None
-                return algo_id_str, trigger_value
-        return None
+                found.append((algo_id_str, trigger_value))
+        return found
+
+    @staticmethod
+    def _live_stop_order(
+        algo_orders: List[Dict[str, Any]],
+        direction: Direction,
+    ) -> Optional[Tuple[Optional[str], float]]:
+        """Açık algo emirlerinden pozisyon yönünü gerçekten koruyan STOP'u bul.
+
+        ``(algo_id, tetik_fiyatı)`` döner; algo_id (veya orderId alias'ı)
+        yanıtta yoksa ``None`` olur — çağıran bu durumda DB'deki son bilinen
+        kimliğe düşer.
+
+        Birden çok geçerli STOP varsa (stop taşırken eski SL'nin iptali
+        başarısız olduysa borsada ikisi birden kalır) pozisyon yönünde EN
+        KORUYUCU olan seçilir: LONG için en YÜKSEK, SHORT için en DÜŞÜK tetik.
+        Eşitlikte borsanın verdiği ilk sıra korunur.
+        """
+        stops = ExitManager._live_stop_orders(algo_orders, direction)
+        if not stops:
+            return None
+        best = stops[0]
+        for candidate in stops[1:]:
+            tighter = (
+                candidate[1] > best[1]
+                if direction == Direction.LONG
+                else candidate[1] < best[1]
+            )
+            if tighter:
+                best = candidate
+        return best
 
     @staticmethod
     def _live_stop_trigger(
@@ -2529,6 +2596,95 @@ class ExitManager:
         """
         found = ExitManager._live_stop_order(algo_orders, direction)
         return found[1] if found is not None else None
+
+    async def _pick_recovery_stop(
+        self,
+        symbol: str,
+        trade: Any,
+        algo_orders: List[Dict[str, Any]],
+        direction: Direction,
+    ) -> Optional[Tuple[Optional[str], float]]:
+        """Kurtarmada izlenecek STOP'u seç; fazla stopları temizle.
+
+        * Seçim: ``_live_stop_order`` (en koruyucu).
+        * Birden çok geçerli STOP varsa seçilen DIŞINDAKİ kimlikler (a)
+          ledger'a ek SL adayı olarak hatırlanır (kapanıştan sonra borsada stop
+          kalmadığı için kimlikler ŞİMDİ alınmalıdır) ve (b) seçilen stop
+          borsada yerindeyken ``pm._cancel_stale_stops`` ile iptal edilir —
+          koruma boşluğu açılmaz. Temizlik en iyi çabadır: hata kurtarmayı
+          ENGELLEMEZ.
+        * Seçilen kimliğin güncel hali DB'ye yazılır (`sl_algo_id` yalnız
+          açılışta yazıldığı için bayat olabilir).
+        """
+        live_stop = self._live_stop_order(algo_orders, direction)
+        if live_stop is None:
+            return None
+        keep_id = live_stop[0]
+        stops = self._live_stop_orders(algo_orders, direction)
+        extras = [sid for sid, _ in stops if sid is not None and sid != keep_id]
+        # `keep_id is None` iken `_cancel_stale_stops` SEÇİLEN stopu da
+        # iptal ederdi (hiçbir kimlik "None"a eşit değil) — asla çağrılmaz.
+        if len(stops) > 1 and keep_id is not None and extras:
+            trade_id = getattr(trade, "id", None)
+            if trade_id is not None:
+                remembered = self._recovery_extra_sl_ids().setdefault(trade_id, [])
+                for sid in extras:
+                    if sid not in remembered:
+                        remembered.append(sid)
+            self.logger.warning(
+                f"⚠️ recover(): {symbol} borsada {len(stops)} STOP var; en "
+                f"koruyucu #{keep_id} @ {live_stop[1]} seçildi, fazlalar "
+                f"({', '.join(extras)}) iptal ediliyor",
+                extra={"trade": True},
+            )
+            cleaner = getattr(self.pm, "_cancel_stale_stops", None)
+            if callable(cleaner):
+                try:
+                    await cleaner(symbol, keep_order_id=keep_id)
+                except Exception as e:  # pragma: no cover - savunma
+                    self.logger.warning(
+                        f"⚠️ recover(): {symbol} fazla stoplar temizlenemedi ({e})"
+                    )
+        if keep_id is not None and str(getattr(trade, "sl_algo_id", "") or "") != keep_id:
+            await self._persist_sl_algo_id(getattr(trade, "id", None), keep_id)
+        return live_stop
+
+    def _recovery_extra_sl_ids(self) -> Dict[int, List[str]]:
+        store = getattr(self, "_recovery_extra_sl_store", None)
+        if store is None:
+            store = {}
+            self._recovery_extra_sl_store = store
+        return store
+
+    async def _persist_sl_algo_id(self, trade_id: Any, sl_algo_id: Any) -> None:
+        """Güncel SL kimliğini defterdeki ``sl_algo_id``ye yaz (en iyi çaba).
+
+        Neden: ``scalp_trades.sl_algo_id`` yalnız açılışta yazılırdı; SL
+        taşındıkça borsadaki gerçek stopun kimliği değişir. Süreç, pozisyon
+        restart sırasında kapandıysa ``_record_recovery_estimate`` DEFTERDEKİ
+        kimlikle ledger doğrulaması yapar — bayat kimlik SL dolumunu bulamaz ve
+        kapanış "BRÜT TAHMİN"e düşer. Yazım yalnız GERÇEK bir stop taşımasında
+        (zaten 3 REST çağrılık bir işlem) ve kurtarmada olur; periyodik yazım
+        YOKTUR. Hata hiçbir akışı ENGELLEMEZ.
+        """
+        if trade_id is None or sl_algo_id in (None, ""):
+            return
+        writer = getattr(getattr(self, "tracker", None), "update_sl_algo_id", None)
+        if not callable(writer):
+            return
+        cache = getattr(self, "_persisted_sl_ids", None)
+        if cache is None:
+            cache = {}
+            self._persisted_sl_ids = cache
+        if cache.get(trade_id) == str(sl_algo_id):
+            return
+        try:
+            if await writer(trade_id, str(sl_algo_id)) is True:
+                cache[trade_id] = str(sl_algo_id)
+        except Exception as e:
+            logger = getattr(self, "logger", None)
+            if logger is not None:
+                logger.debug(f"#{trade_id}: sl_algo_id yazılamadı ({e})")
 
     async def _record_recovery_estimate(self, trade: Any, notes: str) -> bool:
         """Belirsiz restart kapanışını borsa income/ledger doğrulamasıyla kaydet.
@@ -2742,7 +2898,9 @@ class ExitManager:
             )
             return False
 
-        live_stop = self._live_stop_order(algo_orders, direction)
+        live_stop = await self._pick_recovery_stop(
+            symbol, trade, algo_orders, direction
+        )
         live_sl_algo_id = live_stop[0] if live_stop is not None else None
         current_stop = live_stop[1] if live_stop is not None else None
         if current_stop is None:

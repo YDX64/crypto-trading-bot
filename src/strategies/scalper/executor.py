@@ -1218,7 +1218,7 @@ class ScalpExecutor:
 
         entry_candle_time = (
             ctx.candles_5m[-1].close_time if ctx.candles_5m
-            else int(datetime.utcnow().timestamp() * 1000)
+            else int(time.time() * 1000)
         )
 
         return await self._finalize_position(
@@ -1683,8 +1683,11 @@ class ScalpExecutor:
         # D27/A4 — SESSİZ KALMA. TP1 emri yoksa break-even hiç kurulamaz ve
         # pozisyon tam risk stopuyla taşınır (ölçüldü: 3 işlem, −18.4 USDT).
         # YENİ DENEME YOK (yeni REST ağırlığı sıfır sözleşmesi) ve YENİ KAPI
-        # YOK: yalnız sayaç + CRITICAL. `tp1_qty <= 0` hâli AYRI bir olaydır
-        # (miktar bölünemedi) ve `_place_tp_safely` onu zaten uyarır.
+        # YOK: yalnız sayaç + CRITICAL. HAM `tp1_qty <= 0` hâli AYRI bir olaydır
+        # (miktar bölünemedi) ve `_place_tp_safely` onu zaten uyarır. Ham miktar
+        # > 0 iken borsa stepSize'ına yuvarlanınca 0'a inen miktar (kaba adımlı
+        # sembol, küçük pozisyon) ise emir GÖNDERİLMEDEN `TP_FAIL_ZERO_QTY`
+        # ("rounded_zero") döner ve burada `tp1_missing` olarak sayılır.
         #
         # D27 incelemesi (O7): "emir kabul edildi, kimliği okunamadı" hâli
         # AYRI sayılır — orada emir CANLIdır (pozisyon TP1'de kısmen
@@ -1693,8 +1696,8 @@ class ScalpExecutor:
             if tp1_fail == self.TP_FAIL_UNIDENTIFIED:
                 self._count_order_health("tp1_unidentified", symbol)
                 self.logger.critical(
-                    f"🚨 {symbol}: TP1 emri KABUL EDİLDİ ama KİMLİĞİ OKUNAMADI — "
-                    f"emir canlı olabilir, pozisyon TP1'de kısmen kapanabilir "
+                    f"🚨 {symbol}: TP1 emrinin kabul durumu BELİRSİZ (POST yanıtı kayıp, "
+                    f"clientAlgoId uzlaştırılamadı) — emir canlı olabilir, pozisyon TP1'de kısmen kapanabilir "
                     f"ama break-even YİNE kurulamaz (fill doğrulanamıyor). "
                     f"/scalper/status → order_health.tp1_unidentified",
                     extra={"trade": True},
@@ -2476,7 +2479,10 @@ class ScalpExecutor:
 
         self.logger.info(f"✅ Maker dolum: {symbol} {filled_qty} @ {entry_price}")
 
-        entry_candle_time = int(datetime.utcnow().timestamp() * 1000)
+        # `datetime.utcnow().timestamp()` NAIVE UTC'yi YEREL saat sayar: sunucu
+        # Europe/Stockholm iken değer 2 saat geride kalır (chandelier penceresi
+        # girişten ~24 mum önce başlar). Gerçek epoch ms için `time.time()`.
+        entry_candle_time = int(time.time() * 1000)
 
         try:
             scalp_position = await self._finalize_position(
@@ -3053,6 +3059,17 @@ class ScalpExecutor:
             self.logger.warning(f"⚠️ {symbol}: {label} miktarı sıfır, atlanıyor")
             return None, self.TP_FAIL_ZERO_QTY
         try:
+            # Ham miktar > 0 olsa da borsa stepSize'ına aşağı yuvarlanınca 0'a
+            # inebilir (kaba adımlı sembol, küçük pozisyon). `place_take_profit`
+            # bunu zaten ERR_PRECISION ile reddeder; burada emir GÖNDERİLMEDEN
+            # ayrı etiketlenir ("rounded_zero"). Filtreler önbellekli: yeni REST yok.
+            rounded_qty = await self.client.quantize_quantity(symbol, quantity)
+            if rounded_qty <= 0:
+                self.logger.warning(
+                    f"⚠️ {symbol}: {label} miktarı stepSize'a yuvarlanınca sıfır "
+                    f"(ham={quantity}, rounded_zero), emir gönderilmedi"
+                )
+                return None, self.TP_FAIL_ZERO_QTY
             order = await self.client.place_take_profit(
                 symbol=symbol, side=side, stop_price=price, quantity=quantity
             )
@@ -3065,17 +3082,37 @@ class ScalpExecutor:
                 return None, self.TP_FAIL_UNIDENTIFIED
             return algo_id, None
         except BinanceAPIError as e:
+            if getattr(e, "algo_state_unknown", False):
+                return self._tp_state_unknown(symbol, label, e)
             self.logger.error(
                 f"⚠️ {symbol}: {label} konulamadı (kod={e.code}: {e.msg}). "
                 f"Pozisyon SL ile korunuyor, {label} olmadan devam ediliyor."
             )
             return None, self.TP_FAIL_REJECTED
         except Exception as e:
+            if getattr(e, "algo_state_unknown", False):
+                return self._tp_state_unknown(symbol, label, e)
             self.logger.error(
                 f"⚠️ {symbol}: {label} konulurken beklenmeyen hata ({e}). "
                 f"Pozisyon SL ile korunuyor, {label} olmadan devam ediliyor."
             )
             return None, self.TP_FAIL_ERROR
+
+    def _tp_state_unknown(
+        self, symbol: str, label: str, error: Exception
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """POST sonucu belirsiz + clientAlgoId uzlaştırması başarısız: emir CANLI olabilir.
+
+        `_place_conditional` özgün istisnaya `algo_state_unknown=True` ve
+        `client_algo_id` ekler (yeni alt sınıf YOK). Bu, "KABUL EDİLDİ ama
+        kimliği okunamadı" ile aynı operasyonel durumdur: `unidentified`.
+        """
+        self.logger.error(
+            f"🚨 {symbol}: {label} POST sonucu BELİRSİZ ve clientAlgoId "
+            f"({getattr(error, 'client_algo_id', None)}) uzlaştırılamadı ({error}) — "
+            f"emir CANLI olabilir, izlenemiyor."
+        )
+        return None, self.TP_FAIL_UNIDENTIFIED
 
     @staticmethod
     def _extract_id(order: dict) -> Optional[str]:

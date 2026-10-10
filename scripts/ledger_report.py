@@ -247,10 +247,19 @@ FORENSICS_TAG_LABELS: Dict[str, str] = {
     "gate_bypassed": "kapı açık ama ETKİN DEĞİL (fail-open) iken girildi",
     "fee_dominated": "ücretler kârın yarısından fazlasını yedi",
     "mfe_giveback": "kâr TP1 hedefini gördü ama zararla kapandı",
-    "noise_stop": "stop sonrası fiyat pencerede girişe geri döndü (gürültü)",
+    "noise_stop": "SL sonrası fiyat pencerede girişe geri döndü (gürültü)",
+    "near_entry_exit": "SL dışı zararlı kapanış sonrası fiyat pencerede girişe döndü",
 }
 
 UNTAGGED_KEY = "_etiketsiz_"
+
+#: `noise_stop` anlamı değişti (rapor madde 3): artık YALNIZ SL ailesi; SL dışı
+#: net-zararlı çıkışlar `near_entry_exit`. Geçmiş kayıtlar yeniden hesaplanmadı.
+NOISE_SPLIT_NOTE = (
+    "`noise_stop` artık yalnız SL ailesine yazılır; SL dışı zararlı kapanışlar "
+    "`near_entry_exit` alır. Eski kayıtlar yeniden hesaplanmadı — eski ve yeni "
+    "dönem `noise_stop` sayıları doğrudan kıyaslanamaz."
+)
 
 
 def load_forensics_rows(
@@ -1601,6 +1610,7 @@ def render_text(report: Dict[str, Any]) -> str:
         # kesmelerinde `noise_stop` artık atılmıyor — yani ETİKET dağılımı da
         # 08-24 öncesi/sonrası kıyaslanamaz. Not bu tablonun altına da girer.
         lines.append(f"   NOT: {REAPER_SPLIT_NOTE}")
+        lines.append(f"   NOT: {NOISE_SPLIT_NOTE}")
 
     cfx = report.get("counterfactual")
     if cfx is not None:
@@ -1730,6 +1740,7 @@ def render_md(report: Dict[str, Any]) -> str:
         # D27 incelemesi (B2): etiket dağılımı da 08-24 öncesi/sonrası
         # kıyaslanamaz (REAPER kendi ailesi olunca `noise_stop` değişti).
         lines.append(f"> {REAPER_SPLIT_NOTE}")
+        lines.append(f"> {NOISE_SPLIT_NOTE}")
 
     cfx = report.get("counterfactual")
     if cfx is not None:

@@ -1252,6 +1252,9 @@ class TestApiSurface:
             "pending", "registered", "dedup_hits", "dropped_full", "expired",
             "resolved", "measured", "logged", "log_dropped",
             "candle_buffer_symbols", "candle_buffer_bars",
+            # D27/B-5: ölçülemeyen/düşen satırların NEDEN sayaçları.
+            "unmeasured_gap", "unmeasured_no_data", "unscanned_symbol",
+            "unresolvable_symbol",
         }
         assert set(blok) == beklenen
         assert set(store.counters_snapshot()) == beklenen
@@ -1262,6 +1265,8 @@ class TestApiSurface:
         for sayac in (
             "pending", "registered", "dedup_hits", "dropped_full", "expired",
             "resolved", "measured", "logged", "log_dropped",
+            "unmeasured_gap", "unmeasured_no_data", "unscanned_symbol",
+            "unresolvable_symbol",
         ):
             assert blok[sayac] == 0, sayac
 

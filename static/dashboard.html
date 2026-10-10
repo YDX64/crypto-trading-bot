@@ -881,7 +881,7 @@
     <div class="panel">
       <div class="sparkline-wrap">
         <div class="sparkline-header">
-          <span>Kümülatif Gerçekleşen K/Z</span>
+          <span title="Son 50 kapanmış işlemin kümülatif gerçekleşen K/Z toplamı; strateji filtresi yok, AP satırları dahil. Dönem performansı için performance_scope kullanılır.">Son 50 işlem toplamı (AP dahil)</span>
           <span id="sparkline-last">—</span>
         </div>
         <canvas id="pnl-sparkline"></canvas>
@@ -1842,7 +1842,7 @@
 
     var grid = "";
     grid += aiKv("Mod", '<span style="font-size:13px;">' + escapeHtml(modeTxt) + '</span>',
-      g.runaway ? "ai-warn" : "");
+      (g.runaway && g.mode === "active") ? "ai-warn" : "");
     grid += aiKv("Sağlayıcı",
       '<span style="font-size:13px;">' + escapeHtml(String(g.provider || "—")) + '</span>' +
       (ready === null ? "" :
@@ -1907,8 +1907,14 @@
 
     var notes = [];
     if (g.runaway){
-      notes.push('<span class="ai-warn">KAÇAK KORUMASI: katman shadow\'a düşürüldü</span>' +
-        (g.runaway_at ? " (" + fmtClock(g.runaway_at) + ")" : ""));
+      // Kaçak koruması YALNIZ `active` modda katmanı düşürür; shadow'da bayrak
+      // sadece bilgidir (düşürülecek bir şey yok, errors'a yazılmaz).
+      var rwTime = g.runaway_at ? " (" + fmtClock(g.runaway_at) + ")" : "";
+      if (g.mode === "active"){
+        notes.push('<span class="ai-warn">KAÇAK KORUMASI: katman shadow\'a düşürüldü</span>' + rwTime);
+      } else {
+        notes.push('<span class="ai-caution">yüksek red oranı (bilgi)</span>' + rwTime);
+      }
     }
     if (g.budget_exhausted){
       notes.push('<span class="ai-caution">günlük çağrı tavanı doldu (ai_budget_exhausted)</span>');
@@ -2274,7 +2280,8 @@
     gate_bypassed: "kapı açık ama ETKİN DEĞİL (fail-open) iken girildi",
     fee_dominated: "ücretler kârın yarısından fazlasını yedi",
     mfe_giveback: "kâr TP1 hedefini gördü ama zararla kapandı",
-    noise_stop: "stop sonrası fiyat girişe geri döndü (gürültü)"
+    noise_stop: "SL sonrası fiyat pencerede girişe geri döndü (gürültü)",
+    near_entry_exit: "SL dışı zararlı kapanış sonrası fiyat pencerede girişe döndü"
   };
 
   var fxOpenId = null;      // açık adli kartın işlem id'si (tek seferde bir)

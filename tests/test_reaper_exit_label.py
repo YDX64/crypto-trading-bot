@@ -738,14 +738,16 @@ class TestForensicsPostmortemLosing:
         assert out["returned_to_entry"] is True   # fiyat girişe DÖNDÜ
         assert out["tags"] == []                  # ama kayıplı değil → etiket yok
 
-    def test_negatif_reaper_eski_gibi_davranir(self):
+    def test_negatif_reaper_near_entry_exit_alir(self):
+        """Madde 3: SL DIŞI net-zararlı çıkış `noise_stop` DEĞİL, ayrı etiket."""
         out = self._postmortem("REAPER", -8.0)
         assert out["returned_to_entry"] is True
-        assert out["tags"] == [fx.TAG_NOISE_STOP]
+        assert out["tags"] == [fx.TAG_NEAR_ENTRY_EXIT]
 
     def test_sl_ailesi_artida_bile_kayipli_sayilmaya_devam_eder(self):
-        """Asimetri KASITLIDIR: SL ailesi etiketin kendisiyle kayıplı sayılır;
-        REAPER ise NET PnL ile. Bu test iki kolun ayrıldığını sabitler."""
+        """Asimetri KASITLIDIR: SL ailesi etiketin kendisiyle kayıplı sayılır
+        (`noise_stop`); REAPER ise NET PnL ile (`near_entry_exit`, artıda hiç).
+        Bu test iki kolun ayrıldığını sabitler."""
         sl_out = self._postmortem("SL", +5.0)
         assert sl_out["tags"] == [fx.TAG_NOISE_STOP]
 

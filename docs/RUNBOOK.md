@@ -389,6 +389,49 @@ deploy'u tekrar çalıştırmadan önce `ssh awa 'tail -30 /opt/tradingbot-v2/lo
 - Çalışan `deploy.sh`'i İPTAL ETME (ssh kopar, sunucuda yarım deploy kalabilir); sonucu
   `ssh awa 'tail -30 /opt/tradingbot-v2/logs/deploy.log'` ile doğrula (takipçi: `/opt/tradingbot-ap`).
 
+### Bulutta backtest (data.binance.vision)
+Bulut oturumundan `fapi.binance.com` **HTTP 451** (bölge engeli) verir; harness kline indiremez (cache-miss'te
+`data.py` `MarketDataHostError` yükseltir — sessiz sapma yok). Çözüm: resmi arşivden (`data.binance.vision`,
+erişilebilir) harness'in KENDİ önbellek biçiminde `data/klines_cache` doldurmak, sonra backtest'i AĞSIZ koşmak.
+Motor/harness koduna dokunulmaz (parite #P1 bozulmaz); yalnız `scripts/fill_klines_cache_from_vision.py`.
+
+```bash
+# 1) önbelleği doldur (backtest ile AYNI SCALPER_* ortamıyla; çalışma dizini = repo kökü, .env oradan okunur)
+.venv/bin/python scripts/fill_klines_cache_from_vision.py \
+  --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,BNBUSDT,ADAUSDT,LTCUSDT --start 2026-08-07 --end 2026-08-21
+# 2) aynı pencere/semboller/ortamla harness (fapi'ye gitmez)
+.venv/bin/python -m src.strategies.scalper.backtest --strategies C \
+  --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,BNBUSDT,ADAUSDT,LTCUSDT --start 2026-08-07 --end 2026-08-21
+```
+Bayraklar: `--symbols` (vars. 8 sembol), `--start/--end` (harness ile aynı: UTC, `[start,end)`), `--strategies` (vars. C;
+yalnız doğrulanır — veri ihtiyacı stratejiden değil `SCALPER_TF_*` ve `SCALPER_MARKET_GATE*` ayarlarından gelir),
+`--cache-dir` (vars. `data/klines_cache`), `--download-cache` (vars. `data/vision_cache`, gitignored; zip'ler tekrar
+indirilmez, her kullanımda sha256 yeniden doğrulanır), `--overwrite` (mevcut FARKLI dosyanın üstüne yaz), `--no-monthly`.
+
+**Nasıl çalışır:** hangi dosyanın yazılacağı elle hesaplanmaz; betik harness'in `gather_symbol_data` /
+`gather_leader_series` fonksiyonlarını çağırır (anahtar = `kline_cache.window_start_ms`), yalnız ağ katmanı arşivden
+beslenir. Önce geçici dizine yazar; her dosya katı denetimden geçer (mum sayısı = anahtardaki `needed`, ızgarada, boşluk
+yok, son mum `end-1`) ve her zip'in `.CHECKSUM` sha256'sı doğrulanır — tek sorunda hata ile durur, önbelleğe HİÇBİR şey
+yazılmaz (aksi halde `os.replace` ile atomik terfi). Eksik gün/mum = hata (yama yok).
+
+**Kısıtlar**
+- **Arşiv gecikmesi ~1-2 gün:** günlük zip en geç dünden/evvelsi günden; pencere sonu (`--end`, dahil değil) arşivin
+  son günlük zip'ini aşarsa `ArchiveGapError` (404) ile durur. Aylık zip yalnız TAM ve BİTMİŞ aylar için denenir (404 → günlük).
+- **Sunucu `SCALPER_*` env'i gerekir (CLAUDE.md "Backtest DAİMA sunucu env'iyle"):** bulutta `.env`/sunucu env'i yoksa
+  config varsayılanları kullanılır; bu sonuçlar **karar için GEÇERSİZDİR** (yalnız altyapı/duman testi). Karar için
+  `env $(ssh awa grep ^SCALPER_ ...)` ile aynı değerleri bulutta ver (hem doldurucuya hem backtest'e) — TF'ler ve lider
+  kapısı farklıysa farklı anahtarlı dosyalar yazılır ve backtest cache-miss → 451 alır.
+- Gerçek bir borsa bakım boşluğu içeren pencere (fapi'de de boşluk) burada reddedilir; sessizce yamanmaz.
+- Doldurucu `.env`'deki ayarları backtest ile aynı yoldan okur: komutu repo kökünden çalıştır.
+
+**Parite kanıtı (2026-10-10, bu oturum):** `tests/fixtures/klines` (fapi'den üretilmiş) ile arşivden üretilen önbellek,
+2026-08-07→08-10 BTCUSDT+ETHUSDT 5m+15m (6 dosya, 3880 mum) için dosya adları ve içerik bakımından BİREBİR aynı
+(`VISION_NETWORK_TESTS=1 python -m pytest tests/test_fill_klines_cache_from_vision.py -k network`); ağsız birim testleri
+(36) anahtar paritesini, sha256 retini, eksik mumda retle dosya yazılmamasını, lider kapısı istek kümesinin
+`run_backtest` ile aynılığını ve doldurulan önbellekle golden sonucunun aynılığını kapsar. Aylık zip = günlük zip
+(BTCUSDT 4h Temmuz 2026, 186/186 mum aynı). **4h/1d** doğrudan fapi ile kıyaslanamadı (bulutta 451); dolaylı
+kanıt: SOLUSDT 5m→15m→4h ve BTCUSDT 15m→1d yeniden örneklemelerinde 0 uyuşmazlık.
+
 ### Mainnet halkası
 Durum: pipeline hazır, dizin/program HENÜZ YOK (`/opt/tradingbot-main` bir insan tarafından
 kurulmadan mainnet deploy'u çalışmaz — bkz. `docs/MAINNET_PLAN.md` §1, §5). `scripts/deploy.sh`

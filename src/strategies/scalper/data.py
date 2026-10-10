@@ -65,6 +65,14 @@ from src.trading.binance_client_improved import ImprovedBinanceClient
 # (chandelier son kapanmış mumu hiç görmeden bir tur daha eski seviyeyi
 # gönderirdi). TTL, mum periyodunun küçük bir kesri olmalı: 1m için 5 sn
 # (mum süresinin ~%8'i), 5m için 20 sn (~%7), 15m için 60 sn (~%7).
+#
+# P1 BİLİNEN SAPMA (canlı–harness paritesi): 15m kline'ın 60 sn TTL'i, yeni bir
+# 15m mum kapandıktan sonra bu mumun canlı motora en çok ~60 sn gecikmeyle
+# yansıması demektir (rejim dilimi `SCALPER_TF_REGIME=15m` iken rejim kararı
+# dahil). Harness her barda taze mum görür ve bu gecikmeyi MODELLEMEZ. Rejim
+# önbelleği artık `close_time` anahtarlıdır (engine._get_cached_regime), yani
+# kalan sapma yalnız bu TTL'dir. Davranış değişikliği DEĞİL, kayıt: TTL'i
+# kısaltmak REST ağırlığını artırır (D22).
 _TTL_BY_INTERVAL: Dict[str, float] = {
     "1m": 5.0,
     "5m": 20.0,

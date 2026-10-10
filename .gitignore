@@ -91,6 +91,8 @@ backups/
 .test-logs/
 # Backtest kline onbellegi (harness; fixture dosyalari tests/fixtures altinda)
 data/klines_cache/
+# data.binance.vision zip indirme onbellegi (scripts/fill_klines_cache_from_vision.py)
+data/vision_cache/
 scripts/.scalper_env_snapshot.txt
 
 # D32 (2026-09-03): runtime durum dizini (cooldown/halt/pending) ve eski venv kopyaları

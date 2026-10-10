@@ -170,7 +170,8 @@ class _ExternalSignalStrategy:
 class ScalperEngine:
     """Tarama → sinyal değerlendirme → giriş → çıkış döngüsünü yürütür."""
 
-    _REGIME_CACHE_TTL = 300.0    # saniye — sembol başına rejim önbelleği
+    # Rejim önbelleği zamana değil son kapanmış rejim mumunun close_time'ına
+    # bağlıdır (bkz. _get_cached_regime) — eski 300 sn TTL kaldırıldı.
     _BALANCE_CACHE_TTL = 300.0   # saniye — kill switch için bakiye önbelleği
     # 2026-08-14: 30→120 sn. /fapi/v1/income weight=30; 30 sn TTL tek başına
     # 60 weight/dk yiyordu — testnet'in düşük IP bütçesinde 418'e katkı.
@@ -330,7 +331,7 @@ class ScalperEngine:
         # doldurulur: operatör kapıyı açmadan önce ne yapacağını
         # /scalper/status'tan izleyebilsin (gözlem ucuz, karar değil).
         self._structure: Dict[str, Dict[str, Any]] = {}
-        self._regime_cache: Dict[str, Tuple[Regime, float]] = {}
+        self._regime_cache: Dict[str, Tuple[Regime, int]] = {}
         # Lider piyasa kapısı (D15): {lider: (anlık_görüntü, monotonic_ts,
         # utc_gün_damgası)}. Anlık görüntü türetilmiş metrikleri de taşır ki
         # senkron snapshot() hiç IO yapmadan /scalper/status'e yazabilsin.
@@ -1569,6 +1570,8 @@ class ScalperEngine:
         max_price_age = max(1.0, interval) * self._STALE_TP_PRICE_MAX_AGE_TICKS
         now = datetime.now(timezone.utc)
         now_mono = time.monotonic()
+        backoff = self._aged_close_backoff_map()
+        failures = 0
         for symbol in list(self.exits.tracked_symbols()):
             sp = self.exits._positions.get(symbol)
             if sp is None:
@@ -1599,27 +1602,45 @@ class ScalperEngine:
             )
             if not stale_tp_should_close(cfg, age_ms=age_ms, roi_pct=roi_pct):
                 continue
+            if backoff.get(symbol, 0.0) > time.monotonic():
+                continue  # yakın zamanda başarısız oldu: kısa backoff
+            if failures >= self._AGED_CLOSE_MAX_FAILURES_PER_ROUND:
+                break  # tur başına başarısız deneme tavanı
             side_val = getattr(sp.position.side, "value", str(sp.position.side))
             close_side = "SELL" if str(side_val).endswith("LONG") else "BUY"
-            qty = abs(float(sp.position.quantity))
             try:
-                qty = await self.client.quantize_quantity(symbol, qty)
-                await self._submit_reduce_only_market_close(symbol, close_side, qty)
-                try:
-                    sp.stale_tp_close_at = _utcnow_iso()
-                except Exception:  # pragma: no cover - test çiftleri (SimpleNamespace)
-                    pass
-                self.logger.info(
-                    f"🕒 STALE_TP: {symbol} {age_ms / 3_600_000.0:.1f}sa yaşında, TP1 yok, "
-                    f"ROI %{roi_pct:.2f} ≥ %{float(getattr(cfg, 'scalper_stale_tp_min_roi_pct', 0.0) or 0.0):.2f} — "
-                    f"reduce-only kapanış gönderildi; ledger doğrulaması safety turunda",
-                    extra={"trade": True},
+                outcome = await self._submit_aged_close(
+                    symbol, sp, close_side, label="STALE_TP"
                 )
             except Exception as e:
+                # Başarısız deneme turu BİTİRMEZ (madde 10): sıradaki yaşlı
+                # pozisyon aç kalmasın. Tavan + sembol backoff'u aynı hatayı
+                # saniyede bir tekrarlamayı önler.
+                failures += 1
+                backoff[symbol] = time.monotonic() + self._AGED_CLOSE_BACKOFF_SEC
                 self.logger.warning(
-                    f"🕒 STALE_TP: {symbol} kapanışı gönderilemedi ({e}); sonraki turda denenecek"
+                    f"🕒 STALE_TP: {symbol} kapanışı gönderilemedi ({e}); "
+                    f"{self._AGED_CLOSE_BACKOFF_SEC:.0f}sn sonra yeniden denenecek"
                 )
-            return  # tur başına en fazla bir kapanış
+                continue
+            if outcome == "flat":
+                # Borsada pozisyon yok: emir yok, damga yok. Kısa backoff:
+                # exits.step kapanışı işleyene kadar her safety turunda
+                # positionRisk (weight 5) okunmasın.
+                backoff[symbol] = time.monotonic() + self._AGED_CLOSE_FLAT_BACKOFF_SEC
+                continue
+            backoff.pop(symbol, None)
+            try:
+                sp.stale_tp_close_at = _utcnow_iso()
+            except Exception:  # pragma: no cover - test çiftleri (SimpleNamespace)
+                pass
+            self.logger.info(
+                f"🕒 STALE_TP: {symbol} {age_ms / 3_600_000.0:.1f}sa yaşında, TP1 yok, "
+                f"ROI %{roi_pct:.2f} ≥ %{float(getattr(cfg, 'scalper_stale_tp_min_roi_pct', 0.0) or 0.0):.2f} — "
+                f"reduce-only kapanış gönderildi; ledger doğrulaması safety turunda",
+                extra={"trade": True},
+            )
+            return  # tur başına en fazla bir BAŞARILI kapanış
 
     async def _reap_aged_positions(self) -> None:
         """Yaş limitini aşan KORUMASIZ pozisyonları kapat (ölü-sermaye reaper'ı).
@@ -1641,6 +1662,8 @@ class ScalperEngine:
         if limit_h <= 0:
             return
         now = datetime.now(timezone.utc)
+        backoff = self._aged_close_backoff_map()
+        failures = 0
         for symbol in list(self.exits.tracked_symbols()):
             sp = self.exits._positions.get(symbol)
             if sp is None:
@@ -1660,31 +1683,114 @@ class ScalperEngine:
             age_h = (now - opened).total_seconds() / 3600.0
             if age_h < limit_h:
                 continue
+            if backoff.get(symbol, 0.0) > time.monotonic():
+                continue  # yakın zamanda başarısız oldu: kısa backoff
+            if failures >= self._AGED_CLOSE_MAX_FAILURES_PER_ROUND:
+                break  # tur başına başarısız deneme tavanı
             side_val = getattr(sp.position.side, "value", str(sp.position.side))
             close_side = "SELL" if str(side_val).endswith("LONG") else "BUY"
-            qty = abs(float(sp.position.quantity))
             try:
-                qty = await self.client.quantize_quantity(symbol, qty)
-                await self._submit_reduce_only_market_close(symbol, close_side, qty)
-                # D27/A1 — YALNIZ ETİKET: emir BORSAYA GİTTİKTEN sonra damgala.
-                # Emir hata verirse (except dalı) damga KONULMAZ: kapanmayan bir
-                # pozisyon "REAPER" diye etiketlenmemelidir. Damga hiçbir kapıya
-                # ya da çıkış kararına girmez; yalnız `_infer_exit_reason` kaba
-                # çıkarımının yaş-kesmesini "SL" ile karıştırmasını engeller.
-                try:
-                    sp.reaper_close_at = _utcnow_iso()
-                except Exception:  # pragma: no cover - test çiftleri (SimpleNamespace)
-                    pass
-                self.logger.info(
-                    f"⏳ Reaper: {symbol} {age_h:.1f}sa yaşında (limit {limit_h:.0f}sa) — "
-                    f"reduce-only kapanış gönderildi; ledger doğrulaması safety turunda",
-                    extra={"trade": True},
+                outcome = await self._submit_aged_close(
+                    symbol, sp, close_side, label="REAPER"
                 )
             except Exception as e:
+                # Başarısız deneme turu BİTİRMEZ (madde 10): `tracked_symbols()`
+                # sırası sabittir; kalıcı reddedilen ilk yaşlı pozisyon
+                # arkasındakileri aç bırakırdı. Tavan + sembol backoff'u aynı
+                # hatayı saniyede bir tekrarlamayı önler (2026-08-14 watchdog
+                # dersi).
+                failures += 1
+                backoff[symbol] = time.monotonic() + self._AGED_CLOSE_BACKOFF_SEC
                 self.logger.warning(
-                    f"⏳ Reaper: {symbol} kapanışı gönderilemedi ({e}); sonraki turda denenecek"
+                    f"⏳ Reaper: {symbol} kapanışı gönderilemedi ({e}); "
+                    f"{self._AGED_CLOSE_BACKOFF_SEC:.0f}sn sonra yeniden denenecek"
                 )
-            return  # tur başına en fazla bir kapanış
+                continue
+            if outcome == "flat":
+                # Borsada pozisyon yok: emir yok, damga yok. Kısa backoff:
+                # exits.step kapanışı işleyene kadar her safety turunda
+                # positionRisk (weight 5) okunmasın.
+                backoff[symbol] = time.monotonic() + self._AGED_CLOSE_FLAT_BACKOFF_SEC
+                continue
+            backoff.pop(symbol, None)
+            # D27/A1 — YALNIZ ETİKET: emir BORSAYA GİTTİKTEN sonra damgala.
+            # Emir hata verirse (except dalı) damga KONULMAZ: kapanmayan bir
+            # pozisyon "REAPER" diye etiketlenmemelidir. Damga hiçbir kapıya
+            # ya da çıkış kararına girmez; yalnız `_infer_exit_reason` kaba
+            # çıkarımının yaş-kesmesini "SL" ile karıştırmasını engeller.
+            try:
+                sp.reaper_close_at = _utcnow_iso()
+            except Exception:  # pragma: no cover - test çiftleri (SimpleNamespace)
+                pass
+            self.logger.info(
+                f"⏳ Reaper: {symbol} {age_h:.1f}sa yaşında (limit {limit_h:.0f}sa) — "
+                f"reduce-only kapanış gönderildi; ledger doğrulaması safety turunda",
+                extra={"trade": True},
+            )
+            return  # tur başına en fazla bir BAŞARILI kapanış
+
+    #: Reaper/STALE_TP: tur başına başarısız emir denemesi tavanı ve sembol
+    #: başına yeniden deneme bekleme süresi (sn). Kapanış KURALI (yaş, ROI
+    #: eşiği) değişmez; yalnız başarısız bir denemenin turu bitirmesi ve aynı
+    #: hatanın her safety turunda tekrarlanması önlenir.
+    _AGED_CLOSE_MAX_FAILURES_PER_ROUND = 2
+    _AGED_CLOSE_BACKOFF_SEC = 30.0
+    #: Canlı okuma "flat" dediğinde (emir gönderilmedi) aynı sembolü yeniden
+    #: okumadan önce beklenen süre (sn).
+    _AGED_CLOSE_FLAT_BACKOFF_SEC = 10.0
+
+    def _aged_close_backoff_map(self) -> Dict[str, float]:
+        """sembol → monotonic bitiş; süresi dolanları budar. `getattr`: eski
+        test çiftleri `__init__`i atlayıp motoru kurar."""
+        backoff = getattr(self, "_aged_close_backoff", None)
+        if not isinstance(backoff, dict):
+            backoff = {}
+            self._aged_close_backoff = backoff
+        now = time.monotonic()
+        for key in [k for k, until in backoff.items() if until <= now]:
+            backoff.pop(key, None)
+        return backoff
+
+    async def _submit_aged_close(
+        self, symbol: str, sp: Any, close_side: str, *, label: str
+    ) -> str:
+        """Reaper/STALE_TP için TEK reduce-only MARKET gönderimi.
+
+        Döner: `"sent"` (emir borsaya gitti) ya da `"flat"` (borsada pozisyon
+        yok, EMİR GÖNDERİLMEDİ). Hata dalında istisna yükseltir; çağıran
+        damgayı yalnız `"sent"`ten sonra koyar.
+
+        Miktar CANLI okunur (`get_position_risk(force_fresh=True)`):
+        `sp.position.quantity` GİRİŞ dolumudur ve kısmi TP'lerden sonra
+        güncellenmez (bkz. `_close_position_market` D10 notu). Okuma yoksa/
+        başarısızsa plan miktarına dönülür. Bilerek `_close_position_market`
+        ÇAĞRILMAZ: onun senkron doğrulaması (5 deneme, ~4 sn uyku) safety
+        turunu uzatır; burada doğrulama bir sonraki turda `exits.step`te.
+        """
+        qty = abs(float(sp.position.quantity))
+        reader = getattr(self.client, "get_position_risk", None)
+        if reader is not None:
+            try:
+                info = await reader(symbol, force_fresh=True)
+                if isinstance(info, dict) and "positionAmt" in info:
+                    amt = float(info.get("positionAmt") or 0.0)
+                    if amt == 0.0:
+                        self.logger.info(
+                            f"{label}: {symbol} borsada flat (positionAmt=0) — "
+                            f"emir gönderilmedi; kapanışı safety turu doğrulayacak"
+                        )
+                        return "flat"
+                    qty = abs(amt)
+                    close_side = "SELL" if amt > 0 else "BUY"
+            except Exception as e:
+                self.logger.debug(
+                    f"{label}: {symbol} canlı miktar okunamadı ({e}); plan miktarı kullanılıyor"
+                )
+        qty = await self.client.quantize_quantity(symbol, qty)
+        if not qty or float(qty) <= 0.0:
+            raise ValueError(f"{symbol}: kapanış miktarı yuvarlanınca 0")
+        await self._submit_reduce_only_market_close(symbol, close_side, qty)
+        return "sent"
 
     async def _submit_reduce_only_market_close(
         self, symbol: str, close_side: str, qty: float
@@ -1812,6 +1918,13 @@ class ScalperEngine:
         # SL/TP, kapanış doğrulaması) bırakılır. Yeni pozisyon açmamak
         # ucuzdur; açık pozisyonda körleşmek 2026-08-12'de saatlerce süren
         # 418 ban döngüsünün ta kendisiydi.
+        #
+        # D27/B-5: karşı-olgu defterinin YAŞ SÜPÜRMESİ giriş kapısına BAĞLI
+        # DEĞİLDİR. Girişler kapalıyken (`_entries_ready()` False) ya da REST
+        # geri çekilmesinde tur erken döner; süpürme `_evaluate_symbol`'e
+        # bağlı kalırsa defter saatlerce güncellenmez. Süpürme saf bellek
+        # işidir (REST YOK), bu yüzden tur başında koşar.
+        self._counterfactual_sweep()
         backoff = self._rest_weight_backoff_level()
         if backoff != "off":
             self._mark_scan_degraded(
@@ -1833,6 +1946,12 @@ class ScalperEngine:
         else:
             universe = await self.scanner.get_universe()
         self._universe = self._exclude_follower_symbols(universe)
+        # D27/B-5: defter, evren dışı sembolleri (çözüm kancasına ulaşamayan)
+        # kayıt anında ayırt edebilsin. Saf bellek, REST yok.
+        try:
+            counterfactual_store.set_scan_universe(self._universe)
+        except Exception:  # pragma: no cover - teşhis akışı turu ASLA düşürmez
+            pass
 
         if not self._entries_ready():
             return
@@ -2943,6 +3062,18 @@ class ScalperEngine:
             return counterfactual_store.counters_snapshot()
         except Exception as e:  # pragma: no cover - teşhis alanı status'u düşürmez
             return {"error": f"{type(e).__name__}: {e}"}
+
+    def _counterfactual_sweep(self) -> None:
+        """Karşı-olgu defterinin yaş süpürmesi — saf bellek, REST YOK.
+
+        `_scan_tick` başında, `_entries_ready()` kapısından ÖNCE çağrılır.
+        Hız sınırı store içindedir (`SWEEP_MIN_INTERVAL_SEC`). Hata sessizce
+        yutulur: bir ölçüm kaydı tarama turunu ASLA düşürmemeli.
+        """
+        try:
+            counterfactual_store.sweep_expired(time.time(), force=False)
+        except Exception:  # pragma: no cover - teşhis akışı turu ASLA düşürmez
+            return
 
     def _counterfactual_resolve(self, symbol: str, ctx: StrategyContext) -> None:
         """Olgunlaşmış karşı-olgu kayıtlarını ZATEN ÇEKİLMİŞ mumlarla çöz.
@@ -4701,12 +4832,42 @@ class ScalperEngine:
         }
 
     def _get_cached_regime(self, symbol: str, candles_4h: list) -> Regime:
-        now = time.monotonic()
+        """Rejimi hesapla; önbellek anahtarı SON KAPANMIŞ rejim mumunun
+        `close_time`'ıdır (zaman TTL'i DEĞİL).
+
+        Eskiden sembol başına 300 sn zamana bağlı önbellek vardı: canlı profil
+        `SCALPER_TF_REGIME=15m` iken bu bir 15m mumunun üçte biri kadar
+        bayatlıktı ve yeni mum kapandığında rejim 5 dakikaya kadar eski kalıyordu
+        (kaçan DOWN-LONG / gereksiz bloklanan geçerli giriş, iki yönde de).
+        Harness her barda rejimi TAZE hesaplar (`backtest.py` `build_context`);
+        bu, canlıyı harness'a yaklaştırır. `detect_regime` yalnız mum listesinin
+        saf fonksiyonudur: son kapanmış mum değişmedikçe sonuç da değişmez, yani
+        aynı `close_time` için eski rejimi döndürmek ÖNBELLEKSİZ hesapla
+        özdeştir.
+
+        P1 BİLİNEN SAPMA (kalan): `data.py` `_TTL_BY_INTERVAL` 15m kline'ı 60 sn
+        önbellekler. Yeni 15m mum kapandıktan sonra rejim mumu en çok ~60 sn
+        gecikmeyle görülür; harness bu gecikmeyi modellemez. Önceki 300 sn'lik
+        sapmadan küçüktür ama sıfır değildir (bkz. DECISIONS #P1 listesi).
+
+        `close_time` okunamazsa (sayı değil / liste boş) önbelleğe YAZILMAZ ve
+        her çağrıda taze hesaplanır.
+        """
+        close_time: Optional[int] = None
+        try:
+            if candles_4h:
+                raw = getattr(candles_4h[-1], "close_time", None)
+                if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                    close_time = int(raw)
+        except Exception:
+            close_time = None
+        if close_time is None:
+            return detect_regime(candles_4h)
         cached = self._regime_cache.get(symbol)
-        if cached is not None and (now - cached[1]) < self._REGIME_CACHE_TTL:
+        if cached is not None and cached[1] == close_time:
             return cached[0]
         regime = detect_regime(candles_4h)
-        self._regime_cache[symbol] = (regime, now)
+        self._regime_cache[symbol] = (regime, close_time)
         return regime
 
     # ------------------------------------------------------------------
