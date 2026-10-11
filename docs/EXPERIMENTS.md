@@ -1,5 +1,11 @@
 # Deney defteri — backtest ve ölçüm kayıtları
 
+**11 Eki 2026 — E17 ön-kayıtlı giriş-TF deneyi: KAZANAN YOK (DEV-YOK).** C'nin "dipten long,
+tepeden short" sinyali 5m/15m/30m (ve açıklayıcı 1h) grafikte, ATR-ölçekli veya bugünkü geometriyle,
+2025'in tamamında **komisyonsuz bile** kâr etmiyor (brüt PF en iyi 0.93). Net PF 0.42–0.71; canlı 1m
+ayarı aynı yılda PF 0.78 (3370 işlem). Onay verisi (2023–2024) hiç indirilmedi, son sınav penceresi
+dokunulmadı. Bkz. **E17** (dosya sonu).
+
 **10 Eki 2026 — E16 ön-kayıtlı çıkış deneyi: KAZANAN YOK.** İlk kez dokunulmamış
 8 pencerede (2025, UP/DOWN/FLAT) ölçüldü. Bugünkü sunucu ayarı (B0) havuz PF **0.77**,
 8 pencerenin yalnız 1'inde PF>1, her rejim grubunda zarar. 10 çıkış varyantının
@@ -1654,3 +1660,68 @@ Yönler ayrı ayrı: LONG 642 işlem / −18 832; SHORT 977 işlem / −10 645.
 
 **Kanıt:** `docs/audits/2026-10-10-prereg-exits/` (plan, karar betiği ve testleri, koşu betikleri,
 `DECISION.md`, `results.csv`, `artifacts.tgz` = 121 backtest + 9 veri doldurma logu + JSON çıktılar + C1/C2 yaması).
+
+
+## E17 — Ön-kayıtlı giriş zaman dilimi deneyi: C büyük grafikte (2026-10-10/11) — KAZANAN YOK
+
+**Soru (kullanıcı).** "Dipten long, tepeden short" (C) 1m yerine 5m/15m/30m grafikte, kaldıraç coin
+oynaklığına göre ayarlanınca komisyon sonrası para kazandırır mı? (1h açıklayıcı: yılda ≈140 işlemle
+karara bağlanamaz.)
+
+**Tasarım (sonuç görülmeden kilitlendi).** Plan `docs/audits/2026-10-10-prereg-tf/PLAN.md`, kilit
+L2=`c00772ae32bd` (H=`a3168cda7fca`; L1=`f962d4867b83` duman testi altyapı hatası yüzünden yeniden
+kilitlendi, fark yalnız koşu betiği — PLAN §9.1). Aile m=6 (S5/T5, S15/T15, S30/T30):
+- **S:** ATR-ölçekli geometri, stop = 2×ATR(giriş TF), TP1 = 1R.
+- **T:** bugünkü sunucu geometrisi, majörlerde 20x'te sıkışık.
+- Rol üçlüleri: 5m/30m/1h, 15m/1h/4h, 30m/4h/4h.
+- Süre kuralı bar bazlı (480 bar tutma, 60 bar kayıp-bekleme).
+- Canlı kapılar (rejim, BTC hareket, hafta sonu) aile koşularında kapalı, gerekçe güç (§3.1 R2). Kapı etkisi 5m'de S5G/T5G ile ölçüldü.
+
+Setler:
+- **DEV = 2025** (eleme).
+- **VAL = 2023-01-01→2024-11-18** (onay, yalnız DEV geçerse).
+- **FINAL = 2026-09-03→10-08** (veto).
+
+Kapılar G0–G17 R birimindedir. İstatistik: null-merkezli studentize blok bootstrap ve BH. Duman testleri geçti: E16 sayıları birebir üretildi, belirlenimcilik doğrulandı, 13 koşunun check-run'ı geçti.
+
+**Sonuç (`run/DECISION.md`, `run/DEV_SCREEN.json`): DEV-YOK.** Hiçbir arm G2'yi (PF ≥ 1.15) geçmedi; BH 0/6 (en küçük p 0.9996).
+
+| Arm | N | WR% | PF net | PF komisyonsuz (Z0) | PF iyimser bar sırası | ΣR |
+|---|---|---|---|---|---|---|
+| S5 | 1829 | 48.9 | 0.666 | 0.930 | 0.768 | −356 |
+| T5 | 1778 | 83.6 | 0.711 | 0.882 | 0.890 | −84 |
+| S15 | 623 | 45.8 | 0.619 | 0.726 | 0.775 | −138 |
+| T15 | 668 | 81.6 | 0.437 | 0.550 | 0.757 | −71 |
+| S30 | 326 | 45.4 | 0.655 | 0.727 | 0.741 | −64 |
+| T30 | 362 | 81.2 | 0.421 | 0.525 | 0.590 | −40 |
+
+Referanslar ve açıklayıcı arm'lar (karar vermez):
+
+| Arm | N | PF |
+|---|---|---|
+| B0 (canlı 1m, kapılar açık) | 3370 | 0.777 |
+| R1 (1m, kapısız) | 6676 | 0.763 |
+| S5G (5m, kapılar açık) | 662 | 0.609 |
+| T5G (5m, kapılar açık) | 639 | 0.697 |
+| S60 (1h) | 184 | 0.620 (90% GA üst 0.81) |
+| T60 (1h) | 186 | 0.416 (90% GA üst 0.58) |
+
+**Yorum.**
+1. **Ücretten önce de kenar yok.** Komisyon ve kayma sıfırlanınca da hiçbir arm PF 1'e ulaşmıyor. Bu, "1m'de ücret kenarı yiyor, büyük grafikte ücret payı küçülür" fikrini çürütür: sorun ücret değil, sinyalin kendisi.
+2. **Bar-sırası belirsizliği kararı değiştirmiyor.** Aynı-mum sırasının en iyimser yorumunda bile PF ≤ 0.89; hiçbir arm "BAR-ORDER-BELİRSİZ" etiketi almadı.
+3. **Güç sorunu değil.** N 326–1829; %90 güven aralıklarının üst uçları 0.54–0.82. Tasarım (PLAN §11), 15m/30m'de PF ≈ 1.3, 5m'de ≈ 1.45 ve üstü bir kenarı görebilirdi; gözlenen değerler bunun çok altında.
+4. **Canlı kapılar yardım etmiyor.** 5m'de kapılar işlem sayısını üçte birine indirip PF'yi düşürüyor (S5 0.666 → S5G 0.609).
+5. **Canlı 1m ayarı 2025'in tamamında da zararda.** PF 0.777; E16'nın 8 penceresindeki 0.773 ile tutarlı.
+6. **Ters işaret ilginç (yalnız gözlem, test EDİLMEDİ).** Karşı-trend girişler 15m/30m'de ücretsiz bile güçlü kaybediyor (T15/T30 brüt PF 0.55/0.52, WR %81). Bu, o zaman dilimlerinde momentumun ağır bastığını düşündürür. Bu bir hipotezdir: ancak 2023–2024'ün hâlâ dokunulmamış verisinde ayrı, ön-kayıtlı bir deneyle (E18) sınanabilir; 2025 artık o soru için yalnız DEV'dir.
+
+**Harcanmayanlar.** VAL (2023-01→2024-11) çok-sembollü olarak hiç indirilmedi; FINAL penceresine dokunulmadı. İkisi de gelecek deneyler için temiz duruyor.
+
+**Altyapı olayları** (`run/ORCH_NOTES.md`):
+- Duman testinde analizci sahte gizli anahtarlar olmadan çağrıldığı için çöktü. Düzeltildi ve yeniden kilitlendi (L2).
+- Konteyner, oturum boşta kalınca iki kez geri alındı. DEV_B0_Q3 rapor üretmeden iki kez yarıda kaldı; ledger tamamlananları atladı ve koşu üçüncü denemede tamamlandı.
+- Hiçbir olay bir sonucu görerek değiştirmedi.
+
+**Kanıt:** `docs/audits/2026-10-10-prereg-tf/`:
+- Kilitli plan ve kilit dosyaları: `PLAN.md`, `variants.json`, `labels_frozen.json`, `cal_constants.json`, `archive_probe.json`, `LOCK.json`.
+- `evidence/` (Ek B).
+- `run/`: karar dosyaları ve `artifacts.tgz`. Pakette 43 rapor ve 86 log var; `provenance.scalper_config` çıkarıldı ve paket sunucu ayar satırlarına karşı taranıp temiz çıktı.

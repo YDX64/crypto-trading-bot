@@ -1,0 +1,25 @@
+{
+  "l": "c00772ae32bd817c1703f7e97e2199acff445606",
+  "h": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a",
+  "lock_sha256": "6aa9f3a15bd18c67388bebea111370b99271e5a35cb8d6866134697577270c33",
+  "lock_path": "docs/audits/2026-10-10-prereg-tf/LOCK.json",
+  "pushed": true,
+  "history": [
+    {
+      "kind": "lock",
+      "l": "f962d4867b83e2c92478b12ea21a9f06bf0cfc38",
+      "h": "14d3b17c53b18ef5f2eac5029f69fbff1b4119e5",
+      "lock_sha256": "3f7da5dd207cb14878cc1ee83e6bfff70c5787a014d795f6016db9a575a16513",
+      "utc": "2026-10-10T18:58:41Z",
+      "note": "mesaj atıf satırlarıyla düzeltildi (itilmeden önce; ağaç aynı)"
+    },
+    {
+      "kind": "L2",
+      "l": "c00772ae32bd817c1703f7e97e2199acff445606",
+      "h": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a",
+      "lock_sha256": "6aa9f3a15bd18c67388bebea111370b99271e5a35cb8d6866134697577270c33",
+      "utc": "2026-10-10T19:11:45Z",
+      "note": "mesaj atıf satırları + fark listesiyle düzeltildi (itilmeden önce; ağaç aynı)"
+    }
+  ]
+}
