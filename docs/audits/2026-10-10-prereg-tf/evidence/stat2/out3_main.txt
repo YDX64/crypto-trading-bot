@@ -1,0 +1,42 @@
+# senaryo=A FEEGATE=1.5 nsim=300 cfg={}
+S5   PF1.0: dev 0.00 val 0.00 JOINT 0.00 | PF1.15: dev 0.02 val 0.00 JOINT 0.00 | PF1.3: dev 0.50 val 0.49 JOINT 0.24 | PF1.5: dev 1.00 val 1.00 JOINT 1.00
+T5   PF1.0: dev 0.04 val 0.00 JOINT 0.00 | PF1.15: dev 0.47 val 0.34 JOINT 0.18 | PF1.3: dev 0.89 val 0.90 JOINT 0.82 | PF1.5: dev 1.00 val 1.00 JOINT 1.00
+S15  PF1.0: dev 0.04 val 0.01 JOINT 0.00 | PF1.15: dev 0.43 val 0.36 JOINT 0.15 | PF1.3: dev 0.85 val 0.90 JOINT 0.77 | PF1.5: dev 0.99 val 1.00 JOINT 0.99
+T15  PF1.0: dev 0.05 val 0.01 JOINT 0.00 | PF1.15: dev 0.32 val 0.34 JOINT 0.14 | PF1.3: dev 0.71 val 0.80 JOINT 0.59 | PF1.5: dev 0.94 val 0.97 JOINT 0.91
+S30  PF1.0: dev 0.03 val 0.02 JOINT 0.00 | PF1.15: dev 0.28 val 0.23 JOINT 0.06 | PF1.3: dev 0.65 val 0.75 JOINT 0.52 | PF1.5: dev 0.91 val 0.97 JOINT 0.89
+T30  PF1.0: dev 0.02 val 0.01 JOINT 0.00 | PF1.15: dev 0.24 val 0.28 JOINT 0.09 | PF1.3: dev 0.53 val 0.62 JOINT 0.35 | PF1.5: dev 0.84 val 0.94 JOINT 0.81
+# senaryo=A FEEGATE=2.0 nsim=300 cfg={}
+S5   PF1.0: dev 0.00 val 0.00 JOINT 0.00 | PF1.15: dev 0.00 val 0.00 JOINT 0.00 | PF1.3: dev 0.02 val 0.00 JOINT 0.00 | PF1.5: dev 0.66 val 0.75 JOINT 0.48
+T5   PF1.0: dev 0.00 val 0.00 JOINT 0.00 | PF1.15: dev 0.18 val 0.07 JOINT 0.02 | PF1.3: dev 0.62 val 0.64 JOINT 0.41 | PF1.5: dev 0.98 val 1.00 JOINT 0.98
+S15  PF1.0: dev 0.02 val 0.00 JOINT 0.00 | PF1.15: dev 0.32 val 0.15 JOINT 0.06 | PF1.3: dev 0.76 val 0.83 JOINT 0.65 | PF1.5: dev 0.99 val 1.00 JOINT 0.99
+T15  PF1.0: dev 0.05 val 0.01 JOINT 0.00 | PF1.15: dev 0.31 val 0.29 JOINT 0.10 | PF1.3: dev 0.71 val 0.77 JOINT 0.57 | PF1.5: dev 0.94 val 0.97 JOINT 0.91
+S30  PF1.0: dev 0.03 val 0.02 JOINT 0.00 | PF1.15: dev 0.28 val 0.23 JOINT 0.06 | PF1.3: dev 0.65 val 0.75 JOINT 0.52 | PF1.5: dev 0.91 val 0.97 JOINT 0.89
+T30  PF1.0: dev 0.02 val 0.01 JOINT 0.00 | PF1.15: dev 0.24 val 0.28 JOINT 0.09 | PF1.3: dev 0.53 val 0.62 JOINT 0.35 | PF1.5: dev 0.84 val 0.94 JOINT 0.81
+# senaryo=B FEEGATE=1.5 nsim=300 cfg={}
+S5   PF1.0: dev 0.00 val 0.00 JOINT 0.00 | PF1.15: dev 0.08 val 0.03 JOINT 0.00 | PF1.3: dev 0.52 val 0.60 JOINT 0.30 | PF1.5: dev 0.99 val 0.99 JOINT 0.97
+T5   PF1.0: dev 0.15 val 0.00 JOINT 0.00 | PF1.15: dev 0.49 val 0.16 JOINT 0.10 | PF1.3: dev 0.79 val 0.41 JOINT 0.36 | PF1.5: dev 0.94 val 0.80 JOINT 0.78
+S15  PF1.0: dev 0.09 val 0.00 JOINT 0.00 | PF1.15: dev 0.46 val 0.22 JOINT 0.13 | PF1.3: dev 0.85 val 0.74 JOINT 0.65 | PF1.5: dev 0.99 val 0.97 JOINT 0.96
+T15  PF1.0: dev 0.10 val 0.02 JOINT 0.00 | PF1.15: dev 0.35 val 0.21 JOINT 0.11 | PF1.3: dev 0.68 val 0.51 JOINT 0.40 | PF1.5: dev 0.87 val 0.79 JOINT 0.73
+S30  PF1.0: dev 0.06 val 0.02 JOINT 0.00 | PF1.15: dev 0.31 val 0.20 JOINT 0.06 | PF1.3: dev 0.66 val 0.62 JOINT 0.47 | PF1.5: dev 0.92 val 0.89 JOINT 0.83
+T30  PF1.0: dev 0.05 val 0.02 JOINT 0.00 | PF1.15: dev 0.27 val 0.25 JOINT 0.09 | PF1.3: dev 0.56 val 0.45 JOINT 0.30 | PF1.5: dev 0.83 val 0.80 JOINT 0.69
+# senaryo=B FEEGATE=2.0 nsim=300 cfg={}
+S5   PF1.0: dev 0.00 val 0.00 JOINT 0.00 | PF1.15: dev 0.00 val 0.00 JOINT 0.00 | PF1.3: dev 0.07 val 0.06 JOINT 0.00 | PF1.5: dev 0.74 val 0.85 JOINT 0.61
+T5   PF1.0: dev 0.07 val 0.00 JOINT 0.00 | PF1.15: dev 0.35 val 0.13 JOINT 0.06 | PF1.3: dev 0.62 val 0.37 JOINT 0.27 | PF1.5: dev 0.89 val 0.78 JOINT 0.72
+S15  PF1.0: dev 0.04 val 0.00 JOINT 0.00 | PF1.15: dev 0.37 val 0.17 JOINT 0.08 | PF1.3: dev 0.78 val 0.71 JOINT 0.58 | PF1.5: dev 0.98 val 0.97 JOINT 0.95
+T15  PF1.0: dev 0.10 val 0.02 JOINT 0.00 | PF1.15: dev 0.35 val 0.20 JOINT 0.11 | PF1.3: dev 0.68 val 0.51 JOINT 0.40 | PF1.5: dev 0.87 val 0.79 JOINT 0.73
+S30  PF1.0: dev 0.06 val 0.02 JOINT 0.00 | PF1.15: dev 0.31 val 0.20 JOINT 0.06 | PF1.3: dev 0.66 val 0.62 JOINT 0.47 | PF1.5: dev 0.92 val 0.89 JOINT 0.83
+T30  PF1.0: dev 0.05 val 0.02 JOINT 0.00 | PF1.15: dev 0.27 val 0.25 JOINT 0.09 | PF1.3: dev 0.56 val 0.45 JOINT 0.30 | PF1.5: dev 0.83 val 0.80 JOINT 0.69
+# senaryo=C FEEGATE=1.5 nsim=300 cfg={}
+S5   PF1.0: dev 0.01 val 0.00 JOINT 0.00 | PF1.15: dev 0.20 val 0.04 JOINT 0.01 | PF1.3: dev 0.60 val 0.29 JOINT 0.22 | PF1.5: dev 0.95 val 0.81 JOINT 0.79
+T5   PF1.0: dev 0.18 val 0.00 JOINT 0.00 | PF1.15: dev 0.34 val 0.06 JOINT 0.04 | PF1.3: dev 0.55 val 0.16 JOINT 0.13 | PF1.5: dev 0.69 val 0.34 JOINT 0.29
+S15  PF1.0: dev 0.12 val 0.01 JOINT 0.00 | PF1.15: dev 0.46 val 0.10 JOINT 0.07 | PF1.3: dev 0.81 val 0.38 JOINT 0.34 | PF1.5: dev 0.96 val 0.77 JOINT 0.76
+T15  PF1.0: dev 0.17 val 0.02 JOINT 0.01 | PF1.15: dev 0.34 val 0.10 JOINT 0.06 | PF1.3: dev 0.55 val 0.25 JOINT 0.17 | PF1.5: dev 0.74 val 0.45 JOINT 0.40
+S30  PF1.0: dev 0.09 val 0.01 JOINT 0.00 | PF1.15: dev 0.31 val 0.10 JOINT 0.04 | PF1.3: dev 0.63 val 0.41 JOINT 0.33 | PF1.5: dev 0.88 val 0.70 JOINT 0.66
+T30  PF1.0: dev 0.10 val 0.01 JOINT 0.00 | PF1.15: dev 0.32 val 0.17 JOINT 0.10 | PF1.3: dev 0.46 val 0.23 JOINT 0.15 | PF1.5: dev 0.72 val 0.52 JOINT 0.44
+# senaryo=C FEEGATE=2.0 nsim=300 cfg={}
+S5   PF1.0: dev 0.00 val 0.00 JOINT 0.00 | PF1.15: dev 0.02 val 0.00 JOINT 0.00 | PF1.3: dev 0.22 val 0.12 JOINT 0.05 | PF1.5: dev 0.76 val 0.75 JOINT 0.61
+T5   PF1.0: dev 0.15 val 0.00 JOINT 0.00 | PF1.15: dev 0.31 val 0.06 JOINT 0.04 | PF1.3: dev 0.51 val 0.16 JOINT 0.12 | PF1.5: dev 0.68 val 0.34 JOINT 0.29
+S15  PF1.0: dev 0.10 val 0.00 JOINT 0.00 | PF1.15: dev 0.39 val 0.09 JOINT 0.06 | PF1.3: dev 0.75 val 0.37 JOINT 0.31 | PF1.5: dev 0.96 val 0.77 JOINT 0.76
+T15  PF1.0: dev 0.17 val 0.02 JOINT 0.01 | PF1.15: dev 0.33 val 0.10 JOINT 0.06 | PF1.3: dev 0.55 val 0.25 JOINT 0.17 | PF1.5: dev 0.74 val 0.45 JOINT 0.40
+S30  PF1.0: dev 0.09 val 0.01 JOINT 0.00 | PF1.15: dev 0.31 val 0.10 JOINT 0.04 | PF1.3: dev 0.63 val 0.41 JOINT 0.33 | PF1.5: dev 0.88 val 0.70 JOINT 0.66
+T30  PF1.0: dev 0.10 val 0.01 JOINT 0.00 | PF1.15: dev 0.32 val 0.17 JOINT 0.10 | PF1.3: dev 0.46 val 0.23 JOINT 0.15 | PF1.5: dev 0.72 val 0.52 JOINT 0.44

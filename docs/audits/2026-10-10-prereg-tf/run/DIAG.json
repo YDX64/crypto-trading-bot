@@ -1,0 +1,60 @@
+{
+  "arms": {
+    "S5": {
+      "pf_pess": 0.6655016217331237,
+      "pf_opt": 0.7676142681259456,
+      "pf_z0": 0.9301526140150688,
+      "z0_reading": "ücretten önce de kenar yok",
+      "n_pess": 1829,
+      "n_opt": 1821,
+      "labels": []
+    },
+    "T5": {
+      "pf_pess": 0.7109134290244423,
+      "pf_opt": 0.8903191784166782,
+      "pf_z0": 0.8823646631273224,
+      "z0_reading": "ücretten önce de kenar yok",
+      "n_pess": 1778,
+      "n_opt": 1745,
+      "labels": []
+    },
+    "S15": {
+      "pf_pess": 0.6194175734697663,
+      "pf_opt": 0.775443332887731,
+      "pf_z0": 0.7261491562739579,
+      "z0_reading": "ücretten önce de kenar yok",
+      "n_pess": 623,
+      "n_opt": 621,
+      "labels": []
+    },
+    "T15": {
+      "pf_pess": 0.43703063885523685,
+      "pf_opt": 0.7570307164096427,
+      "pf_z0": 0.5503186286554338,
+      "z0_reading": "ücretten önce de kenar yok",
+      "n_pess": 668,
+      "n_opt": 640,
+      "labels": []
+    },
+    "S30": {
+      "pf_pess": 0.6553323460737175,
+      "pf_opt": 0.7407240138635492,
+      "pf_z0": 0.727186624657799,
+      "z0_reading": "ücretten önce de kenar yok",
+      "n_pess": 326,
+      "n_opt": 323,
+      "labels": []
+    },
+    "T30": {
+      "pf_pess": 0.4209885059105161,
+      "pf_opt": 0.5899742335521254,
+      "pf_z0": 0.5247317715500671,
+      "z0_reading": "ücretten önce de kenar yok",
+      "n_pess": 362,
+      "n_opt": 338,
+      "labels": []
+    }
+  },
+  "note": "teşhis; karar vermez",
+  "created_utc": "2026-10-10T23:58:50Z"
+}
