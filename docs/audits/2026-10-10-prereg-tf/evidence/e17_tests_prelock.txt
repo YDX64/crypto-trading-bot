@@ -1,0 +1,14 @@
+# E17 pre-lock test evidence (PLAN §5.1 Kabul notu) — 2026-10-10T18:57:14Z
+# H candidate: 14d3b17c53b18ef5f2eac5029f69fbff1b4119e5  python: Python 3.12.3
+# cmd: E17_SCRIPTS_TESTS=1 E17_SLOW=1 E17_REAL_VARIANTS=<scratchpad variants.json (== docs/.../variants.json)> E17_REAL_SNAPSHOT=$HOME/e17_root/server-scalper-env.txt .venv/bin/python -m pytest tests/test_e17_harness.py tests/test_e17_analyzer.py tests/test_e17_scripts.py tests/test_e17_scripts_fast.py -q -p no:cacheprovider -rs
+# --- last lines of pytest output (no secrets) ---
+........................................................................ [ 18%]
+........................................................................ [ 36%]
+........................................................................ [ 55%]
+..................................................s..................... [ 73%]
+........................................................................ [ 92%]
+..............s...............                                           [100%]
+=========================== short test summary info ============================
+SKIPPED [1] tests/test_e17_analyzer.py:1798: yalnız env'i S'yi listelemeyen arm'lar
+SKIPPED [1] tests/test_e17_scripts.py:1360: root dosya izinlerini aşar; parmak izi koruması yukarıda test edildi
+388 passed, 2 skipped in 291.80s (0:04:51)

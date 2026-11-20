@@ -25,8 +25,15 @@ NASIL ÇALIŞIR (parite için KASITLI tasarım):
   * Önce GEÇİCİ bir hazırlık dizinine yazılır; HER dosya katı denetimden geçer
     (mum sayısı == anahtardan türeyen `needed`, her mum tam ızgarada, boşluk YOK,
     son mum `end-1`'de kapanır). Tek bir sorun -> hata ile durulur, hedef önbelleğe
-    HİÇBİR ŞEY yazılmaz. Hepsi geçerse dosyalar tek tek `os.replace` (atomik) ile
-    taşınır.
+    HİÇBİR ŞEY yazılmaz. Hepsi geçerse dosyalar tek tek `os.replace` ile taşınır:
+    atomiklik DOSYA BAŞINADIR (bir dosya ya tam doğrulanmış haliyle vardır ya da
+    yoktur); terfi TÜM dosyalar için tek işlem DEĞİLDİR. Terfi ortasında G/Ç hatası
+    olursa önbellek KISMEN güncellenmiş olabilir; eksik kalan dosya backtest'te
+    cache-miss ile gürültülü hata verir (sessiz yanlış veri YOK). `--overwrite` ile
+    terfi ortasında G/Ç hatası olursa, henüz terfi EDİLMEMİŞ ve önceden VAR OLAN
+    (eski sürüm) hedef dosyalar SİLİNİR (geçersiz kılınır; eski+yeni karışık veriyle
+    backtest sessizce koşmasın); terfi edilmiş yeni dosyalar kalır. Silme
+    başarısız olursa hata mesajında yazılır. `--overwrite` KAPALIYKEN silme yoktur.
   * Her zip için `.CHECKSUM` (sha256) doğrulanır; uyuşmazlık = hata. İndirilen zip'ler
     `--download-cache` altında tutulur (tekrar indirilmez; her kullanımda sha256
     yeniden doğrulanır).
@@ -91,6 +98,15 @@ class VisionError(RuntimeError):
     """Arşiv/ağ/doğrulama hatası — çağıran durur, önbelleğe bir şey yazılmaz."""
 
 
+class PromotionError(VisionError):
+    """Terfi (hazırlık -> hedef önbellek `os.replace`) sırasında G/Ç hatası.
+
+    Önceki dosyalar yazılmış olabilir: önbellek KISMEN güncellenmiş olabilir.
+    `--overwrite` açıkken terfi edilmemiş eski hedef dosyalar silinir ve mesaja
+    yazılır (silinemeyenler de).
+    """
+
+
 class ArchiveGapError(VisionError):
     """İstenen gün/ay arşivde yok (404) — pencere arşiv kapsamının dışında."""
 
@@ -130,8 +146,8 @@ class HttpTransport:
                     self.requests += 1
                     return None
                 last = exc
-                if exc.code < 500 and exc.code != 429:
-                    break  # kalıcı 4xx: tekrar denemenin anlamı yok
+                if exc.code < 500 and exc.code not in (408, 429):
+                    break  # kalıcı 4xx (408 Request Timeout / 429 geçicidir: yeniden denenir): tekrar denemenin anlamı yok
             except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
                 last = exc
             if attempt < self.retries - 1:
@@ -443,7 +459,7 @@ class ArchiveKlineSource:
 
 
 # --------------------------------------------------------------------------
-# Önbellek dosyası doğrulama + atomik terfi
+# Önbellek dosyası doğrulama + dosya başına atomik terfi
 # --------------------------------------------------------------------------
 
 @dataclass
@@ -544,6 +560,44 @@ class FillReport:
     from_cache: int = 0
 
 
+def _invalidate_unpromoted_old_files(
+    remaining: Sequence[Tuple[StagedFile, Path, str]],
+) -> str:
+    """`--overwrite` terfisi yarıda kaldığında: henüz terfi EDİLMEMİŞ ve önceden
+    VAR OLAN (eski sürüm) hedef dosyaları siler (geçersiz kılar).
+
+    Neden: aksi halde önbellek eski+yeni karışık kalır ve backtest bunu
+    SESSİZCE okur. Silinen dosya backtest'te cache-miss ile gürültülü hata verir.
+    Zaten terfi edilmiş yeni dosyalara dokunulmaz (her biri tek başına
+    doğrulanmıştır); "değişmedi" dosyalar da kalır (içerik arşivle aynı).
+    Silme başarısız olursa bu mesaja yazılır (dosya hâlâ ESKİ sürümdür).
+    """
+    deleted: List[str] = []
+    failed: List[str] = []
+    for _sf, final, status in remaining:
+        if status != "yenilendi":
+            continue
+        try:
+            final.unlink()
+            deleted.append(final.name)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            failed.append(f"{final.name} ({exc!r})")
+    out = ""
+    if deleted:
+        out += (
+            f"; terfi edilmemiş {len(deleted)} eski dosya geçersiz kılındı (silindi): "
+            + ", ".join(deleted)
+        )
+    if failed:
+        out += (
+            f"; UYARI: {len(failed)} eski dosya SİLİNEMEDİ (eski sürüm olarak duruyor, "
+            "backtest karışık veriyle sessizce koşabilir; elle silin): " + ", ".join(failed)
+        )
+    return out
+
+
 async def fill_cache(
     *,
     symbols: Sequence[str],
@@ -562,7 +616,10 @@ async def fill_cache(
 ) -> FillReport:
     """Pencere için harness'in okuyacağı TÜM önbellek dosyalarını doldurur.
 
-    Hata -> VisionError; hedef `cache_dir`e hiçbir dosya yazılmaz.
+    Hata -> VisionError; hedef `cache_dir`e hiçbir dosya yazılmaz
+    (tek istisna: terfi sırasındaki `PromotionError` — kısmi güncelleme olabilir;
+    `overwrite` açıkken terfi edilmemiş ESKİ hedef dosyalar silinir, bkz.
+    `_invalidate_unpromoted_old_files`).
     """
     effective_days, start_ms, end_ms = backtest.resolve_backtest_window(0, start, end)
     if start_ms is None or end_ms is None:  # resolve_backtest_window start/end verildiğinde dolu döner
@@ -616,9 +673,15 @@ async def fill_cache(
                     status = "yenilendi"
             plan.append((sf, final, status))
 
-        for sf, final, status in plan:
+        for idx, (sf, final, status) in enumerate(plan):
             if status != "değişmedi":
-                os.replace(sf.path, final)
+                try:
+                    os.replace(sf.path, final)
+                except OSError as exc:
+                    msg = f"{final.name}: terfi sırasında G/Ç hatası ({exc!r})"
+                    if overwrite:
+                        msg += _invalidate_unpromoted_old_files(plan[idx:])
+                    raise PromotionError(msg) from exc
             report.files.append(FileReport(
                 path=final, symbol=sf.symbol, interval=sf.interval, candles=len(sf.candles),
                 first_open_ms=sf.candles[0].open_time, last_close_ms=sf.candles[-1].close_time,
@@ -702,7 +765,17 @@ def main(argv: Optional[Sequence[str]] = None, transport: Optional[Transport] = 
             market_gate=gate, overwrite=args.overwrite, use_monthly=not args.no_monthly,
             log=log,
         ))
-    except (VisionError, ValueError) as exc:
+    except PromotionError as exc:
+        log(f"HATA: {exc}")
+        log(
+            "Önbellek KISMEN güncellenmiş olabilir; yazılan her dosya tek başına "
+            "doğrulanmıştır (eksik dosya backtest'te cache-miss ile gürültülü hata verir). "
+            "--overwrite açıksa terfi edilmemiş eski dosyalar yukarıdaki mesajda belirtildiği gibi silinir."
+        )
+        return 2
+    except (VisionError, ValueError, OSError) as exc:
+        # OSError: terfi ÖNCESİ G/Ç (hazırlık dizini, indirme önbelleği, disk
+        # dolu...). Terfi sırasındaki OSError PromotionError'a çevrilir (yukarıda).
         log(f"HATA: {exc}")
         log("Önbelleğe HİÇBİR dosya yazılmadı.")
         return 2

@@ -2304,6 +2304,9 @@ class TestRecoverRestoresForensics:
         assert path["trail_updates"] is None       # "0" UYDURMA olurdu
         # Madde 6: MFE de bellekteydi → yazılan sayı yalnız bir ALT SINIR.
         assert path["mfe_lower_bound"] is True
+        # MAE de bellekteydi; imzalı ROI'de gözlenen değer gerçek en kötüden
+        # yukarıda olabilir → yalnız bir ÜST SINIR.
+        assert path["mae_upper_bound"] is True
         # İlk stop kurtarmadaki CANLI stop değil, giriş belgesindeki gerçek.
         assert path["initial_stop"] == 97.5
         # Giriş belgesi geri geldiği için GİRİŞ etiketleri de türetilebiliyor.
@@ -2320,6 +2323,7 @@ class TestRecoverRestoresForensics:
         path = doc["path"]
         assert "restart_gap" not in path
         assert "mfe_lower_bound" not in path
+        assert "mae_upper_bound" not in path
         assert path["trail_updates"] == 4
         assert path["initial_stop"] == 99.0
 
@@ -2593,3 +2597,16 @@ class TestDashboardLabelsMadde3_11_12:
         html = self._html()
         assert "yüksek red oranı (bilgi)" in html
         assert 'g.mode === "active"' in html
+        # Yalnız "iki dize de dosyada var" yetmez: bilgi notu mode kontrolünün
+        # ELSE dalında (active DIŞINDA), KAÇAK KORUMASI uyarısı IF dalında olmalı.
+        import re
+
+        m = re.search(
+            r'if \(g\.mode === "active"\)\{(?P<if_body>[^{}]*)\}\s*else\s*\{(?P<else_body>[^{}]*)\}',
+            html,
+        )
+        assert m, "g.mode === 'active' if/else bloğu bulunamadı"
+        assert "yüksek red oranı (bilgi)" in m.group("else_body")
+        assert "yüksek red oranı (bilgi)" not in m.group("if_body")
+        assert "KAÇAK KORUMASI" in m.group("if_body")
+        assert "KAÇAK KORUMASI" not in m.group("else_body")

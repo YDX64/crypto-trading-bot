@@ -1,0 +1,927 @@
+{
+  "S5": {
+    "G0": {
+      "value": 0.0,
+      "threshold": 0.1,
+      "op": "<=",
+      "limiting": "G0a",
+      "pass": true,
+      "borderline": false,
+      "rows": [
+        {
+          "gate": "G0a",
+          "name": "sessiz düşüş / ham sinyal",
+          "value": 0.0,
+          "threshold": 0.1,
+          "op": "<=",
+          "pass": true,
+          "borderline": false,
+          "note": "0/1843"
+        },
+        {
+          "gate": "G0b",
+          "name": "EOD işlem sayısı",
+          "value": 1,
+          "threshold": 8,
+          "op": "<=",
+          "pass": true,
+          "borderline": false,
+          "note": ""
+        },
+        {
+          "gate": "G0c1",
+          "name": "3x kaldıraç payı",
+          "value": 0.03608529250956807,
+          "threshold": 0.1,
+          "op": "<=",
+          "pass": true,
+          "borderline": false,
+          "note": ""
+        },
+        {
+          "gate": "G0c2",
+          "name": "20x kaldıraç payı",
+          "value": 0.1060688901038819,
+          "threshold": 0.5,
+          "op": "<=",
+          "pass": true,
+          "borderline": false,
+          "note": ""
+        },
+        {
+          "gate": "G0d",
+          "name": "sabit-risk payı",
+          "value": 1.0,
+          "threshold": 0.95,
+          "op": ">=",
+          "pass": true,
+          "borderline": false,
+          "note": ""
+        }
+      ]
+    },
+    "G1": {
+      "gate": "G1",
+      "name": "N (kapasite sonrası)",
+      "value": 1829,
+      "threshold": 200,
+      "op": ">=",
+      "pass": true,
+      "borderline": false,
+      "note": ""
+    },
+    "n": 1829,
+    "pf": 0.6655016217331237,
+    "t_obs": -6.577131132871835,
+    "p7": 1.0,
+    "validity": {
+      "scaled": true,
+      "sessiz_dusus": 0.0
+    },
+    "mc_refined": false,
+    "q": 1.0,
+    "G2": {
+      "gate": "G2",
+      "name": "PF",
+      "value": 0.6655016217331237,
+      "threshold": 1.15,
+      "op": ">=",
+      "pass": false,
+      "borderline": false,
+      "note": ""
+    },
+    "G3": {
+      "gate": "G3",
+      "name": "BH q (m=6, p[b=7])",
+      "value": 1.0,
+      "threshold": 0.2,
+      "op": "<=",
+      "pass": false,
+      "borderline": false,
+      "note": ""
+    },
+    "G4": {
+      "value": 0.639298989047231,
+      "threshold": 1.0,
+      "op": ">=",
+      "limiting": "G4a",
+      "pass": false,
+      "borderline": false,
+      "rows": [
+        {
+          "gate": "G4a",
+          "name": "PF, en iyi ay (2025-11) hariç",
+          "value": 0.639298989047231,
+          "threshold": 1.0,
+          "op": ">=",
+          "pass": false,
+          "borderline": false,
+          "note": ""
+        },
+        {
+          "gate": "G4b",
+          "name": "Σ R, en iyi 5 işlem hariç",
+          "value": -383.2502074106641,
+          "threshold": 0.0,
+          "op": ">",
+          "pass": false,
+          "borderline": false,
+          "note": ""
+        }
+      ]
+    },
+    "G5": {
+      "gate": "G5",
+      "name": "rejim tabanı: uygun (n>=40) grupların en düşük PF'i",
+      "value": 0.5947370379385242,
+      "threshold": 0.8,
+      "op": ">=",
+      "pass": false,
+      "borderline": false,
+      "note": "",
+      "groups": {
+        "UP": {
+          "n": 767,
+          "pf": 0.5947370379385242,
+          "sum_r": -190.55160528909047
+        },
+        "FLAT": {
+          "n": 652,
+          "pf": 0.6823073129154914,
+          "sum_r": -116.16178949095394
+        },
+        "DOWN": {
+          "n": 410,
+          "pf": 0.7838835644168194,
+          "sum_r": -49.52470208715269
+        }
+      }
+    },
+    "pass_g0_g5": false
+  },
+  "T5": {
+    "G0": {
+      "value": 0.004415011037527594,
+      "threshold": 0.1,
+      "op": "<=",
+      "limiting": "G0a",
+      "pass": true,
+      "borderline": false,
+      "rows": [
+        {
+          "gate": "G0a",
+          "name": "sessiz düşüş / ham sinyal",
+          "value": 0.004415011037527594,
+          "threshold": 0.1,
+          "op": "<=",
+          "pass": true,
+          "borderline": false,
+          "note": "8/1812"
+        },
+        {
+          "gate": "G0b",
+          "name": "EOD işlem sayısı",
+          "value": 1,
+          "threshold": 8,
+          "op": "<=",
+          "pass": true,
+          "borderline": false,
+          "note": ""
+        },
+        {
+          "gate": "G0d",
+          "name": "sabit-risk payı",
+          "value": 1.0,
+          "threshold": 0.95,
+          "op": ">=",
+          "pass": true,
+          "borderline": false,
+          "note": ""
+        }
+      ]
+    },
+    "G1": {
+      "gate": "G1",
+      "name": "N (kapasite sonrası)",
+      "value": 1778,
+      "threshold": 200,
+      "op": ">=",
+      "pass": true,
+      "borderline": false,
+      "note": ""
+    },
+    "n": 1778,
+    "pf": 0.7109134290244423,
+    "t_obs": -3.523349110118523,
+    "p7": 0.99985,
+    "validity": {
+      "scaled": false,
+      "sessiz_dusus": 0.004415011037527594
+    },
+    "mc_refined": false,
+    "q": 1.0,
+    "G2": {
+      "gate": "G2",
+      "name": "PF",
+      "value": 0.7109134290244423,
+      "threshold": 1.15,
+      "op": ">=",
+      "pass": false,
+      "borderline": false,
+      "note": ""
+    },
+    "G3": {
+      "gate": "G3",
+      "name": "BH q (m=6, p[b=7])",
+      "value": 1.0,
+      "threshold": 0.2,
+      "op": "<=",
+      "pass": false,
+      "borderline": false,
+      "note": ""
+    },
+    "G4": {
+      "value": 0.690302938281869,
+      "threshold": 1.0,
+      "op": ">=",
+      "limiting": "G4a",
+      "pass": false,
+      "borderline": false,
+      "rows": [
+        {
+          "gate": "G4a",
+          "name": "PF, en iyi ay (2025-08) hariç",
+          "value": 0.690302938281869,
+          "threshold": 1.0,
+          "op": ">=",
+          "pass": false,
+          "borderline": false,
+          "note": ""
+        },
+        {
+          "gate": "G4b",
+          "name": "Σ R, en iyi 5 işlem hariç",
+          "value": -90.61653062583353,
+          "threshold": 0.0,
+          "op": ">",
+          "pass": false,
+          "borderline": false,
+          "note": ""
+        }
+      ]
+    },
+    "G5": {
+      "gate": "G5",
+      "name": "rejim tabanı: uygun (n>=40) grupların en düşük PF'i",
+      "value": 0.6148028521850601,
+      "threshold": 0.8,
+      "op": ">=",
+      "pass": false,
+      "borderline": false,
+      "note": "",
+      "groups": {
+        "UP": {
+          "n": 737,
+          "pf": 0.6148028521850601,
+          "sum_r": -54.18570582497234
+        },
+        "FLAT": {
+          "n": 621,
+          "pf": 0.7832711768854939,
+          "sum_r": -20.127285406060757
+        },
+        "DOWN": {
+          "n": 420,
+          "pf": 0.8306730019468251,
+          "sum_r": -9.614634334262735
+        }
+      }
+    },
+    "pass_g0_g5": false
+  },
+  "S15": {
+    "G0": {
+      "value": 0.0,
+      "threshold": 0.1,
+      "op": "<=",
+      "limiting": "G0a",
+      "pass": true,
+      "borderline": false,
+      "rows": [
+        {
+          "gate": "G0a",
+          "name": "sessiz düşüş / ham sinyal",
+          "value": 0.0,
+          "threshold": 0.1,
+          "op": "<=",
+          "pass": true,
+          "borderline": false,
+          "note": "0/629"
+        },
+        {
+          "gate": "G0b",
+          "name": "EOD işlem sayısı",
+          "value": 0,
+          "threshold": 8,
+          "op": "<=",
+          "pass": true,
+          "borderline": false,
+          "note": ""
+        },
+        {
+          "gate": "G0c1",
+          "name": "3x kaldıraç payı",
+          "value": 0.048154093097913325,
+          "threshold": 0.1,
+          "op": "<=",
+          "pass": true,
+          "borderline": false,
+          "note": ""
+        },
+        {
+          "gate": "G0c2",
+          "name": "20x kaldıraç payı",
+          "value": 0.060995184590690206,
+          "threshold": 0.5,
+          "op": "<=",
+          "pass": true,
+          "borderline": false,
+          "note": ""
+        },
+        {
+          "gate": "G0d",
+          "name": "sabit-risk payı",
+          "value": 1.0,
+          "threshold": 0.95,
+          "op": ">=",
+          "pass": true,
+          "borderline": false,
+          "note": ""
+        }
+      ]
+    },
+    "G1": {
+      "gate": "G1",
+      "name": "N (kapasite sonrası)",
+      "value": 623,
+      "threshold": 200,
+      "op": ">=",
+      "pass": true,
+      "borderline": false,
+      "note": ""
+    },
+    "n": 623,
+    "pf": 0.6194175734697663,
+    "t_obs": -4.332765649075477,
+    "p7": 1.0,
+    "validity": {
+      "scaled": true,
+      "sessiz_dusus": 0.0
+    },
+    "mc_refined": false,
+    "q": 1.0,
+    "G2": {
+      "gate": "G2",
+      "name": "PF",
+      "value": 0.6194175734697663,
+      "threshold": 1.15,
+      "op": ">=",
+      "pass": false,
+      "borderline": false,
+      "note": ""
+    },
+    "G3": {
+      "gate": "G3",
+      "name": "BH q (m=6, p[b=7])",
+      "value": 1.0,
+      "threshold": 0.2,
+      "op": "<=",
+      "pass": false,
+      "borderline": false,
+      "note": ""
+    },
+    "G4": {
+      "value": 0.6097215988024928,
+      "threshold": 1.0,
+      "op": ">=",
+      "limiting": "G4a",
+      "pass": false,
+      "borderline": false,
+      "rows": [
+        {
+          "gate": "G4a",
+          "name": "PF, en iyi ay (2025-02) hariç",
+          "value": 0.6097215988024928,
+          "threshold": 1.0,
+          "op": ">=",
+          "pass": false,
+          "borderline": false,
+          "note": ""
+        },
+        {
+          "gate": "G4b",
+          "name": "Σ R, en iyi 5 işlem hariç",
+          "value": -151.37503691516346,
+          "threshold": 0.0,
+          "op": ">",
+          "pass": false,
+          "borderline": false,
+          "note": ""
+        }
+      ]
+    },
+    "G5": {
+      "gate": "G5",
+      "name": "rejim tabanı: uygun (n>=40) grupların en düşük PF'i",
+      "value": 0.558450642945649,
+      "threshold": 0.8,
+      "op": ">=",
+      "pass": false,
+      "borderline": false,
+      "note": "",
+      "groups": {
+        "UP": {
+          "n": 264,
+          "pf": 0.558450642945649,
+          "sum_r": -69.67450157106984
+        },
+        "FLAT": {
+          "n": 210,
+          "pf": 0.6684110054686806,
+          "sum_r": -38.72841557816646
+        },
+        "DOWN": {
+          "n": 149,
+          "pf": 0.6635257588071151,
+          "sum_r": -29.735817600354206
+        }
+      }
+    },
+    "pass_g0_g5": false
+  },
+  "T15": {
+    "G0": {
+      "value": 0.024602026049204053,
+      "threshold": 0.1,
+      "op": "<=",
+      "limiting": "G0a",
+      "pass": true,
+      "borderline": false,
+      "rows": [
+        {
+          "gate": "G0a",
+          "name": "sessiz düşüş / ham sinyal",
+          "value": 0.024602026049204053,
+          "threshold": 0.1,
+          "op": "<=",
+          "pass": true,
+          "borderline": false,
+          "note": "17/691"
+        },
+        {
+          "gate": "G0b",
+          "name": "EOD işlem sayısı",
+          "value": 0,
+          "threshold": 8,
+          "op": "<=",
+          "pass": true,
+          "borderline": false,
+          "note": ""
+        },
+        {
+          "gate": "G0d",
+          "name": "sabit-risk payı",
+          "value": 1.0,
+          "threshold": 0.95,
+          "op": ">=",
+          "pass": true,
+          "borderline": false,
+          "note": ""
+        }
+      ]
+    },
+    "G1": {
+      "gate": "G1",
+      "name": "N (kapasite sonrası)",
+      "value": 668,
+      "threshold": 200,
+      "op": ">=",
+      "pass": true,
+      "borderline": false,
+      "note": ""
+    },
+    "n": 668,
+    "pf": 0.43703063885523685,
+    "t_obs": -4.882593020996068,
+    "p7": 1.0,
+    "validity": {
+      "scaled": false,
+      "sessiz_dusus": 0.024602026049204053
+    },
+    "mc_refined": false,
+    "q": 1.0,
+    "G2": {
+      "gate": "G2",
+      "name": "PF",
+      "value": 0.43703063885523685,
+      "threshold": 1.15,
+      "op": ">=",
+      "pass": false,
+      "borderline": false,
+      "note": ""
+    },
+    "G3": {
+      "gate": "G3",
+      "name": "BH q (m=6, p[b=7])",
+      "value": 1.0,
+      "threshold": 0.2,
+      "op": "<=",
+      "pass": false,
+      "borderline": false,
+      "note": ""
+    },
+    "G4": {
+      "value": 0.4166244860575136,
+      "threshold": 1.0,
+      "op": ">=",
+      "limiting": "G4a",
+      "pass": false,
+      "borderline": false,
+      "rows": [
+        {
+          "gate": "G4a",
+          "name": "PF, en iyi ay (2025-03) hariç",
+          "value": 0.4166244860575136,
+          "threshold": 1.0,
+          "op": ">=",
+          "pass": false,
+          "borderline": false,
+          "note": ""
+        },
+        {
+          "gate": "G4b",
+          "name": "Σ R, en iyi 5 işlem hariç",
+          "value": -74.35545200401177,
+          "threshold": 0.0,
+          "op": ">",
+          "pass": false,
+          "borderline": false,
+          "note": ""
+        }
+      ]
+    },
+    "G5": {
+      "gate": "G5",
+      "name": "rejim tabanı: uygun (n>=40) grupların en düşük PF'i",
+      "value": 0.34636726194481243,
+      "threshold": 0.8,
+      "op": ">=",
+      "pass": false,
+      "borderline": false,
+      "note": "",
+      "groups": {
+        "UP": {
+          "n": 276,
+          "pf": 0.34636726194481243,
+          "sum_r": -43.65253559464667
+        },
+        "FLAT": {
+          "n": 227,
+          "pf": 0.4710528407240878,
+          "sum_r": -20.09242810810703
+        },
+        "DOWN": {
+          "n": 165,
+          "pf": 0.657853418792671,
+          "sum_r": -7.379177960872823
+        }
+      }
+    },
+    "pass_g0_g5": false
+  },
+  "S30": {
+    "G0": {
+      "value": 0.0,
+      "threshold": 0.1,
+      "op": "<=",
+      "limiting": "G0a",
+      "pass": true,
+      "borderline": false,
+      "rows": [
+        {
+          "gate": "G0a",
+          "name": "sessiz düşüş / ham sinyal",
+          "value": 0.0,
+          "threshold": 0.1,
+          "op": "<=",
+          "pass": true,
+          "borderline": false,
+          "note": "0/327"
+        },
+        {
+          "gate": "G0b",
+          "name": "EOD işlem sayısı",
+          "value": 0,
+          "threshold": 8,
+          "op": "<=",
+          "pass": true,
+          "borderline": false,
+          "note": ""
+        },
+        {
+          "gate": "G0c1",
+          "name": "3x kaldıraç payı",
+          "value": 0.03067484662576687,
+          "threshold": 0.1,
+          "op": "<=",
+          "pass": true,
+          "borderline": false,
+          "note": ""
+        },
+        {
+          "gate": "G0c2",
+          "name": "20x kaldıraç payı",
+          "value": 0.04294478527607362,
+          "threshold": 0.5,
+          "op": "<=",
+          "pass": true,
+          "borderline": false,
+          "note": ""
+        },
+        {
+          "gate": "G0d",
+          "name": "sabit-risk payı",
+          "value": 1.0,
+          "threshold": 0.95,
+          "op": ">=",
+          "pass": true,
+          "borderline": false,
+          "note": ""
+        }
+      ]
+    },
+    "G1": {
+      "gate": "G1",
+      "name": "N (kapasite sonrası)",
+      "value": 326,
+      "threshold": 200,
+      "op": ">=",
+      "pass": true,
+      "borderline": false,
+      "note": ""
+    },
+    "n": 326,
+    "pf": 0.6553323460737175,
+    "t_obs": -2.934254954238749,
+    "p7": 0.9996,
+    "validity": {
+      "scaled": true,
+      "sessiz_dusus": 0.0
+    },
+    "mc_refined": false,
+    "q": 1.0,
+    "G2": {
+      "gate": "G2",
+      "name": "PF",
+      "value": 0.6553323460737175,
+      "threshold": 1.15,
+      "op": ">=",
+      "pass": false,
+      "borderline": false,
+      "note": ""
+    },
+    "G3": {
+      "gate": "G3",
+      "name": "BH q (m=6, p[b=7])",
+      "value": 1.0,
+      "threshold": 0.2,
+      "op": "<=",
+      "pass": false,
+      "borderline": false,
+      "note": ""
+    },
+    "G4": {
+      "value": 0.6166958462968626,
+      "threshold": 1.0,
+      "op": ">=",
+      "limiting": "G4a",
+      "pass": false,
+      "borderline": false,
+      "rows": [
+        {
+          "gate": "G4a",
+          "name": "PF, en iyi ay (2025-01) hariç",
+          "value": 0.6166958462968626,
+          "threshold": 1.0,
+          "op": ">=",
+          "pass": false,
+          "borderline": false,
+          "note": ""
+        },
+        {
+          "gate": "G4b",
+          "name": "Σ R, en iyi 5 işlem hariç",
+          "value": -79.00270412741209,
+          "threshold": 0.0,
+          "op": ">",
+          "pass": false,
+          "borderline": false,
+          "note": ""
+        }
+      ]
+    },
+    "G5": {
+      "gate": "G5",
+      "name": "rejim tabanı: uygun (n>=40) grupların en düşük PF'i",
+      "value": 0.5778827231452421,
+      "threshold": 0.8,
+      "op": ">=",
+      "pass": false,
+      "borderline": false,
+      "note": "",
+      "groups": {
+        "UP": {
+          "n": 138,
+          "pf": 0.7802577302812779,
+          "sum_r": -15.686115988104294
+        },
+        "FLAT": {
+          "n": 106,
+          "pf": 0.5781726210644698,
+          "sum_r": -27.176699387690345
+        },
+        "DOWN": {
+          "n": 82,
+          "pf": 0.5778827231452421,
+          "sum_r": -21.509781370848277
+        }
+      }
+    },
+    "pass_g0_g5": false
+  },
+  "T30": {
+    "G0": {
+      "value": 0.11864406779661017,
+      "threshold": 0.1,
+      "op": "<=",
+      "limiting": "G0a",
+      "pass": false,
+      "borderline": false,
+      "rows": [
+        {
+          "gate": "G0a",
+          "name": "sessiz düşüş / ham sinyal",
+          "value": 0.11864406779661017,
+          "threshold": 0.1,
+          "op": "<=",
+          "pass": false,
+          "borderline": false,
+          "note": "49/413"
+        },
+        {
+          "gate": "G0b",
+          "name": "EOD işlem sayısı",
+          "value": 1,
+          "threshold": 8,
+          "op": "<=",
+          "pass": true,
+          "borderline": false,
+          "note": ""
+        },
+        {
+          "gate": "G0d",
+          "name": "sabit-risk payı",
+          "value": 1.0,
+          "threshold": 0.95,
+          "op": ">=",
+          "pass": true,
+          "borderline": false,
+          "note": ""
+        }
+      ]
+    },
+    "G1": {
+      "gate": "G1",
+      "name": "N (kapasite sonrası)",
+      "value": 362,
+      "threshold": 200,
+      "op": ">=",
+      "pass": true,
+      "borderline": false,
+      "note": ""
+    },
+    "n": 362,
+    "pf": 0.4209885059105161,
+    "t_obs": -4.176046266406722,
+    "p7": 1.0,
+    "validity": {
+      "scaled": false,
+      "sessiz_dusus": 0.11864406779661017
+    },
+    "mc_refined": false,
+    "q": 1.0,
+    "G2": {
+      "gate": "G2",
+      "name": "PF",
+      "value": 0.4209885059105161,
+      "threshold": 1.15,
+      "op": ">=",
+      "pass": false,
+      "borderline": false,
+      "note": ""
+    },
+    "G3": {
+      "gate": "G3",
+      "name": "BH q (m=6, p[b=7])",
+      "value": 1.0,
+      "threshold": 0.2,
+      "op": "<=",
+      "pass": false,
+      "borderline": false,
+      "note": ""
+    },
+    "G4": {
+      "value": 0.4066000466424804,
+      "threshold": 1.0,
+      "op": ">=",
+      "limiting": "G4a",
+      "pass": false,
+      "borderline": false,
+      "rows": [
+        {
+          "gate": "G4a",
+          "name": "PF, en iyi ay (2025-02) hariç",
+          "value": 0.4066000466424804,
+          "threshold": 1.0,
+          "op": ">=",
+          "pass": false,
+          "borderline": false,
+          "note": ""
+        },
+        {
+          "gate": "G4b",
+          "name": "Σ R, en iyi 5 işlem hariç",
+          "value": -43.65841040854553,
+          "threshold": 0.0,
+          "op": ">",
+          "pass": false,
+          "borderline": false,
+          "note": ""
+        }
+      ]
+    },
+    "G5": {
+      "gate": "G5",
+      "name": "rejim tabanı: uygun (n>=40) grupların en düşük PF'i",
+      "value": 0.33329966052136684,
+      "threshold": 0.8,
+      "op": ">=",
+      "pass": false,
+      "borderline": false,
+      "note": "",
+      "groups": {
+        "UP": {
+          "n": 161,
+          "pf": 0.48151712858295337,
+          "sum_r": -14.893316784880382
+        },
+        "FLAT": {
+          "n": 117,
+          "pf": 0.4153748819880304,
+          "sum_r": -13.190194987562457
+        },
+        "DOWN": {
+          "n": 84,
+          "pf": 0.33329966052136684,
+          "sum_r": -12.25621902077151
+        }
+      }
+    },
+    "pass_g0_g5": false
+  },
+  "_meta": {
+    "l": "c00772ae32bd817c1703f7e97e2199acff445606",
+    "h": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a",
+    "created_utc": "2026-10-10T23:22:02Z",
+    "g6_needed": [],
+    "bh": {
+      "p": {
+        "S5": 1.0,
+        "T5": 0.99985,
+        "S15": 1.0,
+        "T15": 1.0,
+        "S30": 0.9996,
+        "T30": 1.0
+      },
+      "q": {
+        "S5": 1.0,
+        "T5": 1.0,
+        "S15": 1.0,
+        "T15": 1.0,
+        "S30": 1.0,
+        "T30": 1.0
+      },
+      "m": 6
+    }
+  }
+}

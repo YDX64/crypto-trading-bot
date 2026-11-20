@@ -1,0 +1,90 @@
+{
+  "S1_AYI": {
+    "pass": true,
+    "mismatch": []
+  },
+  "S1_V1": {
+    "pass": true,
+    "mismatch": []
+  },
+  "S2": {
+    "pass": true,
+    "n_trades": 53
+  },
+  "S3": {
+    "S5": {
+      "pass": true,
+      "problems": [],
+      "n": 152,
+      "lev3_share": 0.0,
+      "lev20_share": 0.17105263157894737,
+      "h1_keys_present": []
+    },
+    "T5": {
+      "pass": true,
+      "problems": [],
+      "n": 133,
+      "lev3_share": 0.0,
+      "lev20_share": 1.0,
+      "h1_keys_present": []
+    },
+    "S15": {
+      "pass": true,
+      "problems": [],
+      "n": 53,
+      "lev3_share": 0.0,
+      "lev20_share": 0.07547169811320754,
+      "h1_keys_present": []
+    },
+    "T15": {
+      "pass": true,
+      "problems": [],
+      "n": 53,
+      "lev3_share": 0.0,
+      "lev20_share": 1.0,
+      "h1_keys_present": []
+    },
+    "S30": {
+      "pass": true,
+      "problems": [],
+      "n": 27,
+      "lev3_share": 0.0,
+      "lev20_share": 0.07407407407407407,
+      "h1_keys_present": []
+    },
+    "T30": {
+      "pass": true,
+      "problems": [],
+      "n": 30,
+      "lev3_share": 0.0,
+      "lev20_share": 0.9333333333333333,
+      "h1_keys_present": []
+    },
+    "S60": {
+      "pass": true,
+      "problems": [],
+      "n": 14,
+      "lev3_share": 0.0,
+      "lev20_share": 0.0,
+      "h1_keys_present": []
+    },
+    "T60": {
+      "pass": true,
+      "problems": [],
+      "n": 15,
+      "lev3_share": 0.0,
+      "lev20_share": 0.7333333333333333,
+      "h1_keys_present": []
+    },
+    "R1": {
+      "pass": true,
+      "problems": [],
+      "n": 105,
+      "lev3_share": 0.0,
+      "lev20_share": 1.0,
+      "h1_keys_present": []
+    }
+  },
+  "pass": true,
+  "l": "c00772ae32bd817c1703f7e97e2199acff445606"
+}

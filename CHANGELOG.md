@@ -9,6 +9,12 @@
 - P2-v2 kabul kuralı (eşleşmiş bootstrap + Benjamini-Hochberg + pencere zararı + DD + stres); eski kural "P2-eski" olarak basılır
 - `scripts/walk_forward.py` (örneklem-dışı katlar), `docs/holdout_registry.json` (yanık/doğrulama/mühürlü pencere kaydı)
 - `src/strategies/scalper/montecarlo.py`, `scripts/fill_funding_cache.py`; `ledger_report.py` ayrımları (pnl_source, AP, LONG/SHORT)
+- D42: strateji C giriş korumaları (bağlam-RSI koruması + ATR% bandı), varsayılan KAPALI; canlı davranış değişmez
+- D43: 2026-11-20 ölçüm hükmü (E19-E22; hiçbir ayar değişmez, mainnet NO-GO teyit) ve `docs/audits/2026-11-20-olcum-denetimi.md` raporu
+- `scripts/preflight_server_env.sh`: deploy öncesi temiz kopya + sunucu ayarlarıyla test
+- origin/main ile birleştirme: E16/E17 ölçüm eklentileri korundu; `--legacy-model` origin/main'in modeliyle aynı sonucu verir
+  (EXPERIMENTS E19 "Birleştirme sonrası eşdeğerlik"); main'deki D40 takip düzeltmeleri (Reaper/STALE_TP) ilk kez bir sonraki deploy ile
+  sunucuya ulaşır
 
 ### 🐛 Düzeltilen Hatalar
 

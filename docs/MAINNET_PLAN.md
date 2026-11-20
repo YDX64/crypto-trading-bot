@@ -6,7 +6,9 @@ Durum (2026-11-20, D43): **NO-GO teyit edildi.** Gerçekçi harness'te C'nin gö
 örneklem-dışı kanıttır. Kesintisiz geçmişte (2026-01-23..08-21, 191 gün; örneklem-içi sayılır) PF 0.85 (E22). Bu dönem yanık
 standart pencerelerin altısını içerir; C'nin ayarları için bağımsız DEĞİLDİR, yalnız D42 koruma hipotezlerinden bağımsızdır.
 Başka kurulumlar (A, B, D, E) da PF 0.76-0.84 (E20); sekiz giriş koruması P2-v2'yi geçmedi (E22). §2'nin 3. şartı
-karşılanmıyor (canlı defter negatif) ve terfi ettirilecek aday yok; hiçbir ayar değişmedi.
+karşılanmıyor (canlı defter negatif) ve terfi ettirilecek aday yok; hiçbir ayar değişmedi. main'deki iki ön-kayıtlı deney (E16, E17;
+eski model, 2025 verisi) aynı sonucu bağımsız doğruladı: bugünkü ayarlar 8 taze pencerede PF 0.773, 2025'in tamamında PF 0.777; hiçbir
+çıkış varyantı ve giriş zaman dilimi geçmedi.
 Bu doküman mainnet'e geçişin **şartlarını** ve **mimarisini** sabitler; tarih vermez — tarih
 kanıtla gelir.
 

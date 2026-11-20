@@ -41,6 +41,32 @@ CLI:
     # --refresh önbelleği yok sayıp TAZE çeker ve üzerine yazar.
     python -m src.strategies.scalper.backtest --days 7 --symbols BTCUSDT \\
         --cache-dir data/klines_cache --refresh
+
+E17 ölçüm eklentileri (docs/audits/2026-10-10-prereg-tf, PLAN §5.1) — bayraksız
+koşuda ve `--diagnostics` ile karar yolu DEĞİŞMEZ (tests/test_golden_backtest.py
+baytı baytına aynı kalır). İSTİSNA: `--same-bar-order optimistic` çıkışları
+BİLEREK değiştirir; yalnız bir teşhis aracıdır, bir iyimser ÜST SINIR değildir
+(gerçekçilik özellikleri açıkken bkz. aşağıdaki not):
+  H1  `open_position`'ın sessiz reddleri `missed_counter`'da sayılır
+      (stop_band_low/high, price_distance_zero, qty_zero, no_next_candle);
+      anahtar yalnız red olunca oluşur.
+  H2  `--diagnostics` (aynı-bar belirsizlik sayaçları → rapor `diagnostics`)
+      ve `--same-bar-order {pessimistic,optimistic}` (varsayılan pessimistic =
+      bugünkü davranış). Rapor anahtarları (`diagnostics`,
+      `provenance.sim_options`) YALNIZ bayrak verilince yazılır. Permütasyon
+      turları her zaman varsayılan (pessimistic, sayaçsız) koşar.
+  Bu eklentiler HER İKİ modelde de geçerlidir (gerçekçi varsayılan model ve
+  `--legacy-model`): sayaçlar mum-içi DEĞME olaylarıdır (gerçekçilik yol
+  mantığından bağımsız), `optimistic` gerçekçi mantığın ÜSTÜNE biner (dolum
+  mumunda çıkış + likidasyon yok; funding yine tahsil edilir).
+  DİKKAT — `optimistic` eski mum modelinde (E17) tanımlıdır. `gap_fills`,
+  `intrabar_path` veya `maker_fill_bar` AÇIKKEN iyimser ÜST SINIR DEĞİLDİR:
+  atlanan bir stop sonraki mumda boşlukla dolabilir (örnek: pessimistic TP1
+  mumunda BE stopunda +6.00 kapatır; optimistic stopu atlar, sonraki mum stopun
+  ötesinde açılır ve boşluk dolumu −24.20 yazar). Bu durumda yalnız teşhis
+  olarak okunur ve rapor `provenance.sim_options` içinde bunu belirtir. Gerçekçi
+  modelde sıra duyarlılığı için `--disable-realism intrabar_path` (ve
+  `maker_fill_bar`) kullanılır.
 """
 
 from __future__ import annotations
@@ -573,6 +599,23 @@ _WARMUP_BY_ROLE: Tuple[int, int, int] = (
 )
 
 
+def check_timeframe_roles(timeframes: Tuple[str, str, str]) -> None:
+    """E17/H3 — rol üçlüsü (entry, context, regime) tutarlılığı.
+
+    Seri sözlüğü aralık adıyla anahtarlandığından `giriş == bağlam` veya
+    `giriş == rejim` aynı anahtara iki rolün farklı ısınma pencerelerini
+    yazar ve giriş serisini SESSİZCE bozar. Reddedilir. `bağlam == rejim`
+    BİLİNÇLİDİR (30m/4h/4h, 1h/4h/4h): ikisi de aynı seriyi paylaşır, rejim
+    penceresi (en uzun) bağlamı da kapsar; reddedilmez.
+    """
+    entry, context, regime = timeframes
+    if entry == context or entry == regime:
+        raise ValueError(
+            "Zaman dilimi rolleri çakışıyor: giriş aralığı bağlam veya rejim "
+            f"ile aynı olamaz (entry, context, regime) = {tuple(timeframes)!r}"
+        )
+
+
 async def gather_symbol_data(
     fetch: FetchFn, symbol: str, days: int, end_time: Optional[int] = None,
     timeframes: Tuple[str, str, str] = ("5m", "15m", "4h"),
@@ -1026,6 +1069,14 @@ def _find_maker_fill(
     return None
 
 
+def _count_silent_drop(missed_counter: Optional[Dict[str, int]], key: str) -> None:
+    """E17/H1 (YALNIZ ÖLÇÜM): `open_position`'ın eskiden SESSİZ `None`
+    döndüğü reddi `missed_counter[key]` altında say. Sayaç verilmediyse
+    (permütasyon yolu dahil) hiçbir şey yapmaz; karar yolu değişmez."""
+    if missed_counter is not None:
+        missed_counter[key] = missed_counter.get(key, 0) + 1
+
+
 def open_position(
     signal: ScalpSignal,
     candles_5m: List[Candle],
@@ -1054,6 +1105,12 @@ def open_position(
       verilmişse (mutasyonla) sayaç artırılır, işlem raporlanabilsin diye.
       `maker_stats` verilirse {"placed","filled","timed_out"} sayaçları
       (mutasyonla) güncellenir. `maker_realism=None` → tam maker gerçekçiliği.
+
+    E17/H1 (YALNIZ ÖLÇÜM): geri kalan sessiz reddler de sayılır —
+    `stop_band_low` / `stop_band_high` (stop mesafesi MIN/MAX bandı dışında),
+    `price_distance_zero`, `qty_zero`, `no_next_candle` (taker modda sonraki
+    mum yok). `entry_hint <= 0` ham veri bozukluğudur, sayılmaz. Anahtar
+    yalnız red olduğunda oluşur; karar yolu değişmez.
     """
     entry_hint = signal.entry_price
     stop_price = signal.stop_price
@@ -1062,6 +1119,13 @@ def open_position(
 
     stop_distance_pct = abs(entry_hint - stop_price) / entry_hint * 100.0
     if not (cfg.scalper_min_stop_pct <= stop_distance_pct <= cfg.scalper_max_stop_pct):
+        # E17/H1 (YALNIZ ÖLÇÜM): bant dışı red artık sessiz değil. Anahtar
+        # yalnız red olunca oluşur → golden rapor baytı baytına aynı kalır.
+        _count_silent_drop(
+            missed_counter,
+            "stop_band_low" if stop_distance_pct < cfg.scalper_min_stop_pct
+            else "stop_band_high",
+        )
         return None
 
     # Canlı executor ile aynı minimum R:R kapısı. Beklenen runner getirisi
@@ -1089,6 +1153,7 @@ def open_position(
 
     price_distance = abs(entry_hint - stop_price)
     if price_distance <= 0:
+        _count_silent_drop(missed_counter, "price_distance_zero")
         return None
 
     entry_mode = getattr(cfg, "scalper_entry_mode", "taker")
@@ -1123,6 +1188,7 @@ def open_position(
         entry_commission_rate = cfg.scalper_maker_fee_pct / 100.0
     else:
         if signal_idx + 1 + delay >= len(candles_5m):
+            _count_silent_drop(missed_counter, "no_next_candle")
             return None  # sonraki mum yok — dolum yapılamaz
         entry_idx = signal_idx + 1 + delay
         entry_candle = candles_5m[entry_idx]
@@ -1147,6 +1213,7 @@ def open_position(
         qty = nominal_cap / entry_hint
 
     if qty <= 0:
+        _count_silent_drop(missed_counter, "qty_zero")
         return None
 
     stop_price = fill_anchored_stop_price(
@@ -1414,9 +1481,99 @@ def _liquidate(pos: OpenPosition, c: Candle, direction: Direction) -> None:
     pos.exit_time = c.close_time
 
 
-def _process_candle_exits(pos: OpenPosition, c: Candle, direction: Direction) -> bool:
+# E17/H2 — aynı-bar sıra teşhisi (YALNIZ ÖLÇÜM). `pessimistic` = bugünkü
+# davranış (varsayılan, bayt aynı). `optimistic` = OHLC mumunda sırası
+# bilinemeyen üç durumda "önce kâr" varsayımı (yalnız DIAG_SBO teşhisi).
+SAME_BAR_ORDER_PESSIMISTIC = "pessimistic"
+SAME_BAR_ORDER_OPTIMISTIC = "optimistic"
+SAME_BAR_ORDERS = (SAME_BAR_ORDER_PESSIMISTIC, SAME_BAR_ORDER_OPTIMISTIC)
+
+# `--diagnostics` rapor bloğunun anahtarları (sıra sabit; hepsi her zaman var).
+# Sayaçlar, modelin değerlendirdiği mumda TAM-MUM DEĞME olaylarıdır. Bu mum,
+# `maker_fill_bar` açıkken dolum mumunun dolum-SONRASI kısmıdır (dolum öncesi
+# değmeler sayılmaz). Likidasyon ön kontrolünün (A3) bitirdiği mum hiçbir
+# DEĞME sayacı üretmez. Gerçekçi modelde `tp2_then_floor_same_bar`,
+# `tp1_then_stop_same_bar` ile AYNI mumda pessimistic'te de oluşabilir (yol
+# mantığı TP2'yi BE değmesinden önce doldurur); eski model bunu hiç üretmez.
+DIAGNOSTIC_KEYS = (
+    "tp1_fills",                # TP1 dolum sayısı
+    "sl_tp1_same_bar",          # TP1 öncesi aşamada SL ve TP1 AYNI mumda değdi
+    "tp1_then_stop_same_bar",   # TP1 dolan mumda BE/trail stopu da değdi
+    "tp2_then_floor_same_bar",  # TP2 dolan mumda TP1 tabanı da değdi (kalan > 0)
+    "fill_bar_exit",            # dolum mumunda (idx == entry_idx) kapanan işlem
+    "fill_bar_total",           # yönetilen toplam işlem (fill_bar_exit paydası)
+)
+
+
+def check_same_bar_order(same_bar_order: str) -> None:
+    """Bilinmeyen `same_bar_order` değerini (yazım hatası dahil) reddet;
+    aksi halde sessizce `pessimistic` davranışı alınırdı."""
+    if same_bar_order not in SAME_BAR_ORDERS:
+        raise ValueError(
+            f"same_bar_order {SAME_BAR_ORDERS} içinden olmalı: {same_bar_order!r}"
+        )
+
+
+# `optimistic` bu özelliklerden en az biri AÇIKKEN iyimser ÜST SINIR DEĞİLDİR
+# (atlanan stop sonraki mumda boşlukla dolabilir). Eski modelde (üçü de kapalı)
+# uyarı yoktur: origin/main raporu ve stdout'u birebir aynı kalır.
+OPTIMISTIC_CAVEAT_FEATURES = ("gap_fills", "intrabar_path", "maker_fill_bar")
+OPTIMISTIC_CAVEAT_NOTE = (
+    "same_bar_order=optimistic gerçekçilik özellikleri (gap_fills / "
+    "intrabar_path / maker_fill_bar) açıkken iyimser ÜST SINIR DEĞİLDİR: atlanan "
+    "stop sonraki mumda boşlukla dolabilir; yalnız teşhis olarak okuyun. Sıra "
+    "duyarlılığı için --disable-realism intrabar_path (ve maker_fill_bar) kullanın."
+)
+
+
+def optimistic_caveat_applies(same_bar_order: str, disabled_realism: Any) -> bool:
+    """`optimistic` VE `OPTIMISTIC_CAVEAT_FEATURES`'ten en az biri açık mı?"""
+    if same_bar_order != SAME_BAR_ORDER_OPTIMISTIC:
+        return False
+    disabled = frozenset(disabled_realism or ())
+    return any(name not in disabled for name in OPTIMISTIC_CAVEAT_FEATURES)
+
+
+def new_diagnostics() -> Dict[str, int]:
+    """Sıfırlanmış `--diagnostics` sayaç sözlüğü (`DIAGNOSTIC_KEYS`)."""
+    return {key: 0 for key in DIAGNOSTIC_KEYS}
+
+
+def _diag_add(diag: Optional[Dict[str, int]], key: str) -> None:
+    if diag is not None:
+        diag[key] = diag.get(key, 0) + 1
+
+
+def _process_candle_exits(
+    pos: OpenPosition,
+    c: Candle,
+    direction: Direction,
+    diag: Optional[Dict[str, int]] = None,
+    same_bar_order: str = SAME_BAR_ORDER_PESSIMISTIC,
+) -> bool:
     """Bir mum için çıkış kurallarını uygular. Pozisyon TAMAMEN kapandıysa
     True döner.
+
+    E17/H2 (YALNIZ ÖLÇÜM): `diag` verilirse aynı-bar belirsizlik olayları
+    sayılır (`DIAGNOSTIC_KEYS`). `same_bar_order="optimistic"` iken (i) TP1'in
+    dolduğu mumda BE stopu, (ii) TP2'nin dolduğu mumda TP1 tabanı
+    DEĞERLENDİRİLMEZ. Varsayılan (`pessimistic`, `diag=None`) davranış birebir
+    eskisiyle aynıdır; sayaç artırmak karar yolunu etkilemez. `optimistic`
+    ise çıkışları BİLEREK değiştirir (yalnız teşhis; bkz. `manage_position`).
+
+    Sayaçlar, bu fonksiyonun değerlendirdiği mumda TAM-MUM DEĞME olaylarını
+    sayar (`maker_fill_bar` açıkken bu mum dolum mumunun dolum-SONRASI kısmıdır,
+    dolum öncesi değmeler sayılmaz) ve gerçekçi modelin yol mantığının
+    SONUCUNDAN bağımsızdır: `tp1_then_stop_same_bar` / `tp2_then_floor_same_bar`
+    taşınan stopun TAM-MUM değmesine bakar (`_is_hit`), `intrabar_path`'in
+    "TP'den sonra stop yolda var mı" kararına DEĞİL — böylece eski ve gerçekçi
+    modelde aynı olay aynı noktada sayılır. Likidasyon (A3) bu mumu bitirdiyse
+    (aşağıdaki aşamalara ulaşılmaz) o mum için HİÇBİR değme sayacı üretilmez.
+    Gerçekçi modelde `tp2_then_floor_same_bar` aynı mumda `tp1_then_stop_same_bar`
+    ile birlikte pessimistic'te de sayılabilir: yol mantığı TP2'yi BE
+    değmesinden önce doldurur (eski model bunu hiç yapmaz). `optimistic`
+    gerçekçi mantığın ÜSTÜNE biner: (i) `sl_hit`i, (ii) TP2 sonrası taban
+    kapanışını bastırır.
 
     AŞAMA A (TP1 dolmadan): ilk stop VS TP1. Aynı mumda ikisi de değindiyse
     SL ÖNCE sayılır (kötümser) — TP1 kısmi dolumu OLMAZ, tüm miktar SL'de
@@ -1432,6 +1589,8 @@ def _process_candle_exits(pos: OpenPosition, c: Candle, direction: Direction) ->
     sıra yoldan okunur: TP2 stoptan önce değiyorsa TP2 dolar (sonra TP1 tabanı
     TP2-sonrası yolda sınanır). Yalnız ilk stop-vs-TP1 eşitliği sabit SL-önce.
     """
+    check_same_bar_order(same_bar_order)
+    optimistic = same_bar_order == SAME_BAR_ORDER_OPTIMISTIC
     # A3: likidasyon her şeyden ÖNCE (stop-vs-TP1 eşitliğindeki kötümser kural
     # ile aynı yönde: belirsizlikte zarar sayılır).
     if _liquidation_hit(pos, c, direction):
@@ -1439,12 +1598,15 @@ def _process_candle_exits(pos: OpenPosition, c: Candle, direction: Direction) ->
         return True
 
     # TP1 bu mumda mı doldu? (taşınan BE stopu bu mumda doğdu → açılışa
-    # düşme yok, yolun TP-sonrası kısmı sınanır)
+    # düşme yok, yolun TP-sonrası kısmı sınanır). E17/H2'nin "TP1 bu mumda
+    # doldu" bayrağı da BUDUR (tek değişken).
     tp1_this_bar = False
     if not pos.tp1_filled:
         sl_hit = _is_hit(c, pos.current_stop, direction, is_stop=True)
         tp1_hit = _is_hit(c, pos.tp1_price, direction, is_stop=False)
 
+        if sl_hit and tp1_hit:
+            _diag_add(diag, "sl_tp1_same_bar")
         if sl_hit:
             # Etiket ayrımı (yalnız raporlama): yapı çıkışı (SCALPER_STRUCTURE_
             # EXIT=be) stopu BE'ye çekmişse bu bir "SL kaybı" değil, kesilmiş
@@ -1461,6 +1623,7 @@ def _process_candle_exits(pos: OpenPosition, c: Candle, direction: Direction) ->
             tp1_this_bar = True
             pos.current_stop = pos.breakeven_price
             pos.trailing_active = True
+            _diag_add(diag, "tp1_fills")
 
     if pos.remaining_qty <= 1e-12:
         return True
@@ -1477,6 +1640,16 @@ def _process_candle_exits(pos: OpenPosition, c: Candle, direction: Direction) ->
             and _is_hit(c, pos.tp2_price, direction, is_stop=False)
         )
 
+        if (
+            diag is not None and tp1_this_bar
+            and _is_hit(c, pos.current_stop, direction, is_stop=True)
+        ):
+            # E17/H2 (YALNIZ SAYAÇ): TP1'in dolduğu mumda BE stopuna TAM-MUM
+            # değme. Gerçekçi modelin yol kararından (`sl_hit`) bağımsızdır.
+            _diag_add(diag, "tp1_then_stop_same_bar")
+        if optimistic and tp1_this_bar:
+            # (i) TP1'in dolduğu mumda BE stopu değerlendirilmez.
+            sl_hit = False
         if (
             sl_hit and tp2_hit and tp1_this_bar
             and _tp_before_stop_after_touch(
@@ -1506,15 +1679,24 @@ def _process_candle_exits(pos: OpenPosition, c: Candle, direction: Direction) ->
             )
             # Taşınan taban TP2'ye değdikten SONRAKİ yolda sınanır
             # (`intrabar_path` kapalıyken eski tam-mum kötümser testi).
+            if (
+                diag is not None and pos.remaining_qty > 1e-12
+                and _is_hit(c, pos.current_stop, direction, is_stop=True)
+            ):
+                # E17/H2 (YALNIZ SAYAÇ): TP2'nin dolduğu mumda TP1 tabanına
+                # TAM-MUM değme (yol kararından bağımsız).
+                _diag_add(diag, "tp2_then_floor_same_bar")
             if pos.remaining_qty > 1e-12 and _stop_hit_after_touch(
                 pos, c, pos.tp2_price, pos.current_stop, direction
             ):
-                _close_remaining(
-                    pos,
-                    _stop_fill_price(pos, c, pos.current_stop, allow_gap=False),
-                    c.close_time, "TRAIL",
-                )
-                return True
+                # (ii) optimistic: TP2'nin dolduğu mumda taban kontrolü yok.
+                if not optimistic:
+                    _close_remaining(
+                        pos,
+                        _stop_fill_price(pos, c, pos.current_stop, allow_gap=False),
+                        c.close_time, "TRAIL",
+                    )
+                    return True
 
     return pos.remaining_qty <= 1e-12
 
@@ -1735,9 +1917,28 @@ def manage_position(
     candles_5m: List[Candle],
     cfg: Any,
     structure_feed: Optional["_StructureFeed"] = None,
+    diag: Optional[Dict[str, int]] = None,
+    same_bar_order: str = SAME_BAR_ORDER_PESSIMISTIC,
 ) -> BacktestTrade:
     """Pozisyonu entry_idx'ten itibaren, kapanana ya da veri bitene (EOD)
     kadar mum mum yönetir.
+
+    E17/H2 (YALNIZ ÖLÇÜM): `diag` sayaç sözlüğü ve `same_bar_order`
+    `_process_candle_exits`'e geçirilir. `optimistic` iken ayrıca (iii)
+    dolum mumunda (`idx == pos.entry_idx`) HİÇBİR çıkış adımı (SL/TP, yapı,
+    STALE_TP, REAPER) işlenmez (pozisyon sonraki mumdan itibaren aktif);
+    MAE/MFE ve EOD adımları değişmez. `fill_bar_exit` dolum mumunda kapanan
+    HER işlemi sayar (SL/TP'ye ek olarak pessimistic'te CHOCH/STALE_TP/REAPER
+    kapanışları da; EOD hariç) — "dolum barında kapanan işlem payı" budur.
+
+    UYARI: `optimistic` eski mum modelinde (E17) tanımlıdır. `gap_fills`,
+    `intrabar_path` veya `maker_fill_bar` AÇIKKEN iyimser ÜST SINIR DEĞİLDİR:
+    atlanan bir stop sonraki mumda boşlukla dolabilir (pessimistic TP1 mumunda
+    BE'de +6.00 kapatırken optimistic stopu atlar, sonraki mum stopun ötesinde
+    açılır ve boşluk dolumu −24.20 yazabilir). Orada yalnız teşhis olarak
+    okunmalıdır; gerçekçi modelde sıra duyarlılığı için `--disable-realism
+    intrabar_path` (ve `maker_fill_bar`) kullanılır. Eski modelde (i)/(ii) için
+    atlanan stop sonraki mumda stop fiyatından dolar, bu sorun oluşmaz.
 
     `structure_feed` verilirse (yalnız `SCALPER_STRUCTURE_EXIT != off`) her
     mum sonunda yapı-tabanlı çıkış kararı da uygulanır — canlı safety
@@ -1746,6 +1947,7 @@ def manage_position(
     max-hold/REAPER kesmesi. Verilmezse yalnız yapı adımı atlanır; STALE_TP
     ve REAPER cfg'deki eşikleri >0 ise yine işler.
     """
+    check_same_bar_order(same_bar_order)
     n = len(candles_5m)
     exit_idx = n - 1
 
@@ -1758,8 +1960,18 @@ def manage_position(
             c = _post_fill_candle(c, pos.direction, pos.fill_bar_trigger)
         _update_mae_mfe(pos, c, pos.direction, pos.leverage)
 
+        # Funding ZAMANA bağlıdır (çıkış adımı değil): optimistic (iii) dolum
+        # mumunda da tahsil edilir; likidasyon ise çıkış adımıdır → atlanır.
         _charge_funding(pos, candles_5m, idx)
-        closed = _process_candle_exits(pos, c, pos.direction)
+        if same_bar_order == SAME_BAR_ORDER_OPTIMISTIC and idx == pos.entry_idx:
+            # (iii) dolum mumunda HİÇBİR çıkış adımı işlenmez (SL/TP, likidasyon,
+            # yapı, STALE_TP, REAPER); yalnız MAE/MFE, funding ve equity işareti
+            # sürer.
+            _mark_equity(pos, c)
+            continue
+        closed = _process_candle_exits(
+            pos, c, pos.direction, diag=diag, same_bar_order=same_bar_order,
+        )
         if closed:
             exit_idx = idx
             _mark_equity(pos, c)
@@ -1845,6 +2057,12 @@ def manage_position(
         # da düşülmüş kapanış değeriyle yer değiştirir).
         _mark_equity(pos, last)
 
+    if diag is not None:
+        _diag_add(diag, "fill_bar_total")
+        # EOD bir sıra belirsizliği değildir (veri bitti); sayılmaz.
+        if exit_idx == pos.entry_idx and pos.exit_reason != "EOD":
+            _diag_add(diag, "fill_bar_exit")
+
     return _finalize_trade(pos, exit_idx, candles_5m)
 
 
@@ -1866,6 +2084,8 @@ def simulate_symbol(
     maker_stats: Optional[Dict[str, int]] = None,
     funding_fallback_pct: Optional[float] = None,
     funding_cache_dir: Optional[str | Path] = None,
+    diag: Optional[Dict[str, int]] = None,
+    same_bar_order: str = SAME_BAR_ORDER_PESSIMISTIC,
 ) -> List[BacktestTrade]:
     """Bir sembol için TEK eşzamanlı pozisyonla tam backtest simülasyonu.
     AĞ YOK — yalnız zaten çekilmiş mum listeleri üzerinde çalışır (saf,
@@ -1878,6 +2098,11 @@ def simulate_symbol(
     cfg.scalper_regime_filter (varsayılan True) rejime ters sinyalleri
     engeller (DOWN'da LONG, UP'ta SHORT) — canlı motorla (engine.py) birebir
     parite. Engellenenler `missed_counter["regime_gate"]` altında sayılır.
+
+    E17/H2 (YALNIZ ÖLÇÜM): `diag` (bkz. `new_diagnostics`) ve `same_bar_order`
+    `manage_position`'a geçirilir; varsayılanlarda (None / pessimistic)
+    davranış birebir aynıdır. Sayaçlar kapasite kapısından ÖNCE, simüle
+    edilen tüm adaylar üzerindedir.
 
     `leader` verilir VE `cfg.scalper_market_gate` açıksa lider piyasa kapısı
     (D15) da uygulanır — canlı motorla AYNI saf fonksiyonla
@@ -2088,7 +2313,10 @@ def simulate_symbol(
                 i += 1
             continue
 
-        trade = manage_position(pos, candles_5m, cfg, structure_feed=structure_feed)
+        trade = manage_position(
+            pos, candles_5m, cfg, structure_feed=structure_feed,
+            diag=diag, same_bar_order=same_bar_order,
+        )
         trades.append(trade)
         if loss_cooldown_ms > 0 and (trade.exit_reason == "SL" or trade.pnl < 0.0):
             cooldown_until_ms = trade.exit_time + loss_cooldown_ms
@@ -2732,6 +2960,7 @@ def write_json_report(
     run_metadata: Optional[Dict[str, Any]] = None,
     output_dir: str | Path = "logs",
     permutation: Optional[Dict[str, Any]] = None,
+    diagnostics: Optional[Dict[str, int]] = None,
 ) -> str:
     by_strategy = _group_by_strategy(all_trades)
     by_strategy_regime = _group_by_strategy_regime(all_trades)
@@ -2779,6 +3008,10 @@ def write_json_report(
         # (rapor ŞEKLİ sabit kalsın diye anahtar her zaman var).
         "market_gate": metadata.get("market_gate"),
     }
+    # E17/H2: `provenance.sim_options` YALNIZ --diagnostics / --same-bar-order
+    # verilince yazılır → varsayılan rapor şekli (golden) değişmez.
+    if metadata.get("sim_options") is not None:
+        provenance["sim_options"] = metadata["sim_options"]
 
     payload = {
         "generated_at": _utc_iso_now(),
@@ -2804,6 +3037,9 @@ def write_json_report(
         "permutation": permutation,
         "trades": [t.to_dict() for t in all_trades],
     }
+    # E17/H2: `diagnostics` bloğu yalnız --diagnostics ile yazılır.
+    if diagnostics is not None:
+        payload["diagnostics"] = dict(diagnostics)
 
     logs_dir = Path(output_dir)
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -3123,6 +3359,8 @@ async def run_backtest(
     maker_trade_through_pct: Optional[float] = None,
     funding_fallback_pct: Optional[float] = None,
     funding_cache_dir: Optional[str | Path] = None,
+    diag: Optional[Dict[str, int]] = None,
+    same_bar_order: str = SAME_BAR_ORDER_PESSIMISTIC,
 ) -> List[BacktestTrade]:
     """Verilen semboller için tarihsel veriyi çeker ve tüm stratejileri
     simüle eder; tüm işlemleri (tüm semboller birleşik) döndürür.
@@ -3138,6 +3376,11 @@ async def run_backtest(
 
     `missed_counter` verilirse (mutasyonla) kapılarda reddedilen/timeout olan
     sinyallerin sayısı buraya birikir (tüm semboller toplamı).
+
+    E17/H2: `diag` verilirse (mutasyonla, `new_diagnostics()`) aynı-bar
+    belirsizlik sayaçları birikir; `same_bar_order` "optimistic" ise
+    `_process_candle_exits`/`manage_position` üç belirsiz durumda kâr-önce
+    varsayar (yalnız teşhis). Varsayılanlar bugünkü davranışla birebir aynıdır.
 
     `end_time_ms` tüm sembol ve aralıklara aynı sabit test bitişini uygular.
     `start_time_ms` verilirse (CLI --start/--end) test penceresi `days`
@@ -3158,6 +3401,7 @@ async def run_backtest(
         raise ValueError("Backtest gün sayısı pozitif olmalı")
     # Gerçekçilik anahtarları (REALISM_FEATURES): bilinmeyen ad burada patlar.
     disabled_realism = normalize_disabled_realism(disabled_realism)
+    check_same_bar_order(same_bar_order)
 
     strategies = get_enabled(strategy_names)
     if not strategies:
@@ -3228,6 +3472,7 @@ async def run_backtest(
     maker_stats: Dict[str, int] = {}
     try:
         timeframes = resolve_timeframes(cfg)
+        check_timeframe_roles(timeframes)
         tf_entry, tf_context, tf_regime = timeframes
 
         # D15 lider piyasa kapısı: lider serisi pencere başında BİR KEZ
@@ -3324,6 +3569,8 @@ async def run_backtest(
                 maker_stats=maker_stats,
                 funding_fallback_pct=funding_fallback_pct,
                 funding_cache_dir=funding_cache_dir,
+                diag=diag,
+                same_bar_order=same_bar_order,
             )
             app_logger.info(f"✅ {symbol}: {len(trades)} işlem simüle edildi")
             all_trades.extend(trades)
@@ -3982,6 +4229,31 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "scripts/fill_funding_cache.py doldurur. Dosya yoksa yedek oran"
         ),
     )
+    # ---- E17/H2 ölçüm bayrakları — VARSAYILAN KAPALI/bugünkü davranış ----
+    parser.add_argument(
+        "--diagnostics", action="store_true",
+        help=(
+            "Rapora `diagnostics` bloğu yaz: aynı-bar belirsizlik sayaçları "
+            "(tp1_fills, sl_tp1_same_bar, tp1_then_stop_same_bar, "
+            "tp2_then_floor_same_bar, fill_bar_exit, fill_bar_total). Yalnız "
+            "ölçüm; karar yolunu DEĞİŞTİRMEZ"
+        ),
+    )
+    parser.add_argument(
+        "--same-bar-order", choices=SAME_BAR_ORDERS,
+        default=None,
+        help=(
+            "Aynı mumda sırası bilinemeyen çıkışlar: pessimistic (varsayılan, "
+            "bugünkü davranış) | optimistic (TP1 mumunda BE stopu yok, TP2 "
+            "mumunda taban yok, dolum mumunda çıkış/likidasyon yok — YALNIZ "
+            "teşhis; eski mum modelinde (E17) tanımlıdır, her iki modelde "
+            "gerçekçi mantığın üstüne biner). gap_fills, intrabar_path veya "
+            "maker_fill_bar AÇIKKEN optimistic bir ÜST SINIR DEĞİLDİR (atlanan "
+            "stop sonraki mumda boşlukla dolabilir); yalnız teşhis olarak "
+            "okuyun. Gerçekçi modelde sıra duyarlılığı için "
+            "--disable-realism intrabar_path (ve maker_fill_bar) kullanın"
+        ),
+    )
     return parser
 
 
@@ -4028,7 +4300,24 @@ async def main_async(args: argparse.Namespace) -> None:
 
     missed_counter: Dict[str, int] = {}
     run_metadata: Dict[str, Any] = {}
+    # E17/H2: bayraklar verilmediyse hiçbir şey kurulmaz (rapor şekli aynı).
+    # `--same-bar-order` argparse varsayılanı None: açıkça verilip verilmediği
+    # (pessimistic dahil) ayırt edilsin diye (sim_options yalnız bayrak varsa).
+    same_bar_flag = getattr(args, "same_bar_order", None)
+    same_bar_order = str(same_bar_flag or SAME_BAR_ORDER_PESSIMISTIC)
+    diagnostics_on = bool(getattr(args, "diagnostics", False))
+    diag_counter: Optional[Dict[str, int]] = new_diagnostics() if diagnostics_on else None
     permutations = max(0, int(getattr(args, "permutations", 0) or 0))
+    if permutations > 0 and same_bar_order != SAME_BAR_ORDER_PESSIMISTIC:
+        # Permütasyon turları HER ZAMAN pessimistic simüle eder; gözlenen
+        # istatistik optimistic olursa null ile karşılaştırma geçersiz olur.
+        raise ValueError(
+            "--permutations yalnız --same-bar-order pessimistic ile geçerlidir "
+            "(permütasyon yolu optimistic'i taşımaz; p-değeri geçersiz olurdu)"
+        )
+    optimistic_caveat = optimistic_caveat_applies(same_bar_order, disabled_realism)
+    if optimistic_caveat:
+        app_logger.warning(f"⚠️ {OPTIMISTIC_CAVEAT_NOTE}")
     series_by_symbol: Dict[str, Dict[str, List[Candle]]] = {}
     leader_holder: List[Optional[LeaderSeries]] = []
     all_trades = await run_backtest(
@@ -4050,7 +4339,17 @@ async def main_async(args: argparse.Namespace) -> None:
         funding_cache_dir=funding_cache_dir,
         series_out=series_by_symbol if permutations > 0 else None,
         leader_out=leader_holder if permutations > 0 else None,
+        diag=diag_counter,
+        same_bar_order=same_bar_order,
     )
+    if diagnostics_on or same_bar_flag is not None:
+        run_metadata["sim_options"] = {
+            "same_bar_order": same_bar_order,
+            "diagnostics": diagnostics_on,
+        }
+        if optimistic_caveat:
+            run_metadata["sim_options"]["optimistic_is_upper_bound"] = False
+            run_metadata["sim_options"]["note"] = OPTIMISTIC_CAVEAT_NOTE
     run_metadata.setdefault("cost_model", {})
     run_metadata["cost_model"]["stress_multiplier"] = stress_multiplier
 
@@ -4111,6 +4410,7 @@ async def main_async(args: argparse.Namespace) -> None:
         cfg=run_cfg,
         run_metadata=run_metadata,
         permutation=permutation_study,
+        diagnostics=diag_counter,
     )
 
 

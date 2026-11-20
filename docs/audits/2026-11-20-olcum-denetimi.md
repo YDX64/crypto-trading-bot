@@ -3,6 +3,8 @@
 Kapsam: yalnız ölçüm zinciri (harness, kabul kuralları, canlı defterin okunması). Strateji ayarı ve sunucu `.env` DEĞİŞMEDİ; bu belge yazılırken kod sunucuya deploy edilmemişti
 (deploy kaydı: D43'ün sonu). Tüm "canlı" sayılar TESTNET defterinden (simülasyon parası, gerçek para değil); backtest sayıları geçmiş
 piyasa verisi üzerinde simülasyondur. Kararlar: D41, D42 (sonuç eklendi), D43. Deneyler: EXPERIMENTS E19-E22.
+Denetim, 2026-10-10/11 tarihli iki commit'ten (E16, E17) yoksun bir main'den başladı; bunlar sonradan birleştirildi ve bu raporla
+uyuşur (bölüm 7).
 
 ## 1. Özet
 
@@ -14,10 +16,12 @@ piyasa verisi üzerinde simülasyondur. Kararlar: D41, D42 (sonuç eklendi), D43
    (2026-01-23..08-21, 191 gün; örneklem-içi sayılır) PF 0.85. Bu dönem yanık standart pencerelerin altısını içerir; C'nin
    ayarları için bağımsız DEĞİLDİR, yalnız D42 koruma hipotezlerinden bağımsızdır.
 6. Canlı testnet defteri, C id ≥ 278: PF 0.43, sanal sermaye 1000'den yaklaşık 169'a indi.
-7. Başka hiçbir kurulum (A, B, D, E) tek başına kenar göstermedi (PF 0.76-0.84, yanık pencerelerde); sekiz giriş koruması
+7. main'de zaten duran iki ön-kayıtlı deney (E16, E17; eski model, 2025 verisi) bağımsız olarak kenar bulamamıştı: bugünkü ayarlar 8 taze
+   pencerede PF 0.773, 2025'in tamamında PF 0.777; hiçbir çıkış varyantı ve hiçbir giriş zaman dilimi kabul kuralını geçmedi.
+8. Başka hiçbir kurulum (A, B, D, E) tek başına kenar göstermedi (PF 0.76-0.84, yanık pencerelerde); sekiz giriş koruması
    P2-v2'yi geçmedi.
-8. Hüküm: örneklem dışında kenar gösterilemedi; hiçbir ayar değişmez; mainnet NO-GO teyit.
-9. Bu raporda yapılmayanlar ve doğrulanmayanlar bölüm 9'da, açık araştırma yönleri bölüm 10'da.
+9. Hüküm: örneklem dışında kenar gösterilemedi; hiçbir ayar değişmez; mainnet NO-GO teyit.
+10. Bu raporda yapılmayanlar ve doğrulanmayanlar bölüm 9'da, açık araştırma yönleri bölüm 10'da.
 
 ## 2. Ölçüm zincirinde ne yanlıştı
 
@@ -46,7 +50,7 @@ Not: denetimin kendi boyutları (ayakta): `walkforward-oos` 7, `parity` 7, `para
 | Dokuz gerçekçilik anahtarı (varsayılan AÇIK): boşluk dolumu, çıkış kayması, mum içi yol, maker trade-through, dolum mumu, tek bekleyen emir, fonlama, likidasyon, günlük kesici | işlem sayısı ve PnL gerçekçi |
 | P2-v2 kabul kuralı | örneklem ≥ 60, eşleşmiş bootstrap + BH q ≤ 0.10, pencere zararı, DD, maliyet 2× ve 1 mum gecikme stresi |
 | `scripts/walk_forward.py` | örneklem-dışı katlar, embargo; yalnız önbellekle |
-| `docs/holdout_registry.json` | 12 pencere: 10 yanık, 1 doğrulama, 1 mühürlü; mühürlüye `--open-sealed` olmadan koşu reddedilir |
+| `docs/holdout_registry.json` | D41'de 12 pencere: 10 yanık, 1 doğrulama, 1 mühürlü; birleştirmeden sonra 14 (+ yanık `DEV-2025`, + mühürlü `SEAL-2023-2024`); mühürlüye `--open-sealed` olmadan koşu reddedilir |
 | Permütasyon, Monte Carlo, defter raporu düzeltmeleri | p-değeri yanlılığı ve metrik kaynak karışıklığı giderildi |
 
 Eski sayıları üretmek için `--legacy-model` (tüm anahtarlar kapalı): 7 pencerede işlem listesi ve net PnL eski koşuyla birebir
@@ -159,6 +163,8 @@ ratchet'ı kayıpları düzeltmiyor; mevcut SL gerçekleşmesi temiz (kayma ort.
 | Harness-canlı farkı | | kazanma oranında 9-19 puan iyimser; TP1'e ulaşan %66 vs %54; çıkış başına ROI ±1 içinde | E21 |
 | Kurulum sayımı | 7 standart pencere | A 0.79 / B 0.81 / D 0.84 / E 0.80 PF; denge filtresi kapalıyken de negatif; LONG 10 koşunun hepsinde negatif | E20 |
 | Koruma adayları K1..K8 | 2026-01-23..08-21, 191 gün | taban PF 0.85; en iyi p 0.143, q 0.349; hiçbiri geçmedi | E22 |
+| Ön-kayıtlı çıkış deneyi (eski model; main) | 2025, 8 taze pencere (V1..V8) | 1619 işlem, PF **0.773**; 11 çıkış varyantından 0'ı geçti | E16 |
+| Ön-kayıtlı giriş zaman dilimi deneyi (eski model; main) | 2025'in tamamı | altı kolun net PF 0.42-0.71, komisyonsuz bile < 1; canlı 1m ayarı 3370 işlem, PF 0.777 | E17 |
 
 Mevcut boyutlamada (marj %10, stop −%5 sermaye) 90 günlük yollarda tepeden ≥ %50 düşüş olasılığı: harness havuzu 0.36 (7 pencere) /
 0.65 (7 pencere + VAL); canlı defter C için 0.86 (E21). Bu üç değer bileşik boyutlama modelindendir; toplamsal modelde aynı
@@ -170,12 +176,16 @@ sırayla 0.39 / 0.68 / 0.96.
   canlı testnet defteri (PF 0.43); ikisi de negatif. Kesintisiz geçmişte (örneklem-içi sayılır) PF 0.85.
 - Yanık 7 pencerede (örneklem-içi) A, B, D, E'nin hiçbiri kârlı değil (PF 0.76-0.84; yön kırılımında en iyiler B SHORT PF 1.00
   ve D SHORT PF 1.02, başabaş); kayıp-örüntü korumaları kabul kuralını geçmedi.
+- Aynı sonuca E16 ve E17 de bağımsız olarak, ön-kayıtlı tasarımlarla ve 2025 verisinde (eski model) vardı.
 - Hiçbir ayar değişmez; mainnet NO-GO teyit (D43, `docs/MAINNET_PLAN.md`).
 
 ## 9. Yapılmayanlar ve doğrulanmayanlar
 
 - Harness-canlı TP1 farkının NEDENİ ölçülmedi (gecikme, testnet fiyat tabanı, TV slotları, %87 maker dolum varsayımı: hipotez).
 - Mühürlü `SEAL-2026Q4b` açılmadı.
+- Bu denetim, çekilmemiş (fetch yapılmamış) eski bir yerel main'den başladı; E16/E17 sonradan birleştirildi.
+- E16/E17 gerçekçi modelde yeniden koşulmadı (2025 verisi yerel önbellekte yok).
+- VAL-2026Q4a, E16'nın CANLI / E17'nin FINAL penceresiyle örtüşür (EXPERIMENTS E21 örtüşme notu).
 - E22'da 19/210 gün kline önbelleği deliği nedeniyle kapsanmadı; E22 gücü sınırlı (asgari tespit edilebilir fark ≈ 5300-17 500).
   Delikler sonradan dolduruldu (önbellek 2026-01-23..11-18 arası 8 sembolde kesintisiz; dosya sayısı 409 → 508); E22 bu 19 günle
   YENİDEN KOŞULMADI.
@@ -185,8 +195,11 @@ sırayla 0.39 / 0.68 / 0.96.
   çıkış sonrası hareket) tekrarlanmadı. Bir bulgu bağımsız hesapla uyuşmadı (TP1 sonrası artık: 3.66 vs 4.08 ROI).
 - `/health` mandalının kod düzeltmesi yapılmadı (yeniden başlatma bayrağı temizler). TV sessizliğinin sunucu tarafı incelendi
   (bölüm 5); TradingView'in Alarmlar paneli açılmadı, alarmlar yeniden kurulmadı.
-- Tam test paketi bu belgenin yazılışında yeniden koşulmadı (yalnız `tests/test_walk_forward.py`: 31 geçti); CLAUDE.md'deki 3658 sayısı
-  koşturan orkestratörden alındı.
+- Test paketi (origin/main birleştirildikten sonraki son ağaç): depoda 4046 geçti / 85 atlandı; temiz kopyada sunucunun secret olmayan
+  ayarlarıyla (`scripts/preflight_server_env.sh awa`, 66 ayar satırı) 4045 geçti / 86 atlandı; temiz kopyada yalnız `env.example` ile
+  4045 geçti / 86 atlandı. Atlananlar isteğe bağlı testlerdir (E17'nin yavaş betik testleri, ağ ve testnet testleri; kopyada `.git`
+  olmadığı için bir test daha). Birleştirmeden önce ilk sunucu-ayarlı koşuda iki test kalmıştı (yapılandırmaları `.env`'den stop modunu
+  ve dinamik kaldıracı devralıyordu); düzeltildi (D43 "Deploy öncesi ön sınav").
 
 ## 10. Açık araştırma yönleri
 
@@ -194,7 +207,9 @@ Hepsi hipotez; her biri kullanılmadan önce walk-forward / P2-v2 ile yargılan�
 
 1. Trend-yönlü (with-trend) giriş ailesi. 4 saatlik rejim tanımıyla trendle aynı yönlü işlemler (UP-LONG + DOWN-SHORT, n=308)
    PF 1.29, +340; kârın tamamı Ağustos UP-LONG'undan. EMA50/200 farkı tanımıyla trendle aynı yönlü işlemler (n=223) ise −550. İki
-   tanım TERS sonuç veriyor: 'trend yönlü giriş daha iyi' kanıtı sağlam değil, hipotez düzeyinde.
+   tanım TERS sonuç veriyor: 'trend yönlü giriş daha iyi' kanıtı sağlam değil, hipotez düzeyinde. E17'nin "Yorum" 6. maddesi aynı
+   ipucunu verir (karşı-trend girişler 15m/30m'de ücretsiz bile güçlü kaybediyor; sınanmadı). E18 numarası ve dokunulmamış
+   2023-01-01 → 2024-11-18 verisi yeni bir fikrin ön-kayıtlı sınaması için ayrıldı.
 2. Maker (limit) kâr-al emirleri: ücretler brüt kârın %31.5'i; harness çıkış tarafında maker modeli yok.
 3. Giriş gecikmesi / kovalama-yok kuralı: kötü maker dolumlar (198 işlem, −525); emrin dolduğunun gözlenmesi medyan 43 sn
    (ort. 61 sn, n=321); sinyalden giriş kaydına medyan 60 sn (ort. 79 sn, n=399).
@@ -227,6 +242,7 @@ Kanıt klasörü (YEREL, git'te izlenmez; `logs/` .gitignore'da): `logs/audit_20
 | `eval_out/guards/` | E22 117 koşunun raporları, `analyze.py`, `report.py`, `jobs.sh`, `configs.json`, `segments.json` |
 | `legacy_eq/` | eski modelin birebir yeniden üretimi, 7 pencere |
 | `attrib/` | özellik başına etki koşuları: AYI, BOĞA, ÇÖKÜŞ |
+| `merge_eq/` | birleştirme sonrası eşdeğerlik koşuları: origin/main, birleşik eski model, birleşik gerçekçi model, ölçüm bayrakları |
 | `tv_silence/README.txt` | TradingView kaynağının sessizliği: salt-okunur inceleme, secret içermez |
 | `run_bt.sh` | koşu çalıştırıcısı (komut içindeki yollar oturum çalışma alanına işaret eder) |
 | `audit_result.json`, `impl_result.json`, `forensics_result.json`, `measure_result.json`, `guards_result.json` | denetim, uygulama, canlı defter incelemesi, ölçümler, koruma sınavı |

@@ -1886,6 +1886,11 @@ class ExitManager:
                 # olabilir; `mfe_giveback` gibi etiketler EKSİK sayar, fazla
                 # saymaz). Değer uydurulmaz, periyodik DB yazımı eklenmez.
                 path["mfe_lower_bound"] = True
+                # MAE'nin yönü TERS: imzalı ROI'de (negatif = aleyhe) bellekte
+                # gözlenen en kötü değer, restart öncesindeki GERÇEK en
+                # kötüden daha yukarıda (daha az kötü) olabilir; yani yazılan
+                # MAE sayısı ancak bir ÜST SINIRdır (cubic/PR #7).
+                path["mae_upper_bound"] = True
                 if not path["trail_updates"]:
                     path["trail_updates"] = None
                 # `plan.initial_stop` kurtarmada CANLI stop ile kurulur, ilk

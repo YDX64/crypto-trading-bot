@@ -105,7 +105,7 @@ Yeni sinyal kaynağı (haber botu vb.) eklemek: `docs/INTEGRATIONS.md`. Otomatik
 
 ## Nasıl çalıştırılır / test edilir / deploy edilir
 ```bash
-python3 -m pytest tests -q                      # 3658 test (+3 atlanan), ~80 sn — her değişiklikten önce
+python3 -m pytest tests -q                      # 4046 test (+85 atlanan), ~150 sn — her değişiklikten önce
 scripts/preflight_server_env.sh awa             # deploy ÖNCESİ: temiz kopya + sunucu ayarlarıyla test (D43)
 scripts/deploy.sh awa                           # push edilmiş main'i sunucuya uygula (test + restart + sağlık + otomatik geri alma)
 DEPLOY_NO_RESTART=1 scripts/deploy.sh awa       # yalnız kod/test; süreci yeniden başlatma
@@ -117,6 +117,8 @@ scripts/deploy.sh awa <önceki-commit>           # geri alma (backups/commit.pre
 kullanıcının Mac'inden `scripts/deploy.sh awa` ile yapılır (bulut awa'ya ERİŞEMEZ; Actions deploy'u YOK).
 Bulutta bağımlılıklar `.claude/hooks/session-start.sh` ile Python 3.12 `.venv`'e kurulur (sistem Python 3.13
 sabit pin'leri derleyemez). Ayrıntı: `docs/RUNBOOK.md` "Bulutta geliştirme, yerelden deploy", D39.
+Kural: yeni bir dal açmadan önce `git fetch origin` çalıştır ve origin/main ile karşılaştır. 2026-11-20'de yerel main 40 gün geriydi
+(iki bulut birleştirmesi) ve bir günlük iş E16/E17 olmadan ilerledi.
 
 Backtest DAİMA sunucu env'iyle:
 ```bash
@@ -129,7 +131,7 @@ Koşuları sıralı yap (paralel = Binance 429). Sonuç `docs/EXPERIMENTS.md`'ye
 **Değerlendirme prosedürü (D41, 2026-11-20 — harness artık GERÇEKÇİ model varsayılan):** harness boşluk/çıkış kayması,
 maker trade-through, fonlama (`data/funding_cache`), likidasyon ve günlük kesiciyi varsayılan AÇIK uygular
 (`--disable-realism a,b`; `--legacy-model` = eski model, eski sayıları birebir üretir). RESMİ sayı gerçekçi modeldir;
-eski (E2…E13) sayılarla kıyas yalnız `--legacy-model` ile yapılır. Sweep kabul kuralı **P2-v2**'dir
+eski (E2…E17) sayılarla kıyas yalnız `--legacy-model` ile yapılır. Sweep kabul kuralı **P2-v2**'dir
 (`scripts/autoresearch.py`; eski P2 yalnız "P2-eski" olarak basılır): örneklem ≥ 60 işlem/pencere, eşleşmiş bootstrap
 + BH q ≤ 0.10, pencere zararı ≤ 0.20×scale, DD ≤ 1.2× taban, maliyet 2× ve 1 mum gecikme stresi. Örneklem-dışı sınama:
 `scripts/walk_forward.py` (yalnız kline önbelleğiyle). Pencere kullanımı `docs/holdout_registry.json` kaydındadır;
@@ -168,6 +170,9 @@ da `docs/holdout_registry.json`'da YANIK; yeni pencereler `VAL-2026Q4a` ve müh�
   görülmemiş doğrulama penceresi `VAL-2026Q4a` PF 0.58 ve canlı testnet defteri C id ≥ 278 PF 0.43. Kesintisiz geçmişte
   (2026-01-23..08-21, 191 gün; örneklem-içi sayılır) PF 0.85: bu dönem yanık standart pencerelerin altısını içerir; C'nin
   ayarları için bağımsız DEĞİLDİR, yalnız D42 koruma hipotezlerinden bağımsızdır.
+- E16/E17 (main, 2026-10-10/11, eski model) 2025 verisinde aynı hükme vardı: 8 taze pencerede PF 0.773, 2025'in tamamında PF 0.777;
+  hiçbir çıkış varyantı ya da giriş zaman dilimi geçmedi, komisyonsuz PF yine < 1. E18 numarası, dokunulmamış 2023-01-01 → 2024-11-18
+  verisinde yeni bir fikrin ön-kayıtlı sınaması için ayrıldı.
 - Başka kurulumlar (A, B, D, E) PF 0.76-0.84, kenarı yok; sekiz D42 koruması P2-v2'yi geçmedi (en iyi p 0.14). Ayarlar KAPALI
   kalır, mainnet NO-GO; harness canlıdan kazanma oranında 9-19 puan iyimser (TP1'e ulaşma %66 vs %54).
 - Sürpriz bir şey görürsen önce `docs/DECISIONS.md`'de denenmiş mi bak; sonra

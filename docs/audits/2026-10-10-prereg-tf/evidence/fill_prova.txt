@@ -1,0 +1,12 @@
+# E17 P0 doldurma provasi (PLAN §6 P0(b), §4.5, §15.1) — 2026-10-10T18:45:24Z baslangic
+komut : E17_PRELOCK=1 E17_H_COMMIT=14d3b17c53b18ef5f2eac5029f69fbff1b4119e5 E17_ROOT=$HOME/e17_root E17_SNAPSHOT=$E17_ROOT/server-scalper-env.txt scripts/e17/run_prova.sh
+        (varsayilan arm S15 = 15m/1h/4h, pencere SMOKE_W 2026-04-01..2026-05-01, YALNIZ CAL; --tf-* yok; market-gate bayragi yok)
+isci   : 8 (E17_FILL_WORKERS varsayilan; sembol basina 1 isci). 4 isciye dusme GEREKMEDI.
+sonuc  : FILL OK PROVA_S15 46   (betik duvar suresi 45.7 sn, rc=0)
+hata/cakisma : YOK — CHAIN.log bos (FILL RETRY/FAIL satiri yok), 8 isci gunlugunde hata/Traceback yok.
+zip    : isci basina 51 indirildi, 0 indirme onbelleginden -> toplam 408 zip (+408 .CHECKSUM = 816 HTTP istegi, turetilmis)
+dosya  : isci basina 3 onbellek dosyasi (15m, 1h, 4h) -> 24 dosya (8 sembol x 3), toplam 34240 mum (8 x 4280); hepsi sha256+boslukluk dogrulamali
+dl/    : 408 zip (daily+monthly), 4.8 MB; cache/: 868 KB (BTCUSDT 1d dosyasi dahil 25 dosya)
+not    : her isci FARKLI sembol oldugundan ayni indirme-onbellegi yolunu iki isci yazmadi; ayni sembolu iki uclu icin eszamanli
+         dolduran isciler bu provada SINANMADI (tek arm/uclu kosuldu).
+         Prova sirasinda ayni makinede pytest (1 cekirdek) calisiyordu; sure bundan hafif etkilenmis olabilir.

@@ -1,0 +1,273 @@
+{
+  "2025-01": {
+    "ret_pct": 9.43988592050351,
+    "label": "UP",
+    "shock": false,
+    "partial": false,
+    "set": "DEV"
+  },
+  "2025-02": {
+    "ret_pct": -17.659929009433494,
+    "label": "DOWN",
+    "shock": false,
+    "partial": false,
+    "set": "DEV"
+  },
+  "2025-03": {
+    "ret_pct": -2.1140076583993306,
+    "label": "FLAT",
+    "shock": true,
+    "partial": false,
+    "set": "DEV"
+  },
+  "2025-04": {
+    "ret_pct": 14.0668343078741,
+    "label": "UP",
+    "shock": true,
+    "partial": false,
+    "set": "DEV"
+  },
+  "2025-05": {
+    "ret_pct": 11.069830396110714,
+    "label": "UP",
+    "shock": true,
+    "partial": false,
+    "set": "DEV"
+  },
+  "2025-06": {
+    "ret_pct": 2.432263359370057,
+    "label": "FLAT",
+    "shock": false,
+    "partial": false,
+    "set": "DEV"
+  },
+  "2025-07": {
+    "ret_pct": 8.040169095681748,
+    "label": "UP",
+    "shock": false,
+    "partial": false,
+    "set": "DEV"
+  },
+  "2025-08": {
+    "ret_pct": -6.47283903773036,
+    "label": "DOWN",
+    "shock": false,
+    "partial": false,
+    "set": "DEV"
+  },
+  "2025-09": {
+    "ret_pct": 5.34191430609825,
+    "label": "UP",
+    "shock": false,
+    "partial": false,
+    "set": "DEV"
+  },
+  "2025-10": {
+    "ret_pct": -3.887578330132724,
+    "label": "FLAT",
+    "shock": true,
+    "partial": false,
+    "set": "DEV"
+  },
+  "2025-11": {
+    "ret_pct": -17.55849912191987,
+    "label": "DOWN",
+    "shock": false,
+    "partial": false,
+    "set": "DEV"
+  },
+  "2025-12": {
+    "ret_pct": -3.0029727470507805,
+    "label": "FLAT",
+    "shock": false,
+    "partial": false,
+    "set": "DEV"
+  },
+  "2023-01": {
+    "ret_pct": 39.79984882842027,
+    "label": "UP",
+    "shock": true,
+    "partial": false,
+    "set": "VAL"
+  },
+  "2023-02": {
+    "ret_pct": 0.04368606587512591,
+    "label": "FLAT",
+    "shock": true,
+    "partial": false,
+    "set": "VAL"
+  },
+  "2023-03": {
+    "ret_pct": 23.023212579497354,
+    "label": "UP",
+    "shock": true,
+    "partial": false,
+    "set": "VAL"
+  },
+  "2023-04": {
+    "ret_pct": 2.69972025809353,
+    "label": "FLAT",
+    "shock": false,
+    "partial": false,
+    "set": "VAL"
+  },
+  "2023-05": {
+    "ret_pct": -6.918865277350039,
+    "label": "DOWN",
+    "shock": false,
+    "partial": false,
+    "set": "VAL"
+  },
+  "2023-06": {
+    "ret_pct": 11.981500748131513,
+    "label": "UP",
+    "shock": true,
+    "partial": false,
+    "set": "VAL"
+  },
+  "2023-07": {
+    "ret_pct": -4.0689161594474115,
+    "label": "FLAT",
+    "shock": false,
+    "partial": false,
+    "set": "VAL"
+  },
+  "2023-08": {
+    "ret_pct": -11.26868532004599,
+    "label": "DOWN",
+    "shock": true,
+    "partial": false,
+    "set": "VAL"
+  },
+  "2023-09": {
+    "ret_pct": 3.9451558161061495,
+    "label": "FLAT",
+    "shock": false,
+    "partial": false,
+    "set": "VAL"
+  },
+  "2023-10": {
+    "ret_pct": 28.571852621424078,
+    "label": "UP",
+    "shock": true,
+    "partial": false,
+    "set": "VAL"
+  },
+  "2023-11": {
+    "ret_pct": 8.846395816619236,
+    "label": "UP",
+    "shock": true,
+    "partial": false,
+    "set": "VAL"
+  },
+  "2023-12": {
+    "ret_pct": 12.188435422847576,
+    "label": "UP",
+    "shock": false,
+    "partial": false,
+    "set": "VAL"
+  },
+  "2024-01": {
+    "ret_pct": 0.5825495108002121,
+    "label": "FLAT",
+    "shock": true,
+    "partial": false,
+    "set": "VAL"
+  },
+  "2024-02": {
+    "ret_pct": 43.80305682499031,
+    "label": "UP",
+    "shock": true,
+    "partial": false,
+    "set": "VAL"
+  },
+  "2024-03": {
+    "ret_pct": 16.59992189963613,
+    "label": "UP",
+    "shock": true,
+    "partial": false,
+    "set": "VAL"
+  },
+  "2024-04": {
+    "ret_pct": -15.0102994548996,
+    "label": "DOWN",
+    "shock": true,
+    "partial": false,
+    "set": "VAL"
+  },
+  "2024-05": {
+    "ret_pct": 11.420548975123324,
+    "label": "UP",
+    "shock": true,
+    "partial": false,
+    "set": "VAL"
+  },
+  "2024-06": {
+    "ret_pct": -7.1205231296030185,
+    "label": "DOWN",
+    "shock": false,
+    "partial": false,
+    "set": "VAL"
+  },
+  "2024-07": {
+    "ret_pct": 2.9246679338050363,
+    "label": "FLAT",
+    "shock": true,
+    "partial": false,
+    "set": "VAL"
+  },
+  "2024-08": {
+    "ret_pct": -8.761210987929136,
+    "label": "DOWN",
+    "shock": true,
+    "partial": false,
+    "set": "VAL"
+  },
+  "2024-09": {
+    "ret_pct": 7.409330204828812,
+    "label": "UP",
+    "shock": false,
+    "partial": false,
+    "set": "VAL"
+  },
+  "2024-10": {
+    "ret_pct": 11.077255998357249,
+    "label": "UP",
+    "shock": false,
+    "partial": false,
+    "set": "VAL"
+  },
+  "2024-11": {
+    "ret_pct": 27.840544695180313,
+    "label": "UP",
+    "shock": true,
+    "partial": true,
+    "set": "VAL"
+  },
+  "counts": {
+    "DEV": {
+      "UP": 5,
+      "FLAT": 4,
+      "DOWN": 3,
+      "months": 12,
+      "partial_months": 0
+    },
+    "VAL": {
+      "UP": 11,
+      "FLAT": 6,
+      "DOWN": 5,
+      "months": 22,
+      "partial_months": 1
+    }
+  },
+  "rule": {
+    "series": "BTCUSDT 1d, takvim ayı; getiri = son gün kapanış / ilk gün açılış - 1",
+    "UP": ">= +5.0%",
+    "DOWN": "<= -5.0%",
+    "FLAT": "aksi",
+    "shock": "ayda herhangi günlük |kapanış/açılış-1| >= 6.0% (raporlanır, kullanılmaz)",
+    "assignment": "işlem, GİRİŞ (dolum) barı open_time'ının UTC ayının etiketini alır",
+    "partial_months": "kısmi ay (VAL Kasım 1-17) kendi getirisiyle etiketlenir; G10 gruplarına girer, M'ye girmez"
+  },
+  "frozen_utc": "2026-10-10T18:39:01Z"
+}

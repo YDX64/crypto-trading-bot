@@ -1,0 +1,303 @@
+[
+  {
+    "etiket": "SMOKE_B0_AYI",
+    "utc": "2026-10-10T19:13:25Z",
+    "saniye": null,
+    "sha256": "5957205dd3cf9f2758ede369b38d371be93892d439dc4e8276206dc1313c67a9",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "SMOKE_B0_V1",
+    "utc": "2026-10-10T19:14:16Z",
+    "saniye": null,
+    "sha256": "7e26183f87b820c291a4c0477674d09660376fa4d07e620f70dfa3b3506b7222",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "SMOKE_S15_h0",
+    "utc": "2026-10-10T19:14:21Z",
+    "saniye": null,
+    "sha256": "96fa1638309026dbe147902f4ac7c5522bfc1f022a4119bb5e579d4033f2cacf",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "SMOKE_S15_h1",
+    "utc": "2026-10-10T19:14:27Z",
+    "saniye": null,
+    "sha256": "ee152b02982265f932e931b745e460e6f5f2870775dc0a2ac80045124ec53a45",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "SMOKE_S5_W",
+    "utc": "2026-10-10T19:14:42Z",
+    "saniye": null,
+    "sha256": "1f25dec06c302e295b136d363ddda46d74f434a7d2b1846758678bafecb38a79",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "SMOKE_T5_W",
+    "utc": "2026-10-10T19:14:56Z",
+    "saniye": null,
+    "sha256": "aac74b45344645675af2483e451bbf5aa4ef385e4d5c9101ec0890a18f782041",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "SMOKE_S15_W",
+    "utc": "2026-10-10T19:15:01Z",
+    "saniye": null,
+    "sha256": "12ea1c851735c61def473350f90ef506863ff2d35b283db7f3a4fc0a167c4027",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "SMOKE_T15_W",
+    "utc": "2026-10-10T19:15:06Z",
+    "saniye": null,
+    "sha256": "de3a86c43ff6b88d8956863aa3f2fa73d7dad137fde44ad084c15078e1857574",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "SMOKE_S30_W",
+    "utc": "2026-10-10T19:15:09Z",
+    "saniye": null,
+    "sha256": "81e0c33fb0f4d74b7a1416fae6ca886e67126289e4ba955cd0b152c5803088ae",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "SMOKE_T30_W",
+    "utc": "2026-10-10T19:15:13Z",
+    "saniye": null,
+    "sha256": "4710afa10d15f2befd58c7d39ba7e38070a4906997a0750e1426b7c815525a7a",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "SMOKE_S60_W",
+    "utc": "2026-10-10T19:15:15Z",
+    "saniye": null,
+    "sha256": "4e0083045a458a12ee754de7b4ccf1132cae71f4ec6d86823cd33773e86ce013",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "SMOKE_T60_W",
+    "utc": "2026-10-10T19:15:17Z",
+    "saniye": null,
+    "sha256": "86ec3ec33819e78ab89d55d2e9e1b5dd0715c372d54c942b6a840dc02c68005c",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "SMOKE_R1_M1",
+    "utc": "2026-10-10T19:15:27Z",
+    "saniye": null,
+    "sha256": "de7c793044afa7124a908aebf6c64c6511497bf190f175e059b65ed01fc15e26",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_S5",
+    "utc": "2026-10-10T19:54:36Z",
+    "saniye": null,
+    "sha256": "0feec0a4510952dd80fa0758bea383b80258ae84a966257c0b17741dc1aa55e3",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_T5",
+    "utc": "2026-10-10T20:02:42Z",
+    "saniye": null,
+    "sha256": "fbc91bc26b9bec5d074b7e79599e322f95d05535f9588b9d329b952065f6df4c",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_S15",
+    "utc": "2026-10-10T20:04:01Z",
+    "saniye": null,
+    "sha256": "0c20c2519e5f392101034ea16751c3a62fbd587bafbee1ebfc914cd034062f62",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_T15",
+    "utc": "2026-10-10T20:04:59Z",
+    "saniye": null,
+    "sha256": "8ae0ae5bba4d91ac20cbee0d9fdad42939bd8d23db1ea1c2165ac25e0aad1fa6",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_S30",
+    "utc": "2026-10-10T20:05:28Z",
+    "saniye": null,
+    "sha256": "89b909f8b57489c6c80a19087fe23b919a08eec2636064fa8abe1f18798be571",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_T30",
+    "utc": "2026-10-10T20:05:55Z",
+    "saniye": null,
+    "sha256": "49750a13d312e1060aee87037aa9c78549dc458730b087af3081bcfc252c650f",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_S60",
+    "utc": "2026-10-10T20:06:08Z",
+    "saniye": null,
+    "sha256": "c2422dccb6400d51472ce3779498107f2278b496ae46b53b931b7a9e51b384a6",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_T60",
+    "utc": "2026-10-10T20:06:21Z",
+    "saniye": null,
+    "sha256": "ea701009aecb9c06f028a777b58ce373317fa25d6f73bb63e0e94e7b61a839ce",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_S5G",
+    "utc": "2026-10-10T20:10:14Z",
+    "saniye": null,
+    "sha256": "c37242ea455952b58dd64feb684bd2dc0810aae888a109dcd97e4cffcbcb44c3",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_T5G",
+    "utc": "2026-10-10T20:14:44Z",
+    "saniye": null,
+    "sha256": "8ec54ed65f3ec676a384f6776f3bd2e11b16124316478eb6ca613be8f0eb291a",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_R1_Q1",
+    "utc": "2026-10-10T20:27:47Z",
+    "saniye": null,
+    "sha256": "315631d90fad3e59aa8b758c2bf964fe135b155b5dad3ae27d9651d3dd2ccc68",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_R1_Q2",
+    "utc": "2026-10-10T20:40:44Z",
+    "saniye": null,
+    "sha256": "75a9b7cd5fe4ba7156e4483e8cfa4290c7cba131712ac4e440711ac83bf5d5ea",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_R1_Q3",
+    "utc": "2026-10-10T20:52:24Z",
+    "saniye": null,
+    "sha256": "a35e5b5c273cf15ab6bb3903e45d715ad77d50cedae9e10c3e3c8e46f336da66",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_R1_Q4",
+    "utc": "2026-10-10T21:02:58Z",
+    "saniye": null,
+    "sha256": "ed50e2e8b5d6b7d47545c5de073d0aeb76774e98ce9420d508b579ab2807c8f3",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_B0_Q1",
+    "utc": "2026-10-10T21:09:52Z",
+    "saniye": null,
+    "sha256": "ab3d890c661439f63ead4ce7a0379633a69edde31286b05e5712885329a74a7f",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_B0_Q2",
+    "utc": "2026-10-10T21:17:20Z",
+    "saniye": null,
+    "sha256": "3f451c881d7538913bdf96cf60cb117cb559c5211ab6307e53a1ab41b5930596",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_B0_Q3",
+    "utc": "2026-10-10T23:15:32Z",
+    "saniye": null,
+    "sha256": "b260878ecdf4b417e18daf83309b95c428adc8852bba1ea71dc7b6edfef7db6d",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_B0_Q4",
+    "utc": "2026-10-10T23:21:53Z",
+    "saniye": null,
+    "sha256": "2e32bb76df418f156dd2e1f3bf345e3689e448d7509e1a3c1515538eda323feb",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_S5_DIAG_Z0",
+    "utc": "2026-10-10T23:28:56Z",
+    "saniye": null,
+    "sha256": "cbf6f6f918174bff0f1d12d809dbcfb310ffaf6867cd73978651a1084e8ca79f",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_T5_DIAG_Z0",
+    "utc": "2026-10-10T23:36:32Z",
+    "saniye": null,
+    "sha256": "4fb39320fef31967a2b7e047a3b40f6064c82c4e4af2c3e0c9d99d9418474ed3",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_S15_DIAG_Z0",
+    "utc": "2026-10-10T23:37:41Z",
+    "saniye": null,
+    "sha256": "a888df4d8df1612d0a53da5c519ab7e380da4e0402f07f742b2ef68fba4a0c0a",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_T15_DIAG_Z0",
+    "utc": "2026-10-10T23:38:40Z",
+    "saniye": null,
+    "sha256": "5b808a479d1f547fa912f9feee0c7b3215d19dfdb122edf36ad0d72240018ff1",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_S30_DIAG_Z0",
+    "utc": "2026-10-10T23:39:08Z",
+    "saniye": null,
+    "sha256": "b5a16da718c3c912d444fe1b555b3d852e3da8879b78c09bd6da1c5e2fd96ceb",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_T30_DIAG_Z0",
+    "utc": "2026-10-10T23:39:34Z",
+    "saniye": null,
+    "sha256": "05158125f7e10c09f2bca0fb560b83240796436d43e57be7efc924fa46bb6763",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_S5_DIAG_SBO",
+    "utc": "2026-10-10T23:46:34Z",
+    "saniye": null,
+    "sha256": "ee7c2b8e9e7dbe48283d50559b812d6b78d27f71f6e6fbf61d508bd1a541bcfe",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_T5_DIAG_SBO",
+    "utc": "2026-10-10T23:55:18Z",
+    "saniye": null,
+    "sha256": "157c02caead801adfcb4d228b5db89c25a15394fa720477c374637be72e06dc7",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_S15_DIAG_SBO",
+    "utc": "2026-10-10T23:56:36Z",
+    "saniye": null,
+    "sha256": "a43fedc003b793ad822503e036f280a571a08d1beae90d386c6c60ddbcfccce7",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_T15_DIAG_SBO",
+    "utc": "2026-10-10T23:57:51Z",
+    "saniye": null,
+    "sha256": "a8f0deb74b146507be08f13589ec823a616416f3c34f303322cf4e433983b8ad",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_S30_DIAG_SBO",
+    "utc": "2026-10-10T23:58:20Z",
+    "saniye": null,
+    "sha256": "58e85cd4c0b0db521ca5352b7fc6c4edaed9e2e2aee378e4aa2ca196cb53d6ad",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  },
+  {
+    "etiket": "DEV_T30_DIAG_SBO",
+    "utc": "2026-10-10T23:58:48Z",
+    "saniye": null,
+    "sha256": "3ef826f178c82fc735b1a72abcc94b10f12ac1e7edd13968ab1b7cceabbafbde",
+    "git_sha": "a3168cda7fcaa7e3a6d5276be03ee5bb96cec27a"
+  }
+]

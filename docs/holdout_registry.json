@@ -104,7 +104,7 @@
     "start": "2026-04-01",
     "end": "2026-04-30",
     "status": "burned",
-    "note": "Backtest [2026-04-01, 2026-05-01). D29/U50 için sonuç görülmeden mühürlü ilan edilmişti; U50 açık aşamada RED olunca açılmadı. SONRA E13 doğrulaması için yargıç tarafından AÇILDI (logs/backtest_20260903_213004.json, -470 / PF 0.61; docs/EXPERIMENTS.md E13 'artık taze sayılmaz') ve YANDI.",
+    "note": "Backtest [2026-04-01, 2026-05-01). D29/U50 için sonuç görülmeden mühürlü ilan edilmişti; U50 açık aşamada RED olunca açılmadı. SONRA E13 doğrulaması için yargıç tarafından AÇILDI (logs/backtest_20260903_213004.json, -470 / PF 0.61; docs/EXPERIMENTS.md E13 'artık taze sayılmaz') ve YANDI. Not (2026-11-20): E17 bu aralığı (2026-04-01 → 2026-05-01) SMOKE_W adlı duman/kalibrasyon penceresi olarak kullandı.",
     "opens": [
       {
         "at": "2026-09-03T21:30:04Z",
@@ -114,11 +114,19 @@
     ]
   },
   {
+    "name": "DEV-2025",
+    "start": "2025-01-01",
+    "end": "2025-12-31",
+    "status": "burned",
+    "note": "E17'nin DEV kümesi ve E16'nın sekiz doğrulama penceresi V1..V8 bu yılın içindedir; bugünkü ayarlar burada ESKİ modelle ölçüldü (yıl boyunca PF 0.777, V1..V8'de PF 0.773). 'end' kapsayıcıdır.",
+    "opens": []
+  },
+  {
     "name": "VAL-2026Q4a",
     "start": "2026-09-04",
     "end": "2026-10-15",
     "status": "validation",
-    "note": "Doğrulama: walk-forward örneklem-dışı katlara izin verilir (parametre seçimi bu pencerede YAPILMAZ). 'end' kapsayıcıdır. Not (2026-11-20): D42 koruma hipotezleri canlı defterin 2026-08-23..2026-11-19 işlemlerinden türetildi; bu pencere o dönemin içinde kaldığı için bu hipotezler için bağımsız kanıt SAYILMAZ.",
+    "note": "Doğrulama: walk-forward örneklem-dışı katlara izin verilir (parametre seçimi bu pencerede YAPILMAZ). 'end' kapsayıcıdır. Not (2026-11-20): D42 koruma hipotezleri canlı defterin 2026-08-23..2026-11-19 işlemlerinden türetildi; bu pencere o dönemin içinde kaldığı için bu hipotezler için bağımsız kanıt SAYILMAZ. Not (2026-11-20, birleştirme sonrası): pencere E16'nın 'CANLI' son sınav penceresiyle ve E17'nin FINAL kümesiyle (2026-09-03 → 2026-10-08, bitiş hariç) örtüşür; bu pencerenin tabanı E16 planı için ESKİ modelle zaten ölçülmüştü (320 işlem, WR %72.5, PF 0.90; canlı testnet defteri 124 işlem, PF 0.47). Örtüşme E21 koşarken bilinmiyordu (dal o commit'lerden öncesine aitti); E21 aday seçmedi, aday vetosu harcanmadı; pencere artık gerçekçi model tabanını da taşır (231 işlem, PF 0.576).",
     "opens": [
       {
         "at": "2026-11-20T03:02:33Z",
@@ -133,6 +141,14 @@
     "end": "2026-11-19",
     "status": "sealed",
     "note": "Final sınavı: aday paketi başına BİR kez açılır, yalnız VETO eder (terfi ettirmez). Açılış --open-sealed \"<amaç>\" ile yapılır ve opens'a yazılır. Not (2026-11-20): D42 koruma hipotezleri canlı defterin 2026-08-23..2026-11-19 işlemlerinden türetildi; bu pencere o dönemin içinde kaldığı için bu hipotezler için bağımsız kanıt SAYILMAZ (mühür yine de açılmadı).",
+    "opens": []
+  },
+  {
+    "name": "SEAL-2023-2024",
+    "start": "2023-01-01",
+    "end": "2024-11-17",
+    "status": "sealed",
+    "note": "E17'nin VAL kümesi (2023-01-01 → 2024-11-18, bitiş hariç); hiç indirilmedi ve koşulmadı. E17'nin kilitli planı E18'i ('yeni fikir, yeni veri') bunun için ayırır. Yalnız --open-sealed ile açılır. 'end' kapsayıcıdır.",
     "opens": []
   }
 ]

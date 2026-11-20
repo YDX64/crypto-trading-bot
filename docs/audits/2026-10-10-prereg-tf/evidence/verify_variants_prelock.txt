@@ -1,0 +1,244 @@
+# E17 pre-lock verify_variants (PLAN §3.1, §5.2) — 2026-10-10T18:45:14Z
+# H candidate: 14d3b17c53b18ef5f2eac5029f69fbff1b4119e5
+# cmd: .venv/bin/python scripts/e17/verify_variants.py --snapshot $E17_ROOT/server-scalper-env.txt --variants docs/audits/2026-10-10-prereg-tf/variants.json(=scratchpad variants.json, identical) --repo . ; exit code 0
+# variants.json sha256: 0e7874030699f81fd8ea77f0bbe64b7a91c4373ce48f863d5954baf20ece6794
+# (snapshot degerleri BASILMAZ; yalnizca kontrol adlari)
+[OK]   schema == e17-variants/2
+[OK]   family sayısı == 6
+[OK]   descriptive sayısı == 2
+[OK]   references sayısı == 4
+[OK]   overlays sayısı == 7
+[OK]   varyant id'leri tekil
+[OK]   kaplama id'leri tekil
+[OK]   common_cli --symbols sabit sırada, --tf-* yok
+[OK]   symbols_order_pinned == sabit sıra
+[OK]   snapshot sha256 == variants.json snapshot.sha256
+[OK]   variants.json override anahtarları planlı kümede (STRICT_KEYS)
+[OK]   Settings(S5) çözülmüş değerler == variants.json (12 override)
+[OK]   Settings(T5) çözülmüş değerler == variants.json (8 override)
+[OK]   Settings(S15) çözülmüş değerler == variants.json (12 override)
+[OK]   Settings(T15) çözülmüş değerler == variants.json (8 override)
+[OK]   Settings(S30) çözülmüş değerler == variants.json (12 override)
+[OK]   Settings(T30) çözülmüş değerler == variants.json (8 override)
+[OK]   Settings(S60) çözülmüş değerler == variants.json (12 override)
+[OK]   Settings(T60) çözülmüş değerler == variants.json (8 override)
+[OK]   Settings(S5G) çözülmüş değerler == variants.json (9 override)
+[OK]   Settings(T5G) çözülmüş değerler == variants.json (5 override)
+[OK]   Settings(B0) çözülmüş değerler == variants.json (0 override)
+[OK]   Settings(R1) çözülmüş değerler == variants.json (3 override)
+[OK]   Settings(S5+ROB_FEE2) çözülmüş değerler == variants.json (12 override)
+[OK]   Settings(S5+ROB_DLY1) çözülmüş değerler == variants.json (12 override)
+[OK]   Settings(S5+ROB_TAKER) çözülmüş değerler == variants.json (13 override)
+[OK]   Settings(S5+ROB_WALL) çözülmüş değerler == variants.json (12 override)
+[OK]   Settings(S5+DIAG_Z0) çözülmüş değerler == variants.json (15 override)
+[OK]   Settings(S5+DIAG_SBO) çözülmüş değerler == variants.json (12 override)
+[OK]   Settings(S5+DIAG_FEE15) çözülmüş değerler == variants.json (12 override)
+[OK]   Settings(T5+ROB_FEE2) çözülmüş değerler == variants.json (8 override)
+[OK]   Settings(T5+ROB_DLY1) çözülmüş değerler == variants.json (8 override)
+[OK]   Settings(T5+ROB_TAKER) çözülmüş değerler == variants.json (9 override)
+[OK]   Settings(T5+ROB_WALL) çözülmüş değerler == variants.json (8 override)
+[OK]   Settings(T5+DIAG_Z0) çözülmüş değerler == variants.json (11 override)
+[OK]   Settings(T5+DIAG_SBO) çözülmüş değerler == variants.json (8 override)
+[OK]   Settings(T5+DIAG_FEE15) çözülmüş değerler == variants.json (8 override)
+[OK]   Settings(S15+ROB_FEE2) çözülmüş değerler == variants.json (12 override)
+[OK]   Settings(S15+ROB_DLY1) çözülmüş değerler == variants.json (12 override)
+[OK]   Settings(S15+ROB_TAKER) çözülmüş değerler == variants.json (13 override)
+[OK]   Settings(S15+ROB_WALL) çözülmüş değerler == variants.json (12 override)
+[OK]   Settings(S15+DIAG_Z0) çözülmüş değerler == variants.json (15 override)
+[OK]   Settings(S15+DIAG_SBO) çözülmüş değerler == variants.json (12 override)
+[OK]   Settings(S15+DIAG_FEE15) çözülmüş değerler == variants.json (12 override)
+[OK]   Settings(T15+ROB_FEE2) çözülmüş değerler == variants.json (8 override)
+[OK]   Settings(T15+ROB_DLY1) çözülmüş değerler == variants.json (8 override)
+[OK]   Settings(T15+ROB_TAKER) çözülmüş değerler == variants.json (9 override)
+[OK]   Settings(T15+ROB_WALL) çözülmüş değerler == variants.json (8 override)
+[OK]   Settings(T15+DIAG_Z0) çözülmüş değerler == variants.json (11 override)
+[OK]   Settings(T15+DIAG_SBO) çözülmüş değerler == variants.json (8 override)
+[OK]   Settings(T15+DIAG_FEE15) çözülmüş değerler == variants.json (8 override)
+[OK]   Settings(S30+ROB_FEE2) çözülmüş değerler == variants.json (12 override)
+[OK]   Settings(S30+ROB_DLY1) çözülmüş değerler == variants.json (12 override)
+[OK]   Settings(S30+ROB_TAKER) çözülmüş değerler == variants.json (13 override)
+[OK]   Settings(S30+ROB_WALL) çözülmüş değerler == variants.json (12 override)
+[OK]   Settings(S30+DIAG_Z0) çözülmüş değerler == variants.json (15 override)
+[OK]   Settings(S30+DIAG_SBO) çözülmüş değerler == variants.json (12 override)
+[OK]   Settings(S30+DIAG_FEE15) çözülmüş değerler == variants.json (12 override)
+[OK]   Settings(T30+ROB_FEE2) çözülmüş değerler == variants.json (8 override)
+[OK]   Settings(T30+ROB_DLY1) çözülmüş değerler == variants.json (8 override)
+[OK]   Settings(T30+ROB_TAKER) çözülmüş değerler == variants.json (9 override)
+[OK]   Settings(T30+ROB_WALL) çözülmüş değerler == variants.json (8 override)
+[OK]   Settings(T30+DIAG_Z0) çözülmüş değerler == variants.json (11 override)
+[OK]   Settings(T30+DIAG_SBO) çözülmüş değerler == variants.json (8 override)
+[OK]   Settings(T30+DIAG_FEE15) çözülmüş değerler == variants.json (8 override)
+[OK]   Settings(S60+ROB_FEE2) çözülmüş değerler == variants.json (12 override)
+[OK]   Settings(S60+ROB_DLY1) çözülmüş değerler == variants.json (12 override)
+[OK]   Settings(S60+ROB_TAKER) çözülmüş değerler == variants.json (13 override)
+[OK]   Settings(S60+ROB_WALL) çözülmüş değerler == variants.json (12 override)
+[OK]   Settings(S60+DIAG_Z0) çözülmüş değerler == variants.json (15 override)
+[OK]   Settings(S60+DIAG_SBO) çözülmüş değerler == variants.json (12 override)
+[OK]   Settings(S60+DIAG_FEE15) çözülmüş değerler == variants.json (12 override)
+[OK]   Settings(T60+ROB_FEE2) çözülmüş değerler == variants.json (8 override)
+[OK]   Settings(T60+ROB_DLY1) çözülmüş değerler == variants.json (8 override)
+[OK]   Settings(T60+ROB_TAKER) çözülmüş değerler == variants.json (9 override)
+[OK]   Settings(T60+ROB_WALL) çözülmüş değerler == variants.json (8 override)
+[OK]   Settings(T60+DIAG_Z0) çözülmüş değerler == variants.json (11 override)
+[OK]   Settings(T60+DIAG_SBO) çözülmüş değerler == variants.json (8 override)
+[OK]   Settings(T60+DIAG_FEE15) çözülmüş değerler == variants.json (8 override)
+[OK]   S5: TF üçlüsü == triple
+[OK]   S5: rol çakışması yok (giriş!=bağlam, giriş!=rejim)
+[OK]   S5: FIXED_STOP_ROI_PCT == S_arm
+[OK]   S5: stop bandı [0.250,1.667] MIN_STOP/MAX_STOP içinde — [0.250,1.667] ⊂ [0.15,5.5]
+[OK]   S5: k (DYN_LEV_STOP_ATR_MULT) == 2
+[OK]   S5: TP1_ROI == S ve TP2_ROI == 2S
+[OK]   S5: S == constants.S_by_entry_minutes[5]
+[OK]   S5: TB süre kuralı (480 bar / 60 bar / 3 bar / stale 0)
+[OK]   S5: BG kapı paketi (rejim/market/hafta sonu KAPALI)
+[OK]   S5: BG anahtarları çözülmüş env'de
+[OK]   T5: TF üçlüsü == triple
+[OK]   T5: rol çakışması yok (giriş!=bağlam, giriş!=rejim)
+[OK]   T5: FIXED_STOP_ROI_PCT == S_arm
+[OK]   T5: TB süre kuralı (480 bar / 60 bar / 3 bar / stale 0)
+[OK]   T5: BG kapı paketi (rejim/market/hafta sonu KAPALI)
+[OK]   T5: BG anahtarları çözülmüş env'de
+[OK]   S15: TF üçlüsü == triple
+[OK]   S15: rol çakışması yok (giriş!=bağlam, giriş!=rejim)
+[OK]   S15: FIXED_STOP_ROI_PCT == S_arm
+[OK]   S15: stop bandı [0.450,3.000] MIN_STOP/MAX_STOP içinde — [0.450,3.000] ⊂ [0.15,5.5]
+[OK]   S15: k (DYN_LEV_STOP_ATR_MULT) == 2
+[OK]   S15: TP1_ROI == S ve TP2_ROI == 2S
+[OK]   S15: S == constants.S_by_entry_minutes[15]
+[OK]   S15: TB süre kuralı (480 bar / 60 bar / 3 bar / stale 0)
+[OK]   S15: BG kapı paketi (rejim/market/hafta sonu KAPALI)
+[OK]   S15: BG anahtarları çözülmüş env'de
+[OK]   T15: TF üçlüsü == triple
+[OK]   T15: rol çakışması yok (giriş!=bağlam, giriş!=rejim)
+[OK]   T15: FIXED_STOP_ROI_PCT == S_arm
+[OK]   T15: TB süre kuralı (480 bar / 60 bar / 3 bar / stale 0)
+[OK]   T15: BG kapı paketi (rejim/market/hafta sonu KAPALI)
+[OK]   T15: BG anahtarları çözülmüş env'de
+[OK]   S30: TF üçlüsü == triple
+[OK]   S30: rol çakışması yok (giriş!=bağlam, giriş!=rejim)
+[OK]   S30: FIXED_STOP_ROI_PCT == S_arm
+[OK]   S30: stop bandı [0.650,4.333] MIN_STOP/MAX_STOP içinde — [0.650,4.333] ⊂ [0.15,5.5]
+[OK]   S30: k (DYN_LEV_STOP_ATR_MULT) == 2
+[OK]   S30: TP1_ROI == S ve TP2_ROI == 2S
+[OK]   S30: S == constants.S_by_entry_minutes[30]
+[OK]   S30: TB süre kuralı (480 bar / 60 bar / 3 bar / stale 0)
+[OK]   S30: BG kapı paketi (rejim/market/hafta sonu KAPALI)
+[OK]   S30: BG anahtarları çözülmüş env'de
+[OK]   T30: TF üçlüsü == triple
+[OK]   T30: rol çakışması yok (giriş!=bağlam, giriş!=rejim)
+[OK]   T30: FIXED_STOP_ROI_PCT == S_arm
+[OK]   T30: TB süre kuralı (480 bar / 60 bar / 3 bar / stale 0)
+[OK]   T30: BG kapı paketi (rejim/market/hafta sonu KAPALI)
+[OK]   T30: BG anahtarları çözülmüş env'de
+[OK]   S60: TF üçlüsü == triple
+[OK]   S60: rol çakışması yok (giriş!=bağlam, giriş!=rejim)
+[OK]   S60: FIXED_STOP_ROI_PCT == S_arm
+[OK]   S60: stop bandı [0.800,5.333] MIN_STOP/MAX_STOP içinde — [0.800,5.333] ⊂ [0.15,5.5]
+[OK]   S60: k (DYN_LEV_STOP_ATR_MULT) == 2
+[OK]   S60: TP1_ROI == S ve TP2_ROI == 2S
+[OK]   S60: S == constants.S_by_entry_minutes[60]
+[OK]   S60: TB süre kuralı (480 bar / 60 bar / 3 bar / stale 0)
+[OK]   S60: BG kapı paketi (rejim/market/hafta sonu KAPALI)
+[OK]   S60: BG anahtarları çözülmüş env'de
+[OK]   T60: TF üçlüsü == triple
+[OK]   T60: rol çakışması yok (giriş!=bağlam, giriş!=rejim)
+[OK]   T60: FIXED_STOP_ROI_PCT == S_arm
+[OK]   T60: TB süre kuralı (480 bar / 60 bar / 3 bar / stale 0)
+[OK]   T60: BG kapı paketi (rejim/market/hafta sonu KAPALI)
+[OK]   T60: BG anahtarları çözülmüş env'de
+[OK]   S5G: TF üçlüsü == triple
+[OK]   S5G: rol çakışması yok (giriş!=bağlam, giriş!=rejim)
+[OK]   S5G: FIXED_STOP_ROI_PCT == S_arm
+[OK]   S5G: stop bandı [0.250,1.667] MIN_STOP/MAX_STOP içinde — [0.250,1.667] ⊂ [0.15,5.5]
+[OK]   S5G: k (DYN_LEV_STOP_ATR_MULT) == 2
+[OK]   S5G: TP1_ROI == S ve TP2_ROI == 2S
+[OK]   S5G: S == constants.S_by_entry_minutes[5]
+[OK]   S5G: TB süre kuralı (480 bar / 60 bar / 3 bar / stale 0)
+[OK]   S5G: kapılar korunmuş (market gate + rejim filtresi açık)
+[OK]   S5G: BG anahtarları çözülmüş env'de
+[OK]   T5G: TF üçlüsü == triple
+[OK]   T5G: rol çakışması yok (giriş!=bağlam, giriş!=rejim)
+[OK]   T5G: FIXED_STOP_ROI_PCT == S_arm
+[OK]   T5G: TB süre kuralı (480 bar / 60 bar / 3 bar / stale 0)
+[OK]   T5G: kapılar korunmuş (market gate + rejim filtresi açık)
+[OK]   T5G: BG anahtarları çözülmüş env'de
+[OK]   B0: TF üçlüsü == triple
+[OK]   B0: rol çakışması yok (giriş!=bağlam, giriş!=rejim)
+[OK]   B0: FIXED_STOP_ROI_PCT == S_arm
+[OK]   B0: kapılar korunmuş (market gate + rejim filtresi açık)
+[OK]   B0: BG anahtarları çözülmüş env'de
+[OK]   R1: TF üçlüsü == triple
+[OK]   R1: rol çakışması yok (giriş!=bağlam, giriş!=rejim)
+[OK]   R1: FIXED_STOP_ROI_PCT == S_arm
+[OK]   R1: BG kapı paketi (rejim/market/hafta sonu KAPALI)
+[OK]   R1: BG anahtarları çözülmüş env'de
+[OK]   S5+ROB_FEE2: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S5+ROB_DLY1: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S5+ROB_TAKER: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S5+ROB_WALL: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S5+DIAG_Z0: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S5+DIAG_SBO: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S5+DIAG_FEE15: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T5+ROB_FEE2: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T5+ROB_DLY1: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T5+ROB_TAKER: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T5+ROB_WALL: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T5+DIAG_Z0: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T5+DIAG_SBO: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T5+DIAG_FEE15: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S15+ROB_FEE2: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S15+ROB_DLY1: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S15+ROB_TAKER: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S15+ROB_WALL: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S15+DIAG_Z0: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S15+DIAG_SBO: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S15+DIAG_FEE15: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T15+ROB_FEE2: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T15+ROB_DLY1: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T15+ROB_TAKER: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T15+ROB_WALL: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T15+DIAG_Z0: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T15+DIAG_SBO: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T15+DIAG_FEE15: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S30+ROB_FEE2: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S30+ROB_DLY1: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S30+ROB_TAKER: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S30+ROB_WALL: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S30+DIAG_Z0: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S30+DIAG_SBO: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S30+DIAG_FEE15: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T30+ROB_FEE2: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T30+ROB_DLY1: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T30+ROB_TAKER: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T30+ROB_WALL: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T30+DIAG_Z0: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T30+DIAG_SBO: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T30+DIAG_FEE15: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S60+ROB_FEE2: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S60+ROB_DLY1: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S60+ROB_TAKER: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S60+ROB_WALL: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S60+DIAG_Z0: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S60+DIAG_SBO: kaplama yalnız kendi alanlarını değiştirir
+[OK]   S60+DIAG_FEE15: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T60+ROB_FEE2: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T60+ROB_DLY1: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T60+ROB_TAKER: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T60+ROB_WALL: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T60+DIAG_Z0: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T60+DIAG_SBO: kaplama yalnız kendi alanlarını değiştirir
+[OK]   T60+DIAG_FEE15: kaplama yalnız kendi alanlarını değiştirir
+[OK]   sızıntı duvarı: min(DEV en erken bar) > VAL bitişi (2024-11-18) — min DEV 2024-11-20 08:00
+[OK]   FINAL en erken bar > DEV bitişi (2026-01-01)
+[OK]   kilitli en erken bar (backtest fonksiyonlarıyla): 15m/1h/4h DEV == 2024-11-20 08:00
+[OK]   kilitli en erken bar (backtest fonksiyonlarıyla): 15m/1h/4h FINAL == 2026-07-23 08:00
+[OK]   kilitli en erken bar (backtest fonksiyonlarıyla): 15m/1h/4h VAL == 2022-11-20 08:00
+[OK]   kilitli en erken bar (backtest fonksiyonlarıyla): 1h/4h/4h DEV == 2024-11-20 08:00
+[OK]   kilitli en erken bar (backtest fonksiyonlarıyla): 1h/4h/4h VAL == 2022-11-20 08:00
+[OK]   kilitli en erken bar (backtest fonksiyonlarıyla): 30m/4h/4h DEV == 2024-11-20 08:00
+[OK]   kilitli en erken bar (backtest fonksiyonlarıyla): 30m/4h/4h FINAL == 2026-07-23 08:00
+[OK]   kilitli en erken bar (backtest fonksiyonlarıyla): 30m/4h/4h VAL == 2022-11-20 08:00
+[OK]   kilitli en erken bar (backtest fonksiyonlarıyla): 5m/30m/1h DEV == 2024-12-21 14:00
+[OK]   kilitli en erken bar (backtest fonksiyonlarıyla): 5m/30m/1h FINAL == 2026-08-23 14:00
+[OK]   kilitli en erken bar (backtest fonksiyonlarıyla): 5m/30m/1h VAL == 2022-12-21 14:00
+verify_variants: 238 kontrol, 0 başarısız

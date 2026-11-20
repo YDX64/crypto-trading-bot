@@ -4,7 +4,20 @@
 trade-through, fonlama, likidasyon ve günlük kesici eklendi (D41; hepsi varsayılan AÇIK). Aynı strateji, aynı 7
 pencere: **1124 işlem / +2679.50 → 751 işlem / +107.10**, havuz PF 1.04 → 1.00; en büyük katkı `daily_latch` ve
 `maker_trade_through`. Eski sayılar `--legacy-model` ile birebir üretilir. [Tablo ve özellik katkıları](#e19--harness-gerçekçilik-paketi-7-pencerede-eski--yeni-model-2026-11-20-d41).
-Bu defterdeki E2…E13 sayıları ESKİ modelin sayılarıdır ve mutlak değer olarak yeni modelle karşılaştırılmaz.
+Bu defterdeki E2…E17 sayıları ESKİ modelin sayılarıdır (E18 henüz koşulmadı) ve mutlak değer olarak yeni modelle
+karşılaştırılmaz.
+
+**11 Eki 2026 — E17 ön-kayıtlı giriş-TF deneyi: KAZANAN YOK (DEV-YOK).** C'nin "dipten long,
+tepeden short" sinyali 5m/15m/30m (ve açıklayıcı 1h) grafikte, ATR-ölçekli veya bugünkü geometriyle,
+2025'in tamamında **komisyonsuz bile** kâr etmiyor (brüt PF en iyi 0.93). Net PF 0.42–0.71; canlı 1m
+ayarı aynı yılda PF 0.78 (3370 işlem). Onay verisi (2023–2024) hiç indirilmedi, son sınav penceresi
+dokunulmadı. Bkz. **E17** (dosya sonu).
+
+**10 Eki 2026 — E16 ön-kayıtlı çıkış deneyi: KAZANAN YOK.** İlk kez dokunulmamış
+8 pencerede (2025, UP/DOWN/FLAT) ölçüldü. Bugünkü sunucu ayarı (B0) havuz PF **0.77**,
+8 pencerenin yalnız 1'inde PF>1, her rejim grubunda zarar. 10 çıkış varyantının
+hiçbiri kâra çevirmedi (en iyi havuz PF 0.85). Üç klasik pencerede aynı B0 = PF 1.65:
+o pencereler kenarı abartıyor. Bkz. **E16** (dosya sonu).
 
 **7 Eyl 2026 — E15 miktar ölçeği:** kullanıcı talebiyle %0.5→%10 TESTNET
 marj tavanı. Altı cache-only koşuda üç bilinen rejimin PF/ROI/işlem sayısı
@@ -1615,6 +1628,141 @@ değişmedi: C'nin 2026 Mar–Ağu penceresinde kalıcı kenarı yok; giriş fil
 
 > *Not (2026-11-20, D41): bu paragraftaki "dokunulmamış" etiketi yanlıştı — Mart, Çöküş, Mayıs, Haziran `docs/holdout_registry.json`'da YANMIŞ pencerelerdir (E11-E13 seçim kümesi).*
 
+## E16 — Ön-kayıtlı çıkış deneyi: 8 taze pencere, 11 varyant (2026-10-10) — KAZANAN YOK
+
+**Soru.** Canlı defter (31 gün, 124 işlem, PF 0.47) ve CANLI dönemin backtest'i (320 işlem, PF 0.90)
+zararda. Kayıp yapısı R:R ≈ 1:5 (stop ≈ %2.5, TP1 ≈ %0.5; başabaş WR ≈ %83). Çıkış yapısını
+(stop/TP/kaldıraç) değiştirmek C'yi kâra çevirir mi?
+
+**Yöntem (sonuç görülmeden kilitlendi).** Plan `PLAN.md` sha256 `fe9b8354…`, karar betiği
+`analyze_prereg.py` sha256 `32df0bc1…`. 11 varyantlık aile:
+- **E1–E8:** env ile stop/TP/kaldıraç.
+- **C1:** swing+ATR stop.
+- **C2:** Bollinger hedefi.
+- **C3:** sinyal gücüne göre TP. Ön-koşulu sağlanmadı: güç skoru MFE ile ilişkisiz, bu yüzden kodlanmadı.
+
+Akış şöyle:
+1. **DEV elemesi:** üç klasik pencerede havuz PF ≥ 1.0 ve işlem ≥ B0'ın yarısı.
+2. **Doğrulama:** 8 dokunulmamış 2025 penceresi (V1–V8). Rejim etiketleri performansa bakmadan BTC 1d'den donduruldu: FLAT×2, UP×2, DOWN×4; 3 pencerede ŞOK.
+3. **Kapılar G1–G8**, örneğin PF>1 pencere ≥ 6/8, havuz PF ≥ 1.15, her rejimde PF ≥ 0.9.
+4. **G9:** maliyet 2× ve 1 mum gecikme.
+5. **G10:** day-block bootstrap p-değeri + Benjamini-Hochberg q ≤ 0.10.
+
+Son sınav (CANLI dönem, tek atış) yalnız kazanan çıkarsa koşulacaktı.
+
+Taban B0 = sunucu `SCALPER_*` env'i (2026-10-10, 97a9099 dönemi). Veri: data.binance.vision (sha256). Belirlenimcilik: B0 AYI tekrar koşusu 149 / %87.2 / PF 2.03 — önceki ölçümle birebir.
+
+**Sonuç.** `DECISION.md`: **KAZANAN YOK, üretim ayarı değişmez.** BH 0/11 reddetti (en küçük p 0.976).
+
+| | İşlem | WR% | ΣPnL | Havuz PF | Medyan PF | PF>1 pencere | UP / DOWN / FLAT PF |
+|---|---|---|---|---|---|---|---|
+| **B0 (bugünkü ayar)** | 1619 | 76.0 | **−29 477** | **0.773** | 0.807 | 1/8 | 0.81 / 0.79 / 0.72 |
+| E1 (en iyi havuz PF) | 1513 | — | — | 0.849 | 0.830 | 1/8 | 0.89 / 0.90 / 0.73 |
+| E3 | 1104 | — | — | 0.825 | 0.783 | 1/8 | 0.84 / 0.87 / 0.74 |
+| C2 (Bollinger hedefi + %50/%25 kısmi) | 1497 | — | — | 0.749 | 0.702 | 1/8 | 0.81 / 0.75 / 0.69 |
+
+Tam tablo, pencere pencere PF ve kapı gerekçeleri: `DECISION.md`, `results.csv`. C1 DEV'de elendi (havuz PF 0.78).
+
+**B0'ın 8 penceredeki çıkış kırılımı** (loglardan toplandı):
+
+| Çıkış | İşlem | ΣPnL | Ort. |
+|---|---|---|---|
+| TRAIL | 1207 | +99 550 | +82 |
+| SL | 185 | −95 090 | −514 |
+| REAPER | 224 | −33 628 | −150 |
+| EOD (pencere sonu) | 3 | −309 | −103 |
+| **Toplam** | **1619** | **−29 477** | |
+
+Yönler ayrı ayrı: LONG 642 işlem / −18 832; SHORT 977 işlem / −10 645.
+
+**Yorum.**
+1. **Klasik pencereler kenarı abartıyor.** Aynı B0, üç klasik pencerede havuz PF 1.65; taze 2025'te 0.77. Kayıp üç rejim grubunun hepsinde var, yani bu bir rejim talihsizliği değil. Canlı PF 0.47 ve CANLI backtest PF 0.90 bu tabloyla tutarlı. E13.3'ün hükmü ("C'nin kalıcı kenarı yok") 8 pencere daha ile güçlendi.
+2. **Denenen çıkışlar kaybı küçültür, kâra çevirmez.** En iyi varyant havuz PF'yi 0.77 → 0.85'e taşıyor; denenen 10 varyantın hiçbiri 1.0'a ulaşmıyor. Bu hüküm yalnız E16'da denenen stop/TP/kaldıraç ailesi için geçerlidir; "hiçbir çıkış kurtaramaz" demek DEĞİLDİR. Yine de geniş bir aralıkta (stop %0.5–%2.5, TP1 0.2R–1.5R, kısmi oranlar, sabit/oynaklık-ölçekli kaldıraç) hiçbir noktada kâr görülmedi; sıradaki soru girişin kendisidir.
+3. **E10 ile çelişmez, sınırını gösterir.** E10 permütasyon testi "AYI penceresinde giriş şanstan ayırt edilebilir" diyordu (tek, klasik pencere). Taze verideki karşılığı zarar.
+
+**Yapılmayanlar / sınırlar.**
+- G9 (maliyet 2×, gecikme) koşulmadı: G1–G8'i geçen yoktu.
+- Son sınav koşulmadı: kazanan yoktu.
+- V1–V8 artık çıkış sorusu için **kullanılmış** pencerelerdir. Yeni bir soru (örneğin giriş sinyali) için yeni taze pencereler gerekir (2024 ve öncesi arşivde var).
+- C1/C2 kodu main'e girmedi; yama `artifacts.tgz` içinde.
+- **C2 saf bir "Bollinger hedefi" testi DEĞİLDİR.** Plan "C2 vs E2 yalnız TP kuralını izole eder" diyordu, ama C2 kısmi kapanış oranlarını da değiştirdi (%50/%25; E2 tabandan %40/%20 aldı). C2 = hedef + oran birleşik testidir. Hüküm (kazanan değil) bundan etkilenmez.
+- Arşivlenen betiklerin bilinen sınırları ve bu koşuyu etkilemediklerinin kanıtı: klasörün `README.md`'si.
+
+**Kanıt:** `docs/audits/2026-10-10-prereg-exits/` (plan, karar betiği ve testleri, koşu betikleri,
+`DECISION.md`, `results.csv`, `artifacts.tgz` = 121 backtest + 9 veri doldurma logu + JSON çıktılar + C1/C2 yaması).
+
+
+## E17 — Ön-kayıtlı giriş zaman dilimi deneyi: C büyük grafikte (2026-10-10/11) — KAZANAN YOK
+
+**Soru (kullanıcı).** "Dipten long, tepeden short" (C) 1m yerine 5m/15m/30m grafikte, kaldıraç coin
+oynaklığına göre ayarlanınca komisyon sonrası para kazandırır mı? (1h açıklayıcı: yılda ≈140 işlemle
+karara bağlanamaz.)
+
+**Tasarım (sonuç görülmeden kilitlendi).** Plan `docs/audits/2026-10-10-prereg-tf/PLAN.md`, kilit
+L2=`c00772ae32bd` (H=`a3168cda7fca`; L1=`f962d4867b83` duman testi altyapı hatası yüzünden yeniden
+kilitlendi, fark yalnız koşu betiği — PLAN §9.1). Aile m=6 (S5/T5, S15/T15, S30/T30):
+- **S:** ATR-ölçekli geometri, stop = 2×ATR(giriş TF), TP1 = 1R.
+- **T:** bugünkü sunucu geometrisi, majörlerde 20x'te sıkışık.
+- Rol üçlüleri: 5m/30m/1h, 15m/1h/4h, 30m/4h/4h.
+- Süre kuralı bar bazlı (480 bar tutma, 60 bar kayıp-bekleme).
+- Canlı kapılar (rejim, BTC hareket, hafta sonu) aile koşularında kapalı, gerekçe güç (§3.1 R2). Kapı etkisi 5m'de S5G/T5G ile ölçüldü.
+
+Setler:
+- **DEV = 2025** (eleme).
+- **VAL = 2023-01-01→2024-11-18** (onay, yalnız DEV geçerse).
+- **FINAL = 2026-09-03→10-08** (veto).
+
+Kapılar G0–G17 R birimindedir. İstatistik: null-merkezli studentize blok bootstrap ve BH. Duman testleri geçti: E16 sayıları birebir üretildi, belirlenimcilik doğrulandı, 13 koşunun check-run'ı geçti.
+
+**Sonuç (`run/DECISION.md`, `run/DEV_SCREEN.json`): DEV-YOK.** Hiçbir arm G2'yi (PF ≥ 1.15) geçmedi; BH 0/6 (en küçük p 0.9996).
+
+| Arm | N | WR% | PF net | PF komisyonsuz (Z0) | PF iyimser bar sırası | ΣR |
+|---|---|---|---|---|---|---|
+| S5 | 1829 | 48.9 | 0.666 | 0.930 | 0.768 | −356 |
+| T5 | 1778 | 83.6 | 0.711 | 0.882 | 0.890 | −84 |
+| S15 | 623 | 45.8 | 0.619 | 0.726 | 0.775 | −138 |
+| T15 | 668 | 81.6 | 0.437 | 0.550 | 0.757 | −71 |
+| S30 | 326 | 45.4 | 0.655 | 0.727 | 0.741 | −64 |
+| T30 | 362 | 81.2 | 0.421 | 0.525 | 0.590 | −40 |
+
+Referanslar ve açıklayıcı arm'lar (karar vermez):
+
+| Arm | N | PF |
+|---|---|---|
+| B0 (canlı 1m, kapılar açık) | 3370 | 0.777 |
+| R1 (1m, kapısız) | 6676 | 0.763 |
+| S5G (5m, kapılar açık) | 662 | 0.609 |
+| T5G (5m, kapılar açık) | 639 | 0.697 |
+| S60 (1h) | 184 | 0.620 (90% GA üst 0.81) |
+| T60 (1h) | 186 | 0.416 (90% GA üst 0.58) |
+
+**Yorum.**
+1. **Ücretten önce de kenar yok.** Komisyon ve kayma sıfırlanınca da hiçbir arm PF 1'e ulaşmıyor. Bu, "1m'de ücret kenarı yiyor, büyük grafikte ücret payı küçülür" fikrini çürütür: sorun ücret değil, sinyalin kendisi.
+2. **Bar-sırası belirsizliği kararı değiştirmiyor.** Aynı-mum sırasının en iyimser yorumunda bile PF ≤ 0.89; hiçbir arm "BAR-ORDER-BELİRSİZ" etiketi almadı.
+3. **Güç sorunu değil.** N 326–1829; %90 güven aralıklarının üst uçları 0.54–0.82. Tasarım (PLAN §11), 15m/30m'de PF ≈ 1.3, 5m'de ≈ 1.45 ve üstü bir kenarı görebilirdi; gözlenen değerler bunun çok altında.
+4. **Canlı kapılar yardım etmiyor.** 5m'de kapılar işlem sayısını üçte birine indirip PF'yi düşürüyor (S5 0.666 → S5G 0.609).
+5. **Canlı 1m ayarı 2025'in tamamında da zararda.** PF 0.777; E16'nın 8 penceresindeki 0.773 ile tutarlı.
+6. **Ters işaret ilginç (yalnız gözlem, test EDİLMEDİ).** Karşı-trend girişler 15m/30m'de ücretsiz bile güçlü kaybediyor (T15/T30 brüt PF 0.55/0.52, WR %81). Bu, o zaman dilimlerinde momentumun ağır bastığını düşündürür. Bu bir hipotezdir: ancak 2023–2024'ün hâlâ dokunulmamış verisinde ayrı, ön-kayıtlı bir deneyle (E18) sınanabilir; 2025 artık o soru için yalnız DEV'dir.
+
+**Harcanmayanlar.** VAL (2023-01→2024-11) çok-sembollü olarak hiç indirilmedi; FINAL penceresine dokunulmadı. İkisi de gelecek deneyler için temiz duruyor.
+
+**Altyapı olayları** (`run/ORCH_NOTES.md`):
+- Duman testinde analizci sahte gizli anahtarlar olmadan çağrıldığı için çöktü. Düzeltildi ve yeniden kilitlendi (L2).
+- Konteyner, oturum boşta kalınca iki kez geri alındı. DEV_B0_Q3 rapor üretmeden iki kez yarıda kaldı; ledger tamamlananları atladı ve koşu üçüncü denemede tamamlandı.
+- Hiçbir olay bir sonucu görerek değiştirmedi.
+
+**Kanıt:** `docs/audits/2026-10-10-prereg-tf/`:
+- Kilitli plan ve kilit dosyaları: `PLAN.md`, `variants.json`, `labels_frozen.json`, `cal_constants.json`, `archive_probe.json`, `LOCK.json`.
+- `evidence/` (Ek B).
+- `run/`: karar dosyaları ve `artifacts.tgz`. Pakette 43 rapor ve 86 log var; `provenance.scalper_config` çıkarıldı ve paket sunucu ayar satırlarına karşı taranıp temiz çıktı.
+
+## E18 — AYRILDI (henüz koşulmadı)
+
+E17'nin kilitli planı (`docs/audits/2026-10-10-prereg-tf/PLAN.md`, "yeni fikir = E18, yeni veri") bu numarayı YENİ bir fikir için,
+YENİ veride ayırır. E17 "Yorum" 6. maddesindeki momentum gözlemi (karşı-trend girişler 15m/30m'de ücretsiz bile güçlü kaybediyor;
+sınanmadı) ve o plandaki ipuçları aday kapsamdır, sabit bir kapsam değildir. Dokunulmamış veri E17'nin VAL kümesidir: 2023-01-01 →
+2024-11-18 (bitiş hariç). Bu numara altında henüz hiçbir şey koşulmadı ve hiçbir veri indirilmedi; plan ve sonuç yok.
+
 ## E19 — Harness gerçekçilik paketi: 7 pencerede eski / yeni model (2026-11-20, D41)
 
 *(Numara notu: D41 paketi bu deneyi önce "E15", sonra "E16" diye anıyordu. E15 dosya başındaki 7 Eyl miktar-ölçeği notunda
@@ -1719,6 +1867,33 @@ vermiyor (harness: LONG −2201 / SHORT +2308; defter: LONG +252 / SHORT −480)
 `timings.txt` (yeni) · `logs/audit_20261120/ledger_report_full.md` (defter). Çalıştırıcı: `logs/audit_20261120/run_bt.sh`.
 `legacy_eq/` (`--legacy-model` doğrulaması) ve `attrib/` (tek-özellik-kapat koşuları) sonradan kopyalandı:
 `logs/audit_20261120/legacy_eq/` ve `logs/audit_20261120/attrib/`.
+
+**Birleştirme sonrası eşdeğerlik (2026-11-20, origin/main 1167699).** Bu dal, origin/main'in iki squash birleştirmesinden (#8, #9;
+2026-10-10/11) ÖNCEKİ yerel main'den ayrılmıştı; sonradan origin/main birleştirildi (E16/E17 ölçüm eklentileri korundu). Birleşik
+harness'in iki modda iki referansla aynı sonucu verdiği gerçek piyasa verisinde, 7 standart pencerede, sunucu ayarlarıyla ölçüldü:
+
+| Karşılaştırma | Sonuç |
+|---|---|
+| origin/main 1167699 harness, varsayılan bayraklar, D41 öncesi referansa karşı | işlem işlem aynı; 1124 işlem, +2679.50 |
+| Birleşik harness `--legacy-model`, aynı D41 öncesi referansa karşı | işlem işlem aynı; 1124 işlem, +2679.50 |
+| Birleşik harness varsayılan (gerçekçi), dalın birleştirme öncesi gerçekçi referansına karşı | işlem işlem aynı; 751 işlem, +107.10 |
+| `--legacy-model --diagnostics` ve `--legacy-model --same-bar-order optimistic --diagnostics`, origin/main'de aynı bayraklarla (AYI, BOĞA, ÇÖKÜŞ) | işlemler, altı sayaç ve `provenance.sim_options` aynı |
+| Gerçekçi model, `--diagnostics` açık / kapalı (aynı üç pencere) | işlemler aynı; 236 işlem, +2450.38 |
+
+Ayrıntılar. (a) AYI'da eski modelde sayaçlar: `tp1_fills` 131, `tp1_then_stop_same_bar` 7, `tp2_then_floor_same_bar` 1 (kötümser) / 4
+(iyimser), `fill_bar_total` 150. Eski model iyimser sıralamada net AYI +6267.35 (kötümser +5703.23), ÇÖKÜŞ −372.13 (kötümser −720.32).
+(b) Gerçekçi modelde `--same-bar-order optimistic` bir ÜST SINIR DEĞİLDİR: AYI +2777.85 (kötümser +2808.05), ÇÖKÜŞ +463.28 (kötümser
++499.09); iki durumda da bir işlemde, TP1 mumunda atlanan başabaş stopu sonraki mumda boşlukla doluyor. (c) Üç bağımsız inceleyici
+kural ihlali bulmadı; sentetik fark sondaları (milyonlarca `manage_position` koşusu, `simulate_symbol` ve CLI raporları) eski modda
+origin/main ile, varsayılan modda dalla örtüştü.
+
+**Uyarılar.** `--legacy-model` İŞLEMLERİ ve ortak rapor alanlarını birebir üretir; `--permutations` bloğu (boş örnekler, p-değerleri) D41'de
+her model için yeniden tasarlandı ve origin/main'inkiyle aynı DEĞİLDİR. Gerçekçi model raporları artık `missed_signals` içinde E17'nin H1
+anahtarlarını (örneğin `no_next_candle`) taşıyabilir. E16 ve E17 betikleri kendi kilitli commit'lerine sabitli bir klonda koşar
+(`scripts/e17/lib17.sh` `e17_ensure_clone`, `verify-lock`); sonraki harness değişiklikleri bir yeniden koşuyu sessizce değiştiremez.
+Bu iki deneyin sayıları ESKİ modelin sayılarıdır; gerçekçi modelde yeniden koşulmadılar.
+
+Kanıt klasörü (yerel, git'te izlenmez): `logs/audit_20261120/merge_eq/`.
 
 ## E20 — Kurulum sayımı: A, B, C, D, E tek başına, 7 standart pencere, gerçekçi model (2026-11-20)
 
@@ -1881,6 +2056,13 @@ kullanıldı. (e) Canlı defter MC'si gerçekleşen USDT PnL'ini 1000 sanal serm
 aynı oran), fark taban sermayeden gelir.
 (f) Bu pencere D42 hipotezlerinin türetildiği canlı dönemle (2026-08-23..11-19) KESİŞİR; bu yüzden VAL, D42 korumaları için bağımsız
 kanıt sayılmaz (registry notu).
+
+**Örtüşme notu (birleştirme sonrası, 2026-11-20).** `VAL-2026Q4a` (2026-09-04..10-15), E16'nın "CANLI" son sınav penceresiyle ve
+E17'nin FINAL kümesiyle (2026-09-03 → 2026-10-08, bitiş hariç) örtüşür. Bu pencerenin tabanı E16'nın planı için ESKİ modelle zaten
+ölçülmüştü (2026-09-03 → 2026-10-08: 320 işlem, WR %72.5, PF 0.90; aynı tarihlerde canlı testnet defteri 124 işlem, PF 0.47). E21
+koşarken örtüşme bilinmiyordu: bu dal o commit'lerden öncesine aitti. E21 aday seçmedi (yalnız taban ve parite), yani bir aday vetosu
+HARCANMADI; ancak pencere artık gerçekçi model tabanını da taşıyor (231 işlem, PF 0.576). Eski ve gerçekçi model arasındaki
+PF farkı (0.90 → 0.576) aynı dönemin değil, birbirine yakın ama aynı olmayan pencerelerin (09-04..10-15 ve 09-03..10-08) karşılaştırmasıdır.
 
 ## E22 — D42 koruma adayları K1..K8: bağımsız geçmişte P2-v2 sınavı (2026-11-20)
 
