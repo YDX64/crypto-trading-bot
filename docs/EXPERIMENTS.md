@@ -1756,12 +1756,61 @@ Referanslar ve açıklayıcı arm'lar (karar vermez):
 - `evidence/` (Ek B).
 - `run/`: karar dosyaları ve `artifacts.tgz`. Pakette 43 rapor ve 86 log var; `provenance.scalper_config` çıkarıldı ve paket sunucu ayar satırlarına karşı taranıp temiz çıktı.
 
-## E18 — AYRILDI (henüz koşulmadı)
+## E18 — Ön-kayıtlı momentum deneyi: trend yönünde giriş, 6 kol, DEV 2025 (2026-11-20) — DEV-YOK
 
-E17'nin kilitli planı (`docs/audits/2026-10-10-prereg-tf/PLAN.md`, "yeni fikir = E18, yeni veri") bu numarayı YENİ bir fikir için,
-YENİ veride ayırır. E17 "Yorum" 6. maddesindeki momentum gözlemi (karşı-trend girişler 15m/30m'de ücretsiz bile güçlü kaybediyor;
-sınanmadı) ve o plandaki ipuçları aday kapsamdır, sabit bir kapsam değildir. Dokunulmamış veri E17'nin VAL kümesidir: 2023-01-01 →
-2024-11-18 (bitiş hariç). Bu numara altında henüz hiçbir şey koşulmadı ve hiçbir veri indirilmedi; plan ve sonuç yok.
+**Soru.** Trendle AYNI yönde giren basit bir kural (kurulum M: kırılım ya da geri çekilme-devam; 15m ve 30m; yavaş ya da hızlı
+trend tanımı), aynı çıkış makinesiyle, komisyon ve kayma sonrası kenar üretir mi? Plan sonuç görülmeden kilitlendi:
+`docs/audits/2026-11-20-prereg-e18/PLAN.md` (kod H `425e82a`, kilit L `cab30bb`, `LOCK.json` sha256 `3607e392…67e6`).
+Ölçüm D41 gerçekçi model, taker giriş, sunucu `SCALPER_*` özeti + yalnız `variants.json` override'ları.
+
+**Sonuç: DEV-YOK.** Altı kolun hiçbiri DEV (2025-01-01 → 2026-01-01, 365 gün) kapılarını geçmedi; hepsinde ΣR < 0.
+Kural gereği VAL indirilmedi ve koşulmadı; `SEAL-2023-2024` ve `SEAL-2026Q4b` mühürlü kaldı.
+
+| Kol | N | WR % | PF | ΣR | t_obs | PF %90 GA | ΣR > 0 çeyrek |
+|---|---|---|---|---|---|---|---|
+| K15R (kırılım, 15m, yavaş trend) | 1434 | 47.6 | 0.707 | −241.6 | −4.16 | [0.60, 0.82] | 0 / 4 |
+| K30R (kırılım, 30m, yavaş trend) | 1073 | 47.3 | 0.880 | −64.1 | −1.09 | [0.70, 1.08] | 1 / 4 |
+| K15B (kırılım, 15m, hızlı trend) | 1635 | 44.9 | 0.642 | −353.2 | −6.04 | [0.54, 0.75] | 0 / 4 |
+| K30B (kırılım, 30m, hızlı trend) | 1148 | 47.3 | 0.864 | −79.1 | −1.31 | [0.69, 1.06] | 0 / 4 |
+| G15B (geri çekilme, 15m, hızlı trend) | 2268 | 50.7 | 0.836 | −196.9 | −2.78 | [0.73, 0.95] | 1 / 4 |
+| G30B (geri çekilme, 30m, hızlı trend) | 1353 | 45.8 | 0.752 | −169.6 | −3.41 | [0.64, 0.87] | 0 / 4 |
+
+Kapılar: G0 (bütünlük) ve G1 (pencere başına N ≥ 60) altı kolda geçti; G2 (PF ≥ 1.15), G3 (BH q ≤ 0.10; hepsinde q = 1.0),
+G4 (≥ 3 pozitif çeyrek) ve G5 (en iyi ay / en iyi 5 işlem hariç) altı kolda kaldı. Stres koşusu gerekmedi (aday yok).
+
+**Teşhis (karar vermez; DEV, karar yazıldıktan sonra koşuldu).**
+
+| Kol | Komisyonsuz + kaymasız PF | Limit giriş PF | Sunucu çıkış geometrisi PF | Günlük kesicisiz PF |
+|---|---|---|---|---|
+| K15R | 0.987 | 0.771 | 0.740 | 0.772 |
+| K30R | 1.145 | 0.930 | 0.834 | 0.931 |
+| K15B | 0.961 | 0.709 | 0.764 | 0.748 |
+| K30B | 1.099 | 0.865 | 0.740 | 0.849 |
+| G15B | 1.130 | 0.901 | 0.661 | 0.725 |
+| G30B | 0.947 | 0.799 | 0.669 | 0.791 |
+
+**Yorum.**
+1. Maliyet sıfırlanınca üç kol (K30R, K30B, G15B) PF 1.10–1.15'e çıkıyor, üçü 1'in altında kalıyor. Ham kenar en iyi
+   durumda incedir ve komisyon + kayma onu yer; "maliyetten önce güçlü kenar" hiçbir kolda yok.
+2. Sonuç çıkış geometrisine, giriş kipine ya da günlük kesiciye bağlı değil: dört teşhisin hiçbiri net PF'yi 1'in üstüne
+   taşımadı. Günlük kesici kaldırılınca işlem sayısı artar ve zarar büyür (kesici burada koruyor).
+3. LONG ve SHORT ayrı: on iki (kol, yön) hücresinin hepsinde ΣR < 0; en iyisi K30R LONG PF 0.95.
+4. Şok günleri (BTC 1d |getiri| ≥ %3): altı kolda da şok günü işlemleri PF > 1 (1.11–2.09), normal günler PF 0.55–0.77
+   düzeyinde. Bu ayrım günün KAPANIŞINI kullanır (ileri bakış) ve yalnız betimleyicidir: "büyük hareket gününde trend
+   yönlü giriş kazanır" işlem anında bilinemeyen bir koşuldur, sınanmış bir kural DEĞİLDİR. Ayrı bir numara ve yeni veri ister.
+5. Güç: tasarım net PF ≈ 1.2 düzeyinde bir kenarı görecek güçteydi (PLAN §7); PF %90 güven aralıklarının üst ucu en iyi iki
+   kolda 1.06–1.08, yani 1.15 eşiğinin altında.
+
+**Bütünlük.** Ledger 42 satır (S1 parite, S2 belirlenimcilik, 12 CAL, 6 DEV taban, 24 DEV teşhis; hepsi check-run'dan
+geçti, hepsi H'de). Sayım penceresi (CAL, 2026-03-01 → 06-01) yalnız işlem sayısı için okundu. Kilit öncesi bir kez H
+değişti (`c9c99fa` → `425e82a`: teşhis tablosunun `variants.json`'dan okunması + `DIAG_NOLATCH`); CAL sayımı iki H'de bayt
+bayt aynıdır. Tam test paketi `c9c99fa`'da yeşil (4171 geçti, 85 atlandı); `425e82a`'da E18 ve M testleri (125) geçti.
+Canlı ayar, `.env`, deploy, restart: yok. M kurulumu kodda varsayılan KAPALI kalır.
+
+**Dosyalar.** `docs/audits/2026-11-20-prereg-e18/`: `PLAN.md`, `variants.json`, `shock_days.json`, `cal_counts.json`,
+`LOCK.json`; `run/DECISION.md` (kol başına pencere, yön, şok, rejim, sembol kırılımları), `run/results.csv`,
+`run/DEV_SCREEN.json`, `run/DEV_DECISION.json`, `run/LOCK_REF.json`, `run/artifacts.tgz` (45 rapor + ledger + manifest;
+`provenance.scalper_config` çıkarıldı, sunucu ayar satırlarına karşı tarandı: 0 eşleşme).
 
 ## E19 — Harness gerçekçilik paketi: 7 pencerede eski / yeni model (2026-11-20, D41)
 

@@ -1,0 +1,88 @@
+{
+  "schema": "e18-variants/1",
+  "plan": "docs/audits/2026-11-20-prereg-e18/PLAN.md",
+  "snapshot": {
+    "policy": "Sunucu SCALPER_* satirlari yalniz yerelde tutulur; icerik depoya girmez, yalniz sha256 kilide girer.",
+    "sha256": "2a4748a3d0e822751c2da071a105e8a5b5391206b62d6e3f27515a7789e841a2",
+    "scalper_lines": 55,
+    "source": "2026-11-20 olcum denetimi oturumunun yerel kopyasi (server_env_nonsecret.txt); E18 sunucuya baglanmadi."
+  },
+  "symbols": "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,BNBUSDT,ADAUSDT,LTCUSDT",
+  "common_cli": ["--strategies", "M", "--diagnostics"],
+  "base_env": {
+    "SCALPER_REGIME_FILTER": "false",
+    "SCALPER_MARKET_GATE": "false",
+    "SCALPER_ENTRY_BLOCK_WEEKDAYS_UTC": "",
+    "SCALPER_ENTRY_MODE": "taker",
+    "SCALPER_DYN_LEV_STOP_ATR_MULT": "2"
+  },
+  "triples": {
+    "15m": {
+      "triple": ["15m", "1h", "4h"],
+      "S": 9,
+      "env": {
+        "SCALPER_TF_ENTRY": "15m",
+        "SCALPER_TF_CONTEXT": "1h",
+        "SCALPER_TF_REGIME": "4h",
+        "SCALPER_FIXED_STOP_ROI_PCT": "9",
+        "SCALPER_TP1_ROI": "9",
+        "SCALPER_TP2_ROI": "18"
+      }
+    },
+    "30m": {
+      "triple": ["30m", "4h", "4h"],
+      "S": 13,
+      "env": {
+        "SCALPER_TF_ENTRY": "30m",
+        "SCALPER_TF_CONTEXT": "4h",
+        "SCALPER_TF_REGIME": "4h",
+        "SCALPER_FIXED_STOP_ROI_PCT": "13",
+        "SCALPER_TP1_ROI": "13",
+        "SCALPER_TP2_ROI": "26"
+      }
+    }
+  },
+  "family": [
+    {"id": "K15R", "trigger": "breakout", "trend": "regime", "entry_tf": "15m",
+     "env": {"SCALPER_M_TRIGGER": "breakout", "SCALPER_M_TREND": "regime"}},
+    {"id": "K30R", "trigger": "breakout", "trend": "regime", "entry_tf": "30m",
+     "env": {"SCALPER_M_TRIGGER": "breakout", "SCALPER_M_TREND": "regime"}},
+    {"id": "K15B", "trigger": "breakout", "trend": "context", "entry_tf": "15m",
+     "env": {"SCALPER_M_TRIGGER": "breakout", "SCALPER_M_TREND": "context"}},
+    {"id": "K30B", "trigger": "breakout", "trend": "context", "entry_tf": "30m",
+     "env": {"SCALPER_M_TRIGGER": "breakout", "SCALPER_M_TREND": "context"}},
+    {"id": "G15B", "trigger": "pullback", "trend": "context", "entry_tf": "15m",
+     "env": {"SCALPER_M_TRIGGER": "pullback", "SCALPER_M_TREND": "context"}},
+    {"id": "G30B", "trigger": "pullback", "trend": "context", "entry_tf": "30m",
+     "env": {"SCALPER_M_TRIGGER": "pullback", "SCALPER_M_TREND": "context"}}
+  ],
+  "overlays": [
+    {"id": "ROB_FEE2", "role": "gate", "cli": ["--fee-stress"], "env": {},
+     "note": "komisyon + kayma 2x; --fee-stress-multiplier GECILMEZ (varsayilan 2.0)"},
+    {"id": "ROB_DLY1", "role": "gate", "cli": ["--entry-delay-candles", "1"], "env": {},
+     "note": "taker modda dolum sinyal mumundan 2 mum sonraki acilis"},
+    {"id": "DIAG_Z0", "role": "diag", "cli": [],
+     "env": {"SCALPER_MAKER_FEE_PCT": "0", "SCALPER_TAKER_FEE_PCT": "0", "SCALPER_SLIPPAGE_RATE": "0"},
+     "note": "komisyonsuz ve kaymasiz (fonlama kalir); karar vermez"},
+    {"id": "DIAG_MAKER", "role": "diag", "cli": [], "env": {"SCALPER_ENTRY_MODE": "maker"},
+     "note": "limit giris (sunucu varsayilani); karar vermez"},
+    {"id": "DIAG_T", "role": "diag", "cli": [], "S": 50,
+     "env": {"SCALPER_DYN_LEV_STOP_ATR_MULT": "3.0", "SCALPER_FIXED_STOP_ROI_PCT": "50",
+             "SCALPER_TP1_ROI": "10", "SCALPER_TP2_ROI": "25"},
+     "note": "sunucu cikis geometrisi (stop ROI 50, TP1 ROI 10); karar vermez"},
+    {"id": "DIAG_NOLATCH", "role": "diag", "cli": [], "env": {"SCALPER_DAILY_LOSS_LIMIT_PCT": "0"},
+     "note": "gunluk zarar siniri kapali (gunluk kesici dusurmez); karar vermez"}
+  ],
+  "sets": {
+    "CAL": ["2026-03-01", "2026-06-01"],
+    "DEV": ["2025-01-01", "2026-01-01"],
+    "VAL": ["2023-01-01", "2024-11-18"],
+    "FINAL": ["2026-10-16", "2026-11-20"]
+  },
+  "smoke": {
+    "S1": {"strategy": "C", "window": ["2026-01-23", "2026-02-13"], "env": "snapshot (override yok)",
+           "expect": {"trades": 92, "total_pnl_2dp": 2808.05},
+           "source": "docs/EXPERIMENTS.md E19 (AYI, gercekci model)"},
+    "S2": {"arm": "K15R", "set": "CAL", "hashseeds": [0, 1]}
+  }
+}

@@ -178,6 +178,11 @@ canlı defterdeki işaretler örneklem-içidir ve ~25 kesitin taranmasından gel
    −550. İki tanım TERS sonuç veriyor: 'trend yönlü giriş daha iyi' kanıtı sağlam değil, hipotez düzeyinde. TV trend yönlü
    girişleri (n=78, PF 2.13) fade'lerden iyi görünüyor. Ham sinyal kaynağı henüz tanımlı değil. E17'nin "Yorum" 6. maddesi aynı ipucunu başka açıdan verir (karşı-trend girişler 15m/30m'de
 ücretsiz bile güçlü kaybediyor); E18 numarası ve dokunulmamış 2023-01-01 → 2024-11-18 verisi yeni bir fikrin ön-kayıtlı sınaması için ayrıldı.
+   **Sonuç (E18, 2026-11-20): DEV-YOK.** Trend yönlü aile (kırılım ve geri çekilme, 15m ve 30m, iki trend tanımı; 6 kol)
+   ön-kayıtlı olarak 2025 verisinde sınandı: altı kolda da PF 0.64–0.88, ΣR < 0, BH q = 1.0; LONG ve SHORT ayrı ayrı da < 1;
+   maliyetsiz PF en çok 1.15. VAL (2023-01-01 → 2024-11-18) AÇILMADI ve mühürlü duruyor. Şok günlerinde PF > 1 gözlemi
+   ileri bakışlıdır (günün kapanışını kullanır), kural değildir. Ayar değişmedi; M kurulumu kodda varsayılan KAPALI.
+   Kayıt: `docs/EXPERIMENTS.md` E18, `docs/audits/2026-11-20-prereg-e18/`.
 2. **Maker (limit) kâr-al emirleri:** ücretler brüt kârın %31.5'ini yiyor (387 vs 1229 USDT, 464 işlem); 20x'te gidiş-dönüş
    1.4-2.0 ROI = tipik +8 kazancın %17-25'i. Harness çıkış tarafında maker modeli yok; önce modellenmeli.
    E17, komisyon ve kayma sıfırken bile hiçbir kolun PF 1'e ulaşmadığını gösterdi (0.53-0.93): düşük maliyet kaybı küçültebilir, tek başına
