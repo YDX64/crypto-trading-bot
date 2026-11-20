@@ -105,7 +105,7 @@ Yeni sinyal kaynağı (haber botu vb.) eklemek: `docs/INTEGRATIONS.md`. Otomatik
 
 ## Nasıl çalıştırılır / test edilir / deploy edilir
 ```bash
-python3 -m pytest tests -q                      # 4065 test (+85 atlanan), ~170 sn — her değişiklikten önce
+python3 -m pytest tests -q                      # 4071 test (+85 atlanan), ~170 sn — her değişiklikten önce
 scripts/preflight_server_env.sh awa             # deploy ÖNCESİ: temiz kopya + sunucu ayarlarıyla test (D43)
 scripts/deploy.sh awa                           # push edilmiş main'i sunucuya uygula (test + restart + sağlık + otomatik geri alma)
 DEPLOY_NO_RESTART=1 scripts/deploy.sh awa       # yalnız kod/test; süreci yeniden başlatma

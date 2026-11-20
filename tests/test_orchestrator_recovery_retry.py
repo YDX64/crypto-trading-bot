@@ -481,6 +481,173 @@ async def test_precondition_false_waits_then_true_attempts(clock, monkeypatch):
 
 
 # ----------------------------------------------------------------------
+# 9b) Açılış çağrısı da ön koşula bağlı (D46)
+# ----------------------------------------------------------------------
+
+
+async def test_start_skips_initial_recovery_while_precondition_false(
+    clock, db_sessionmaker, monkeypatch
+):
+    """Scalper kurtarması bitmediyse açılış pozisyon kurtarma sorgusu atmaz, hiçbir şey sahiplenmez.
+
+    Senaryo: scalper'ın ilk yoklaması başarısız oldu, kurtarması koşmadı ve
+    sembolleri rezerve edilmedi. Borsada scalper'a ait, henüz OPEN `scalp_trades`
+    satırı olmayan (maker dolumu) STOP'suz bir pozisyon var. Eski açılış onu
+    "yetim" sanıp acil kapatırdı.
+    """
+    fake = FakeExchange()
+    fake.positions = [_btc_position()]
+    fake.algo_orders = []  # stop yok: sahiplenilseydi acil kapatılırdı
+    fake.risk_amounts["BTCUSDT"] = 0.01
+    orch = _make_orchestrator(fake, monkeypatch)
+    orch.recovery_precondition = lambda: False
+
+    with LogCapture() as logs:
+        await _start_without_loop(orch)
+        skipped = logs.messages("WARNING", "Açılış kurtarması ATLANDI")
+
+    assert fake.get_all_positions_calls == 0  # start() kurtarma sorgusu atmadı
+    assert orch._recovery_ready is False
+    assert orch.active_positions == {}
+    assert symbol_reservations.snapshot() == {}
+    assert fake.orders == [] and fake.cancels == []
+    assert await _position_rows(db_sessionmaker) == []
+    assert orch._recovery_retry_attempts == 0
+    assert orch._recovery_retry_due_monotonic == T0 + orch.RECOVERY_RETRY_INITIAL_SECONDS
+    assert orch.health_snapshot()["recovery_next_retry_in_seconds"] == 30.0
+    assert len(skipped) == 1
+
+    # Gerçek izleme döngüsü ilk turda salt-okunur bir hazır-olma yoklaması atar
+    # (D44'ün başarısız-açılış yolunda da böyle). Borsayı OKUR ama listeyi
+    # kullanmaz: sahiplenme, emir ve kurtarma bayrağı değişmez.
+    await orch._refresh_exchange_readiness_if_due()
+
+    assert fake.get_all_positions_calls == 1
+    assert orch._exchange_ready is True
+    assert orch._recovery_ready is False
+    assert orch.active_positions == {}
+    assert symbol_reservations.snapshot() == {}
+    assert fake.orders == [] and fake.cancels == []
+    assert await _position_rows(db_sessionmaker) == []
+
+
+async def test_skipped_initial_recovery_heals_once_precondition_turns_true(
+    clock, db_sessionmaker, monkeypatch
+):
+    fake = FakeExchange()
+    fake.positions = [_btc_position()]
+    fake.algo_orders = [dict(STOP_ORDER)]
+    fake.risk_amounts["BTCUSDT"] = 0.01
+    orch = _make_orchestrator(fake, monkeypatch)
+    settled = {"value": False}
+    orch.recovery_precondition = lambda: settled["value"]
+    await _start_without_loop(orch)
+    assert fake.get_all_positions_calls == 0
+
+    # Vade geldi ama scalper hâlâ hazır değil: deneme yok, deneme hakkı harcanmaz.
+    clock.now = orch._recovery_retry_due_monotonic + 1
+    await orch._retry_recovery_if_due()
+    assert fake.get_all_positions_calls == 0
+    assert orch._recovery_retry_attempts == 0
+    assert orch._recovery_ready is False
+
+    # Scalper kurtarmasını bitirdi: sıradaki turda kurtarma koşar.
+    settled["value"] = True
+    await orch._retry_recovery_if_due()
+
+    assert fake.get_all_positions_calls == 1
+    assert orch._recovery_retry_attempts == 1
+    assert orch._recovery_ready is True
+    assert orch._recovery_retry_due_monotonic is None
+    assert set(orch.active_positions) == {"BTCUSDT"}
+    assert symbol_reservations.snapshot() == {"BTCUSDT": "telegram"}
+    assert fake.orders == []
+
+
+async def test_real_loop_recovers_and_health_heals_after_scalper_settles(monkeypatch):
+    """GERÇEK _monitoring_loop + main._scalper_recovery_settled: scalper hazır olunca sağlık düzelir."""
+    engine = SimpleNamespace(_recovery_ready=False)
+    monkeypatch.setattr(main_module, "scalper_engine", engine)
+    fake = FakeExchange()
+    orch = _make_orchestrator(fake, monkeypatch)
+    orch.recovery_precondition = main_module._scalper_recovery_settled
+    monkeypatch.setattr(orch.config, "check_interval_seconds", 0.005)
+    monkeypatch.setattr(TradingOrchestrator, "RECOVERY_RETRY_INITIAL_SECONDS", 0.01)
+    monkeypatch.setattr(TradingOrchestrator, "RECOVERY_RETRY_MAX_SECONDS", 0.02)
+    original = orch.recover_open_positions
+    calls = {"n": 0}
+
+    async def spy(*args: Any, **kwargs: Any) -> bool:
+        calls["n"] += 1
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(orch, "recover_open_positions", spy)
+    try:
+        await orch.start()
+        # Vade (10 ms) çoktan doldu; scalper hazır değilken kurtarma HİÇ koşmaz.
+        await asyncio.sleep(0.1)
+        assert calls["n"] == 0
+        assert orch._recovery_ready is False
+        assert orch.health_snapshot()["healthy"] is False
+
+        engine._recovery_ready = True
+        for _ in range(200):
+            if orch._recovery_ready:
+                break
+            await asyncio.sleep(0.005)
+        await asyncio.sleep(0.03)  # döngü bir tur daha damga bassın
+
+        assert calls["n"] == 1
+        assert orch._recovery_ready is True
+        assert orch.health_snapshot()["healthy"] is True
+    finally:
+        await orch.stop()
+
+
+@pytest.mark.parametrize("precondition", [None, lambda: True], ids=["yok", "saglaniyor"])
+async def test_start_recovers_immediately_when_precondition_missing_or_true(
+    clock, db_sessionmaker, monkeypatch, precondition
+):
+    """Ön koşul yoksa ya da sağlanıyorsa açılış bugünküyle BİREBİR aynı çalışır."""
+    fake = FakeExchange()
+    fake.positions = [_btc_position()]
+    fake.algo_orders = [dict(STOP_ORDER)]
+    fake.risk_amounts["BTCUSDT"] = 0.01
+    orch = _make_orchestrator(fake, monkeypatch)
+    orch.recovery_precondition = precondition
+
+    await _start_without_loop(orch)
+
+    assert fake.get_all_positions_calls == 1
+    assert orch._recovery_ready is True
+    assert orch._exchange_ready is True
+    assert orch._recovery_retry_due_monotonic is None
+    assert set(orch.active_positions) == {"BTCUSDT"}
+    assert symbol_reservations.snapshot() == {"BTCUSDT": "telegram"}
+
+
+async def test_start_with_precondition_true_and_unreachable_exchange_keeps_failure_path(
+    clock, monkeypatch
+):
+    """Ön koşul sağlanıyorsa borsa hatası ATLAMA değil, D44'ün başarısızlık yoludur."""
+    fake = FakeExchange()
+    fake.fail = True
+    orch = _make_orchestrator(fake, monkeypatch)
+    orch.recovery_precondition = lambda: True
+
+    with LogCapture() as logs:
+        await _start_without_loop(orch)
+        failed = logs.messages("WARNING", "Açılış kurtarması tamamlanamadı")
+        skipped = logs.messages("WARNING", "Açılış kurtarması ATLANDI")
+
+    assert fake.get_all_positions_calls == 1
+    assert orch._recovery_ready is False
+    assert orch._recovery_retry_due_monotonic == T0 + orch.RECOVERY_RETRY_INITIAL_SECONDS
+    assert len(failed) == 1
+    assert skipped == []
+
+
+# ----------------------------------------------------------------------
 # 10) recover_open_positions beklenmedik istisna
 # ----------------------------------------------------------------------
 

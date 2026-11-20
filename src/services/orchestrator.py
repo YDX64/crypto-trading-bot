@@ -82,6 +82,7 @@ class TradingOrchestrator:
 
         # D44: gecikmeli kurtarma yeniden denemesi durumu. `main.py` ön koşulu
         # bağlar (scalper kendi kurtarmasını bitirmiş olmalı); None = ön koşul yok.
+        # D46: `start()` açılış kurtarması da aynı ön koşula bağlıdır.
         self.recovery_precondition: Optional[Callable[[], bool]] = None
         self._recovery_retry_delay = self.RECOVERY_RETRY_INITIAL_SECONDS
         self._recovery_retry_due_monotonic: Optional[float] = None
@@ -105,7 +106,17 @@ class TradingOrchestrator:
                 "❌ Binance bağlantısı kurulamadı! Orchestrator sinyal kabul etmeyecek."
             )
 
-        self._recovery_ready = await self.recover_open_positions()
+        # D46: scalper kendi kurtarmasını bitirmeden borsadaki pozisyonlara DOKUNMA.
+        # Scalper'ın ilk borsa yoklaması başarısızsa `_attempt_recovery()` hiç
+        # koşmamıştır, sembolleri rezerve değildir; buradaki sorgu saniyeler sonra
+        # başarılı olursa OPEN `scalp_trades` satırı olmayan bir scalper pozisyonu
+        # "yetim" diye sahiplenilirdi (stop yoksa acil kapatma). Atlanan kurtarma
+        # D44 döngüsünün işidir; döngü aynı ön koşulu orada da sorar.
+        scalper_pending = self._recovery_precondition_pending()
+        if scalper_pending:
+            self._recovery_ready = False
+        else:
+            self._recovery_ready = await self.recover_open_positions()
         self._exchange_ready = self._recovery_ready and self._exchange_ready
 
         # D44: açılış kurtarması başarısızsa (ör. Binance açılışta erişilemezdi)
@@ -117,11 +128,20 @@ class TradingOrchestrator:
         if not self._recovery_ready:
             first_delay = self._recovery_retry_delay
             self._schedule_recovery_retry()
-            self.logger.warning(
-                "⚠️ Açılış kurtarması tamamlanamadı; izleme döngüsü "
-                f"{first_delay:.0f} sn sonra geri çekilmeyle (backoff) yeniden "
-                "deneyecek. Telegram girişleri ve /health o zamana dek kapalı."
-            )
+            if scalper_pending:
+                self.logger.warning(
+                    "Açılış kurtarması ATLANDI: scalper kendi kurtarmasını henüz "
+                    "bitirmedi (ilk borsa yoklaması başarısız olmuş olabilir); "
+                    "borsadaki pozisyonlar sahiplenilmedi. İzleme döngüsü scalper "
+                    f"hazır olunca, en erken {first_delay:.0f} sn sonra kurtaracak. "
+                    "Telegram girişleri ve /health o zamana dek kapalı."
+                )
+            else:
+                self.logger.warning(
+                    "⚠️ Açılış kurtarması tamamlanamadı; izleme döngüsü "
+                    f"{first_delay:.0f} sn sonra geri çekilmeyle (backoff) yeniden "
+                    "deneyecek. Telegram girişleri ve /health o zamana dek kapalı."
+                )
 
         self._running = True
         if not self.monitoring_task or self.monitoring_task.done():
@@ -435,6 +455,10 @@ class TradingOrchestrator:
         self._recovery_retry_due_monotonic = time.monotonic() + delay
         self._recovery_retry_delay = min(delay * 2.0, self.RECOVERY_RETRY_MAX_SECONDS)
 
+    def _recovery_precondition_pending(self) -> bool:
+        """Ön koşul bağlı ve SAĞLANMIYOR mu? `start()` ve yeniden deneme AYNI kapıyı kullanır."""
+        return self.recovery_precondition is not None and not self.recovery_precondition()
+
     @staticmethod
     def _rest_ban_active() -> bool:
         """Binance REST 418/-1003 ban devre kesicisi şu an açık mı?"""
@@ -474,6 +498,7 @@ class TradingOrchestrator:
         (c) `recovery_precondition`: scalper önce kendi kurtarmasını bitirmeli
             (main.py başlangıç sırasıyla aynı); aksi hâlde scalper'a ait ama
             OPEN `scalp_trades` satırı henüz olmayan pozisyon benimsenebilirdi.
+            `start()` açılış kurtarması da aynı kapıdan geçer (D46).
         (d) Backoff: sonraki deneme çağrıdan ÖNCE planlanır; istisna da
             geri çekilir. Ban/ön koşul beklemesi deneme hakkı tüketmez.
 
@@ -487,7 +512,7 @@ class TradingOrchestrator:
             return
         if self._rest_ban_active():
             return
-        if self.recovery_precondition is not None and not self.recovery_precondition():
+        if self._recovery_precondition_pending():
             return
 
         self._schedule_recovery_retry()
