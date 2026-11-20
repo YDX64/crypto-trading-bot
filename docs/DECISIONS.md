@@ -7,6 +7,57 @@ Pencereler: AYI 2026-01-23→02-13 (BTC −30%) · YATAY 2026-07-01→07-21 · B
 
 ## Aktif kararlar
 
+### D42 — Strateji C giriş korumaları: bağlam-RSI koruması + ATR% bandı (ölçülebilir hâle getirildi) · 2026-11-20 · KOD VAR, VARSAYILAN KAPALI — canlı davranış DEĞİŞMEDİ
+
+**Soru.** Canlı testnet defterinin (399 strateji-C işlemi, giriş bağlamı kayıtlı, 2026-08-23..2026-11-19) iki zarar
+kümesi dört ayın dördünde de negatifti: (1) 1 dakikalık RSI ucunu AYNI yönde aşırı bir bağlam RSI'sı teyit ediyor
+(gerçek momentum; 199 işlem, net −651 USDT, stop oranı %16 vs %8); (2) çok yüksek kısa vadeli oynaklık
+(ATR% >= 0.12: 116 işlem, 45 stop, ort. −34.6 ROI) ve daha zayıf olarak çok düşük oynaklık (ATR% < 0.05: zaman çıkışı
+kanaması). Bunlar **örneklem-içi hipotezdir**; görmediği geçmişte (2026-01-23..2026-08-21) ölçülmeden açılmaz.
+
+**Karar.** Dört yeni ayar, hepsi KAPALI; yalnız sinyal stratejisi `C` iken (TV dış sinyali dahil diğerleri etkilenmez):
+
+| Ayar | Varsayılan (kapalı) | Anlam |
+|---|---|---|
+| `SCALPER_C_CTX_RSI_SHORT_MAX` | 100 | SHORT, bağlam RSI `>=` bu değerse RED |
+| `SCALPER_C_CTX_RSI_LONG_MIN` | 0 | LONG, bağlam RSI `<=` bu değerse RED |
+| `SCALPER_C_ATR_PCT_MAX` | 0 | ATR% `>=` bu değerse RED (>0 iken) |
+| `SCALPER_C_ATR_PCT_MIN` | 0 | ATR% `<` bu değerse RED (>0 iken) |
+
+Aday değerler: 60 / 40 / 0.12 / 0.05 ("SHORT yalnız bağlam RSI < 60, LONG yalnız > 40").
+
+**Ölçülen büyüklüklerin tam tanımı** (forensics `indicators.rsi_context` / `indicators.atr_pct` ile AYNI; analiz,
+harness ve canlıda eşik aynı şeyi söyler):
+- *Bağlam RSI:* RSI(14, Wilder, `indicators.rsi_series`) — kapanışlar `ctx.candles_15m` (rol adı "bağlam"; zaman dilimi
+  `SCALPER_TF_CONTEXT`, canlı profilde 5m), **son eleman (indeks −1) = karar anında kapanmış en güncel bağlam mumu**;
+  birim 0-100. Seri ≤ 14 mumsa ölçülemez (rsi_series'in 50 dolgusu ölçüm sayılmaz).
+- *ATR%:* ATR(14, giriş TF = `SCALPER_TF_ENTRY`) / giriş fiyatı × 100, **yüzde birimi** (0.12 = %0.12); HAM sinyalin
+  `atr_5m / entry_price` değeri (`apply_stop_policy` öncesi, `entry_gates.atr_pct_of`). Forensics 3 hane yuvarlar;
+  kapı yuvarlanmamış değerle karar verir.
+- Ölçülemeyen büyüklük → o koruma uygulanmaz (fail-open).
+- *Bilinen canlı–harness sapması (kayıt, ölçülmedi):* 5m kline önbelleği TTL 20 sn (`data._TTL_BY_INTERVAL`); karar mumu
+  bir 5m kapanışıyla çakıştığında (≈ 5 dakikada 1) canlı bağlam serisi o yeni kapanan 5m mumu en çok ~20 sn eksik görebilir,
+  harness (`build_context`, `close_time <= karar mumu`) görür. Look-ahead DEĞİL, yalnız bir bağlam mumu gecikme; forensics
+  `rsi_context` aynı gecikmeyi paylaşır (analiz↔canlı uyumlu). Eşik 5m sınırında bir mum RSI duyarlılığına yakınsa karar
+  farklılaşabilir; TTL kısaltmak REST ağırlığı artırır (D22), bu yüzden kabul edildi. Açmadan önce eşik çevresi duyarlılığı ölçülmeli.
+
+**Mimari.** Tek kod yolu: `entry_gates.c_entry_guard_verdict` (saf). Canlı motor `_evaluate_symbol`'de genel kapılardan
+SONRA, `apply_stop_policy` ÖNCESİ (fail-open; kapalı olmayan koruma girdisi ölçülemezse her sinyalde WARNING); harness `simulate_symbol`'de AYNI fonksiyon/girdiler
+(`ctx.candles_15m`, ham sinyal). `evaluate_entry_gates` imzası ve sırası DEĞİŞMEDİ. Ret kaydı: niyet defteri
+`reason="c_ctx_rsi_guard"` / `"c_atr_band"` (`extra` içinde ölçülen RSI/ATR% ve eşikler) → karşı-olgu defteri
+(`/scalper/counterfactual`) bu korumanın neyi engellediğini ölçer; harness'te `missed_counter` aynı anahtarlarla sayar.
+Doğrulama (Settings + harness): RSI eşikleri 0-100, ATR% >= 0, ikisi açıkken MIN < MAX.
+
+**Kanıt durumu.** YALNIZ örneklem-içi (yukarıdaki canlı defter). Henüz hiçbir görülmemiş pencerede ölçülmedi. Testler:
+`tests/test_c_entry_guards.py` (eşikler iki yönde, kapalı=inert, diğer stratejiler, niyet gerekçesi, motor↔harness
+aynı karar, look-ahead yok, config doğrulaması); varsayılanlarda golden backtest ve tüm mevcut testler değişmedi.
+
+**Nasıl açılır.** Önce harness'te sunucu env'iyle görülmemiş pencerelerde (P2-v2, D41; saklı pencere kaydına uy) ölç:
+`SCALPER_C_CTX_RSI_SHORT_MAX=60 SCALPER_C_CTX_RSI_LONG_MIN=40` ve ayrı koşuda `SCALPER_C_ATR_PCT_MAX=0.12`
+(ATR alt ucu ayrı). Kabul sonrası testnet `.env` + `scripts/restart_safe.sh testnet` (yedekle); karşı-olgu defterinden izle.
+
+**Geri alma.** Dört ayarı `.env`'den sil (ya da kapalı değerlere çek) ve restart; kod değişmez, davranış anında eski.
+
 ### D41 — Değerlendirme harness'i gerçekçilik paketi: boşluk/kayma, maker dolumu, fonlama, likidasyon, günlük kesici, P2-v2 kabul kuralı, walk-forward, saklı pencere kaydı · 2026-11-20 · KOD VAR (dal `audit/eval-harness-fixes`) — canlı davranış DEĞİŞMEDİ
 
 **Talep:** "backtest sayılarına güvenebilir miyiz" sorusu için 10 boyutlu (maliyet modeli, look-ahead, walk-forward/OOS,

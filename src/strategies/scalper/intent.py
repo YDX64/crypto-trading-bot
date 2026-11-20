@@ -83,6 +83,9 @@ REASON_HOUR_GATE = "hour_gate"
 REASON_WEEKDAY_GATE = "weekday_gate"
 REASON_SYMBOL_DIR_GATE = "symbol_dir_gate"
 REASON_ATR_GATE = "atr_gate"
+# D42 strateji C korumaları (entry_gates.REASON_C_* ile birebir aynı dize)
+REASON_C_CTX_RSI_GUARD = "c_ctx_rsi_guard"
+REASON_C_ATR_BAND = "c_atr_band"
 REASON_TV_CONFLUENCE = "tv_confluence"
 REASON_TV_SOURCE_BLOCKED = "tv_source_blocked"
 REASON_LOSS_COOLDOWN = "loss_cooldown"
@@ -120,6 +123,8 @@ REASON_LABELS: Dict[str, str] = {
     REASON_WEEKDAY_GATE: "hafta günü kapısı: giriş mumunun UTC hafta günü×yönü yasak",
     REASON_SYMBOL_DIR_GATE: "sembol×yön kapısı: sembol×yön çifti yasak listesinde",
     REASON_ATR_GATE: "ATR kapısı: ATR% bandı dışında",
+    REASON_C_CTX_RSI_GUARD: "C bağlam-RSI koruması: bağlam RSI ucu aynı yönde (gerçek momentum)",
+    REASON_C_ATR_BAND: "C ATR% bandı koruması: kısa vadeli oynaklık bant dışında",
     REASON_TV_CONFLUENCE: "TV sağlaması dolmadı (yeterli farklı kaynak yok)",
     REASON_TV_SOURCE_BLOCKED: "TV giriş kaynağı performans karantinasında",
     REASON_LOSS_COOLDOWN: "zarar sonrası sembol cooldown'ı aktif",
@@ -151,6 +156,8 @@ KNOWN_REASONS: frozenset = frozenset(
         REASON_WEEKDAY_GATE,
         REASON_SYMBOL_DIR_GATE,
         REASON_ATR_GATE,
+        REASON_C_CTX_RSI_GUARD,
+        REASON_C_ATR_BAND,
         REASON_TV_CONFLUENCE,
         REASON_TV_SOURCE_BLOCKED,
         REASON_LOSS_COOLDOWN,

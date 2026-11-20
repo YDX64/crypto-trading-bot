@@ -75,6 +75,7 @@ from src.strategies.scalper.funding import (
 )
 from src.strategies.scalper.indicators import atr, chandelier_stop
 from src.strategies.scalper.entry_gates import (
+    c_entry_guard_verdict,
     evaluate_entry_gates,
     validate_entry_gate_settings,
 )
@@ -2045,6 +2046,17 @@ def simulate_symbol(
             symbol,
             cfg,
         )
+        # D42: strateji C'ye özel bağlam-RSI + ATR% bandı koruması (KAPALI;
+        # motorla AYNI fonksiyon/girdiler: ctx.candles_15m = bağlam dilimi).
+        if entry_gate_reason is None:
+            entry_gate_reason = c_entry_guard_verdict(
+                getattr(raw_signal, "strategy", None),
+                raw_signal.direction,
+                ctx.candles_15m,
+                raw_signal.atr_5m,
+                raw_signal.entry_price,
+                cfg,
+            )[0]
         if entry_gate_reason is not None:
             if missed_counter is not None:
                 missed_counter[entry_gate_reason] = (

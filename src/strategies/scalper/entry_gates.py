@@ -87,6 +87,10 @@ REASON_HOUR = "hour_gate"
 REASON_WEEKDAY = "weekday_gate"
 REASON_SYMBOL_DIR = "symbol_dir_gate"
 REASON_ATR = "atr_gate"
+# D42: strateji C'ye ÖZEL iki giriş koruması (varsayılan KAPALI; ayrı çağrı —
+# `evaluate_c_entry_guards`; `evaluate_entry_gates` imzası/sırası DEĞİŞMEZ).
+REASON_C_CTX_RSI = "c_ctx_rsi_guard"
+REASON_C_ATR_BAND = "c_atr_band"
 
 # Hangi env değişkeni(leri) hangi gerekçeyi üretir — log/pano metni için.
 REASON_ENV_VARS: Dict[str, str] = {
@@ -95,6 +99,8 @@ REASON_ENV_VARS: Dict[str, str] = {
     REASON_WEEKDAY: "SCALPER_ENTRY_BLOCK_WEEKDAYS_UTC/SCALPER_ENTRY_BLOCK_WEEKDAYS_DIRECTION",
     REASON_SYMBOL_DIR: "SCALPER_SYMBOL_DIRECTION_BLOCK",
     REASON_ATR: "SCALPER_MIN_ATR_PCT/SCALPER_MAX_ATR_PCT",
+    REASON_C_CTX_RSI: "SCALPER_C_CTX_RSI_SHORT_MAX/SCALPER_C_CTX_RSI_LONG_MIN",
+    REASON_C_ATR_BAND: "SCALPER_C_ATR_PCT_MIN/SCALPER_C_ATR_PCT_MAX",
 }
 
 # cfg alan adları (Settings alanları; harness dataclass'larında getattr ile
@@ -106,6 +112,11 @@ CFG_BLOCK_WEEKDAYS_DIRECTION = "scalper_entry_block_weekdays_direction"
 CFG_SYMBOL_DIRECTION_BLOCK = "scalper_symbol_direction_block"
 CFG_MIN_ATR_PCT = "scalper_min_atr_pct"
 CFG_MAX_ATR_PCT = "scalper_max_atr_pct"
+CFG_C_CTX_RSI_SHORT_MAX = "scalper_c_ctx_rsi_short_max"
+CFG_C_CTX_RSI_LONG_MIN = "scalper_c_ctx_rsi_long_min"
+CFG_C_ATR_PCT_MAX = "scalper_c_atr_pct_max"
+CFG_C_ATR_PCT_MIN = "scalper_c_atr_pct_min"
+C_CTX_RSI_PERIOD = 14
 
 VALID_REGIMES: FrozenSet[str] = frozenset({"UP", "DOWN", "RANGE", "UNKNOWN"})
 VALID_DIRECTIONS: FrozenSet[str] = frozenset({"LONG", "SHORT"})
@@ -493,6 +504,123 @@ def atr_gate_blocks(atr_5m: Any, entry_price: Any, cfg: Any) -> bool:
     return False
 
 
+
+# --------------------------------------------------------------------------
+# 6) D42 — strateji C giriş korumaları (bağlam RSI + ATR% bandı), KAPALI
+# --------------------------------------------------------------------------
+#
+# Ölçülen büyüklüklerin TANIMI (forensics.indicator_snapshot ile AYNI):
+#   * bağlam RSI  = RSI(14, Wilder; indicators.rsi_series) — kapanışlar
+#     `ctx.candles_15m` (rol adı "bağlam"; zaman dilimi SCALPER_TF_CONTEXT,
+#     canlı profilde 5m) üzerinden, SON eleman (= karar anında kapanmış en
+#     güncel bağlam mumu, indeks -1). Birim: 0-100. Seri ≤ 14 mumsa
+#     ölçülemez → None (rsi_series'in 50.0 dolgusu "nötr ölçüm" sayılmaz).
+#   * ATR%        = ATR(14, giriş TF) / giriş fiyatı × 100 (YÜZDE: 0.12 =
+#     %0.12), HAM sinyalin atr_5m / entry_price değerleri (`atr_pct_of`).
+#     Forensics `indicators.atr_pct` aynı oran, 3 hane yuvarlı; kapı
+#     yuvarlanmamış değerle karar verir.
+# Karşılaştırma yönü: bağlam RSI SHORT için `>= SHORT_MAX`, LONG için
+# `<= LONG_MIN` RED; ATR% `>= MAX` (MAX>0) ya da `< MIN` (MIN>0) RED.
+# Ölçülemeyen büyüklük → o koruma UYGULANMAZ (fail-open; çağıran loglar).
+
+C_STRATEGY_NAME = "C"
+
+
+def c_ctx_rsi_guard_enabled(cfg: Any) -> bool:
+    return (
+        _cfg_float(cfg, CFG_C_CTX_RSI_SHORT_MAX, 100.0) < 100.0
+        or _cfg_float(cfg, CFG_C_CTX_RSI_LONG_MIN, 0.0) > 0.0
+    )
+
+
+def c_atr_band_guard_enabled(cfg: Any) -> bool:
+    return (
+        _cfg_float(cfg, CFG_C_ATR_PCT_MAX) > 0.0
+        or _cfg_float(cfg, CFG_C_ATR_PCT_MIN) > 0.0
+    )
+
+
+def c_entry_guards_enabled(cfg: Any) -> bool:
+    return c_ctx_rsi_guard_enabled(cfg) or c_atr_band_guard_enabled(cfg)
+
+
+def context_rsi_of(context_candles: Any) -> Optional[float]:
+    """Bağlam RSI'sı (tanım yukarıda) — SAF; ölçülemezse None."""
+    if not context_candles:
+        return None
+    candles = list(context_candles)
+    if len(candles) <= C_CTX_RSI_PERIOD:
+        return None
+    from src.strategies.scalper.indicators import rsi_series  # yerel: forensics ile aynı
+
+    vals = rsi_series([c.close for c in candles], C_CTX_RSI_PERIOD)
+    return _as_float(vals[-1]) if vals else None
+
+
+def c_entry_guard_verdict(
+    strategy: Any,
+    direction: Any,
+    context_candles: Any,
+    atr_5m: Any,
+    entry_price: Any,
+    cfg: Any,
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    """(gerekçe | None, ölçülen büyüklükler). Yalnız strateji C; kapalıyken
+    hiçbir hesap yapılmaz ve (None, {}) döner. Sıra: bağlam RSI → ATR bandı."""
+    if not c_entry_guards_enabled(cfg):
+        return None, {}
+    if _norm_token(strategy) != C_STRATEGY_NAME:
+        return None, {}
+    side = _norm_token(direction)
+    detail: Dict[str, Any] = {}
+    if c_ctx_rsi_guard_enabled(cfg):
+        rsi = context_rsi_of(context_candles)
+        short_max = _cfg_float(cfg, CFG_C_CTX_RSI_SHORT_MAX, 100.0)
+        long_min = _cfg_float(cfg, CFG_C_CTX_RSI_LONG_MIN, 0.0)
+        detail.update({
+            "ctx_rsi": None if rsi is None else round(rsi, 2),
+            "ctx_rsi_short_max": short_max,
+            "ctx_rsi_long_min": long_min,
+            "direction": side,
+        })
+        if rsi is not None:
+            if side == "SHORT" and short_max < 100.0 and rsi >= short_max:
+                detail["gate"] = REASON_C_CTX_RSI
+                return REASON_C_CTX_RSI, detail
+            if side == "LONG" and long_min > 0.0 and rsi <= long_min:
+                detail["gate"] = REASON_C_CTX_RSI
+                return REASON_C_CTX_RSI, detail
+    if c_atr_band_guard_enabled(cfg):
+        pct = atr_pct_of(atr_5m, entry_price)
+        max_pct = _cfg_float(cfg, CFG_C_ATR_PCT_MAX)
+        min_pct = _cfg_float(cfg, CFG_C_ATR_PCT_MIN)
+        detail.update({
+            "atr_pct": None if pct is None else round(pct, 4),
+            "atr_pct_max": max_pct,
+            "atr_pct_min": min_pct,
+        })
+        if pct is not None:
+            if (max_pct > 0.0 and pct >= max_pct) or (min_pct > 0.0 and pct < min_pct):
+                detail["gate"] = REASON_C_ATR_BAND
+                return REASON_C_ATR_BAND, detail
+    return None, detail
+
+
+def format_c_entry_guard_detail(detail: Dict[str, Any]) -> str:
+    gate = detail.get("gate") if isinstance(detail, dict) else None
+    if gate == REASON_C_CTX_RSI:
+        return (
+            f"bağlam RSI {detail.get('ctx_rsi')} ({detail.get('direction')}; "
+            f"SHORT_MAX {detail.get('ctx_rsi_short_max')}, "
+            f"LONG_MIN {detail.get('ctx_rsi_long_min')})"
+        )
+    if gate == REASON_C_ATR_BAND:
+        return (
+            f"ATR% {detail.get('atr_pct')} bant dışı "
+            f"[min {detail.get('atr_pct_min')}, max {detail.get('atr_pct_max')}]"
+        )
+    return str(gate)
+
 # --------------------------------------------------------------------------
 # Birleşik değerlendirme + doğrulama + teşhis
 # --------------------------------------------------------------------------
@@ -591,6 +719,43 @@ def validate_entry_gate_settings(cfg: Any) -> None:
     if min_pct > 0.0 and max_pct > 0.0 and not (min_pct < max_pct):
         raise ValueError(
             f"SCALPER_MIN_ATR_PCT ({min_pct}) < SCALPER_MAX_ATR_PCT ({max_pct}) olmalı "
+            f"(ikisi de açıkken)"
+        )
+    _validate_c_entry_guard_settings(cfg)
+
+
+def _validate_c_entry_guard_settings(cfg: Any) -> None:
+    """D42 — strateji C korumaları: RSI eşikleri 0-100, ATR% ≥ 0, ikisi de
+    açıkken MIN < MAX. Alan yoksa varsayılan (kapalı) sayılır."""
+    short_max = _as_float(getattr(cfg, CFG_C_CTX_RSI_SHORT_MAX, 100.0))
+    long_min = _as_float(getattr(cfg, CFG_C_CTX_RSI_LONG_MIN, 0.0))
+    if short_max is None or long_min is None:
+        raise ValueError(
+            f"{REASON_ENV_VARS[REASON_C_CTX_RSI]}: sayısal olmalı "
+            f"(verilen: {getattr(cfg, CFG_C_CTX_RSI_SHORT_MAX, None)!r} / "
+            f"{getattr(cfg, CFG_C_CTX_RSI_LONG_MIN, None)!r})"
+        )
+    if not (0.0 <= short_max <= 100.0) or not (0.0 <= long_min <= 100.0):
+        raise ValueError(
+            f"{REASON_ENV_VARS[REASON_C_CTX_RSI]}: 0-100 aralığında olmalı "
+            f"(verilen: {short_max} / {long_min})"
+        )
+    a_max = _as_float(getattr(cfg, CFG_C_ATR_PCT_MAX, 0.0))
+    a_min = _as_float(getattr(cfg, CFG_C_ATR_PCT_MIN, 0.0))
+    if a_max is None or a_min is None:
+        raise ValueError(
+            f"{REASON_ENV_VARS[REASON_C_ATR_BAND]}: sayısal olmalı "
+            f"(verilen: {getattr(cfg, CFG_C_ATR_PCT_MAX, None)!r} / "
+            f"{getattr(cfg, CFG_C_ATR_PCT_MIN, None)!r})"
+        )
+    if a_max < 0.0 or a_min < 0.0:
+        raise ValueError(
+            f"{REASON_ENV_VARS[REASON_C_ATR_BAND]}: negatif olamaz (0 = kapalı; "
+            f"verilen: {a_min} / {a_max})"
+        )
+    if a_min > 0.0 and a_max > 0.0 and not (a_min < a_max):
+        raise ValueError(
+            f"SCALPER_C_ATR_PCT_MIN ({a_min}) < SCALPER_C_ATR_PCT_MAX ({a_max}) olmalı "
             f"(ikisi de açıkken)"
         )
 

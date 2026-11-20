@@ -552,6 +552,17 @@ class Settings(BaseSettings):
     #    İkisi de >0 ise min < max şart (startup'ta doğrulanır).
     scalper_min_atr_pct: float = 0.0
     scalper_max_atr_pct: float = 0.0
+    # 6) D42 — strateji C'ye ÖZEL giriş korumaları (HEPSİ KAPALI; yalnız sinyal
+    #    stratejisi "C" iken). Bağlam RSI = RSI(14) bağlam TF'nin son kapanmış
+    #    mumu (SCALPER_TF_CONTEXT); ATR% = ATR(14, giriş TF)/fiyat×100 (yüzde).
+    #    SHORT, bağlam RSI >= SHORT_MAX ise RED (100 = kapalı); LONG, bağlam RSI
+    #    <= LONG_MIN ise RED (0 = kapalı). ATR% >= MAX (MAX>0) ya da < MIN
+    #    (MIN>0) ise RED. Doğrulama: RSI 0-100, ATR% >= 0, MIN < MAX (ikisi
+    #    açıkken). Kanıt durumu: yalnız örneklem-içi (docs/DECISIONS.md D42).
+    scalper_c_ctx_rsi_short_max: float = 100.0
+    scalper_c_ctx_rsi_long_min: float = 0.0
+    scalper_c_atr_pct_max: float = 0.0
+    scalper_c_atr_pct_min: float = 0.0
     # --- İşlem adli kaydı (D21, 2026-08-23) — YALNIZ GÖZLEM -------------
     # Hiçbir kapı/boyutlama/çıkış kararı bu ayarları okumaz; kapatılırsa
     # yalnız kayıt tutulmaz, motor davranışı HER İKİ durumda da aynıdır.

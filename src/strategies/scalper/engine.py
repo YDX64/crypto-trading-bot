@@ -52,6 +52,8 @@ from urllib.parse import urlsplit
 from src.strategies.scalper.entry_gates import (
     REASON_ENV_VARS as ENTRY_GATE_ENV_VARS,
     atr_gate_enabled,
+    c_entry_guard_verdict,
+    format_c_entry_guard_detail,
     atr_pct_of,
     entry_gate_detail,
     evaluate_entry_gates,
@@ -2380,6 +2382,7 @@ class ScalperEngine:
             # Kapalıyken evaluate_entry_gates birkaç ucuz alan okumasıyla None döner.
             entry_gate_reason: Optional[str] = None
             entry_close_time_ms: Optional[int] = None
+            c_guard_detail: Dict[str, Any] = {}
             try:
                 # getattr: sadeleştirilmiş test çiftleri `close_time` taşımayabilir
                 # (repo konvansiyonu — bkz. _counterfactual_resolve); yoksa saat
@@ -2395,6 +2398,37 @@ class ScalperEngine:
                     symbol,
                     self.cfg,
                 )
+                # D42: strateji C'ye özel iki koruma (bağlam RSI + ATR% bandı),
+                # VARSAYILAN KAPALI; harness AYNI fonksiyonu AYNI girdilerle
+                # çağırır (backtest.simulate_symbol). Genel kapılardan SONRA.
+                if entry_gate_reason is None:
+                    entry_gate_reason, c_guard_detail = c_entry_guard_verdict(
+                        getattr(sig, "strategy", None),
+                        sig.direction,
+                        ctx.candles_15m,
+                        sig.atr_5m,
+                        sig.entry_price,
+                        self.cfg,
+                    )
+                # D42: koruma AÇIK ama girdi ölçülemedi → koruma uygulanmadı
+                # (fail-open); sessiz kalmasın. Kapalıyken c_guard_detail boştur.
+                if entry_gate_reason is None and c_guard_detail:
+                    if (
+                        c_guard_detail.get("ctx_rsi_short_max") is not None
+                        and c_guard_detail.get("ctx_rsi") is None
+                    ):
+                        self.logger.warning(
+                            f"⚠️ {symbol}: bağlam RSI hesaplanamadı (bağlam mum "
+                            f"sayısı={len(ctx.candles_15m or [])}) — "
+                            f"SCALPER_C_CTX_RSI_SHORT_MAX/LONG_MIN koruması bu "
+                            f"sinyalde UYGULANMADI (fail-open)"
+                        )
+                    if "atr_pct" in c_guard_detail and c_guard_detail["atr_pct"] is None:
+                        self.logger.warning(
+                            f"⚠️ {symbol}: ATR% hesaplanamadı (atr_5m={sig.atr_5m!r}, "
+                            f"entry={sig.entry_price!r}) — SCALPER_C_ATR_PCT_MIN/MAX "
+                            f"koruması bu sinyalde UYGULANMADI (fail-open)"
+                        )
                 # ATR bandı AÇIK ama ATR ölçülemedi → kapı uygulanmadı; sessiz
                 # kalmasın (kapı kapalıyken bu dal HİÇ çalışmaz).
                 if (
@@ -2409,6 +2443,7 @@ class ScalperEngine:
                     )
             except Exception as e:
                 entry_gate_reason = None
+                c_guard_detail = {}
                 if not getattr(self, "_entry_gates_error_logged", False):
                     self._entry_gates_error_logged = True
                     self.logger.warning(
@@ -2418,20 +2453,27 @@ class ScalperEngine:
                         f"SCALPER_ENTRY_BLOCK_WEEKDAYS_UTC / "
                         f"SCALPER_ENTRY_BLOCK_WEEKDAYS_DIRECTION / "
                         f"SCALPER_SYMBOL_DIRECTION_BLOCK / SCALPER_MIN_ATR_PCT / "
-                        f"SCALPER_MAX_ATR_PCT ayarlarını kontrol edin)"
+                        f"SCALPER_MAX_ATR_PCT / SCALPER_C_CTX_RSI_SHORT_MAX / "
+                        f"SCALPER_C_CTX_RSI_LONG_MIN / SCALPER_C_ATR_PCT_MIN / "
+                        f"SCALPER_C_ATR_PCT_MAX ayarlarını kontrol edin)"
                     )
             if entry_gate_reason is not None:
                 yon = getattr(sig.direction, "value", str(sig.direction))
                 kaynak = "TV sinyali" if is_external else "girişi"
-                gate_detail = entry_gate_detail(
-                    entry_gate_reason, ctx.regime, sig.direction,
-                    entry_close_time_ms, sig.atr_5m, sig.entry_price, symbol, self.cfg,
-                )
+                if c_guard_detail.get("gate") == entry_gate_reason:
+                    gate_detail = dict(c_guard_detail)  # D42 koruması
+                    gate_text = format_c_entry_guard_detail(gate_detail)
+                else:
+                    gate_detail = entry_gate_detail(
+                        entry_gate_reason, ctx.regime, sig.direction,
+                        entry_close_time_ms, sig.atr_5m, sig.entry_price, symbol, self.cfg,
+                    )
+                    gate_text = format_entry_gate_detail(gate_detail)
                 self.logger.info(
                     f"⛔ {symbol}: "
                     f"{intent.REASON_LABELS.get(entry_gate_reason, entry_gate_reason)} "
                     f"— {yon} {kaynak} engellendi "
-                    f"({format_entry_gate_detail(gate_detail)}; "
+                    f"({gate_text}; "
                     f"{ENTRY_GATE_ENV_VARS.get(entry_gate_reason, '')})"
                 )
                 self._count_engine_reject(entry_gate_reason)
