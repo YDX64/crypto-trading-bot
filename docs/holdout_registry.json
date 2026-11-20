@@ -1,0 +1,132 @@
+[
+  {
+    "name": "AYI",
+    "start": "2026-01-23",
+    "end": "2026-02-12",
+    "status": "burned",
+    "note": "SECİM penceresi (backtest [2026-01-23, 2026-02-13)). E2-E9'un 36 varyantı, D6/E2a seçimi, autoresearch (scripts/autoresearch.py WINDOWS), E11-E13 tabanı. 'end' kapsayıcıdır.",
+    "opens": []
+  },
+  {
+    "name": "YATAY",
+    "start": "2026-07-01",
+    "end": "2026-07-20",
+    "status": "burned",
+    "note": "SECİM penceresi (backtest [2026-07-01, 2026-07-21)). E2-E9, autoresearch, E11-E13 tabanı.",
+    "opens": []
+  },
+  {
+    "name": "BOGA",
+    "start": "2026-08-07",
+    "end": "2026-08-20",
+    "status": "burned",
+    "note": "SECİM penceresi (backtest [2026-08-07, 2026-08-21)). E2-E9, autoresearch, E11-E13 tabanı; altın fixture (08-07..08-10) bunun içinde.",
+    "opens": []
+  },
+  {
+    "name": "OOS_MART",
+    "start": "2026-03-01",
+    "end": "2026-03-31",
+    "status": "burned",
+    "note": "Backtest [2026-03-01, 2026-04-01). D28 tek kullanımlık saklı pencereydi (TP1 %8 adayı veto edildi) ve YANDI; sonra D30, E11, E12, E13 (~305 post-hoc kural), E13.1, E13.2 seçim kümesi olarak kullanıldı. 'DOKUNULMAMIŞ' etiketi yanlıştı.",
+    "opens": [
+      {
+        "at": "2026-08-27T00:00:00Z",
+        "by": "D28",
+        "purpose": "saklı pencere açılışı 1: TP1 ROI %8 adayı vetosu (docs/EXPERIMENTS.md)"
+      }
+    ]
+  },
+  {
+    "name": "COKUS",
+    "start": "2026-08-21",
+    "end": "2026-09-02",
+    "status": "burned",
+    "note": "Backtest [2026-08-21, 2026-09-03). D30, E11, E12, E13 post-hoc kural taraması ('dokunulmamış 4'ün biri).",
+    "opens": []
+  },
+  {
+    "name": "HOLD_MAY",
+    "start": "2026-05-04",
+    "end": "2026-05-24",
+    "status": "burned",
+    "note": "Backtest [2026-05-04, 2026-05-25). E11, E12, E13 (~305 kural) seçim kümesi.",
+    "opens": []
+  },
+  {
+    "name": "HOLD_JUN",
+    "start": "2026-06-08",
+    "end": "2026-06-28",
+    "status": "burned",
+    "note": "Backtest [2026-06-08, 2026-06-29). E11, E12, E13 (~305 kural) seçim kümesi.",
+    "opens": []
+  },
+  {
+    "name": "FRESH_SUBAT",
+    "start": "2026-02-13",
+    "end": "2026-02-28",
+    "status": "burned",
+    "note": "Backtest [2026-02-13, 2026-03-01). E13.3 'son sınav': hafta sonu LONG ve ADA LONG kuralları İKİ KEZ bu pencerede koşuldu (FRESH=1 yalnız env değişkeniydi, sayaç yoktu).",
+    "opens": [
+      {
+        "at": "2026-09-04T04:10:00Z",
+        "by": "E13.3",
+        "purpose": "son sınav: hafta sonu LONG yasağı"
+      },
+      {
+        "at": "2026-09-04T04:10:00Z",
+        "by": "E13.3",
+        "purpose": "son sınav: ADA LONG yasağı"
+      }
+    ]
+  },
+  {
+    "name": "FRESH_TEMMUZ",
+    "start": "2026-07-21",
+    "end": "2026-08-06",
+    "status": "burned",
+    "note": "Backtest [2026-07-21, 2026-08-07). E13.3 'son sınav': iki kural da burada koşuldu.",
+    "opens": [
+      {
+        "at": "2026-09-04T04:10:00Z",
+        "by": "E13.3",
+        "purpose": "son sınav: hafta sonu LONG yasağı"
+      },
+      {
+        "at": "2026-09-04T04:10:00Z",
+        "by": "E13.3",
+        "purpose": "son sınav: ADA LONG yasağı"
+      }
+    ]
+  },
+  {
+    "name": "SAKLI_NISAN",
+    "start": "2026-04-01",
+    "end": "2026-04-30",
+    "status": "burned",
+    "note": "Backtest [2026-04-01, 2026-05-01). D29/U50 için sonuç görülmeden mühürlü ilan edilmişti; U50 açık aşamada RED olunca açılmadı. SONRA E13 doğrulaması için yargıç tarafından AÇILDI (logs/backtest_20260903_213004.json, -470 / PF 0.61; docs/EXPERIMENTS.md E13 'artık taze sayılmaz') ve YANDI.",
+    "opens": [
+      {
+        "at": "2026-09-03T21:30:04Z",
+        "by": "E13-yargic",
+        "purpose": "yargıç doğrulama koşusu: logs/backtest_20260903_213004.json (-470 / PF 0.61); 11-14 saat yasağı 'taze Nisan'da rastgelenin altında kaldı"
+      }
+    ]
+  },
+  {
+    "name": "VAL-2026Q4a",
+    "start": "2026-09-04",
+    "end": "2026-10-15",
+    "status": "validation",
+    "note": "Doğrulama: walk-forward örneklem-dışı katlara izin verilir (parametre seçimi bu pencerede YAPILMAZ). 'end' kapsayıcıdır.",
+    "opens": []
+  },
+  {
+    "name": "SEAL-2026Q4b",
+    "start": "2026-10-16",
+    "end": "2026-11-19",
+    "status": "sealed",
+    "note": "Final sınavı: aday paketi başına BİR kez açılır, yalnız VETO eder (terfi ettirmez). Açılış --open-sealed \"<amaç>\" ile yapılır ve opens'a yazılır.",
+    "opens": []
+  }
+]

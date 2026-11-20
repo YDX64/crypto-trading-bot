@@ -1,5 +1,25 @@
 # Değişiklik Günlüğü
 
+## v2.1.0 - Değerlendirme harness'i gerçekçilik paketi (D41, 2026-11-20)
+
+### 🎉 Yeni Özellikler
+
+- Harness gerçekçilik anahtarları (varsayılan AÇIK): `gap_fills`, `exit_slippage`, `intrabar_path`, `maker_trade_through`,
+  `maker_fill_bar`, `single_pending`, `funding`, `liquidation`, `daily_latch`; `--disable-realism`, `--legacy-model`
+- P2-v2 kabul kuralı (eşleşmiş bootstrap + Benjamini-Hochberg + pencere zararı + DD + stres); eski kural "P2-eski" olarak basılır
+- `scripts/walk_forward.py` (örneklem-dışı katlar), `docs/holdout_registry.json` (yanık/doğrulama/mühürlü pencere kaydı)
+- `src/strategies/scalper/montecarlo.py`, `scripts/fill_funding_cache.py`; `ledger_report.py` ayrımları (pnl_source, AP, LONG/SHORT)
+
+### 🐛 Düzeltilen Hatalar
+
+- Autoresearch önbelleği tam anahtarlı; izole ortam; `run_windows.sh` boş pencere ve çıkış kodu
+- Permütasyon: +inf null, ortak mum permütasyonu, ortak indeks, sıfır-işlemli null hariç
+
+### ⚠️ Breaking Changes
+
+- Resmi backtest sayıları düşer (7 pencerede 1124 → 751 işlem, +2679.50 → +107.10); eski sayılar için `--legacy-model`
+- Canlı davranış ve sunucu DEĞİŞMEDİ; ayrıntı `docs/DECISIONS.md` D41, `docs/EXPERIMENTS.md` E16
+
 ## v2.0.0 - Çoklu Sinyal Yönetimi ve Yeni Format Desteği
 
 ### 🎉 Yeni Özellikler

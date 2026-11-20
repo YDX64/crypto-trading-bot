@@ -24,6 +24,8 @@ from src.strategies.scalper.permutation import (
     direction_of,
     merge_clamp_stats,
     permute_candles,
+    apply_permutation_index,
+    draw_permutation_index,
 )
 from src.strategies.scalper.types import Candle
 
@@ -61,26 +63,19 @@ class TestPermuteCandles:
             assert c.high >= c.low
         assert stats["clamp_applied"] is True
 
-    def test_unclamped_run_produces_measurable_violations(self):
-        """Kelepçe KAPALIYKEN ihlal çıkmalı — çıkmıyorsa kelepçe gereksizdir
-        ve bu testin kendisi anlamsızlaşır (plan bunu kanıt olarak istedi)."""
+    def test_joint_scheme_has_zero_violations_even_unclamped(self):
+        """C-paketi (montecarlo-3): tüm bar (h-o, l-o, c-o) üçlüsü BİRLİKTE
+        taşındığı için kelepçe KAPALIYKEN de ihlal yoktur — kelepçe artık
+        gereksiz bir emniyet. (Eski test bağımsız karıştırmanın ihlal
+        ürettiğini kodluyordu; davranış bilerek değişti.)"""
         candles = _series()
-        out, stats = permute_candles(candles, start_index=50, seed=7, clamp=False)
-        violations = sum(
-            1 for c in out[51:]
-            if c.high < max(c.open, c.close) - 1e-12
-            or c.low > min(c.open, c.close) + 1e-12
-        )
-        assert violations > 0
-        assert stats["violated_bars"] == violations
-        assert stats["violated_bar_pct"] > 0.0
-        # Kelepçeli koşu AYNI tohumla AYNI ihlalleri SAYAR ama düzeltir.
-        _, clamped_stats = permute_candles(
-            candles, start_index=50, seed=7, clamp=True
-        )
-        assert clamped_stats["violated_bars"] == stats["violated_bars"]
-        assert clamped_stats["mean_abs_adjust_pct"] > 0.0
-        assert stats["mean_abs_adjust_pct"] == 0.0
+        for clamp in (False, True):
+            out, stats = permute_candles(candles, start_index=50, seed=7, clamp=clamp)
+            assert stats["violated_bars"] == 0
+            assert stats["mean_abs_adjust_pct"] == 0.0
+            for c in out[51:]:
+                assert c.high >= max(c.open, c.close)
+                assert c.low <= min(c.open, c.close)
 
     def test_prefix_before_start_index_is_untouched(self):
         candles = _series()
@@ -217,21 +212,33 @@ class TestComputePValues:
         assert row["p_value"] > 0.0
         assert row["p_value"] == pytest.approx(1 / 51, rel=1e-4)
 
-    def test_non_finite_real_gets_no_p_value(self):
+    def test_nan_real_gets_no_p_value(self):
         null = [{"profit_factor": 1.0 + i / 10.0} for i in range(20)]
         row = compute_p_values(
-            {"profit_factor": float("inf")}, null, ["profit_factor"]
+            {"profit_factor": float("nan")}, null, ["profit_factor"]
         )["metrics"]["profit_factor"]
         assert "p_value" not in row
         assert "sonlu değil" in row["note"]
 
-    def test_non_finite_null_values_dropped(self):
+    def test_infinite_real_pf_gets_p_value(self):
+        """Gerçek PF=+inf (hiç kayıp yok): inf null'lar >= sayılır, p tanımlı."""
+        null = [{"profit_factor": float("inf")}] * 5 + [{"profit_factor": 1.0}] * 5
+        row = compute_p_values(
+            {"profit_factor": float("inf")}, null, ["profit_factor"]
+        )["metrics"]["profit_factor"]
+        assert row["count_at_least_as_extreme"] == 5
+        assert row["p_value"] == pytest.approx(6 / 11, abs=1e-6)
+
+    def test_infinite_null_values_count_as_exceedances(self):
+        """montecarlo-1: PF=inf null'lar EN İYİ null sonuçlardır; atılmaz,
+        `>= gerçek` sayılır. (Eski test atılmasını kodluyordu.)"""
         null = [{"profit_factor": 1.0}, {"profit_factor": float("inf")}]
         row = compute_p_values(
             {"profit_factor": 2.0}, null, ["profit_factor"]
         )["metrics"]["profit_factor"]
-        assert row["n"] == 1
-        assert row["non_finite_dropped"] == 1
+        assert row["n"] == 2
+        assert row["count_at_least_as_extreme"] == 1
+        assert row["p_value"] == pytest.approx((1 + 1) / (2 + 1), abs=1e-6)
 
     def test_unknown_metric_is_skipped_not_guessed(self):
         out = compute_p_values({"avg_duration_min": 5.0}, [{"avg_duration_min": 1.0}],
@@ -288,3 +295,125 @@ class TestClampReporting:
         merged = merge_clamp_stats([])
         assert merged["permuted_bars"] == 0
         assert merged["violated_bar_pct"] == 0.0
+
+
+def _log_ranges(cs):
+    return [math.log(c.high) - math.log(c.low) for c in cs]
+
+
+class TestJointPermutation:
+    def test_mean_log_range_equals_real(self):
+        candles = _series()
+        out, _ = permute_candles(candles, start_index=50, seed=5)
+        real = _log_ranges(candles[51:])
+        perm = _log_ranges(out[51:])
+        assert sum(perm) / len(perm) == pytest.approx(sum(real) / len(real), rel=1e-9)
+        # sıralı değerler birebir aynı (bar şekilleri sadece yer değiştirdi)
+        assert sorted(perm) == pytest.approx(sorted(real), rel=1e-9)
+
+    def test_first_and_last_price_preserved(self):
+        candles = _series()
+        out, _ = permute_candles(candles, start_index=50, seed=5, block_length=7)
+        assert out[50] == candles[50]
+        assert out[-1].close == pytest.approx(candles[-1].close, rel=1e-9)
+
+    def test_block_length_deterministic_and_different(self):
+        candles = _series()
+        a, _ = permute_candles(candles, start_index=10, seed=3, block_length=10)
+        b, _ = permute_candles(candles, start_index=10, seed=3, block_length=10)
+        c, _ = permute_candles(candles, start_index=10, seed=3, block_length=1)
+        assert a == b
+        assert a != c
+
+    def test_block_keeps_contiguous_shapes(self):
+        """block_length=n-ish: bar şekilleri blok içinde ardışık kalır."""
+        n = 41
+        candles = _series(n)
+        idx = draw_permutation_index(n - 1, seed=2, block_length=10)
+        # şekil indeksi 10'luk ardışık parçalardan oluşur
+        s = list(idx.shape)
+        runs = 0
+        for i in range(1, len(s)):
+            if s[i] != s[i - 1] + 1:
+                runs += 1
+        assert runs <= 4  # 40 bar, 4 blok -> en çok 3 kopuş + sınır payı
+        assert sorted(s) == list(range(n - 1))
+
+    def test_invalid_block_length(self):
+        with pytest.raises(ValueError):
+            permute_candles(_series(20), seed=1, block_length=0)
+
+
+class TestSharedIndex:
+    def test_same_index_same_result_as_permute_candles(self):
+        candles = _series()
+        idx = draw_permutation_index(len(candles) - 51, seed=9, block_length=1)
+        a = apply_permutation_index(candles, idx, start_index=50)
+        b, _ = permute_candles(candles, start_index=50, seed=9)
+        assert a == b
+
+    def test_same_index_applies_to_two_series(self):
+        x = _series(100)
+        y = _series(100, start=50.0)
+        idx = draw_permutation_index(100 - 11, seed=4)
+        px = apply_permutation_index(x, idx, start_index=10)
+        py = apply_permutation_index(y, idx, start_index=10)
+        # aynı indeks -> bar k'nin şekli, kaynağın idx.shape[k]'inci barı
+        for series, perm in ((x, px), (y, py)):
+            base = [math.log(c.close / c.open) for c in series[11:]]
+            got = [math.log(c.close / c.open) for c in perm[11:]]
+            assert got == pytest.approx([base[i] for i in idx.shape], abs=1e-9)
+
+    def test_length_mismatch_raises(self):
+        idx = draw_permutation_index(10, seed=1)
+        with pytest.raises(ValueError, match="uzunluk"):
+            apply_permutation_index(_series(50), idx, start_index=10)
+
+    def test_draw_deterministic(self):
+        a = draw_permutation_index(30, seed=5, block_length=4)
+        b = draw_permutation_index(30, seed=5, block_length=4)
+        assert list(a.gap) == list(b.gap) and list(a.shape) == list(b.shape)
+
+
+class TestPValueExtras:
+    def test_inf_nulls_reproduce_audit_scenario(self):
+        null = [{"profit_factor": float("inf")}] * 50 + [{"profit_factor": 1.0}] * 50
+        out = compute_p_values({"profit_factor": 2.0}, null, ["profit_factor"])
+        row = out["metrics"]["profit_factor"]
+        assert row["count_at_least_as_extreme"] == 50
+        assert row["p_value"] == pytest.approx(51 / 101, abs=1e-6)
+        assert out["infinite_pf_nulls"] == 50
+
+    def test_inf_null_not_better_for_lower_is_better(self):
+        null = [{"max_drawdown": float("inf")}, {"max_drawdown": 5.0}]
+        row = compute_p_values({"max_drawdown": 6.0}, null, ["max_drawdown"])["metrics"]["max_drawdown"]
+        assert row["count_at_least_as_extreme"] == 1
+
+    def test_zero_trade_runs_excluded_from_winrate_pf_kept_in_pnl_dd(self):
+        null = (
+            [{"trades": 0, "winrate": 0.0, "profit_factor": 0.0,
+              "total_pnl": 0.0, "max_drawdown": 0.0}] * 2
+            + [{"trades": 5, "winrate": 40.0, "profit_factor": 1.0,
+                "total_pnl": 10.0, "max_drawdown": 8.0}] * 2
+        )
+        real = {"winrate": 50.0, "profit_factor": 2.0, "total_pnl": 5.0,
+                "max_drawdown": 3.0}
+        out = compute_p_values(real, null, ["winrate", "profit_factor",
+                                            "total_pnl", "max_drawdown"])
+        m = out["metrics"]
+        assert out["zero_trade_null_fraction"] == 0.5
+        assert m["winrate"]["n"] == 2 and m["profit_factor"]["n"] == 2
+        assert m["total_pnl"]["n"] == 4 and m["max_drawdown"]["n"] == 4
+        assert m["total_pnl"]["count_at_least_as_extreme"] == 2   # 10,10 >= 5
+        assert m["max_drawdown"]["count_at_least_as_extreme"] == 2  # 0,0 <= 3
+
+    def test_metadata_fields(self):
+        null = [{"total_pnl": 1.0}] * 4
+        out = compute_p_values({"total_pnl": 0.5}, null, ["total_pnl"],
+                               seed=123, block_length=6)
+        assert out["permutations"] == 4
+        assert out["seed"] == 123
+        assert out["block_length"] == 6
+        assert out["zero_trade_null_fraction"] == 0.0
+        assert out["primary_metric"] == "total_pnl"
+        assert "düzeltilmemiş" in out["multiplicity_note"]

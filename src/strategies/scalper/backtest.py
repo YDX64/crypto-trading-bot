@@ -64,6 +64,15 @@ from src.core.config import settings
 from src.core.logger import app_logger
 from src.strategies.scalper import kline_cache
 from src.strategies.scalper.data import KlineFetcher
+from src.strategies.scalper.funding import (
+    DEFAULT_FUNDING_FALLBACK_PCT,
+    SOURCE_FALLBACK,
+    SOURCE_HISTORICAL,
+    FundingSchedule,
+    funding_payment,
+    load_funding_schedule,
+    settlements_between,
+)
 from src.strategies.scalper.indicators import atr, chandelier_stop
 from src.strategies.scalper.entry_gates import (
     evaluate_entry_gates,
@@ -78,9 +87,10 @@ from src.strategies.scalper.permutation import (
     DEFAULT_METRICS as PERMUTATION_DEFAULT_METRICS,
     aggregate_from,
     clamp_shift_report,
+    _apply_index as _apply_permutation_index,  # ortak indeks + kelepçe istatistiği
     compute_p_values,
+    draw_permutation_index,
     merge_clamp_stats,
-    permute_candles,
 )
 from src.strategies.scalper.regime import detect_regime
 from src.strategies.scalper.scanner import UniverseScanner
@@ -210,6 +220,249 @@ def stressed_cfg(cfg: Any, multiplier: float) -> Any:
     for name, value in updates.items():
         setattr(clone, name, value)
     return clone
+
+# ==========================================================================
+# Gerçekçilik anahtarları (audit/eval-harness-fixes, paket A1+)
+# ==========================================================================
+# Harness'ın iyimser varsayımlarını kapatan özellikler. `--legacy-model` (ya
+# da tümünü `--disable-realism` ile kapatmak) bu işten ÖNCEKİ sayıları BİREBİR
+# üretir. Sonraki paketler (A2 maker giriş, A3 fonlama+likidasyon, A4 portföy)
+# kendi adlarını bu demete ekler.
+REALISM_FEATURES: Tuple[str, ...] = (
+    "gap_fills",       # stop/TP tetik fiyatı = mum açılışı (açılış ötedeyse)
+    "exit_slippage",   # her market-tipi çıkışta aleyhte kayma
+    "intrabar_path",   # TP sonrası taşınan stop yalnız TP'DEN SONRAKİ yolda sınanır
+    # A2 — maker (limit) giriş gerçekçiliği; YALNIZ scalper_entry_mode=maker'ı
+    # etkiler (taker çıktısı bu üçüyle DEĞİŞMEZ).
+    "maker_trade_through",  # limit yalnız fiyat limitin ÖTESİNE geçince dolar
+    "maker_fill_bar",       # dolum mumunda yalnız dolumdan SONRAKİ yol sayılır
+    "single_pending",       # bekleyen emir varken aynı sembole ikinci emir yok
+    # A3 — fonlama ve likidasyon (izole marj yaklaşımı)
+    "funding",              # 00/08/16 UTC funding'i açık miktar üzerinden tahsil et
+    "liquidation",          # stop likidasyon fiyatının ötesindeyse / boşlukta likide ol
+    # A4 — canlı günlük kayıp kesicisi (engine._update_kill_switch): UTC günü
+    # gerçekleşmiş PnL eşiği aşınca o günün kalan girişleri düşer.
+    "daily_latch",
+)
+
+# Maker trade-through eşiği, YÜZDE (0.01 = 1 baz puan = %0.01).
+DEFAULT_MAKER_TRADE_THROUGH_PCT = 0.01
+
+
+def normalize_disabled_realism(disabled: Any) -> frozenset:
+    """None / virgüllü metin / iterable → doğrulanmış kapalı-özellik kümesi.
+    Bilinmeyen ad ValueError'dır (yazım hatası sessizce 'gerçekçi' koşu
+    üretmesin)."""
+    if disabled is None:
+        return frozenset()
+    if isinstance(disabled, str):
+        names = [n.strip() for n in disabled.split(",") if n.strip()]
+    else:
+        names = [str(n).strip() for n in disabled if str(n).strip()]
+    unknown = [n for n in names if n not in REALISM_FEATURES]
+    if unknown:
+        raise ValueError(
+            f"Bilinmeyen gerçekçilik özelliği: {unknown}; geçerli: {list(REALISM_FEATURES)}"
+        )
+    return frozenset(names)
+
+
+@dataclass(frozen=True)
+class ExitRealism:
+    """Çıkış dolum modeli (bir koşu boyunca sabit). Varsayılan (alan
+    varsayılanları) = ESKİ model: boşluksuz, kaymasız, tam-mum stop testi."""
+    gap_fills: bool = False
+    exit_slippage_rate: float = 0.0
+    intrabar_path: bool = False
+
+
+LEGACY_EXIT_REALISM = ExitRealism()
+
+
+def build_exit_realism(
+    cfg: Any,
+    disabled: Any = None,
+    exit_slippage_rate: Optional[float] = None,
+) -> ExitRealism:
+    """Çıkış gerçekçilik ayarı. `exit_slippage_rate=None` → giriş kaymasıyla
+    aynı (`slippage_rate(cfg)`; `--fee-stress` zaten onu çarpar)."""
+    off = normalize_disabled_realism(disabled)
+    if exit_slippage_rate is None:
+        rate = slippage_rate(cfg)
+    else:
+        rate = float(exit_slippage_rate)
+        if rate < 0.0:
+            raise ValueError("Çıkış kayması negatif olamaz")
+    return ExitRealism(
+        gap_fills="gap_fills" not in off,
+        exit_slippage_rate=0.0 if "exit_slippage" in off else rate,
+        intrabar_path="intrabar_path" not in off,
+    )
+
+
+@dataclass(frozen=True)
+class MakerRealism:
+    """Maker giriş dolum modeli (bir koşu boyunca sabit). Varsayılan (alan
+    varsayılanları) = ESKİ model: temas = dolum, tam-mum, çoklu bekleyen emir."""
+    trade_through_rate: float = 0.0   # oran (0.0001 = 1 bp); 0 = yalnız temas
+    fill_bar_path: bool = False
+    single_pending: bool = False
+
+
+LEGACY_MAKER_REALISM = MakerRealism()
+
+
+def build_maker_realism(
+    disabled: Any = None,
+    maker_trade_through_pct: Optional[float] = None,
+) -> MakerRealism:
+    """`maker_trade_through_pct` YÜZDE (None → DEFAULT_MAKER_TRADE_THROUGH_PCT);
+    "maker_trade_through" kapalıysa oran 0 (eski temas-dolum)."""
+    off = normalize_disabled_realism(disabled)
+    pct = (
+        DEFAULT_MAKER_TRADE_THROUGH_PCT if maker_trade_through_pct is None
+        else float(maker_trade_through_pct)
+    )
+    if pct < 0.0:
+        raise ValueError("Maker trade-through yüzdesi negatif olamaz")
+    return MakerRealism(
+        trade_through_rate=0.0 if "maker_trade_through" in off else pct / 100.0,
+        fill_bar_path="maker_fill_bar" not in off,
+        single_pending="single_pending" not in off,
+    )
+
+
+def maker_orders_report(stats: Optional[Dict[str, int]]) -> Dict[str, Any]:
+    """JSON raporundaki "maker_orders": verilen/dolan/zaman aşımına uğrayan
+    maker emirleri ve dolum oranı (emir yoksa None = ölçülmedi)."""
+    s = stats or {}
+    placed = int(s.get("placed", 0))
+    filled = int(s.get("filled", 0))
+    return {
+        "placed": placed,
+        "filled": filled,
+        "timed_out": int(s.get("timed_out", 0)),
+        "fill_rate": (filled / placed) if placed > 0 else None,
+    }
+
+
+def realism_report(
+    cfg: Any,
+    disabled: Any = None,
+    exit_slippage_rate: Optional[float] = None,
+    maker_trade_through_pct: Optional[float] = None,
+    funding_fallback_pct: Optional[float] = None,
+    funding_cache_dir: Optional[str | Path] = None,
+) -> Dict[str, Any]:
+    """JSON raporundaki "realism" nesnesi: açık/kapalı özellikler + sayılar."""
+    off = normalize_disabled_realism(disabled)
+    if exit_slippage_rate is None:
+        rate = slippage_rate(cfg)
+    else:
+        rate = float(exit_slippage_rate)
+    return {
+        "enabled": [f for f in REALISM_FEATURES if f not in off],
+        "disabled": [f for f in REALISM_FEATURES if f in off],
+        "parameters": {
+            "exit_slippage_rate": rate,
+            "maker_trade_through_pct": (
+                DEFAULT_MAKER_TRADE_THROUGH_PCT if maker_trade_through_pct is None
+                else float(maker_trade_through_pct)
+            ),
+            "funding_fallback_pct": (
+                DEFAULT_FUNDING_FALLBACK_PCT if funding_fallback_pct is None
+                else float(funding_fallback_pct)
+            ),
+            "funding_cache_dir": (
+                None if funding_cache_dir is None else str(funding_cache_dir)
+            ),
+        },
+    }
+
+
+# --------------------------------------------------------------------------
+# A3 — likidasyon (izole marj yaklaşımı) ve funding ayarı
+# --------------------------------------------------------------------------
+
+# Binance USDⓈ-M TIER-1 bakım marjı oranları (YAKLAŞIK: tier'lar notional'a
+# göre değişir; harness tier-1'i tüm pozisyona uygular). Tabloda olmayan
+# sembol için varsayılan.
+MAINTENANCE_MARGIN_RATES: Dict[str, float] = {
+    "BTCUSDT": 0.004,
+    "ETHUSDT": 0.005,
+}
+DEFAULT_MAINTENANCE_MARGIN_RATE = 0.0065
+
+
+def maintenance_margin_rate(symbol: str) -> float:
+    return MAINTENANCE_MARGIN_RATES.get(str(symbol).upper(), DEFAULT_MAINTENANCE_MARGIN_RATE)
+
+
+def liquidation_price(
+    entry_price: float, leverage: int, direction: Direction, mmr: float
+) -> float:
+    """İzole marj yaklaşımı: LONG entry*(1-1/lev+mmr), SHORT entry*(1+1/lev-mmr)."""
+    lev = max(1, int(leverage))
+    if direction == Direction.LONG:
+        return entry_price * (1.0 - 1.0 / lev + mmr)
+    return entry_price * (1.0 + 1.0 / lev - mmr)
+
+
+@dataclass(frozen=True)
+class RiskRealism:
+    """Funding + likidasyon modeli (bir koşu boyunca sabit). Alan
+    varsayılanları = ESKİ model (ikisi de kapalı)."""
+    funding: bool = False
+    liquidation: bool = False
+    funding_fallback_rate: float = DEFAULT_FUNDING_FALLBACK_PCT / 100.0  # 8 saatlik oran
+    funding_cache_dir: Optional[str] = None
+    _schedules: Dict[str, FundingSchedule] = field(
+        default_factory=dict, compare=False, repr=False
+    )
+
+    def schedule_for(self, symbol: str) -> Optional[FundingSchedule]:
+        """Sembolün funding takvimi (dosya bir kez okunur); funding kapalıysa None."""
+        if not self.funding:
+            return None
+        key = str(symbol).upper()
+        sched = self._schedules.get(key)
+        if sched is None:
+            sched = load_funding_schedule(key, self.funding_cache_dir, self.funding_fallback_rate)
+            self._schedules[key] = sched
+        return sched
+
+
+LEGACY_RISK_REALISM = RiskRealism()
+
+
+def build_risk_realism(
+    disabled: Any = None,
+    funding_fallback_pct: Optional[float] = None,
+    funding_cache_dir: Optional[str | Path] = None,
+) -> RiskRealism:
+    """`funding_fallback_pct` YÜZDE / 8 saat (None → 0.01). Önbellek dizini
+    verilmezse tarihsel oran okunmaz (tamamı yedek oran; testler hermetik)."""
+    off = normalize_disabled_realism(disabled)
+    pct = (
+        DEFAULT_FUNDING_FALLBACK_PCT if funding_fallback_pct is None
+        else float(funding_fallback_pct)
+    )
+    return RiskRealism(
+        funding="funding" not in off,
+        liquidation="liquidation" not in off,
+        funding_fallback_rate=pct / 100.0,
+        funding_cache_dir=None if funding_cache_dir is None else str(funding_cache_dir),
+    )
+
+
+def intrabar_path(c: Candle) -> Tuple[float, float, float, float]:
+    """Mum içi VARSAYILAN fiyat sırası: yükselen mum (close >= open) önce
+    dibe, sonra tepeye gider; düşen mum tersine. OHLC bunu kanıtlayamaz —
+    tek tutarlı varsayımdır ve tüm TP-sonrası kararlar bunu kullanır."""
+    if c.close >= c.open:
+        return (c.open, c.low, c.high, c.close)
+    return (c.open, c.high, c.low, c.close)
+
 
 _DEFAULT_VIRTUAL_BALANCE = 10_000.0
 _AUTO_UNIVERSE_TOP_N = 8
@@ -428,6 +681,11 @@ class LeaderSeries:
     intraday_open_times: List[int] = field(default_factory=list)
     intraday_opens: List[float] = field(default_factory=list)
     intraday_close_times: List[int] = field(default_factory=list)
+    # A4 — HAM mumlar (yalnız permütasyon sürücüsü okur; `inputs_at` kullanmaz).
+    # Verilmezse lider permüte EDİLEMEZ, gerçek kalır (rapora yazılır).
+    entry_candles: Optional[List[Candle]] = field(default=None, repr=False, compare=False)
+    daily_candles: Optional[List[Candle]] = field(default=None, repr=False, compare=False)
+    intraday_candles: Optional[List[Candle]] = field(default=None, repr=False, compare=False)
 
     def inputs_at(
         self, cutoff_ms: int
@@ -530,6 +788,9 @@ async def gather_leader_series(
         intraday_open_times=[c.open_time for c in intraday_candles],
         intraday_opens=[c.open for c in intraday_candles],
         intraday_close_times=[c.close_time for c in intraday_candles],
+        entry_candles=list(entry_candles),
+        daily_candles=list(daily_candles),
+        intraday_candles=list(intraday_candles),
     )
 
 
@@ -649,6 +910,23 @@ class OpenPosition:
     # o barın kapanışında pozisyonun net K/Z'si). YALNIZ ÖLÇÜM; hiçbir
     # çıkış/stop/boyut kararı bunu okumaz (bkz. `_mark_equity`).
     equity_marks: List[Tuple[int, float]] = field(default_factory=list)
+    # Çıkış dolum modeli. DOĞRUDAN kurulan OpenPosition ESKİ modeldir;
+    # `open_position()` koşunun modelini buraya yazar.
+    exit_realism: ExitRealism = LEGACY_EXIT_REALISM
+    # maker_fill_bar: limit dolum tetiği (LONG L*(1-tt), SHORT L*(1+tt)).
+    # None (varsayılan / taker / özellik kapalı) → dolum mumu TAM sayılır.
+    fill_bar_trigger: Optional[float] = None
+    # A3 — bar-içi AŞIRI UÇTA işaretlenen özkaynak (YALNIZ ÖLÇÜM; bkz.
+    # `_mark_equity`): LONG için low, SHORT için high.
+    equity_marks_adverse: List[Tuple[int, float]] = field(default_factory=list)
+    # A3 — funding. `funding_schedule=None` → funding yok (eski model).
+    funding_schedule: Optional[FundingSchedule] = None
+    funding_paid: float = 0.0            # + = ödenen, - = alınan (USD)
+    funding_events: List[Dict[str, Any]] = field(default_factory=list)
+    funding_cursor: Optional[int] = None  # son işlenen mum open_time'ı
+    # A3 — likidasyon. `liq_price=None` → likidasyon yok (eski model).
+    liq_price: Optional[float] = None
+    stop_beyond_liq: bool = False        # açılışta stop likidasyonun ÖTESİNDEydi
 
     def __post_init__(self) -> None:
         self.remaining_qty = self.qty_total
@@ -689,11 +967,19 @@ class BacktestTrade:
     # JSON raporunu megabaytlara şişirir ve rapor tüketicileri (pano,
     # ledger_report) bunu okumaz — seri `bar_equity_series` ile TÜREVİLİR.
     equity_marks: List[Tuple[int, float]] = field(default_factory=list)
+    # A3 — bar-içi aşırı uçta işaretler (to_dict DIŞINDA, aynı gerekçe).
+    equity_marks_adverse: List[Tuple[int, float]] = field(default_factory=list)
+    # A3 — funding (pnl'e DAHİL; + = ödenen) ve likidasyon alanları.
+    funding: float = 0.0
+    funding_settlements: int = 0
+    funding_historical: int = 0
+    funding_fallback: int = 0
+    stop_beyond_liq: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         d = {
             k: v for k, v in self.__dict__.items()
-            if k not in ("exit_idx", "equity_marks")
+            if k not in ("exit_idx", "equity_marks", "equity_marks_adverse")
         }
         return d
 
@@ -701,11 +987,17 @@ class BacktestTrade:
 def _find_maker_fill(
     signal: ScalpSignal, candles_5m: List[Candle], signal_idx: int, cfg: Any,
     entry_delay_candles: int = 0,
+    trade_through_rate: float = 0.0,
 ) -> Optional[tuple]:
     """Maker giriş modu: LIMIT fiyatı = sinyal mumunun kapanışı. Sonraki
     `scalper_maker_fill_timeout_candles` mum içinde fiyat limite değerse
     (LONG: mum.low <= limit; SHORT: mum.high >= limit) ilk değen mumda,
     kaymasız, limit fiyatından dolum sayılır.
+
+    `trade_through_rate` (A2, varsayılan 0 = yalnız temas, eski davranış):
+    emir kuyruğun ARKASINDA durur; yalnız fiyat limitin ötesine `tt` oranında
+    geçerse (LONG low <= L*(1-tt), SHORT high >= L*(1+tt)) dolar. Dolum
+    fiyatı yine L'dir.
 
     `entry_delay_candles` (D24/A5 çürütme koşusu, varsayılan 0) emrin borsaya
     N mum GEÇ ulaştığı senaryoyu simüle eder: tarama penceresi N mum kayar,
@@ -723,8 +1015,9 @@ def _find_maker_fill(
             break
         c = candles_5m[idx]
         touched = (
-            c.low <= limit_price if signal.direction == Direction.LONG
-            else c.high >= limit_price
+            c.low <= limit_price * (1.0 - trade_through_rate)
+            if signal.direction == Direction.LONG
+            else c.high >= limit_price * (1.0 + trade_through_rate)
         )
         if touched:
             return idx, limit_price
@@ -740,6 +1033,10 @@ def open_position(
     balance: float = _DEFAULT_VIRTUAL_BALANCE,
     missed_counter: Optional[Dict[str, int]] = None,
     entry_delay_candles: int = 0,
+    exit_realism: Optional[ExitRealism] = None,
+    maker_realism: Optional[MakerRealism] = None,
+    maker_stats: Optional[Dict[str, int]] = None,
+    risk_realism: Optional[RiskRealism] = None,
 ) -> Optional[OpenPosition]:
     """Sinyalden pozisyon kurar: risk bazlı boyutlama + stop mesafesi kapısı
     + dolum simülasyonu. Kapı geçilmezse None döner (işlem yok).
@@ -754,6 +1051,8 @@ def open_position(
     - "maker": LIMIT emri simülasyonu (bkz. _find_maker_fill) — timeout
       içinde dolmazsa sinyal SESSİZCE iptal edilir; `missed_counter`
       verilmişse (mutasyonla) sayaç artırılır, işlem raporlanabilsin diye.
+      `maker_stats` verilirse {"placed","filled","timed_out"} sayaçları
+      (mutasyonla) güncellenir. `maker_realism=None` → tam maker gerçekçiliği.
     """
     entry_hint = signal.entry_price
     stop_price = signal.stop_price
@@ -794,15 +1093,32 @@ def open_position(
     entry_mode = getattr(cfg, "scalper_entry_mode", "taker")
 
     delay = max(0, int(entry_delay_candles or 0))
+    fill_bar_trigger: Optional[float] = None
     if entry_mode == "maker":
+        mk = maker_realism if maker_realism is not None else build_maker_realism()
+        if maker_stats is not None:
+            for key in ("placed", "filled", "timed_out"):
+                maker_stats.setdefault(key, 0)
+            maker_stats["placed"] += 1
         fill = _find_maker_fill(
             signal, candles_5m, signal_idx, cfg, entry_delay_candles=delay,
+            trade_through_rate=mk.trade_through_rate,
         )
         if fill is None:
             if missed_counter is not None:
                 missed_counter["maker_missed"] = missed_counter.get("maker_missed", 0) + 1
+            if maker_stats is not None:
+                maker_stats["timed_out"] = maker_stats.get("timed_out", 0) + 1
             return None
         entry_idx, entry_price = fill
+        if maker_stats is not None:
+            maker_stats["filled"] = maker_stats.get("filled", 0) + 1
+        if mk.fill_bar_path:
+            fill_bar_trigger = (
+                entry_price * (1.0 - mk.trade_through_rate)
+                if signal.direction == Direction.LONG
+                else entry_price * (1.0 + mk.trade_through_rate)
+            )
         entry_commission_rate = cfg.scalper_maker_fee_pct / 100.0
     else:
         if signal_idx + 1 + delay >= len(candles_5m):
@@ -841,6 +1157,20 @@ def open_position(
     )
     entry_candle = candles_5m[entry_idx]
 
+    # A3: None → tam gerçekçilik (funding yedek oranla, likidasyon açık).
+    risk = risk_realism if risk_realism is not None else build_risk_realism()
+    liq_price: Optional[float] = None
+    stop_beyond_liq = False
+    if risk.liquidation:
+        liq_price = liquidation_price(
+            entry_price, leverage, signal.direction,
+            maintenance_margin_rate(signal.symbol),
+        )
+        stop_beyond_liq = (
+            stop_price < liq_price if signal.direction == Direction.LONG
+            else stop_price > liq_price
+        )
+
     tp1_price = price_at_roi(entry_price, cfg.scalper_tp1_roi, leverage, signal.direction)
     tp2_price = price_at_roi(entry_price, cfg.scalper_tp2_roi, leverage, signal.direction)
     tp1_qty = qty * cfg.scalper_tp1_fraction
@@ -876,6 +1206,41 @@ def open_position(
         entry_commission_rate=entry_commission_rate,
         exit_commission_rate=exit_commission_rate,
         signal_close_time=candles_5m[signal_idx].close_time,
+        # None → tam gerçekçi çıkış modeli (varsayılan kayma = giriş kayması).
+        exit_realism=(
+            exit_realism if exit_realism is not None else build_exit_realism(cfg)
+        ),
+        fill_bar_trigger=fill_bar_trigger,
+        funding_schedule=risk.schedule_for(signal.symbol),
+        liq_price=liq_price,
+        stop_beyond_liq=stop_beyond_liq,
+    )
+
+
+def _post_fill_candle(c: Candle, direction: Direction, trigger: float) -> Candle:
+    """Maker dolum mumunun DOLUMDAN SONRAKİ görünümü: mum-içi yol
+    (`intrabar_path`) tetik seviyesini ilk kestiği noktadan itibaren kısaltılır;
+    open = tetik (mum zaten ötede açıldıysa gerçek open), high/low = kalan yolun
+    uçları, close aynı. LONG'da low her zaman dolum ANINDA ya da SONRASINDA gelir;
+    high yalnız low'dan SONRA geliyorsa kalır. Yol tetiği kesmiyorsa (tutarsız
+    veri) mum aynen döner."""
+    pts = intrabar_path(c)
+    long_ = direction == Direction.LONG
+    if (c.open <= trigger) if long_ else (c.open >= trigger):
+        remaining = list(pts)  # açılışta zaten ötede: yolun TAMAMI dolum sonrası
+    else:
+        remaining = None
+        for k in range(len(pts) - 1):
+            p0, p1 = pts[k], pts[k + 1]
+            if min(p0, p1) <= trigger <= max(p0, p1):
+                remaining = [trigger] + list(pts[k + 1:])
+                break
+        if remaining is None:
+            return c
+    return Candle(
+        open_time=c.open_time, open=remaining[0], high=max(remaining),
+        low=min(remaining), close=c.close, volume=c.volume,
+        close_time=c.close_time,
     )
 
 
@@ -885,6 +1250,113 @@ def _is_hit(c: Candle, level: float, direction: Direction, is_stop: bool) -> boo
     if direction == Direction.LONG:
         return (c.low <= level) if is_stop else (c.high >= level)
     return (c.high >= level) if is_stop else (c.low <= level)
+
+
+def _apply_exit_slippage(pos: OpenPosition, price: float) -> float:
+    """Market-tipi çıkışta aleyhte kayma: LONG satar (aşağı), SHORT geri alır
+    (yukarı). Maker (limit) dolumlarda ÇAĞRILMAZ."""
+    s = pos.exit_realism.exit_slippage_rate
+    if s <= 0.0:
+        return price
+    if pos.direction == Direction.LONG:
+        return price * (1.0 - s)
+    return price * (1.0 + s)
+
+
+def _stop_fill_price(
+    pos: OpenPosition, c: Candle, stop: float, allow_gap: bool = True
+) -> float:
+    """STOP_MARKET dolumu: mum stopun ÖTESİNDE açıldıysa tetik = açılış,
+    değilse stop. `allow_gap=False` — stop bu mum İÇİNDE (TP dolumundan sonra)
+    taşındıysa açılışta henüz yoktu; açılışa düşülemez."""
+    trigger = stop
+    if pos.exit_realism.gap_fills and allow_gap:
+        if pos.direction == Direction.LONG:
+            if c.open <= stop:
+                trigger = c.open
+        elif c.open >= stop:
+            trigger = c.open
+    return _apply_exit_slippage(pos, trigger)
+
+
+def _tp_fill_price(pos: OpenPosition, c: Candle, level: float) -> float:
+    """TAKE_PROFIT_MARKET (canlıda `place_take_profit`, binance_client_improved)
+    tetikte market dolar: mum hedefin ötesinde açıldıysa açılışta (lehte
+    boşluk), kayma aleyhte. Limit DEĞİL — bu yüzden kayma uygulanır."""
+    trigger = level
+    if pos.exit_realism.gap_fills:
+        if pos.direction == Direction.LONG:
+            if c.open >= level:
+                trigger = c.open
+        elif c.open <= level:
+            trigger = c.open
+    return _apply_exit_slippage(pos, trigger)
+
+
+def _path_after_touch(
+    pos: OpenPosition, c: Candle, touch_level: float, direction: Direction
+) -> Optional[List[float]]:
+    """`touch_level`e değdikten SONRAKİ mum-içi yol noktaları (ilk nokta
+    dokunuş seviyesi ya da, açılış zaten ötedeyse, açılış). Seviye yolda
+    bulunamazsa None (tutarsız veri)."""
+    pts = intrabar_path(c)
+    long_ = direction == Direction.LONG
+    if (c.open >= touch_level) if long_ else (c.open <= touch_level):
+        return list(pts)  # açılışta zaten ötede: yolun TAMAMI sonrası
+    for p0, p1 in zip(pts, pts[1:]):
+        if min(p0, p1) <= touch_level <= max(p0, p1):
+            i = pts.index(p1)
+            return [touch_level] + list(pts[i:])
+    return None
+
+
+def _stop_hit_after_touch(
+    pos: OpenPosition, c: Candle, touch_level: float, stop: float, direction: Direction
+) -> bool:
+    """TP seviyesine değildikten SONRAKİ mum-içi yolda `stop`a değilir mi?
+    (`intrabar_path` açıkken; kapalıyken tam-mum testi `_is_hit`.)"""
+    if not pos.exit_realism.intrabar_path:
+        return _is_hit(c, stop, direction, is_stop=True)
+    remaining = _path_after_touch(pos, c, touch_level, direction)
+    if remaining is None:  # tutarsız veri: tam-mum (muhafazakâr)
+        return _is_hit(c, stop, direction, is_stop=True)
+    if direction == Direction.LONG:
+        return min(remaining) <= stop
+    return max(remaining) >= stop
+
+
+def _tp_before_stop_after_touch(
+    pos: OpenPosition, c: Candle, touch_level: float, tp_level: float,
+    stop: float, direction: Direction,
+) -> bool:
+    """`touch_level`e (TP1) değdikten sonraki yolda `tp_level` (TP2) `stop`tan
+    (BE) ÖNCE mi değiyor? Yalnız `intrabar_path` açıkken; aynı parçada ikisi de
+    değiyorsa ya da veri tutarsızsa stop ÖNCE (kötümser)."""
+    if not pos.exit_realism.intrabar_path:
+        return False
+    remaining = _path_after_touch(pos, c, touch_level, direction)
+    if not remaining:
+        return False
+    long_ = direction == Direction.LONG
+
+    def stop_in(lo: float, hi: float) -> bool:
+        return lo <= stop if long_ else hi >= stop
+
+    def tp_in(lo: float, hi: float) -> bool:
+        return hi >= tp_level if long_ else lo <= tp_level
+
+    first = remaining[0]
+    if stop_in(first, first):
+        return False
+    if tp_in(first, first):
+        return True
+    for p0, p1 in zip(remaining, remaining[1:]):
+        lo, hi = min(p0, p1), max(p0, p1)
+        if stop_in(lo, hi):
+            return False
+        if tp_in(lo, hi):
+            return True
+    return False
 
 
 def _leg_pnl(pos: OpenPosition, qty: float, exit_price: float) -> float:
@@ -911,18 +1383,63 @@ def _close_remaining(pos: OpenPosition, price: float, close_time: int, reason: s
     pos.exit_time = close_time
 
 
+def _liquidation_hit(pos: OpenPosition, c: Candle, direction: Direction) -> bool:
+    """İzole likidasyon: (a) mum likidasyonun ÖTESİNDE açıldı (boşluk), ya da
+    (b) aşırı uç likidasyona değdi VE stop likidasyonun ötesinde (fiyat stopa
+    varmadan önce likidasyona varır). Stop içerideyse fiyat önce stopa değer →
+    likidasyon yok."""
+    liq = pos.liq_price
+    if liq is None or pos.remaining_qty <= 1e-12:
+        return False
+    if direction == Direction.LONG:
+        return c.open <= liq or (c.low <= liq and pos.current_stop < liq)
+    return c.open >= liq or (c.high >= liq and pos.current_stop > liq)
+
+
+def _liquidate(pos: OpenPosition, c: Candle, direction: Direction) -> None:
+    """Kalan miktarın MARJI kadar zarar; dolum = boşlukta açılış, yoksa
+    likidasyon fiyatı. Komisyon/kayma yok (marj zaten tamamen gider)."""
+    liq = float(pos.liq_price)
+    price = c.open if (
+        (direction == Direction.LONG and c.open <= liq)
+        or (direction == Direction.SHORT and c.open >= liq)
+    ) else liq
+    qty = pos.remaining_qty
+    margin = qty * pos.entry_price / pos.leverage if pos.leverage else qty * pos.entry_price
+    pos.legs.append({"label": "LIQUIDATION", "quantity": qty, "price": price, "pnl": -margin})
+    pos.remaining_qty = 0.0
+    pos.exit_reason = "LIQUIDATION"
+    pos.exit_price = price
+    pos.exit_time = c.close_time
+
+
 def _process_candle_exits(pos: OpenPosition, c: Candle, direction: Direction) -> bool:
     """Bir mum için çıkış kurallarını uygular. Pozisyon TAMAMEN kapandıysa
     True döner.
 
     AŞAMA A (TP1 dolmadan): ilk stop VS TP1. Aynı mumda ikisi de değindiyse
     SL ÖNCE sayılır (kötümser) — TP1 kısmi dolumu OLMAZ, tüm miktar SL'de
-    kapanır.
+    kapanır. Bu eşitlik kuralı BİLEREK muhafazakârdır (mum-içi sıra
+    bilinmez) ve `intrabar_path` ile değiştirilmez.
     AŞAMA B (TP1 dolduktan sonra — aynı mumda devam edebilir): current_stop
     (break-even veya sonrasında chandelier trail) TÜM kalan miktarı korur;
     TP2 henüz dolmadıysa bağımsız sabit hedef olarak aynı anda izlenir. Yine
     aynı mumda ikisi de değindiyse SL/trail ÖNCE sayılır.
+    `intrabar_path` açıkken TP dolumuyla TAŞINAN stop (BE / TP1 tabanı) yalnız
+    TP'ye değdikten SONRAKİ yolda sınanır; kapalıyken eski tam-mum testi.
+    Aynı mumda TP1 dolduysa ve `intrabar_path` açıksa TP2 ile BE stopu arasındaki
+    sıra yoldan okunur: TP2 stoptan önce değiyorsa TP2 dolar (sonra TP1 tabanı
+    TP2-sonrası yolda sınanır). Yalnız ilk stop-vs-TP1 eşitliği sabit SL-önce.
     """
+    # A3: likidasyon her şeyden ÖNCE (stop-vs-TP1 eşitliğindeki kötümser kural
+    # ile aynı yönde: belirsizlikte zarar sayılır).
+    if _liquidation_hit(pos, c, direction):
+        _liquidate(pos, c, direction)
+        return True
+
+    # TP1 bu mumda mı doldu? (taşınan BE stopu bu mumda doğdu → açılışa
+    # düşme yok, yolun TP-sonrası kısmı sınanır)
+    tp1_this_bar = False
     if not pos.tp1_filled:
         sl_hit = _is_hit(c, pos.current_stop, direction, is_stop=True)
         tp1_hit = _is_hit(c, pos.tp1_price, direction, is_stop=False)
@@ -933,13 +1450,14 @@ def _process_candle_exits(pos: OpenPosition, c: Candle, direction: Direction) ->
             # bir kayıptır — E9 ölçümünde ayrı sayılabilsin. Bayrak varsayılan
             # False olduğundan kapalı yapılandırmada davranış birebir aynıdır.
             _close_remaining(
-                pos, pos.current_stop, c.close_time,
+                pos, _stop_fill_price(pos, c, pos.current_stop), c.close_time,
                 "STRUCT_BE" if pos.structure_be_applied else "SL",
             )
             return True
         if tp1_hit:
-            _fill_leg(pos, pos.tp1_qty, pos.tp1_price, "TP1")
+            _fill_leg(pos, pos.tp1_qty, _tp_fill_price(pos, c, pos.tp1_price), "TP1")
             pos.tp1_filled = True
+            tp1_this_bar = True
             pos.current_stop = pos.breakeven_price
             pos.trailing_active = True
 
@@ -947,17 +1465,36 @@ def _process_candle_exits(pos: OpenPosition, c: Candle, direction: Direction) ->
         return True
 
     if pos.tp1_filled:
-        sl_hit = _is_hit(c, pos.current_stop, direction, is_stop=True)
+        if tp1_this_bar:
+            sl_hit = _stop_hit_after_touch(
+                pos, c, pos.tp1_price, pos.current_stop, direction
+            )
+        else:
+            sl_hit = _is_hit(c, pos.current_stop, direction, is_stop=True)
         tp2_hit = (
             not pos.tp2_filled and pos.tp2_qty > 0
             and _is_hit(c, pos.tp2_price, direction, is_stop=False)
         )
 
+        if (
+            sl_hit and tp2_hit and tp1_this_bar
+            and _tp_before_stop_after_touch(
+                pos, c, pos.tp1_price, pos.tp2_price, pos.current_stop, direction
+            )
+        ):
+            # TP1 sonrası yolda TP2, BE stopundan ÖNCE değiyor → TP2 dolar;
+            # yükselen taban (TP1) aşağıdaki TP2 dalında TP2-sonrası yolda sınanır.
+            sl_hit = False
+
         if sl_hit:
-            _close_remaining(pos, pos.current_stop, c.close_time, "TRAIL")
+            _close_remaining(
+                pos,
+                _stop_fill_price(pos, c, pos.current_stop, allow_gap=not tp1_this_bar),
+                c.close_time, "TRAIL",
+            )
             return True
         if tp2_hit:
-            _fill_leg(pos, pos.tp2_qty, pos.tp2_price, "TP2")
+            _fill_leg(pos, pos.tp2_qty, _tp_fill_price(pos, c, pos.tp2_price), "TP2")
             pos.tp2_filled = True
             # Live ExitManager raises the remaining runner's floor to TP1
             # after a proven TP2 fill, while preserving any tighter stop.
@@ -966,14 +1503,16 @@ def _process_candle_exits(pos: OpenPosition, c: Candle, direction: Direction) ->
                 if direction == Direction.LONG
                 else min(pos.current_stop, pos.tp1_price)
             )
-            # As for TP1 -> BE above, an OHLC bar cannot establish whether
-            # its pullback preceded or followed TP2. Apply the same
-            # pessimistic convention; otherwise a next-bar gap could let a
-            # runner escape a floor already crossed in this bar.
-            if pos.remaining_qty > 1e-12 and _is_hit(
-                c, pos.current_stop, direction, is_stop=True
+            # Taşınan taban TP2'ye değdikten SONRAKİ yolda sınanır
+            # (`intrabar_path` kapalıyken eski tam-mum kötümser testi).
+            if pos.remaining_qty > 1e-12 and _stop_hit_after_touch(
+                pos, c, pos.tp2_price, pos.current_stop, direction
             ):
-                _close_remaining(pos, pos.current_stop, c.close_time, "TRAIL")
+                _close_remaining(
+                    pos,
+                    _stop_fill_price(pos, c, pos.current_stop, allow_gap=False),
+                    c.close_time, "TRAIL",
+                )
                 return True
 
     return pos.remaining_qty <= 1e-12
@@ -999,10 +1538,56 @@ def _mark_equity(pos: OpenPosition, c: Candle) -> None:
     if pos.remaining_qty > 1e-12:
         realized += _leg_pnl(pos, pos.remaining_qty, c.close)
     realized -= pos.entry_commission_rate * pos.qty_total * pos.entry_price
+    realized -= pos.funding_paid
+    # A3: aynı işaret AŞIRI UÇ fiyatında (LONG low / SHORT high). Kapanışta
+    # kalan miktar yoksa kapanış işaretiyle aynıdır; min() geçersiz mum
+    # verisinde bile "aşırı uç <= kapanış" değişmezini korur.
+    adverse = realized
+    if pos.remaining_qty > 1e-12:
+        worst = c.low if pos.direction == Direction.LONG else c.high
+        adverse = min(
+            realized,
+            realized
+            - _leg_pnl(pos, pos.remaining_qty, c.close)
+            + _leg_pnl(pos, pos.remaining_qty, worst),
+        )
     if pos.equity_marks and pos.equity_marks[-1][0] == c.close_time:
         pos.equity_marks[-1] = (c.close_time, realized)
     else:
         pos.equity_marks.append((c.close_time, realized))
+    if pos.equity_marks_adverse and pos.equity_marks_adverse[-1][0] == c.close_time:
+        pos.equity_marks_adverse[-1] = (c.close_time, adverse)
+    else:
+        pos.equity_marks_adverse.append((c.close_time, adverse))
+
+
+def _charge_funding(pos: OpenPosition, candles_5m: List[Candle], idx: int) -> None:
+    """Bu mumun BAŞINDA (çıkışlar işlenmeden) `cursor < T <= mum open_time`
+    olan her funding anını, o anda AÇIK miktar üzerinden tahsil et.
+    Fiyat: T'de başlayan mumun open'ı, yoksa T'den önceki son kapanış."""
+    sched = pos.funding_schedule
+    if sched is None:
+        return
+    c = candles_5m[idx]
+    if pos.funding_cursor is None:
+        pos.funding_cursor = pos.entry_time
+    due = settlements_between(pos.funding_cursor, c.open_time)
+    pos.funding_cursor = max(pos.funding_cursor, c.open_time)
+    for t in due:
+        qty = pos.remaining_qty
+        if qty <= 1e-12:
+            break
+        if t == c.open_time or idx == 0:
+            price = c.open
+        else:
+            price = candles_5m[idx - 1].close
+        rate, source = sched.rate_at(t)
+        payment = funding_payment(pos.direction == Direction.LONG, qty, price, rate)
+        pos.funding_paid += payment
+        pos.funding_events.append({
+            "time": t, "price": price, "rate": rate, "quantity": qty,
+            "payment": payment, "source": source,
+        })
 
 
 def _update_trailing(pos: OpenPosition, candles_5m: List[Candle], idx: int, cfg: Any) -> None:
@@ -1060,6 +1645,7 @@ def _finalize_trade(pos: OpenPosition, exit_idx: int, candles_5m: List[Candle]) 
     total_pnl = sum(leg["pnl"] for leg in pos.legs)
     entry_commission = pos.entry_commission_rate * pos.qty_total * pos.entry_price
     total_pnl -= entry_commission
+    total_pnl -= pos.funding_paid
 
     margin = (pos.qty_total * pos.entry_price / pos.leverage) if pos.leverage else pos.qty_total * pos.entry_price
     roi_pct = (total_pnl / margin * 100.0) if margin > 0 else 0.0
@@ -1088,6 +1674,16 @@ def _finalize_trade(pos: OpenPosition, exit_idx: int, candles_5m: List[Candle]) 
         signal_close_time=pos.signal_close_time,
         legs=pos.legs,
         equity_marks=list(pos.equity_marks),
+        equity_marks_adverse=list(pos.equity_marks_adverse),
+        funding=pos.funding_paid,
+        funding_settlements=len(pos.funding_events),
+        funding_historical=sum(
+            1 for e in pos.funding_events if e["source"] == SOURCE_HISTORICAL
+        ),
+        funding_fallback=sum(
+            1 for e in pos.funding_events if e["source"] == SOURCE_FALLBACK
+        ),
+        stop_beyond_liq=pos.stop_beyond_liq,
     )
 
 
@@ -1154,8 +1750,14 @@ def manage_position(
 
     for idx in range(pos.entry_idx, n):
         c = candles_5m[idx]
+        if idx == pos.entry_idx and pos.fill_bar_trigger is not None:
+            # maker_fill_bar: dolum mumunda yalnız dolum SONRASI yol sayılır
+            # (TP, stop, MFE, MAE). Zincirleme izleyici (chandelier) hâlâ
+            # gerçek mumu görür — bkz. rapor notu.
+            c = _post_fill_candle(c, pos.direction, pos.fill_bar_trigger)
         _update_mae_mfe(pos, c, pos.direction, pos.leverage)
 
+        _charge_funding(pos, candles_5m, idx)
         closed = _process_candle_exits(pos, c, pos.direction)
         if closed:
             exit_idx = idx
@@ -1178,7 +1780,9 @@ def manage_position(
                 cfg,
             )
             if action == "close":
-                _close_remaining(pos, c.close, c.close_time, "CHOCH")
+                _close_remaining(
+                    pos, _apply_exit_slippage(pos, c.close), c.close_time, "CHOCH"
+                )
                 exit_idx = idx
                 _mark_equity(pos, c)
                 break
@@ -1207,7 +1811,10 @@ def manage_position(
                 pos.entry_price, c.close, pos.leverage, pos.direction
             ),
         ):
-            _close_remaining(pos, c.close, c.close_time, EXIT_REASON_STALE_TP)
+            _close_remaining(
+                pos, _apply_exit_slippage(pos, c.close), c.close_time,
+                EXIT_REASON_STALE_TP,
+            )
             exit_idx = idx
             _mark_equity(pos, c)
             break
@@ -1219,7 +1826,9 @@ def manage_position(
             and not pos.trailing_active
             and age_ms >= max_hold_h * 3_600_000.0
         ):
-            _close_remaining(pos, c.close, c.close_time, "REAPER")
+            _close_remaining(
+                pos, _apply_exit_slippage(pos, c.close), c.close_time, "REAPER"
+            )
             exit_idx = idx
             _mark_equity(pos, c)
             break
@@ -1227,7 +1836,9 @@ def manage_position(
     else:
         exit_idx = n - 1
         last = candles_5m[-1]
-        _close_remaining(pos, last.close, last.close_time, "EOD")
+        _close_remaining(
+            pos, _apply_exit_slippage(pos, last.close), last.close_time, "EOD"
+        )
         # Aynı `close_time` — `_mark_equity` son işareti GÜNCELLER (döngü
         # sonunda pozisyon henüz açıkken yazılmıştı; şimdi çıkış komisyonu
         # da düşülmüş kapanış değeriyle yer değiştirir).
@@ -1248,6 +1859,12 @@ def simulate_symbol(
     test_start_time_ms: Optional[int] = None,
     leader: Optional[LeaderSeries] = None,
     entry_delay_candles: int = 0,
+    disabled_realism: Any = None,
+    exit_slippage_rate: Optional[float] = None,
+    maker_trade_through_pct: Optional[float] = None,
+    maker_stats: Optional[Dict[str, int]] = None,
+    funding_fallback_pct: Optional[float] = None,
+    funding_cache_dir: Optional[str | Path] = None,
 ) -> List[BacktestTrade]:
     """Bir sembol için TEK eşzamanlı pozisyonla tam backtest simülasyonu.
     AĞ YOK — yalnız zaten çekilmiş mum listeleri üzerinde çalışır (saf,
@@ -1282,6 +1899,14 @@ def simulate_symbol(
     "atr_gate"]` altında sayılır; kapalıyken anahtar EKLENMEZ.
     """
     trades: List[BacktestTrade] = []
+    exit_realism = build_exit_realism(cfg, disabled_realism, exit_slippage_rate)
+    maker_realism = build_maker_realism(disabled_realism, maker_trade_through_pct)
+    risk_realism = build_risk_realism(
+        disabled_realism, funding_fallback_pct, funding_cache_dir
+    )
+    # Sayaç her zaman yerel tutulur: single_pending zaman aşımını buradan okur.
+    mstats: Dict[str, int] = maker_stats if maker_stats is not None else {}
+    maker_timeout = max(0, int(getattr(cfg, "scalper_maker_fill_timeout_candles", 0) or 0))
     # D33: geçersiz kapı ayarı, kapıya hiç sinyal ulaşmayan pencerede bile
     # sessizce 'kapı kapalı' ölçümü üretmesin — alanlar yok/boş/0 iken no-op.
     validate_entry_gate_settings(cfg)
@@ -1430,13 +2055,25 @@ def simulate_symbol(
 
         signal = apply_stop_policy(raw_signal, cfg)
 
+        timed_out_before = mstats.get("timed_out", 0)
         pos = open_position(
             signal, candles_5m, i, cfg, initial_balance,
             missed_counter=missed_counter,
             entry_delay_candles=entry_delay_candles,
+            exit_realism=exit_realism,
+            maker_realism=maker_realism,
+            maker_stats=mstats,
+            risk_realism=risk_realism,
         )
         if pos is None:
-            i += 1
+            if maker_realism.single_pending and mstats.get("timed_out", 0) > timed_out_before:
+                # Canlı parite (executor `symbol in self._pending`): emir
+                # sinyal mumundan timeout mum sonrasına kadar bekler ve bu
+                # sürede aynı sembole yeni emir gitmez. Sonraki sinyal
+                # değerlendirmesi pencerenin ARDINDAKİ mumda.
+                i += maker_timeout + max(0, int(entry_delay_candles or 0)) + 1
+            else:
+                i += 1
             continue
 
         trade = manage_position(pos, candles_5m, cfg, structure_feed=structure_feed)
@@ -1453,7 +2090,9 @@ def simulate_symbol(
 # ==========================================================================
 
 
-def bar_equity_series(trades: List[BacktestTrade]) -> List[Tuple[int, float]]:
+def bar_equity_series(
+    trades: List[BacktestTrade], adverse: bool = False
+) -> List[Tuple[int, float]]:
     """D24/A3 — tüm sembollerin BAR-BAZLI mark-to-market özkaynak eğrisi.
 
     Bugünkü `max_drawdown` yalnız İŞLEM KAPANIŞLARINDA örneklenen kümülatif
@@ -1469,10 +2108,15 @@ def bar_equity_series(trades: List[BacktestTrade]) -> List[Tuple[int, float]]:
 
     İşaret taşımayan işlemler (ör. elle kurulmuş test nesneleri) sessizce
     atlanır ve seri boş dönebilir — bu bir hata değil, "ölçülmedi"dir.
+
+    `adverse=True` (A3): açık pozisyonlar her barda AŞIRI UÇ fiyatında
+    (LONG low / SHORT high) işaretlenir. Aynı bardaki eşzamanlı pozisyonların
+    aşırı uçları AYNI ANDA yaşandı varsayılır (kötümser, üst sınır).
     """
     events: List[Tuple[int, int, float]] = []
     for index, trade in enumerate(trades):
-        for close_time, value in (trade.equity_marks or ()):
+        marks = trade.equity_marks_adverse if adverse else trade.equity_marks
+        for close_time, value in (marks or ()):
             events.append((int(close_time), index, float(value)))
     if not events:
         return []
@@ -1494,16 +2138,71 @@ def bar_equity_series(trades: List[BacktestTrade]) -> List[Tuple[int, float]]:
     return out
 
 
-def bar_drawdown(series: Sequence[Tuple[int, float]]) -> Tuple[float, Optional[int]]:
+def drawdown_percent(
+    values: Sequence[float], initial_balance: float,
+    peaks: Optional[Sequence[float]] = None,
+) -> Tuple[float, float]:
+    """Göreli özkaynak değerlerinden (başlangıç 0) en derin çöküşün yüzdeleri:
+    (başlangıç bakiyesinin %'si, tepe özkaynağın %'si). Tepe özkaynak =
+    başlangıç + o ana kadarki en yüksek göreli K/Z; iki yüzde AYRI çukurlarda
+    maksimum olabilir.
+
+    `peaks` (verilirse `values` ile HİZALI): her noktadaki tepe değer dışarıdan
+    gelir (adverse çöküş için kapanış-işaretli seriden); verilmezse tepe
+    `values`'un kendi koşan maksimumudur."""
+    base = float(initial_balance)
+    peak = 0.0
+    worst = 0.0
+    worst_pct_peak = 0.0
+    for i, v in enumerate(values):
+        peak = max(peak, v)
+        if peaks is not None:
+            peak = max(peak, peaks[i])
+        drop = peak - v
+        worst = max(worst, drop)
+        peak_equity = base + peak
+        if peak_equity > 0:
+            worst_pct_peak = max(worst_pct_peak, drop / peak_equity * 100.0)
+    pct_initial = (worst / base * 100.0) if base > 0 else 0.0
+    return pct_initial, worst_pct_peak
+
+
+def running_peaks_at(
+    series: Sequence[Tuple[int, float]], peak_source: Sequence[Tuple[int, float]]
+) -> List[float]:
+    """`series`'in her damgasında, `peak_source` (kapanış-işaretli seri) içinde
+    o damga DAHİL koşan maksimum (0.0 tabanlı). Adverse çöküşün tepesi için:
+    tepe, çukurla aynı (kötümser) seriden alınırsa fitilli işlemde tepe de düşer
+    ve adverse çöküş kapanış-bazlıdan küçük çıkabilir."""
+    out: List[float] = []
+    j = 0
+    peak = 0.0
+    n = len(peak_source)
+    for stamp, _ in series:
+        while j < n and peak_source[j][0] <= stamp:
+            peak = max(peak, peak_source[j][1])
+            j += 1
+        out.append(peak)
+    return out
+
+
+def bar_drawdown(
+    series: Sequence[Tuple[int, float]],
+    peaks: Optional[Sequence[float]] = None,
+) -> Tuple[float, Optional[int]]:
     """Bar-bazlı özkaynak eğrisinden en derin tepe→dip çöküşü.
 
     Döner: (çöküş büyüklüğü, çukurun zaman damgası). Tepe 0.0'dan başlar —
     `compute_stats`'taki kapanış-bazlı `max_drawdown` ile aynı taban.
+    `peaks` (verilirse `series` ile hizalı): tepe dışarıdan gelir
+    (`running_peaks_at`); tepe yine `series`'in kendi değerlerini de içerir.
     """
     peak = 0.0
     worst = 0.0
     worst_at: Optional[int] = None
-    for stamp, equity in series:
+    for i, (stamp, equity) in enumerate(series):
+        if peaks is not None and peaks[i] > peak:
+            peak = peaks[i]
         if equity > peak:
             peak = equity
         drop = peak - equity
@@ -1583,7 +2282,9 @@ def concentration_stats(trades: List[BacktestTrade]) -> Dict[str, Any]:
     }
 
 
-def compute_stats(trades: List[BacktestTrade]) -> Dict[str, Any]:
+def compute_stats(
+    trades: List[BacktestTrade], initial_balance: float = _DEFAULT_VIRTUAL_BALANCE
+) -> Dict[str, Any]:
     n = len(trades)
     if n == 0:
         return {
@@ -1593,6 +2294,14 @@ def compute_stats(trades: List[BacktestTrade]) -> Dict[str, Any]:
             # D24: EK alanlar — rapor ŞEKLİ boş koşuda da sabit kalmalı.
             "bar_max_drawdown": 0.0, "bar_max_drawdown_at": None,
             "bar_equity_points": 0,
+            # A3: çöküş yüzdeleri, bar-içi aşırı uç çöküşü, funding, likidasyon.
+            "max_drawdown_pct_initial": 0.0, "max_drawdown_pct_peak": 0.0,
+            "bar_max_drawdown_pct_initial": 0.0, "bar_max_drawdown_pct_peak": 0.0,
+            "bar_max_drawdown_adverse": 0.0, "bar_max_drawdown_adverse_at": None,
+            "bar_max_drawdown_adverse_pct_initial": 0.0,
+            "bar_max_drawdown_adverse_pct_peak": 0.0,
+            "total_funding": 0.0, "funding_settlements": 0,
+            "liquidations": 0, "stop_beyond_liquidation": 0,
             **concentration_stats([]),
         }
 
@@ -1620,16 +2329,28 @@ def compute_stats(trades: List[BacktestTrade]) -> Dict[str, Any]:
     cum = 0.0
     peak = 0.0
     max_dd = 0.0
+    closed_curve: List[float] = []
     for t in ordered:
         cum += t.pnl
+        closed_curve.append(cum)
         peak = max(peak, cum)
         max_dd = max(max_dd, peak - cum)
+    dd_pct_initial, dd_pct_peak = drawdown_percent(closed_curve, initial_balance)
 
     # D24/A3 — bar-bazlı (mark-to-market) çöküş. Kapanış-bazlı `max_drawdown`
     # açık pozisyonların bar-içi çukurunu göremez; bu ikinci sayı ONU ölçer ve
     # tanım gereği kapanış-bazlıdan KÜÇÜK OLAMAZ (aynı taban, daha sık örnekleme).
     series = bar_equity_series(ordered)
     bar_max_dd, bar_max_dd_at = bar_drawdown(series)
+    bar_pct_initial, bar_pct_peak = drawdown_percent([v for _, v in series], initial_balance)
+    adv_series = bar_equity_series(ordered, adverse=True)
+    # Tepe KAPANIŞ-işaretli seriden, çukur adverse seriden: aksi halde fitilli
+    # işlemde tepe de düşer ve adverse çöküş kapanış-bazlıdan küçük çıkar.
+    adv_peaks = running_peaks_at(adv_series, series)
+    adv_dd, adv_dd_at = bar_drawdown(adv_series, adv_peaks)
+    adv_pct_initial, adv_pct_peak = drawdown_percent(
+        [v for _, v in adv_series], initial_balance, adv_peaks
+    )
 
     return {
         "trades": n,
@@ -1646,7 +2367,39 @@ def compute_stats(trades: List[BacktestTrade]) -> Dict[str, Any]:
         "bar_max_drawdown": bar_max_dd,
         "bar_max_drawdown_at": bar_max_dd_at,
         "bar_equity_points": len(series),
+        "max_drawdown_pct_initial": dd_pct_initial,
+        "max_drawdown_pct_peak": dd_pct_peak,
+        "bar_max_drawdown_pct_initial": bar_pct_initial,
+        "bar_max_drawdown_pct_peak": bar_pct_peak,
+        "bar_max_drawdown_adverse": adv_dd,
+        "bar_max_drawdown_adverse_at": adv_dd_at,
+        "bar_max_drawdown_adverse_pct_initial": adv_pct_initial,
+        "bar_max_drawdown_adverse_pct_peak": adv_pct_peak,
+        "total_funding": sum(t.funding for t in ordered),
+        "funding_settlements": sum(t.funding_settlements for t in ordered),
+        "liquidations": sum(1 for t in ordered if t.exit_reason == "LIQUIDATION"),
+        "stop_beyond_liquidation": sum(1 for t in ordered if t.stop_beyond_liq),
         **concentration_stats(ordered),
+    }
+
+
+def funding_report(trades: List[BacktestTrade]) -> Dict[str, Any]:
+    """JSON raporundaki "funding": toplam + sembol başına tarihsel/yedek
+    tahsilat sayısı (yedek oran = önbellek o anı kapsamıyor)."""
+    per_symbol: Dict[str, Dict[str, Any]] = {}
+    for t in trades:
+        row = per_symbol.setdefault(
+            t.symbol,
+            {"historical": 0, "fallback": 0, "settlements": 0, "total_funding": 0.0},
+        )
+        row["historical"] += t.funding_historical
+        row["fallback"] += t.funding_fallback
+        row["settlements"] += t.funding_settlements
+        row["total_funding"] += t.funding
+    return {
+        "total_funding": sum(t.funding for t in trades),
+        "settlements": sum(t.funding_settlements for t in trades),
+        "per_symbol": per_symbol,
     }
 
 
@@ -1732,6 +2485,20 @@ def print_report(
     if missed_counter is not None:
         missed_total = sum(missed_counter.values())
         print(f"Kapılarda reddedilen/kaçan sinyal: {missed_total} {dict(missed_counter)}")
+
+    if overall["funding_settlements"] or overall["liquidations"] or overall["stop_beyond_liquidation"]:
+        print(
+            f"Funding: toplam {overall['total_funding']:.2f} USD "
+            f"({overall['funding_settlements']} tahsilat) | likidasyon: "
+            f"{overall['liquidations']} | stopu likidasyon ötesinde açılan: "
+            f"{overall['stop_beyond_liquidation']}"
+        )
+    print(
+        f"Çöküş: kapanış-bazlı %{overall['max_drawdown_pct_initial']:.2f} başlangıç / "
+        f"%{overall['max_drawdown_pct_peak']:.2f} tepe | bar-içi aşırı uç "
+        f"{overall['bar_max_drawdown_adverse']:.2f} USD "
+        f"(%{overall['bar_max_drawdown_adverse_pct_initial']:.2f} başlangıç)"
+    )
 
     print()
     _print_regime_breakdown(all_trades)
@@ -1994,6 +2761,8 @@ def write_json_report(
             "slippage_rate": slippage_rate(cfg),
             "entry_delay_candles": 0,
         }),
+        # Gerçekçilik anahtarları: açık/kapalı özellikler + sayısal parametreler.
+        "realism": metadata.get("realism", realism_report(cfg)),
         # Kapı açıkken lider serisinin kimliği/kapsamı; kapalıyken None
         # (rapor ŞEKLİ sabit kalsın diye anahtar her zaman var).
         "market_gate": metadata.get("market_gate"),
@@ -2007,6 +2776,17 @@ def write_json_report(
         "by_strategy": {name: compute_stats(ts) for name, ts in by_strategy.items()},
         "regime_breakdown": regime_breakdown,
         "missed_signals": dict(missed_counter) if missed_counter is not None else {},
+        # A2: maker emir sayaçları (taker modda hepsi 0, fill_rate None).
+        "maker_orders": metadata.get("maker_orders", maker_orders_report(None)),
+        # A3: funding (sembol başına tarihsel/yedek oran sayısı) ve likidasyon.
+        "funding": funding_report(all_trades),
+        # A4: günlük kayıp mandalı (kapalıysa/ölçülmediyse None).
+        "daily_latch": metadata.get("daily_latch"),
+        "liquidation": {
+            "liquidations": sum(1 for t in all_trades if t.exit_reason == "LIQUIDATION"),
+            "stop_beyond_liquidation": sum(1 for t in all_trades if t.stop_beyond_liq),
+            "margin_mode": "ISOLATED",
+        },
         # D24/A1: Monte-Carlo permütasyon sonucu (yalnız --permutations ile
         # koşulduysa dolu; aksi halde None — "ölçülmedi").
         "permutation": permutation,
@@ -2110,6 +2890,207 @@ def _apply_capacity_gate(
     return accepted
 
 
+def _utc_day_index(ms: int) -> int:
+    return int(ms) // 86_400_000
+
+
+def apply_daily_latch(
+    trades: List[BacktestTrade],
+    cfg: Any,
+    *,
+    capital: float = _DEFAULT_VIRTUAL_BALANCE,
+    missed_counter: Optional[Dict[str, int]] = None,
+) -> Tuple[List[BacktestTrade], Dict[str, Any]]:
+    """Canlı günlük kayıp kesicisiyle PARİTE (A4, parity-1).
+
+    Canlı kural (`engine._update_kill_switch`, engine.py:5413-5531):
+    `scalper_daily_loss_limit_pct > 0` iken UTC günü içindeki GERÇEKLEŞMİŞ
+    (kapanmış işlem) PnL `<= -(gün başı sermaye) * limit/100` olunca
+    `_kill_switch` o günün sonuna kadar kilitlenir (yeni giriş yok, açık
+    pozisyonların çıkışı sürer); ertesi UTC günü sıfırlanır. Gün başı sermaye
+    canlıda `risk_sermayesi - bugünkü_pnl`'dir (sanal scalper kasası ya da
+    cüzdan); harness'ta boyutlama sabit `_DEFAULT_VIRTUAL_BALANCE` üzerinden
+    yapıldığından eşik `-capital * limit / 100`'dür (bileşiksiz).
+
+    Zaman sıralı tek geçiş: işlemler `exit_time` sırasıyla işlenir, gün PnL'i
+    çıkış gününe yazılır (canlı defter de kapanış gününe yazar). Eşik aşılınca
+    o günün mandal zamanı = o çıkışın `exit_time`'ı. Bir işlem, KARAR zamanı
+    (`signal_close_time`, yoksa `entry_time`) mandal gününde ve mandal
+    zamanından önce DEĞİLSE düşer (maker emri mandaldan önce verildiyse canlıda
+    bekler/dolar; bu yüzden dolum anı değil sinyal anı esas). Düşen işlemin
+    PnL'i hiçbir güne yazılmaz.
+
+    BİLİNEN SAPMALAR: kısmi TP dolumları gün PnL'ine kapanış anında girer
+    (canlı gömülü mod da böyle; income yolu kısmi dolumları anında sayar);
+    yalnız kapanmış işlemler sayılır, açık pozisyonun anlık zararı sayılmaz
+    (canlıda da).
+    """
+    try:
+        limit = float(getattr(cfg, "scalper_daily_loss_limit_pct", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        limit = 0.0
+    report: Dict[str, Any] = {
+        "enabled": limit > 0,
+        "limit_pct": limit,
+        "capital": float(capital),
+        "threshold": (-float(capital) * limit / 100.0) if limit > 0 else None,
+        "latched_days": [],
+        "dropped_trades": 0,
+        "dropped_pnl": 0.0,
+    }
+    if limit <= 0:
+        return list(trades), report
+
+    threshold = -float(capital) * limit / 100.0
+    day_pnl: Dict[int, float] = {}
+    latch_time: Dict[int, int] = {}
+    dropped_ids: set = set()
+    order = sorted(
+        range(len(trades)),
+        key=lambda i: (trades[i].exit_time, trades[i].entry_time, trades[i].symbol),
+    )
+    for i in order:
+        t = trades[i]
+        decision = t.signal_close_time if t.signal_close_time else t.entry_time
+        d_day = _utc_day_index(decision)
+        if d_day in latch_time and decision >= latch_time[d_day]:
+            dropped_ids.add(i)
+            continue
+        x_day = _utc_day_index(t.exit_time)
+        if x_day in latch_time:
+            continue  # gün zaten kilitli; PnL'in artık önemi yok
+        day_pnl[x_day] = day_pnl.get(x_day, 0.0) + t.pnl
+        if day_pnl[x_day] <= threshold:
+            latch_time[x_day] = t.exit_time
+            report["latched_days"].append({
+                "day": _ms_to_utc_iso(x_day * 86_400_000)[:10],
+                "latch_time_ms": int(t.exit_time),
+                "day_pnl": round(day_pnl[x_day], 6),
+            })
+
+    kept = [t for i, t in enumerate(trades) if i not in dropped_ids]
+    report["dropped_trades"] = len(dropped_ids)
+    report["dropped_pnl"] = round(sum(trades[i].pnl for i in dropped_ids), 6)
+    if missed_counter is not None and dropped_ids:
+        missed_counter["daily_latch"] = (
+            missed_counter.get("daily_latch", 0) + len(dropped_ids)
+        )
+    return kept, report
+
+
+def _apply_joint_gates(
+    trades: List[BacktestTrade],
+    symbols: List[str],
+    cfg: Any,
+    missed_counter: Optional[Dict[str, int]] = None,
+    *,
+    capital: float = _DEFAULT_VIRTUAL_BALANCE,
+) -> Tuple[List[BacktestTrade], Dict[str, Any]]:
+    """Kapasite kapısı + günlük mandal TEK kronolojik geçişte (denetim bulgusu).
+
+    Önce kapasite sonra mandal uygulanınca mandalın düşüreceği (canlıda HİÇ
+    açılmayacak) işlem kapasite slotu tutuyor ve ondan sonraki geçerli bir
+    girişi haksız reddettiriyordu. Burada adaylar `_apply_capacity_gate` ile
+    AYNI sırayla (giriş zamanı, sembol sırası) gezilir; her aday için ÖNCE
+    mandal (karar zamanında, o UTC gününde kabul edilmiş işlemlerin
+    `exit_time <= karar` olanlarıyla `apply_daily_latch` kuralı), SONRA
+    kapasite sınanır. Düşen/reddedilen aday ne slot ne gün PnL'i tutar.
+    Mandal gecikmesiz doğrudur: karar zamanından sonra çıkan işlem o kararı
+    etkileyemez (çıkış > giriş >= karar).
+    Döner: (kabul edilenler, `apply_daily_latch` biçiminde rapor).
+    """
+    max_positions_raw = getattr(cfg, "scalper_max_positions", 3)
+    max_positions = int(max_positions_raw) if max_positions_raw is not None else 3
+    limit = float(getattr(cfg, "scalper_daily_loss_limit_pct", 0.0) or 0.0)
+    threshold = -float(capital) * limit / 100.0
+
+    order_index = {sym: idx for idx, sym in enumerate(symbols)}
+    ordered = sorted(
+        trades,
+        key=lambda t: (t.entry_time, order_index.get(t.symbol, len(symbols)), t.symbol),
+    )
+
+    accepted: List[BacktestTrade] = []
+    open_exit_times: List[int] = []
+    # gün -> kabul edilmiş işlemlerin (exit_time, entry_time, symbol, pnl) listesi
+    by_exit_day: Dict[int, List[Tuple[int, int, str, float]]] = {}
+    dropped_count = 0
+    dropped_pnl = 0.0
+
+    def _latch_time(day: int, decision: int) -> Optional[int]:
+        cum = 0.0
+        for exit_time, _entry, _sym, pnl in by_exit_day.get(day, ()):
+            if exit_time > decision:
+                break
+            cum += pnl
+            if cum <= threshold:
+                return exit_time
+        return None
+
+    for trade in ordered:
+        decision = trade.signal_close_time if trade.signal_close_time else trade.entry_time
+        lt = _latch_time(_utc_day_index(decision), decision)
+        if lt is not None and decision >= lt:
+            dropped_count += 1
+            dropped_pnl += trade.pnl
+            if missed_counter is not None:
+                missed_counter["daily_latch"] = missed_counter.get("daily_latch", 0) + 1
+            continue
+
+        while open_exit_times and open_exit_times[0] <= trade.entry_time:
+            heapq.heappop(open_exit_times)
+        if len(open_exit_times) >= max_positions:
+            if missed_counter is not None:
+                missed_counter["capacity"] = missed_counter.get("capacity", 0) + 1
+            continue
+
+        heapq.heappush(open_exit_times, trade.exit_time)
+        accepted.append(trade)
+        bisect.insort(
+            by_exit_day.setdefault(_utc_day_index(trade.exit_time), []),
+            (int(trade.exit_time), int(trade.entry_time), trade.symbol, float(trade.pnl)),
+        )
+
+    # Kabul edilenler üzerinde kural kendiliğinden tutarlıdır (hiçbiri düşmez);
+    # `apply_daily_latch` yalnız mandal GÜNLERİNİ raporlamak için çağrılır.
+    kept, rep = apply_daily_latch(accepted, cfg, capital=capital)
+    rep["dropped_trades"] = dropped_count
+    rep["dropped_pnl"] = round(dropped_pnl, 6)
+    return kept, rep
+
+
+def _portfolio_filter(
+    trades: List[BacktestTrade],
+    symbols: List[str],
+    cfg: Any,
+    missed_counter: Optional[Dict[str, int]] = None,
+    disabled_realism: Any = None,
+    report_out: Optional[Dict[str, Any]] = None,
+) -> List[BacktestTrade]:
+    """Portföy kapıları: kapasite (max pozisyon) ve günlük kayıp mandalı.
+
+    Mandal açıkken ikisi TEK kronolojik geçişte uygulanır (`_apply_joint_gates`):
+    sıra sonuç için FARK EDER — mandalın düşüreceği işlem slot tutmamalıdır.
+    Mandal kapalıysa (özellik kapalı ya da limit <= 0) yalnız kapasite kapısı
+    çalışır."""
+    latch_on = "daily_latch" not in normalize_disabled_realism(disabled_realism)
+    try:
+        limit = float(getattr(cfg, "scalper_daily_loss_limit_pct", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        limit = 0.0
+    if not latch_on or limit <= 0:
+        kept = _apply_capacity_gate(trades, symbols, cfg, missed_counter=missed_counter)
+        if latch_on:
+            kept, rep = apply_daily_latch(kept, cfg, missed_counter=missed_counter)
+            if report_out is not None:
+                report_out["daily_latch"] = rep
+        return kept
+    kept, rep = _apply_joint_gates(trades, symbols, cfg, missed_counter=missed_counter)
+    if report_out is not None:
+        report_out["daily_latch"] = rep
+    return kept
+
+
 async def run_backtest(
     days: int,
     symbols: List[str],
@@ -2125,6 +3106,11 @@ async def run_backtest(
     entry_delay_candles: int = 0,
     series_out: Optional[Dict[str, Dict[str, List[Candle]]]] = None,
     leader_out: Optional[List[Optional[LeaderSeries]]] = None,
+    disabled_realism: Any = None,
+    exit_slippage_rate: Optional[float] = None,
+    maker_trade_through_pct: Optional[float] = None,
+    funding_fallback_pct: Optional[float] = None,
+    funding_cache_dir: Optional[str | Path] = None,
 ) -> List[BacktestTrade]:
     """Verilen semboller için tarihsel veriyi çeker ve tüm stratejileri
     simüle eder; tüm işlemleri (tüm semboller birleşik) döndürür.
@@ -2158,6 +3144,8 @@ async def run_backtest(
     """
     if start_time_ms is None and days <= 0:
         raise ValueError("Backtest gün sayısı pozitif olmalı")
+    # Gerçekçilik anahtarları (REALISM_FEATURES): bilinmeyen ad burada patlar.
+    disabled_realism = normalize_disabled_realism(disabled_realism)
 
     strategies = get_enabled(strategy_names)
     if not strategies:
@@ -2191,6 +3179,10 @@ async def run_backtest(
             "slippage_rate": slippage_rate(cfg),
             "entry_delay_candles": int(entry_delay_candles or 0),
         },
+        "realism": realism_report(
+            cfg, disabled_realism, exit_slippage_rate, maker_trade_through_pct,
+            funding_fallback_pct, funding_cache_dir,
+        ),
         "universe_snapshot": {
             "captured_at": _utc_iso_now(),
             "selection_mode": "provided",
@@ -2221,6 +3213,7 @@ async def run_backtest(
     cache_dir_path = Path(cache_dir) if cache_dir is not None else None
 
     all_trades: List[BacktestTrade] = []
+    maker_stats: Dict[str, int] = {}
     try:
         timeframes = resolve_timeframes(cfg)
         tf_entry, tf_context, tf_regime = timeframes
@@ -2313,17 +3306,27 @@ async def run_backtest(
                 test_start_time_ms=test_start_time_ms,
                 leader=leader_series,
                 entry_delay_candles=entry_delay_candles,
+                disabled_realism=disabled_realism,
+                exit_slippage_rate=exit_slippage_rate,
+                maker_trade_through_pct=maker_trade_through_pct,
+                maker_stats=maker_stats,
+                funding_fallback_pct=funding_fallback_pct,
+                funding_cache_dir=funding_cache_dir,
             )
             app_logger.info(f"✅ {symbol}: {len(trades)} işlem simüle edildi")
             all_trades.extend(trades)
     finally:
         await fetcher.close()
+    metadata["maker_orders"] = maker_orders_report(maker_stats)
 
     # Canlı motor paritesi: kapasite kapısı (scalper_max_positions) semboller
     # arası bir kısıttır — sembol-içi simulate_symbol döngüsünde uygulanamaz,
     # bu yüzden tüm sembollerin adayları birleştikten SONRA burada, tek bir
     # kronolojik geçişle uygulanır (bkz. _apply_capacity_gate docstring'i).
-    all_trades = _apply_capacity_gate(all_trades, symbols, cfg, missed_counter=missed_counter)
+    all_trades = _portfolio_filter(
+        all_trades, symbols, cfg, missed_counter=missed_counter,
+        disabled_realism=disabled_realism, report_out=metadata,
+    )
 
     return all_trades
 
@@ -2344,47 +3347,186 @@ def _permutation_start_index(candles: Sequence[Candle], test_start_time_ms: Opti
     return max(0, first_in_window - 1)
 
 
-def _permute_symbol_series(
-    series: Dict[str, List[Candle]],
-    *,
-    test_start_time_ms: Optional[int],
-    seed: int,
-    clamp: bool,
-) -> Tuple[List[Candle], List[Candle], List[Candle], Dict[str, Any]]:
-    """Bir sembolün üç dilimini TUTARLI biçimde permüte et.
+@dataclass
+class SharedWindowPlan:
+    """Tüm sembollerin (ve lider serinin) AYNI permütasyon indeksiyle
+    permüte edileceği ortak pencere planı (montecarlo-4).
 
-    Giriş dilimi doğrudan permüte edilir; bağlam ve rejim dilimleri permüte
-    giriş serisinden TÜRETİLİR (`aggregate_from`). Permüte serinin kapsamadığı
-    (daha eski) bağlam/rejim barları GERÇEK kalır — bkz. permutation.py
-    "NULL'UN KAPSAMI" notu. `run_backtest`'te bir aralık iki role birden
-    hizmet ediyorsa (ör. golden koşuda 15m hem bağlam hem rejim) aynı liste
-    nesnesi paylaşılır; burada da AYNI nesne paylaşımı korunur.
+    `series[ad]`: {"entry": gerçek giriş mumları (ısınma + ortak gövde),
+    "context", "regime", "start_index", "context_is_entry", "regime_is_entry",
+    "regime_is_context"}. `n_perm`: ortak permüte pencere bar sayısı.
     """
-    entry = series["entry"]
-    context = series["context"]
-    regime = series["regime"]
+    series: Dict[str, Dict[str, Any]]
+    n_perm: int
+    leader_entry: Optional[List[Candle]]
+    leader_start_index: int
+    leader: Optional[LeaderSeries]
+    report: Dict[str, Any]
 
-    start_index = _permutation_start_index(entry, test_start_time_ms)
-    perm_entry, stats = permute_candles(
-        entry, start_index=start_index, seed=seed, clamp=clamp
+
+def build_shared_window_plan(
+    series_by_symbol: Dict[str, Dict[str, List[Candle]]],
+    symbols: Sequence[str],
+    *,
+    leader: Optional[LeaderSeries],
+    test_start_time_ms: Optional[int],
+) -> SharedWindowPlan:
+    """Ortak permütasyon penceresini kur.
+
+    Hizalama: her serinin (semboller + lider giriş mumları) permüte başlangıcı
+    `_permutation_start_index` ile bulunur; ortak pencere başı T0 = bunların en
+    geç olanı, sonra TÜM serilerde bulunan zaman damgalarının (open_time)
+    kesişimindeki ilk zamana yuvarlanır. T0'dan ÖNCEKİ bar (ısınma) her seride
+    gerçek kalır. T0 ve sonrasında ortak OLMAYAN barlar o serilerden DÜŞÜRÜLÜR
+    (ortak pencerede her seri aynı sayıda barla aynı indekse oturur; düşen sayı
+    `report["dropped_bars"]`'ta). Aynı yoldan çekilmiş veride (normal koşu)
+    hiçbir bar düşmez. Tek sembol, liderli/liderisiz: eski davranışla aynı
+    pencere.
+    """
+    included: Dict[str, List[Candle]] = {}
+    for sym in symbols:
+        ser = series_by_symbol.get(sym)
+        if ser and ser.get("entry"):
+            included[sym] = ser["entry"]
+    leader_entry = (
+        leader.entry_candles if leader is not None and leader.entry_candles else None
+    )
+    inputs: Dict[str, List[Candle]] = dict(included)
+    if leader_entry is not None:
+        inputs["__leader__"] = leader_entry
+
+    starts: Dict[str, int] = {}
+    start_times: List[int] = []
+    for name, candles in inputs.items():
+        si = _permutation_start_index(candles, test_start_time_ms)
+        if si + 1 < len(candles):          # permüte edilecek bar var
+            starts[name] = si
+            start_times.append(candles[si + 1].open_time)
+
+    report: Dict[str, Any] = {
+        "shared_index": True,
+        "symbols": [n for n in starts if n != "__leader__"],
+        "leader_permuted": False,
+        "window_start_ms": None, "common_bars": 0, "permuted_bars": 0,
+        "dropped_bars": {},
+    }
+    plan_series: Dict[str, Dict[str, Any]] = {}
+    if len(starts) == 0:
+        return SharedWindowPlan(plan_series, 0, None, 0, leader, report)
+
+    time_sets = [set(c.open_time for c in inputs[n]) for n in starts]
+    common = sorted(set.intersection(*time_sets))
+    t0_wanted = max(start_times)
+    candidates = [k for k, t in enumerate(common) if t >= t0_wanted and k >= 1]
+    if not candidates:
+        return SharedWindowPlan(plan_series, 0, None, 0, leader, report)
+    k0 = candidates[0]
+    t0 = common[k0]
+    common_set = set(common)
+    n_perm = len(common) - k0
+    report.update({
+        "window_start_ms": int(t0), "common_bars": len(common),
+        "permuted_bars": n_perm,
+    })
+
+    def _base(candles: List[Candle]) -> Tuple[List[Candle], int, int]:
+        base = [c for c in candles if c.open_time < t0 or c.open_time in common_set]
+        prefix = sum(1 for c in base if c.open_time < t0)
+        dropped = sum(1 for c in candles if c.open_time >= t0 and c.open_time not in common_set)
+        return base, prefix - 1, dropped
+
+    for name in starts:
+        base, start_index, dropped = _base(inputs[name])
+        if name == "__leader__":
+            report["dropped_bars"]["__leader__"] = dropped
+            leader_base, leader_si = base, start_index
+            continue
+        ser = series_by_symbol[name]
+        plan_series[name] = {
+            "entry": base,
+            "context": ser["context"],
+            "regime": ser["regime"],
+            "start_index": start_index,
+            "context_is_entry": ser["context"] is ser["entry"],
+            "regime_is_entry": ser["regime"] is ser["entry"],
+            "regime_is_context": ser["regime"] is ser["context"],
+        }
+        report["dropped_bars"][name] = dropped
+    leader_ok = "__leader__" in starts
+    if leader_ok:
+        report["leader_permuted"] = True
+    return SharedWindowPlan(
+        plan_series, n_perm,
+        leader_base if leader_ok else None,
+        leader_si if leader_ok else 0,
+        leader, report,
     )
 
-    if context is entry:
-        perm_context = perm_entry
-    else:
-        perm_context = aggregate_from(perm_entry, context)
 
-    if regime is entry:
-        perm_regime = perm_entry
-    elif regime is context:
-        perm_regime = perm_context
-    else:
-        perm_regime = aggregate_from(perm_entry, regime)
+def _permuted_inputs(
+    plan: SharedWindowPlan,
+    *,
+    seed: int,
+    block_length: int,
+    clamp: bool,
+) -> Tuple[
+    Dict[str, Tuple[List[Candle], List[Candle], List[Candle]]],
+    Optional[LeaderSeries],
+    List[Dict[str, Any]],
+]:
+    """Bir tur için TEK permütasyon indeksi çiz ve tüm sembollere + lidere
+    uygula. Bağlam/rejim dilimleri permüte giriş serisinden TÜRETİLİR
+    (`aggregate_from`); permüte serinin kapsamadığı daha eski barlar GERÇEK
+    kalır (permutation.py "NULL'UN KAPSAMI"). Lider: giriş serisi aynı indeksle
+    permüte, günlük/gün-içi serileri ondan türetilir; ham mumu yoksa gerçek
+    lider döner."""
+    index = draw_permutation_index(
+        plan.n_perm, seed=seed, block_length=block_length,
+    )
+    out: Dict[str, Tuple[List[Candle], List[Candle], List[Candle]]] = {}
+    stats_all: List[Dict[str, Any]] = []
+    for name, info in plan.series.items():
+        perm_entry, stats = _apply_permutation_index(
+            info["entry"], index, info["start_index"], clamp,
+        )
+        stats_all.append(stats)
+        if info["context_is_entry"]:
+            perm_context = perm_entry
+        else:
+            perm_context = aggregate_from(perm_entry, info["context"])
+        if info["regime_is_entry"]:
+            perm_regime = perm_entry
+        elif info["regime_is_context"]:
+            perm_regime = perm_context
+        else:
+            perm_regime = aggregate_from(perm_entry, info["regime"])
+        out[name] = (perm_entry, perm_context, perm_regime)
 
-    return perm_entry, perm_context, perm_regime, stats
+    leader_out = plan.leader
+    if plan.leader_entry is not None and plan.leader is not None:
+        perm_l, _ = _apply_permutation_index(
+            plan.leader_entry, index, plan.leader_start_index, clamp,
+        )
+        daily = aggregate_from(perm_l, plan.leader.daily_candles or [])
+        intraday = aggregate_from(perm_l, plan.leader.intraday_candles or [])
+        leader_out = LeaderSeries(
+            symbol=plan.leader.symbol,
+            entry_close_times=[c.close_time for c in perm_l],
+            entry_closes=[c.close for c in perm_l],
+            daily_close_times=[c.close_time for c in daily],
+            daily_closes=[c.close for c in daily],
+            intraday_open_times=[c.open_time for c in intraday],
+            intraday_opens=[c.open for c in intraday],
+            intraday_close_times=[c.close_time for c in intraday],
+            entry_candles=perm_l,
+            daily_candles=daily,
+            intraday_candles=intraday,
+        )
+    return out, leader_out, stats_all
 
 
 def _permutation_pass(
+    plan: SharedWindowPlan,
     series_by_symbol: Dict[str, Dict[str, List[Candle]]],
     symbols: Sequence[str],
     strategies: List[StrategyProtocol],
@@ -2393,33 +3535,48 @@ def _permutation_pass(
     test_start_time_ms: Optional[int],
     base_seed: int,
     clamp: bool,
-    leader: Optional[LeaderSeries],
+    block_length: int = 1,
     entry_delay_candles: int,
+    disabled_realism: Any = None,
+    exit_slippage_rate: Optional[float] = None,
+    maker_trade_through_pct: Optional[float] = None,
+    funding_fallback_pct: Optional[float] = None,
+    funding_cache_dir: Optional[str | Path] = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    """Tek bir permütasyon turu: tüm semboller permüte edilip simüle edilir,
-    kapasite kapısı gerçek koşudaki gibi POST-HOC uygulanır ve `compute_stats`
-    döner."""
+    """Tek bir permütasyon turu: TEK ortak indeksle tüm semboller + lider
+    permüte edilip simüle edilir, portföy kapıları (kapasite + günlük mandal)
+    gerçek koşudaki gibi POST-HOC uygulanır ve `compute_stats` döner."""
+    permuted, perm_leader, clamp_stats = _permuted_inputs(
+        plan, seed=base_seed, block_length=block_length, clamp=clamp,
+    )
     trades: List[BacktestTrade] = []
-    clamp_stats: List[Dict[str, Any]] = []
-    for offset, symbol in enumerate(symbols):
-        series = series_by_symbol.get(symbol)
-        if not series:
-            continue
-        perm_entry, perm_context, perm_regime, stats = _permute_symbol_series(
-            series,
-            test_start_time_ms=test_start_time_ms,
-            seed=base_seed + offset,
-            clamp=clamp,
-        )
-        clamp_stats.append(stats)
+    for symbol in symbols:
+        if symbol in permuted:
+            entry, context, regime = permuted[symbol]
+            leader_for = perm_leader
+        else:
+            ser = series_by_symbol.get(symbol)
+            if not ser:
+                continue
+            # Permüte edilemeyen sembol (pencere yok): gerçek seri.
+            entry, context, regime = ser["entry"], ser["context"], ser["regime"]
+            leader_for = plan.leader
         trades.extend(simulate_symbol(
-            symbol, perm_entry, perm_context, perm_regime, strategies, cfg,
+            symbol, entry, context, regime, strategies, cfg,
             missed_counter=None,
             test_start_time_ms=test_start_time_ms,
-            leader=leader,
+            leader=leader_for,
             entry_delay_candles=entry_delay_candles,
+            disabled_realism=disabled_realism,
+            exit_slippage_rate=exit_slippage_rate,
+            maker_trade_through_pct=maker_trade_through_pct,
+            funding_fallback_pct=funding_fallback_pct,
+            funding_cache_dir=funding_cache_dir,
         ))
-    trades = _apply_capacity_gate(trades, list(symbols), cfg, missed_counter=None)
+    trades = _portfolio_filter(
+        trades, list(symbols), cfg, missed_counter=None,
+        disabled_realism=disabled_realism,
+    )
     return compute_stats(trades), clamp_stats
 
 
@@ -2437,7 +3594,13 @@ def run_permutation_study(
     test_start_time_ms: Optional[int] = None,
     leader: Optional[LeaderSeries] = None,
     entry_delay_candles: int = 0,
+    block_length: int = 1,
     progress: bool = True,
+    disabled_realism: Any = None,
+    exit_slippage_rate: Optional[float] = None,
+    maker_trade_through_pct: Optional[float] = None,
+    funding_fallback_pct: Optional[float] = None,
+    funding_cache_dir: Optional[str | Path] = None,
 ) -> Dict[str, Any]:
     """D24/A1 — Monte-Carlo permütasyon testi (AĞ YOK; veri zaten elde).
 
@@ -2469,30 +3632,54 @@ def run_permutation_study(
     clamp_stats_all: List[Dict[str, Any]] = []
     unclamped_stats_all: List[Dict[str, Any]] = []
 
+    if int(block_length) < 1:
+        raise ValueError("block_length >= 1 olmalı")
+    plan = build_shared_window_plan(
+        series_by_symbol, symbols, leader=leader,
+        test_start_time_ms=test_start_time_ms,
+    )
+
+    def _row(stats: Dict[str, Any]) -> Dict[str, Any]:
+        # `trades`: sıfır-işlemli null turlarını p-değerinden ayıklamak için
+        # (permutation.UNDEFINED_ON_ZERO_TRADES) satıra eklenir.
+        row = {k: stats.get(k) for k in wanted}
+        row["trades"] = stats.get("trades")
+        return row
+
     started = time.monotonic()
     for index in range(count):
         base_seed = int(seed) + index * 1_000_003
         stats, clamp_stats = _permutation_pass(
-            series_by_symbol, symbols, strategies, cfg,
+            plan, series_by_symbol, symbols, strategies, cfg,
             test_start_time_ms=test_start_time_ms,
             base_seed=base_seed,
             clamp=True,
-            leader=leader,
+            block_length=int(block_length),
             entry_delay_candles=entry_delay_candles,
+            disabled_realism=disabled_realism,
+            exit_slippage_rate=exit_slippage_rate,
+            maker_trade_through_pct=maker_trade_through_pct,
+            funding_fallback_pct=funding_fallback_pct,
+            funding_cache_dir=funding_cache_dir,
         )
-        clamped_rows.append({k: stats.get(k) for k in wanted})
+        clamped_rows.append(_row(stats))
         clamp_stats_all.extend(clamp_stats)
 
         if clamp_audit:
             raw_stats, raw_clamp = _permutation_pass(
-                series_by_symbol, symbols, strategies, cfg,
+                plan, series_by_symbol, symbols, strategies, cfg,
                 test_start_time_ms=test_start_time_ms,
                 base_seed=base_seed,
                 clamp=False,
-                leader=leader,
+                block_length=int(block_length),
                 entry_delay_candles=entry_delay_candles,
+                disabled_realism=disabled_realism,
+                exit_slippage_rate=exit_slippage_rate,
+                maker_trade_through_pct=maker_trade_through_pct,
+                funding_fallback_pct=funding_fallback_pct,
+                funding_cache_dir=funding_cache_dir,
             )
-            unclamped_rows.append({k: raw_stats.get(k) for k in wanted})
+            unclamped_rows.append(_row(raw_stats))
             unclamped_stats_all.extend(raw_clamp)
 
         if progress and (index + 1) % 10 == 0:
@@ -2501,17 +3688,24 @@ def run_permutation_study(
                 f"({time.monotonic() - started:.1f}s)"
             )
 
-    result = compute_p_values(real_stats, clamped_rows, wanted)
+    result = compute_p_values(
+        real_stats, clamped_rows, wanted, seed=int(seed), block_length=int(block_length),
+    )
     out: Dict[str, Any] = {
         "permutations": count,
         "seed": int(seed),
+        "block_length": int(block_length),
+        # montecarlo-4: tüm semboller + lider aynı indeksle permüte edilir.
+        "shared_index": plan.report,
         "metrics": wanted,
         "elapsed_sec": round(time.monotonic() - started, 2),
         "clamp": merge_clamp_stats(clamp_stats_all),
         "result": result,
         "null_samples": clamped_rows,
         "null_scope": (
-            "KOŞULLU null: yalnız giriş dilimi permüte edilir, bağlam/rejim "
+            "KOŞULLU null: TÜM semboller VE lider seri AYNI permütasyon "
+            "indeksiyle permüte edilir (semboller arası ilişki ve lider "
+            "ilişkisi korunur); yalnız giriş dilimi permüte edilir, bağlam/rejim "
             "dilimleri ondan türetilir; permüte serinin kapsamadığı daha eski "
             "rejim barları GERÇEK kalır. p-değeri 'rejim arka planı aynıyken "
             "giriş sinyalinin kendisi şanstan ayırt edilebilir mi' sorusunu "
@@ -2519,7 +3713,10 @@ def run_permutation_study(
         ),
     }
     if clamp_audit:
-        raw_result = compute_p_values(real_stats, unclamped_rows, wanted)
+        raw_result = compute_p_values(
+            real_stats, unclamped_rows, wanted,
+            seed=int(seed), block_length=int(block_length),
+        )
         out["clamp_audit"] = {
             "result": raw_result,
             "shift": clamp_shift_report(result, raw_result),
@@ -2694,6 +3891,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Permütasyon tohumu (yeniden üretilebilirlik; varsayılan 12345)",
     )
     parser.add_argument(
+        "--permutation-block-length", type=int, default=1,
+        help=(
+            "Permütasyon blok uzunluğu (bar). 1 = bağımsız-bar null'u "
+            "(volatilite kümelenmesi yok edilir); >1 = ardışık bloklar "
+            "karıştırılır, blok içi yapı korunur"
+        ),
+    )
+    parser.add_argument(
         "--permutation-metrics", type=str,
         default=",".join(PERMUTATION_DEFAULT_METRICS),
         help="p-değeri üretilecek metrikler (virgülle ayrılmış)",
@@ -2723,7 +3928,56 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "bugünkü davranış, sinyal mumunun bir sonraki open'ı)"
         ),
     )
+    parser.add_argument(
+        "--disable-realism", type=str, default="",
+        help=(
+            "Virgülle ayrılmış gerçekçilik özellikleri KAPALI olsun "
+            f"({', '.join(REALISM_FEATURES)}); bilinmeyen ad hata"
+        ),
+    )
+    parser.add_argument(
+        "--legacy-model", action="store_true",
+        help="Tüm gerçekçilik özelliklerini kapat = bu işten ÖNCEKİ sayılar",
+    )
+    parser.add_argument(
+        "--exit-slippage-pct", type=float, default=None,
+        help=(
+            "Market-tipi çıkışlarda aleyhte kayma, YÜZDE (0.02 = %0.02). "
+            "Varsayılan: giriş kaymasıyla aynı (SCALPER_SLIPPAGE_RATE). "
+            "--fee-stress bunu da çarpar"
+        ),
+    )
+    parser.add_argument(
+        "--maker-trade-through-pct", type=float, default=None,
+        help=(
+            "Maker limit dolumu için trade-through eşiği, YÜZDE (0.01 = 1 baz "
+            "puan, varsayılan): LONG low <= L*(1-tt), SHORT high >= L*(1+tt). "
+            "Yalnız SCALPER_ENTRY_MODE=maker; --legacy-model / "
+            "--disable-realism maker_trade_through ile kapanır"
+        ),
+    )
+    parser.add_argument(
+        "--funding-fallback-pct", type=float, default=None,
+        help=(
+            "Önbelleğin kapsamadığı funding anları için sabit oran, 8 saatte "
+            "bir, YÜZDE (varsayılan 0.01 = %0.01)"
+        ),
+    )
+    parser.add_argument(
+        "--funding-cache-dir", type=str, default="data/funding_cache",
+        help=(
+            "Tarihsel funding oranları (<SEMBOL>.json); "
+            "scripts/fill_funding_cache.py doldurur. Dosya yoksa yedek oran"
+        ),
+    )
     return parser
+
+
+def resolve_disabled_realism(args: argparse.Namespace) -> frozenset:
+    """CLI: --legacy-model = tüm özellikler kapalı; yoksa --disable-realism."""
+    if getattr(args, "legacy_model", False):
+        return frozenset(REALISM_FEATURES)
+    return normalize_disabled_realism(getattr(args, "disable_realism", "") or "")
 
 
 async def main_async(args: argparse.Namespace) -> None:
@@ -2739,6 +3993,17 @@ async def main_async(args: argparse.Namespace) -> None:
     )
     run_cfg = stressed_cfg(settings, stress_multiplier)
     entry_delay = max(0, int(getattr(args, "entry_delay_candles", 0) or 0))
+    disabled_realism = resolve_disabled_realism(args)
+    maker_tt_pct = getattr(args, "maker_trade_through_pct", None)
+    exit_slip_pct = getattr(args, "exit_slippage_pct", None)
+    funding_fallback_pct = getattr(args, "funding_fallback_pct", None)
+    funding_cache_dir = getattr(args, "funding_cache_dir", None)
+    # Açık verilen çıkış kayması da --fee-stress ile çarpılır; verilmezse
+    # None → slippage_rate(run_cfg) (stres zaten uygulanmış).
+    exit_slippage = (
+        None if exit_slip_pct is None
+        else float(exit_slip_pct) / 100.0 * stress_multiplier
+    )
     if stress_multiplier != 1.0 or entry_delay:
         app_logger.info(
             f"🧪 Çürütme koşusu: maliyet çarpanı {stress_multiplier}× "
@@ -2766,6 +4031,11 @@ async def main_async(args: argparse.Namespace) -> None:
         cache_dir=args.cache_dir,
         refresh=args.refresh,
         entry_delay_candles=entry_delay,
+        disabled_realism=disabled_realism,
+        exit_slippage_rate=exit_slippage,
+        maker_trade_through_pct=maker_tt_pct,
+        funding_fallback_pct=funding_fallback_pct,
+        funding_cache_dir=funding_cache_dir,
         series_out=series_by_symbol if permutations > 0 else None,
         leader_out=leader_holder if permutations > 0 else None,
     )
@@ -2805,6 +4075,12 @@ async def main_async(args: argparse.Namespace) -> None:
             test_start_time_ms=run_metadata.get("test_window", {}).get("start_ms"),
             leader=leader_holder[0] if leader_holder else None,
             entry_delay_candles=entry_delay,
+            block_length=int(getattr(args, "permutation_block_length", 1) or 1),
+            disabled_realism=disabled_realism,
+            exit_slippage_rate=exit_slippage,
+            maker_trade_through_pct=maker_tt_pct,
+            funding_fallback_pct=funding_fallback_pct,
+            funding_cache_dir=funding_cache_dir,
         )
         print_permutation_report(permutation_study)
 

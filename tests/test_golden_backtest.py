@@ -223,13 +223,29 @@ class TestGoldenBacktest:
         stats = compute_stats(trades)
         # 2026-09-06 parity: fee-aware BE + TP2 runner floor + fill-anchored
         # initial stop. Same fixture/trade count, old incorrect model 26.77.
-        assert round(stats["total_pnl"], 2) == 23.79
+        # A1 (audit/eval-harness-fixes): gerçekçi çıkış dolumu (boşluk,
+        # çıkış kayması, mum-içi yol) varsayılan; eski model 23.79 idi ve
+        # aşağıdaki legacy testinde `--legacy-model` ile BİREBİR korunur.
+        assert round(stats["total_pnl"], 2) == 25.17
 
         breakdown = _direction_exit_counts(trades)
         assert breakdown["direction"] == {"LONG": 2}
         assert breakdown["exit_reason"] == {"TRAIL": 2}
 
         assert missed_counter == {"regime_gate": 4}
+
+    @pytest.mark.asyncio
+    async def test_golden_legacy_model_reproduces_pre_a1_numbers(self, monkeypatch):
+        _apply_golden_settings(monkeypatch)
+        monkeypatch.setattr(backtest_module, "KlineFetcher", _NetworkForbiddenKlineFetcher)
+        trades = await run_backtest(
+            days=3, symbols=_SYMBOLS, strategy_names="C", cfg=_GoldenCfg(),
+            missed_counter={}, start_time_ms=_parse_utc_date(_START),
+            end_time_ms=_parse_utc_date(_END), cache_dir=_FIXTURE_DIR,
+            refresh=False, base_url="https://network-must-not-be-used.invalid",
+            disabled_realism=backtest_module.REALISM_FEATURES,
+        )
+        assert round(compute_stats(trades)["total_pnl"], 2) == 23.79
 
     @pytest.mark.asyncio
     async def test_golden_is_deterministic_across_runs(self, monkeypatch):

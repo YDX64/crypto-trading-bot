@@ -273,14 +273,14 @@ def known_dataset(tmp_path):
 
 
 class TestKnownDatasetMath:
-    def _build(self, tmp_path, known_dataset):
+    def _build(self, tmp_path, known_dataset, report_until=None):
         db, klines_path = known_dataset
         since = datetime(2026, 8, 14)
         until = datetime(2026, 8, 16, 23, 59, 59)
         trades, skipped = lr.load_closed_trades(db, since, until)
         daily_changes = lr.klines_to_daily_changes(lr.load_offline_klines(klines_path))
         days = lr.iter_days(since, until)
-        report = lr.build_report(trades, daily_changes, since, until, days, [])
+        report = lr.build_report(trades, daily_changes, since, report_until or until, days, [])
         return report
 
     def test_regime_direction_up_pf_is_infinite(self, tmp_path, known_dataset):
@@ -362,7 +362,9 @@ class TestKnownDatasetMath:
         assert report["headline"]["max_drawdown"] == pytest.approx(50.0)
 
     def test_checklist_down_day_present_but_negative_pnl_fails(self, tmp_path, known_dataset):
-        report = self._build(tmp_path, known_dataset)
+        # metrics-7: 23:59:59 son günü kısmi bırakır (DOWN günü sayılmazdı);
+        # eski test kısmi günü sayıyordu. Pencere tam gece yarısı kapanıyor.
+        report = self._build(tmp_path, known_dataset, report_until=datetime(2026, 8, 17))
         checklist = {item["name"]: item for item in report["checklist"]}
         down_day_item = next(i for i in report["checklist"] if "düşüş" in i["name"])
         assert down_day_item["status"] == "PASS"  # 1 DOWN günü var
@@ -373,7 +375,7 @@ class TestKnownDatasetMath:
         # yalnız 3 gün -> soak süresi FAIL
         soak_item = next(i for i in report["checklist"] if "Soak süresi" in i["name"])
         assert soak_item["status"] == "FAIL"
-        assert "3 gün" in soak_item["detail"]
+        assert "3 tam gün" in soak_item["detail"]
         # UNKNOWN oranı %20 >= %5 eşiği -> FAIL
         unknown_item = next(i for i in report["checklist"] if "UNKNOWN" in i["name"])
         assert unknown_item["status"] == "FAIL"
@@ -422,7 +424,10 @@ class TestChecklistScenarios:
         ]
         klines_path = _write_klines_json(tmp_path, klines)
         since = datetime(2026, 8, 14)
-        until = datetime(2026, 8, 18, 23, 59, 59)
+        # metrics-7: soak yalnız TAM UTC günleri sayar; 08-18 23:59:59 son günü
+        # kısmi bırakırdı (4 tam gün, DOWN günü kısmi). Eski davranış kısmi
+        # günü saydığı için burada until gece yarısına çekildi (5 tam gün).
+        until = datetime(2026, 8, 19)
         trades, _ = lr.load_closed_trades(db, since, until)
         daily_changes = lr.klines_to_daily_changes(lr.load_offline_klines(klines_path))
         days = lr.iter_days(since, until)
@@ -477,6 +482,8 @@ class TestRenderers:
             # D27/A1: "REAPER ayrımı 2026-08-24'ten itibaren" uyarısı JSON
             # tüketicisine de görünmeli (renderer'a bağımlı uyarı, uyarı değil).
             "exit_reason_note",
+            # Paket F (metrics-2): AP takipçi satırı başlıktan ayrı raporlanır.
+            "ap",
         }
         assert parsed["headline"]["total_trades"] == 5
 
@@ -1168,3 +1175,257 @@ class TestConcentration:
         ))
         assert "oğunluk" not in names
         assert "onsantrasyon" not in names
+
+
+
+# --------------------------------------------------------------------------
+# Paket F: metrics-2 (PnL kaynak karışımı, AP ayrımı, LONG/SHORT),
+# metrics-7 (yalnız tam UTC günleri), UP payı n/a
+# --------------------------------------------------------------------------
+
+def _trade(tid, pnl, *, strategy="C", direction="LONG", source="verified",
+           day="2026-08-14", symbol="BTCUSDT", reason="TRAIL"):
+    return lr.ClosedTrade(
+        id=tid, strategy=strategy, symbol=symbol, direction=direction,
+        realized_pnl=pnl, exit_reason=reason,
+        closed_at=datetime.strptime(day, "%Y-%m-%d") + timedelta(hours=tid),
+        day=day, pnl_source=source,
+    )
+
+
+class TestPnlSource:
+    @pytest.mark.parametrize("notes,expected", [
+        ("pnl_source=binance_income_net", "verified"),
+        ("x;pnl_source=binance_account_trades_net;y", "verified"),
+        ("pnl_source=estimated_gross", "fallback"),
+        ("pnl_source=binance_trades_close_net", "fallback"),
+        ("backfill 2026-08-07", "legacy"),
+        (None, "legacy"),
+        ("", "legacy"),
+    ])
+    def test_derivation(self, notes, expected):
+        assert lr.derive_pnl_source(notes) == expected
+
+    def test_parity_with_tracker(self):
+        from src.strategies.scalper.tracker import ScalpTracker
+        for notes in ("pnl_source=binance_income_net", "pnl_source=estimated_gross",
+                      "pnl_source=binance_trades_close_net", "zzz", None):
+            assert lr.derive_pnl_source(notes) == ScalpTracker._pnl_source(notes)
+
+    def test_loaded_from_notes_column(self, tmp_path):
+        db = _make_db(tmp_path, [
+            {"id": 1, "realized_pnl": 1.0, "closed_at": "2026-08-14 01:00:00",
+             "notes": "pnl_source=binance_income_net;exit=x"},
+            {"id": 2, "realized_pnl": 2.0, "closed_at": "2026-08-14 02:00:00",
+             "notes": "pnl_source=estimated_gross"},
+            {"id": 3, "realized_pnl": 3.0, "closed_at": "2026-08-14 03:00:00",
+             "notes": None},
+        ])
+        trades, _ = lr.load_closed_trades(db, datetime(2026, 8, 14), datetime(2026, 8, 15))
+        assert [t.pnl_source for t in trades] == ["verified", "fallback", "legacy"]
+
+    def test_db_without_notes_column_is_legacy(self, tmp_path):
+        # _make_ai_db şemasında notes sütunu YOK: rapor çökmemeli.
+        db = _make_ai_db(tmp_path, [
+            {"id": 1, "strategy": "C", "symbol": "BTCUSDT", "direction": "LONG",
+             "realized_pnl": 4.0, "exit_reason": "TRAIL", "status": "CLOSED",
+             "closed_at": "2026-08-14 01:00:00"},
+        ])
+        trades, _ = lr.load_closed_trades(db, datetime(2026, 8, 14), datetime(2026, 8, 15))
+        assert len(trades) == 1 and trades[0].pnl_source == "legacy"
+
+
+class TestHeadlineSourceMix:
+    def test_split_arithmetic(self):
+        trades = [
+            _trade(1, 10.0, source="verified"),
+            _trade(2, -4.0, source="verified"),
+            _trade(3, 5.0, source="fallback"),
+            _trade(4, 2.0, source="legacy"),
+        ]
+        h = lr.build_headline(trades, {}, ["2026-08-14"])
+        mix = h["pnl_sources"]
+        assert mix["verified"]["trades"] == 2
+        assert mix["verified"]["pnl"] == pytest.approx(6.0)
+        assert mix["verified"]["profit_factor"] == pytest.approx(2.5)
+        assert mix["verified"]["winrate"] == pytest.approx(50.0)
+        assert mix["unverified"]["trades"] == 2
+        assert mix["unverified"]["pnl"] == pytest.approx(7.0)
+        assert mix["unverified"]["fallback_trades"] == 1
+        assert mix["unverified"]["legacy_trades"] == 1
+        assert mix["unverified"]["profit_factor"] == float("inf")
+        assert mix["total"]["pnl"] == pytest.approx(13.0)
+        assert h["pnl"] == pytest.approx(13.0)
+
+    def test_rendered_in_text_and_md(self):
+        trades = [_trade(1, 10.0, source="verified"), _trade(2, 5.0, source="fallback")]
+        report = lr.build_report(trades, {}, datetime(2026, 8, 14), datetime(2026, 8, 15),
+                                 ["2026-08-14"], [])
+        text, md = lr.render_text(report), lr.render_md(report)
+        assert "Doğrulanmış" in text and "Doğrulanmamış" in text
+        assert "Doğrulanmış" in md and "Doğrulanmamış" in md
+
+
+class TestApSeparation:
+    def _trades(self):
+        return [
+            _trade(1, 10.0, strategy="C"),
+            _trade(2, -3.0, strategy="TV", direction="SHORT"),
+            _trade(3, 100.0, strategy="AP"),
+            _trade(4, -20.0, strategy="AP", direction="SHORT"),
+        ]
+
+    def _report(self, **kw):
+        return lr.build_report(self._trades(), {}, datetime(2026, 8, 14), datetime(2026, 8, 15),
+                               ["2026-08-14"], [], **kw)
+
+    def test_default_excludes_ap_from_headline_and_tables(self):
+        r = self._report()
+        assert r["headline"]["total_trades"] == 2
+        assert r["headline"]["pnl"] == pytest.approx(7.0)
+        assert sum(x["trades"] for x in r["symbol"]) == 2
+        assert sum(x["trades"] for x in r["regime_direction"] if x["regime"] != "TOPLAM") == 2
+
+    def test_ap_has_own_line(self):
+        r = self._report()
+        ap = r["ap"]
+        assert ap["trades"] == 2
+        assert ap["pnl"] == pytest.approx(80.0)
+        assert ap["profit_factor"] == pytest.approx(5.0)
+        assert "AP" in lr.render_text(r) and "AP" in lr.render_md(r)
+
+    def test_strategy_table_still_lists_all(self):
+        r = self._report()
+        assert {x["strategy"] for x in r["strategy"]} == {"C", "TV", "AP"}
+
+    def test_include_ap_pools_again(self):
+        r = self._report(include_ap=True)
+        assert r["headline"]["total_trades"] == 4
+        assert r["headline"]["pnl"] == pytest.approx(87.0)
+
+    def test_cli_strategy_ap_filter_still_works(self, tmp_path, capsys):
+        db = _make_db(tmp_path, [
+            {"id": 1, "strategy": "C", "realized_pnl": 10.0, "closed_at": "2026-08-20 10:00:00"},
+            {"id": 2, "strategy": "AP", "realized_pnl": -5.0, "closed_at": "2026-08-20 11:00:00"},
+            {"id": 3, "strategy": "AP", "realized_pnl": 7.0, "closed_at": "2026-08-20 12:00:00"},
+        ])
+        kl = _write_klines_json(tmp_path, [_kline_row("2026-08-20", 100.0, 100.1)])
+        rc = lr.main(["--db", db, "--since", "2026-08-20 00:00", "--until", "2026-08-21 00:00",
+                      "--btc-klines-json", kl, "--strategy", "AP", "--format", "json"])
+        assert rc == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["headline"]["total_trades"] == 2
+        assert parsed["headline"]["pnl"] == pytest.approx(2.0)
+
+    def test_cli_default_excludes_ap(self, tmp_path, capsys):
+        db = _make_db(tmp_path, [
+            {"id": 1, "strategy": "C", "realized_pnl": 10.0, "closed_at": "2026-08-20 10:00:00"},
+            {"id": 2, "strategy": "AP", "realized_pnl": -5.0, "closed_at": "2026-08-20 11:00:00"},
+        ])
+        kl = _write_klines_json(tmp_path, [_kline_row("2026-08-20", 100.0, 100.1)])
+        lr.main(["--db", db, "--since", "2026-08-20 00:00", "--until", "2026-08-21 00:00",
+                 "--btc-klines-json", kl, "--format", "json"])
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["headline"]["total_trades"] == 1
+        assert parsed["ap"]["trades"] == 1
+        assert parsed["ap"]["pnl"] == pytest.approx(-5.0)
+
+
+class TestLongShortSplit:
+    def _trades(self):
+        return [
+            _trade(1, 30.0, direction="LONG"),
+            _trade(2, -10.0, direction="LONG"),
+            _trade(3, -6.0, direction="SHORT"),
+            _trade(4, 2.0, direction="SHORT", day="2026-08-15"),
+        ]
+
+    def test_headline_split(self):
+        h = lr.build_headline(self._trades(), {}, ["2026-08-14", "2026-08-15"])
+        lo, sh = h["long_short"]["LONG"], h["long_short"]["SHORT"]
+        assert (lo["trades"], lo["pnl"], lo["winrate"]) == (2, pytest.approx(20.0), pytest.approx(50.0))
+        assert lo["profit_factor"] == pytest.approx(3.0)
+        assert (sh["trades"], sh["pnl"], sh["winrate"]) == (2, pytest.approx(-4.0), pytest.approx(50.0))
+        assert sh["profit_factor"] == pytest.approx(2.0 / 6.0)
+
+    def test_regime_table_has_direction_totals(self):
+        report = lr.build_report(self._trades(), {}, datetime(2026, 8, 14), datetime(2026, 8, 16),
+                                 ["2026-08-14", "2026-08-15"], [])
+        rows = {(r["regime"], r["direction"]): r for r in report["regime_direction"]}
+        assert rows[("TOPLAM", "LONG")]["trades"] == 2
+        assert rows[("TOPLAM", "LONG")]["pnl"] == pytest.approx(20.0)
+        assert rows[("TOPLAM", "SHORT")]["pnl"] == pytest.approx(-4.0)
+
+    def test_rendered(self):
+        report = lr.build_report(self._trades(), {}, datetime(2026, 8, 14), datetime(2026, 8, 16),
+                                 ["2026-08-14", "2026-08-15"], [])
+        assert "LONG" in lr.render_text(report).split("5) ÖZET")[1]
+        assert "SHORT" in lr.render_md(report).split("## 5) Özet")[1]
+
+
+class TestFullDaySoak:
+    def test_full_days_only(self):
+        since, until = datetime(2026, 1, 1, 23, 59), datetime(2026, 1, 5, 0, 1)
+        full, partial = lr.split_full_days(since, until)
+        assert full == ["2026-01-02", "2026-01-03", "2026-01-04"]
+        assert partial == ["2026-01-01", "2026-01-05"]
+
+    def test_exact_midnight_bounds_are_full(self):
+        full, partial = lr.split_full_days(datetime(2026, 8, 14), datetime(2026, 8, 19))
+        assert len(full) == 5 and partial == []
+
+    def test_range_inside_one_day_has_no_full_day(self):
+        full, partial = lr.split_full_days(datetime(2026, 8, 14, 3), datetime(2026, 8, 14, 20))
+        assert full == [] and partial == ["2026-08-14"]
+
+    def test_soak_checklist_fails_on_partial_days(self):
+        since, until = datetime(2026, 1, 1, 23, 59), datetime(2026, 1, 5, 0, 1)
+        days = lr.iter_days(since, until)  # 5 takvim günü ama 3 tam gün
+        report = lr.build_report([], {}, since, until, days, [])
+        h = report["headline"]
+        assert h["soak_days"] == 3
+        assert h["partial_days"] == ["2026-01-01", "2026-01-05"]
+        item = report["checklist"][0]
+        assert item["status"] == "FAIL"
+        assert "kısmi" in item["detail"]
+
+    def test_five_full_days_pass(self):
+        since, until = datetime(2026, 8, 14), datetime(2026, 8, 19)
+        report = lr.build_report([], {}, since, until, lr.iter_days(since, until), [])
+        assert report["headline"]["soak_days"] == 5
+        assert report["checklist"][0]["status"] == "PASS"
+
+    def test_down_day_in_partial_day_does_not_count(self):
+        since, until = datetime(2026, 8, 14, 12), datetime(2026, 8, 19)
+        days = lr.iter_days(since, until)
+        daily = {"2026-08-14": -3.0}  # DOWN yalnız kısmi ilk günde
+        report = lr.build_report([], daily, since, until, days, [])
+        down = next(i for i in report["checklist"] if i["name"].startswith("En az 1 düşüş"))
+        assert down["status"] == "FAIL"
+
+
+class TestUpShareNa:
+    def test_none_when_total_negative(self):
+        trades = [_trade(1, 10.0, day="2026-08-14"), _trade(2, -40.0, day="2026-08-15")]
+        daily = {"2026-08-14": 3.0, "2026-08-15": 0.0}
+        h = lr.build_headline(trades, daily, ["2026-08-14", "2026-08-15"])
+        assert h["pnl"] == pytest.approx(-30.0)
+        assert h["up_pnl_share_pct"] is None
+
+    def test_none_when_total_zero(self):
+        trades = [_trade(1, 5.0), _trade(2, -5.0)]
+        assert lr.build_headline(trades, {"2026-08-14": 3.0}, ["2026-08-14"])["up_pnl_share_pct"] is None
+
+    def test_positive_total_still_computed(self):
+        trades = [_trade(1, 10.0)]
+        h = lr.build_headline(trades, {"2026-08-14": 3.0}, ["2026-08-14"])
+        assert h["up_pnl_share_pct"] == pytest.approx(100.0)
+
+    def test_rendered_na(self):
+        trades = [_trade(1, 10.0, day="2026-08-14"), _trade(2, -40.0, day="2026-08-15")]
+        daily = {"2026-08-14": 3.0, "2026-08-15": 0.0}
+        report = lr.build_report(trades, daily, datetime(2026, 8, 14), datetime(2026, 8, 16),
+                                 ["2026-08-14", "2026-08-15"], [])
+        assert "n/a" in lr.render_text(report)
+        assert "n/a" in lr.render_md(report)
+        assert "%-" not in lr.render_text(report).split("UP günlerden PnL payı")[1].splitlines()[0]

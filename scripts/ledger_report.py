@@ -60,6 +60,7 @@ UP_THRESHOLD_PCT = 1.5
 DOWN_THRESHOLD_PCT = -1.5
 
 REGIME_ORDER = ["UP", "FLAT", "DOWN", "?"]
+REGIME_TOTAL_LABEL = "TOPLAM"
 # "TRAIL_MARKET"/"BE_MARKET" (D22): koruyucu stop borsaya konulamadı (-2021)
 # ve `position_manager._emergency_close` pozisyonu reduce-only MARKET ile
 # kapattı. TRAIL AİLESİNDENDİRLER ama AYRI SAYILIRLAR — sayıları artıyorsa
@@ -119,6 +120,8 @@ class ClosedTrade:
     exit_reason: str  # ham değer NULL/"" ise "UNKNOWN"'a normalize edilir
     closed_at: datetime  # naive UTC
     day: str  # "YYYY-MM-DD" (UTC)
+    #: "verified" | "fallback" | "legacy" — `derive_pnl_source` (notes sütunu).
+    pnl_source: str = "legacy"
 
 
 # --------------------------------------------------------------------------
@@ -161,6 +164,44 @@ def _parse_db_timestamp(s: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def derive_pnl_source(notes: Optional[str]) -> str:
+    """`notes` içindeki `pnl_source=` etiketinden PnL kaynak sınıfı (metrics-2).
+
+    `src/strategies/scalper/tracker.py::ScalpTracker._pnl_source` ile AYNI
+    kural (script stdlib-only kalmalı, bu yüzden tekrarlanır; eşitlik
+    `tests/test_ledger_report.py` ile doğrulanır):
+      verified = borsa net geliri (income / account_trades),
+      fallback = tahmini brüt ya da kapanış-bacağı neti (komisyon/funding eksik),
+      legacy   = etiket yok.
+    """
+    for part in (notes or "").split(";"):
+        if part.startswith("pnl_source="):
+            value = part.split("=", 1)[1]
+            if value in ("binance_income_net", "binance_account_trades_net"):
+                return "verified"
+            if value in ("estimated_gross", "binance_trades_close_net"):
+                return "fallback"
+    return "legacy"
+
+
+def split_full_days(since: datetime, until: datetime) -> Tuple[List[str], List[str]]:
+    """(tam UTC günleri, kısmi günler) — metrics-7.
+
+    Tam gün: 00:00'ı `since`'ten önce DEĞİL ve ertesi gün 00:00'ı `until`'den
+    sonra DEĞİL olan gün. İlk/son gün yalnız kısmen kapsanıyorsa kısmidir ve
+    soak günü sayılmaz (23:59 ile başlayan pencere 1 gün kazandırmamalı).
+    """
+    full: List[str] = []
+    partial: List[str] = []
+    for label in iter_days(since, until):
+        start = datetime.strptime(label, "%Y-%m-%d")
+        if start >= since and start + timedelta(days=1) <= until:
+            full.append(label)
+        elif start < until:  # until tam gece yarısıysa o gün 0 süre kapsar: kısmi bile değil
+            partial.append(label)
+    return full, partial
+
+
 def iter_days(since: datetime, until: datetime) -> List[str]:
     """[since.date(), until.date()] arasındaki her takvim gününü döner."""
     day = since.date()
@@ -194,10 +235,19 @@ def load_closed_trades(
     con = sqlite3.connect(db_path)
     try:
         con.row_factory = sqlite3.Row
-        cur = con.execute(
-            "SELECT id, strategy, symbol, direction, realized_pnl, exit_reason, closed_at "
-            "FROM scalp_trades WHERE status = 'CLOSED'"
-        )
+        try:
+            cur = con.execute(
+                "SELECT id, strategy, symbol, direction, realized_pnl, exit_reason, "
+                "closed_at, notes FROM scalp_trades WHERE status = 'CLOSED'"
+            )
+            has_notes = True
+        except sqlite3.OperationalError:
+            # Eski DB: notes sütunu yok -> kaynak bilinmez (legacy), çökme yok.
+            cur = con.execute(
+                "SELECT id, strategy, symbol, direction, realized_pnl, exit_reason, "
+                "closed_at FROM scalp_trades WHERE status = 'CLOSED'"
+            )
+            has_notes = False
         rows = cur.fetchall()
     finally:
         con.close()
@@ -224,6 +274,7 @@ def load_closed_trades(
             exit_reason=exit_reason,
             closed_at=closed_dt,
             day=closed_dt.strftime("%Y-%m-%d"),
+            pnl_source=derive_pnl_source(row["notes"] if has_notes else None),
         ))
     trades.sort(key=lambda t: t.closed_at)
     return trades, skipped
@@ -462,6 +513,21 @@ def _group_stats(trades: List[ClosedTrade]) -> Dict[str, Any]:
         "avg_win": (gross_win / len(wins)) if wins else 0.0,
         "avg_loss": (-gross_loss / len(losses)) if losses else 0.0,
     }
+
+
+def _source_split(trades: List[ClosedTrade]) -> Dict[str, Any]:
+    """metrics-2: PnL kaynak karışımı. verified = borsa net geliri; unverified
+    = fallback (tahmini) + legacy (etiketsiz). Toplam = ikisinin birleşimi."""
+    verified = [t for t in trades if t.pnl_source == "verified"]
+    unverified = [t for t in trades if t.pnl_source != "verified"]
+    out: Dict[str, Any] = {
+        "verified": _group_stats(verified),
+        "unverified": _group_stats(unverified),
+        "total": _group_stats(trades),
+    }
+    out["unverified"]["fallback_trades"] = sum(1 for t in unverified if t.pnl_source == "fallback")
+    out["unverified"]["legacy_trades"] = sum(1 for t in unverified if t.pnl_source != "fallback")
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -854,6 +920,10 @@ def build_regime_direction_table(
         for direction in ("LONG", "SHORT"):
             stats = _group_stats(grouped.get((regime, direction), []))
             rows.append({"regime": regime, "direction": direction, **stats})
+    # Rejimden bağımsız yön toplamı (LONG/SHORT ayrımı tek bakışta).
+    for direction in ("LONG", "SHORT"):
+        stats = _group_stats([t for t in trades if t.direction == direction])
+        rows.append({"regime": REGIME_TOTAL_LABEL, "direction": direction, **stats})
     return rows
 
 
@@ -944,6 +1014,7 @@ def build_daily_table(
 
 def build_headline(
     trades: List[ClosedTrade], daily_changes: Dict[str, float], days: List[str],
+    since: Optional[datetime] = None, until: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """Tablo 5: özet — toplamlar + maxDD + UP payı + UNKNOWN payı + rejim
     gün/PnL sayaçları (checklist bunun üstüne kurulur)."""
@@ -962,7 +1033,8 @@ def build_headline(
         t.realized_pnl for t in trades
         if classify_regime(daily_changes.get(t.day)) == "UP"
     )
-    up_pnl_share_pct = (up_pnl / total_pnl * 100.0) if total_pnl != 0 else None
+    # Toplam <= 0 iken "kârın payı" anlamsız (negatif/devasa yüzde) -> n/a.
+    up_pnl_share_pct = (up_pnl / total_pnl * 100.0) if total_pnl > 0 else None
 
     unknown_n = sum(1 for t in trades if t.exit_reason == "UNKNOWN")
     unknown_exit_share_pct = (unknown_n / overall["trades"] * 100.0) if overall["trades"] else 0.0
@@ -970,6 +1042,15 @@ def build_headline(
     regime_day_counts = {"UP": 0, "FLAT": 0, "DOWN": 0, "?": 0}
     for day in days:
         regime_day_counts[classify_regime(daily_changes.get(day))] += 1
+
+    # metrics-7: soak yalnız TAM UTC günlerini sayar; kısmi günler ayrı raporlanır.
+    if since is not None and until is not None:
+        full_days, partial_days = split_full_days(since, until)
+    else:
+        full_days, partial_days = list(days), []
+    full_regime_day_counts = {"UP": 0, "FLAT": 0, "DOWN": 0, "?": 0}
+    for day in full_days:
+        full_regime_day_counts[classify_regime(daily_changes.get(day))] += 1
 
     regime_pnls: Dict[str, float] = {}
     regime_trade_counts: Dict[str, int] = {}
@@ -989,7 +1070,14 @@ def build_headline(
         "regime_day_counts": regime_day_counts,
         "regime_pnls": regime_pnls,
         "regime_trade_counts": regime_trade_counts,
-        "soak_days": len(days),
+        "soak_days": len(full_days),
+        "partial_days": partial_days,
+        "full_regime_day_counts": full_regime_day_counts,
+        "pnl_sources": _source_split(trades),
+        "long_short": {
+            d: _group_stats([t for t in trades if t.direction == d])
+            for d in ("LONG", "SHORT")
+        },
         "concentration": build_concentration(trades),
     }
 
@@ -1054,17 +1142,21 @@ def build_checklist(
     items: List[Dict[str, str]] = []
 
     soak_days = headline["soak_days"]
+    partial = headline.get("partial_days") or []
+    partial_txt = (
+        f"; {len(partial)} kısmi gün sayılmadı ({', '.join(partial)})" if partial else ""
+    )
     items.append({
-        "name": f"Soak süresi >= {SOAK_MIN_DAYS} gün",
+        "name": f"Soak süresi >= {SOAK_MIN_DAYS} tam UTC günü",
         "status": "PASS" if soak_days >= SOAK_MIN_DAYS else "FAIL",
-        "detail": f"{soak_days} gün ({since.date()} -> {until.date()})",
+        "detail": f"{soak_days} tam gün ({since.date()} -> {until.date()}){partial_txt}",
     })
 
-    down_days = headline["regime_day_counts"]["DOWN"]
+    down_days = (headline.get("full_regime_day_counts") or headline["regime_day_counts"])["DOWN"]
     items.append({
         "name": "En az 1 düşüş (DOWN) günü",
         "status": "PASS" if down_days >= 1 else "FAIL",
-        "detail": f"{down_days} DOWN gün",
+        "detail": f"{down_days} DOWN gün (yalnız tam günler)",
     })
 
     unknown_pct = headline["unknown_exit_share_pct"]
@@ -1101,11 +1193,24 @@ def build_report(
     forensics: Optional[List[Dict[str, Any]]] = None,
     ai: Optional[Dict[str, Any]] = None,
     counterfactual: Optional[Dict[str, Any]] = None,
+    include_ap: bool = False,
 ) -> Dict[str, Any]:
+    # metrics-2: AP (gömülü takipçi, sanal defter) scalper başlığına KARIŞMAZ;
+    # kendi satırında raporlanır. `include_ap=True` (ya da --strategy AP ile
+    # zaten daraltılmış set) eski birleşik davranışı geri verir.
+    all_trades = trades
+    ap_trades = [t for t in all_trades if str(t.strategy or "").upper() == "AP"]
+    if not include_ap:
+        trades = [t for t in all_trades if str(t.strategy or "").upper() != "AP"]
+        if ap_trades:
+            notes = list(notes) + [
+                f"{len(ap_trades)} AP (takipçi) işlemi scalper başlığından ÇIKARILDI; "
+                f"ayrı AP satırında raporlanır (--include-ap ile birleştirilir)."
+            ]
     # `forensics`/`ai` YOKSA anahtar hiç eklenmez (renderer'lar `is not None`
     # ile bölümü açar). Tek gövde: iki ayrı sözlük tutmak, birine eklenen bir
     # alanın diğerinde unutulmasına davetiyedir (D21-R3, bulgu 5).
-    headline = build_headline(trades, daily_changes, days)
+    headline = build_headline(trades, daily_changes, days, since, until)
     report: Dict[str, Any] = {
         "meta": {
             "since": since.strftime("%Y-%m-%d %H:%M"),
@@ -1115,7 +1220,9 @@ def build_report(
         "regime_direction": build_regime_direction_table(trades, daily_changes, days),
         "exit_reason_direction": build_exit_reason_direction_table(trades),
         "symbol": build_symbol_table(trades),
-        "strategy": build_strategy_table(trades),
+        "strategy": build_strategy_table(all_trades),
+        "ap": {**_group_stats(ap_trades), "pnl_sources": _source_split(ap_trades),
+               "included_in_headline": bool(include_ap)},
         "daily": build_daily_table(trades, daily_changes, days),
         "headline": headline,
         "checklist": build_checklist(headline, since, until),
@@ -1545,6 +1652,45 @@ def _concentration_lines(conc: Dict[str, Any]) -> List[str]:
     ]
 
 
+def _stats_txt(st: Dict[str, Any]) -> str:
+    return (
+        f"{st['trades']} işlem, PnL {st['pnl']:+.2f}, PF {_fmt_pf(st['profit_factor'])}, "
+        f"WR {st['winrate']:.1f}%"
+    )
+
+
+def _headline_source_lines(report: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """(etiket, değer) çiftleri: PnL kaynak karışımı + LONG/SHORT + AP satırı.
+    text ve md aynı sayıları yazsın diye tek yer."""
+    h = report["headline"]
+    out: List[Tuple[str, str]] = []
+    mix = h.get("pnl_sources")
+    if mix:
+        unv = mix["unverified"]
+        out.append(("Doğrulanmış PnL (borsa net geliri)", _stats_txt(mix["verified"])))
+        out.append((
+            "Doğrulanmamış PnL (tahmini/eski)",
+            _stats_txt(unv)
+            + f" [tahmini {unv.get('fallback_trades', 0)}, etiketsiz {unv.get('legacy_trades', 0)}]",
+        ))
+        out.append(("Toplam PnL (ikisi birlikte)", _stats_txt(mix["total"])))
+    for direction, st in (h.get("long_short") or {}).items():
+        out.append((f"Yön {direction}", _stats_txt(st)))
+    ap = report.get("ap")
+    if ap is not None:
+        tag = "başlığa DAHİL" if ap.get("included_in_headline") else "başlık DIŞI"
+        verified = (ap.get("pnl_sources") or {}).get("verified", {})
+        out.append((
+            f"AP takipçi ({tag})",
+            _stats_txt(ap) + f" [doğrulanmış PnL {verified.get('pnl', 0.0):+.2f}]",
+        ))
+    return out
+
+
+def _up_share_txt(value: Optional[float]) -> str:
+    return f"%{value:.1f}" if value is not None else "n/a (toplam PnL <= 0)"
+
+
 def render_text(report: Dict[str, Any]) -> str:
     meta = report["meta"]
     h = report["headline"]
@@ -1589,13 +1735,19 @@ def render_text(report: Dict[str, Any]) -> str:
     lines.append(f"  Profit factor      : {_fmt_pf(h['profit_factor'])}")
     lines.append(f"  Maks. düşüş (DD)   : {h['max_drawdown']:.2f}")
     up_share = h["up_pnl_share_pct"]
-    up_share_txt = f"%{up_share:.1f}" if up_share is not None else "N/A (toplam PnL=0)"
-    lines.append(f"  UP günlerden PnL payı: {up_share_txt}")
+    lines.append(f"  UP günlerden PnL payı: {_up_share_txt(up_share)}")
     lines.append(f"  exit_reason=UNKNOWN oranı: %{h['unknown_exit_share_pct']:.1f}")
     rdc = h["regime_day_counts"]
     lines.append(
         f"  Rejim gün sayısı   : UP={rdc['UP']} FLAT={rdc['FLAT']} DOWN={rdc['DOWN']} ?={rdc['?']}"
     )
+    partial = h.get("partial_days") or []
+    lines.append(
+        f"  Soak (tam UTC günü): {h['soak_days']}"
+        + (f"  (kısmi, sayılmayan: {', '.join(partial)})" if partial else "")
+    )
+    for label, value in _headline_source_lines(report):
+        lines.append(f"  {label}: {value}")
     lines.extend(_concentration_lines(h.get("concentration") or {}))
 
     if report.get("forensics") is not None:
@@ -1697,7 +1849,7 @@ def render_md(report: Dict[str, Any]) -> str:
     lines.append("")
     lines.append("## 5) Özet")
     up_share = h["up_pnl_share_pct"]
-    up_share_txt = f"%{up_share:.1f}" if up_share is not None else "N/A (toplam PnL=0)"
+    up_share_txt = _up_share_txt(up_share)
     rdc = h["regime_day_counts"]
     lines.append(f"- Toplam işlem: **{h['total_trades']}**")
     lines.append(f"- Kazanma oranı: **{h['winrate']:.1f}%**")
@@ -1707,6 +1859,13 @@ def render_md(report: Dict[str, Any]) -> str:
     lines.append(f"- UP günlerden PnL payı: **{up_share_txt}**")
     lines.append(f"- exit_reason=UNKNOWN oranı: **%{h['unknown_exit_share_pct']:.1f}**")
     lines.append(f"- Rejim gün sayısı: UP={rdc['UP']} FLAT={rdc['FLAT']} DOWN={rdc['DOWN']} ?={rdc['?']}")
+    partial = h.get("partial_days") or []
+    lines.append(
+        f"- Soak (tam UTC günü): **{h['soak_days']}**"
+        + (f" (kısmi, sayılmayan: {', '.join(partial)})" if partial else "")
+    )
+    for label, value in _headline_source_lines(report):
+        lines.append(f"- {label}: **{value}**")
     conc = h.get("concentration") or {}
     if conc:
         lines.append(
@@ -1878,6 +2037,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "gün/rejim kıyaslarında 'at' doğrudur (D27 incelemesi O10)"
         ),
     )
+    parser.add_argument(
+        "--include-ap", action="store_true",
+        help="AP (takipçi) işlemlerini scalper başlığına kat (varsayılan: ayrı satır, başlık DIŞI). "
+             "--strategy verilmişse zaten o strateji raporlanır.",
+    )
     parser.add_argument("--format", choices=["text", "md", "json"], default="text")
     parser.add_argument("--out", default=None, help="çıktı dosyası (varsayılan: stdout)")
     return parser.parse_args(argv)
@@ -1972,6 +2136,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         forensics=forensics_table,
         ai=ai_section,
         counterfactual=counterfactual_section,
+        include_ap=bool(args.include_ap or args.strategy),
     )
     output = RENDERERS[args.format](report)
 

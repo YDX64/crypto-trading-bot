@@ -20,7 +20,10 @@ konteynerde gereksiz tedarik zinciri yüzeyi.
 
 UPSTREAM'DEN AYRILAN İKİ ZORUNLU DÜZELTME
 -----------------------------------------
-1) HIGH/LOW KELEPÇESİ (`clamp=True`, varsayılan).
+0) (C paketi) Artık BAR BÜTÜNÜ karıştırılır (aşağıdaki kelepçe metni TARİHÇEDİR:
+   ortak şemada ihlal yapısal olarak 0'dır, kelepçe yalnız emniyettir).
+
+1) HIGH/LOW KELEPÇESİ (`clamp=True`, varsayılan) — eski bağımsız şema.
    Upstream `rel_open`/`rel_high`/`rel_low`/`rel_close`'u BAĞIMSIZ
    karıştırır. `rel_high >= 0` ve `rel_low <= 0` her zaman doğru olduğundan
    permüte barda High >= Open ve Low <= Open korunur, ama Close bağımsız
@@ -64,6 +67,7 @@ from __future__ import annotations
 
 import bisect
 import math
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -104,50 +108,83 @@ def direction_of(metric: str) -> Optional[str]:
 
 
 # ==========================================================================
-# Permütasyon — log uzayında göreli hareketleri karıştır
+# Permütasyon — BAR BÜTÜNÜ (ortak) karıştırma, log uzayında
 # ==========================================================================
 
-def permute_candles(
-    candles: Sequence[Candle],
-    *,
-    start_index: int = 0,
-    seed: Optional[int] = None,
-    clamp: bool = True,
-) -> Tuple[List[Candle], Dict[str, Any]]:
-    """OHLC'yi log uzayında göreli hareketleri karıştırarak permüte et.
+@dataclass(frozen=True)
+class PermutationIndex:
+    """Bir permütasyonun çizimi: `gap` boşluk (open − önceki close) dizisinin,
+    `shape` bar şekli (h−o, l−o, c−o) üçlülerinin sırasıdır. Aynı nesne birden
+    çok sembole / lider seriye uygulanabilir (`apply_permutation_index`)."""
+    gap: np.ndarray
+    shape: np.ndarray
+    block_length: int = 1
 
-    `start_index` ve ÖNCESİ hiç değişmez (warm-up bağlamı gerçek kalır ve
-    permütasyon test penceresinin başındaki fiyat SEVİYESİ ile başlar).
-    Zaman damgaları ve hacim korunur.
+    @property
+    def length(self) -> int:
+        return int(len(self.shape))
 
-    Matematiksel not: `rel_open` ve `rel_close` AYNI indeks kümesi üzerinde
-    karıştırıldığından toplamları korunur → permüte serinin SON kapanışı
-    orijinalinkiyle (log uzayında) aynıdır. Yani seri arada dolaşır ama
-    toplam sürüklenme (drift) korunur; bu, permüte 5m serisinin permüte
-    edilmemiş bir rejim serisinden seviye olarak kopmasını sınırlar.
 
-    Döner: (permüte mumlar, kelepçe istatistikleri).
-    Kelepçe istatistikleri kelepçe KAPALI iken de doldurulur (ihlal sayımı
-    yapılır, düzeltme uygulanmaz) — böylece "kelepçe ne kadar iş yaptı"
-    sorusu ölçülebilir.
+def _block_permutation(rng: np.random.Generator, n: int, block_length: int) -> np.ndarray:
+    """0..n-1'in blok-permütasyonu: ardışık `block_length` barlık bloklar
+    (sonuncusu kısa olabilir) rastgele sırayla dizilir, blok İÇİ sıra korunur.
+    block_length=1 → düz permütasyon."""
+    if block_length <= 1:
+        return rng.permutation(n)
+    starts = list(range(0, n, block_length))
+    order = rng.permutation(len(starts))
+    parts = [np.arange(starts[k], min(starts[k] + block_length, n)) for k in order]
+    return np.concatenate(parts) if parts else np.arange(0)
+
+
+def draw_permutation_index(
+    n: int, *, seed: Optional[int] = None, block_length: int = 1,
+) -> PermutationIndex:
+    """`n` barlık permüte pencere için TEK permütasyon çiz (gap + shape).
+
+    Aynı (n, seed, block_length) → aynı indeks. Bir sürücü bunu birden çok
+    sembole ve lider seriye uygulayarak semboller arası ilişkiyi korur.
     """
-    n = len(candles)
-    stats: Dict[str, Any] = {
+    if block_length < 1:
+        raise ValueError("block_length >= 1 olmalı")
+    if n < 0:
+        raise ValueError("n >= 0 olmalı")
+    rng = np.random.default_rng(seed)
+    gap = _block_permutation(rng, n, int(block_length))
+    shape = _block_permutation(rng, n, int(block_length))
+    return PermutationIndex(gap=gap, shape=shape, block_length=int(block_length))
+
+
+def _empty_stats(clamp: bool) -> Dict[str, Any]:
+    return {
         "bars": 0, "permuted_bars": 0, "clamp_applied": bool(clamp),
         "high_violations": 0, "low_violations": 0,
         "high_violation_pct": 0.0, "low_violation_pct": 0.0,
         "violated_bars": 0, "violated_bar_pct": 0.0,
         "mean_abs_adjust_pct": 0.0, "max_abs_adjust_pct": 0.0,
     }
+
+
+def _apply_index(
+    candles: Sequence[Candle], index: PermutationIndex, start_index: int, clamp: bool,
+) -> Tuple[List[Candle], Dict[str, Any]]:
+    n = len(candles)
+    stats = _empty_stats(clamp)
     if n == 0:
         return [], stats
     if start_index < 0:
         raise ValueError("start_index >= 0 olmalı")
     if start_index >= n - 1:
-        # Karıştırılacak bar yok — seri aynen döner (hata değil: çok kısa
-        # pencerede permütasyon anlamsızdır, sessizce boş iş yapılır).
         stats["bars"] = n
         return list(candles), stats
+
+    perm_index = start_index + 1
+    perm_n = n - perm_index
+    if index.length != perm_n or len(index.gap) != perm_n:
+        raise ValueError(
+            f"permütasyon indeksi uzunluk uyuşmazlığı: indeks {index.length}, "
+            f"seri permüte pencere {perm_n} bar"
+        )
 
     opens = np.asarray([c.open for c in candles], dtype=float)
     highs = np.asarray([c.high for c in candles], dtype=float)
@@ -167,21 +204,15 @@ def permute_candles(
     log_low = np.log(lows)
     log_close = np.log(closes)
 
-    perm_index = start_index + 1
-    perm_n = n - perm_index
+    gaps = (log_open[1:] - log_close[:-1])[start_index:]       # perm_n
+    rel_high = (log_high - log_open)[perm_index:]
+    rel_low = (log_low - log_open)[perm_index:]
+    rel_close = (log_close - log_open)[perm_index:]
 
-    rel_open = np.empty(n, dtype=float)
-    rel_open[0] = 0.0
-    rel_open[1:] = log_open[1:] - log_close[:-1]
-    rel_high = log_high - log_open
-    rel_low = log_low - log_open
-    rel_close = log_close - log_open
-
-    rng = np.random.default_rng(seed)
-    slice_open = rel_open[perm_index:][rng.permutation(perm_n)]
-    slice_high = rel_high[perm_index:][rng.permutation(perm_n)]
-    slice_low = rel_low[perm_index:][rng.permutation(perm_n)]
-    slice_close = rel_close[perm_index:][rng.permutation(perm_n)]
+    slice_gap = gaps[index.gap]
+    slice_high = rel_high[index.shape]
+    slice_low = rel_low[index.shape]
+    slice_close = rel_close[index.shape]
 
     out: List[Candle] = list(candles[:perm_index])
     prev_close_log = log_close[start_index]
@@ -193,12 +224,13 @@ def permute_candles(
 
     for k in range(perm_n):
         src = candles[perm_index + k]
-        o = prev_close_log + slice_open[k]
+        o = prev_close_log + slice_gap[k]
         h = o + slice_high[k]
         low = o + slice_low[k]
         c = o + slice_close[k]
 
-        # İhlal sayımı (kelepçe kapalıyken de yapılır — ölçüm için).
+        # İhlal sayımı: ortak şemada h>=max(o,c), l<=min(o,c) yapısaldır
+        # (üçlü bir bardan gelir) → sayaç 0 kalmalı; kontrol emniyet için.
         need_high = max(o, c) > h
         need_low = min(o, c) < low
         if need_high:
@@ -245,6 +277,59 @@ def permute_candles(
         ),
     })
     return out, stats
+
+
+def apply_permutation_index(
+    candles: Sequence[Candle], index: PermutationIndex, *, start_index: int = 0,
+) -> List[Candle]:
+    """Önceden çizilmiş `index`'i mum serisine uygula (permüte mumlar döner).
+    Permüte pencere uzunluğu (`len(candles) - start_index - 1`) indeksinkiyle
+    aynı değilse `ValueError`."""
+    out, _ = _apply_index(candles, index, start_index, clamp=True)
+    return out
+
+
+def permute_candles(
+    candles: Sequence[Candle],
+    *,
+    start_index: int = 0,
+    seed: Optional[int] = None,
+    clamp: bool = True,
+    block_length: int = 1,
+) -> Tuple[List[Candle], Dict[str, Any]]:
+    """OHLC'yi log uzayında BAR BÜTÜNÜ olarak karıştır (standart şema).
+
+    Her permüte bar kendi (high−open, low−open, close−open) üçlüsünü taşır;
+    boşluklar (open − önceki close) AYRI karıştırılır. Bar aralığı ortalaması
+    gerçek seriyle aynıdır (log uzayında birebir) ve High>=max(O,C),
+    Low<=min(O,C) yapısaldır → kelepçe ihlali 0 (eski bağımsız-OHLC
+    karıştırmada aralıklar ~%25 şişiyordu).
+
+    `block_length` (bar):
+      * 1 (varsayılan): bağımsız-bar null'u. H0: "getiri/şekil/boşluklar
+        zamanda değiş-tokuş edilebilir"; volatilite kümelenmesi YOK edilir.
+      * >1: ardışık bloklar karıştırılır; blok İÇİ yapı (volatilite
+        kümelenmesi, kısa vadeli otokorelasyon) korunur, yalnız bloklar arası
+        ilişki yok edilir. H0: "blok-iç yapı aynı, bloklar arası zamanlama
+        şans".
+
+    `start_index` ve ÖNCESİ değişmez; zaman damgaları ve hacim korunur. Boşluk
+    ve close−open toplamları korunduğundan SON kapanış orijinalle aynıdır.
+
+    Döner: (permüte mumlar, kelepçe istatistikleri). `clamp` yalnız emniyet:
+    ortak şemada hiçbir şey düzeltmez.
+    """
+    n = len(candles)
+    if block_length < 1:
+        raise ValueError("block_length >= 1 olmalı")
+    if n == 0 or start_index >= n - 1:
+        return _apply_index(candles, PermutationIndex(
+            gap=np.arange(0), shape=np.arange(0)), start_index, clamp)
+    if start_index < 0:
+        raise ValueError("start_index >= 0 olmalı")
+    index = draw_permutation_index(n - start_index - 1, seed=seed,
+                                   block_length=block_length)
+    return _apply_index(candles, index, start_index, clamp)
 
 
 def aggregate_from(source: Sequence[Candle], target: Sequence[Candle]) -> List[Candle]:
@@ -308,10 +393,37 @@ def _finite(value: Any) -> Optional[float]:
     return out if math.isfinite(out) else None
 
 
+#: Sıfır işlemli null koşuda TANIMSIZ olan metrikler (compute_stats sıfır
+#: döndürür; bu 0 "kötü sonuç" değil "ölçülmedi"dir) → bu null'lardan dışlanır.
+#: PnL / drawdown null'larında 0 gerçek değerdir ve KALIR.
+UNDEFINED_ON_ZERO_TRADES = frozenset({
+    "winrate", "profit_factor", "avg_roi", "avg_mfe", "avg_mae",
+})
+TRADE_COUNT_KEY = "trades"
+PRIMARY_METRIC = "total_pnl"
+MULTIPLICITY_NOTE = (
+    "Metrik başına p-değerleri çoklu teste göre düzeltilmemiş; birincil "
+    "metrik total_pnl'dir, diğerleri bilgi içindir. Tarama/çok-varyant "
+    "seçimi için multitest.py (Benjamini-Hochberg) kullanılmalı."
+)
+
+
+def _num(value: Any) -> Optional[float]:
+    """float'a çevir; NaN/None/çevrilemeyen → None. +/-inf KORUNUR."""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(out) else out
+
+
 def compute_p_values(
     real_metrics: Dict[str, Any],
     permuted_metrics: Sequence[Dict[str, Any]],
     metrics: Optional[Iterable[str]] = None,
+    *,
+    seed: Optional[int] = None,
+    block_length: int = 1,
 ) -> Dict[str, Any]:
     """Permütasyon null dağılımından metrik başına p-değeri.
 
@@ -321,14 +433,34 @@ def compute_p_values(
       * `lower` : p = P(null <= gerçek)
 
     p-değeri `(b+1)/(m+1)` (Phipson & Smyth 2010); ham oran `p_raw`.
-    Sonlu OLMAYAN değerler (ör. hiç kayıp yoksa `profit_factor = inf`) null
-    dağılımından ATILIR ve gerçek değer sonlu değilse p-değeri üretilmez
-    (`note` alanında nedeni yazar) — `inf >= inf` karşılaştırmasıyla p=1.0
-    üretmek okuyanı yanıltır.
+
+    Sonsuz null değerler ATILMAZ: hiç kayıpsız null koşunun
+    `profit_factor = inf`'i en iyi null sonuçtur ve `>= gerçek` sayılır
+    (lower-is-better metrikte +inf en kötüdür, `<= gerçek` olmaz). Yalnız
+    NaN/None atılır. Gerçek değer NaN/-inf ise p-değeri üretilmez; higher-is-better
+    metrikte gerçek +inf geçerlidir (p tanımlı).
+
+    Sıfır işlemli null koşular (`trades == 0`, satırda `trades` anahtarı
+    varsa) winrate/PF/avg_* null'larından DIŞLANIR (tanımsız), PnL ve
+    drawdown null'larında 0 olarak KALIR. Oranları sonuçta
+    `zero_trade_null_fraction` verir.
+
+    Sonuç ayrıca `permutations`, `seed`, `block_length`,
+    `infinite_pf_nulls`, `primary_metric` ve çoklu-test notunu taşır.
     """
     wanted = list(metrics) if metrics is not None else list(DEFAULT_METRICS)
     out: Dict[str, Any] = {}
     skipped: List[Dict[str, str]] = []
+
+    m_total = len(permuted_metrics)
+    zero_rows = sum(
+        1 for m in permuted_metrics
+        if TRADE_COUNT_KEY in m and _num(m.get(TRADE_COUNT_KEY)) == 0.0
+    )
+    inf_pf = sum(
+        1 for m in permuted_metrics
+        if (v := _num(m.get("profit_factor"))) is not None and v == math.inf
+    )
 
     for metric in wanted:
         direction = direction_of(metric)
@@ -340,8 +472,23 @@ def compute_p_values(
             continue
 
         real = _finite(real_metrics.get(metric))
-        raw_dist = [m.get(metric) for m in permuted_metrics if metric in m]
-        dist = [v for v in (_finite(x) for x in raw_dist) if v is not None]
+        if real is None and direction == HIGHER_IS_BETTER:
+            # +inf (ör. hiç kayıpsız PF) iyi yönde tanımlı bir sonuçtur; p üretilir.
+            raw_real = _num(real_metrics.get(metric))
+            if raw_real == math.inf:
+                real = raw_real
+        undefined_on_zero = metric in UNDEFINED_ON_ZERO_TRADES
+        raw_dist: List[Any] = []
+        zero_excluded = 0
+        for m in permuted_metrics:
+            if metric not in m:
+                continue
+            if (undefined_on_zero and TRADE_COUNT_KEY in m
+                    and _num(m.get(TRADE_COUNT_KEY)) == 0.0):
+                zero_excluded += 1
+                continue
+            raw_dist.append(m.get(metric))
+        dist = [v for v in (_num(x) for x in raw_dist) if v is not None]
         dropped = len(raw_dist) - len(dist)
 
         row: Dict[str, Any] = {
@@ -350,6 +497,7 @@ def compute_p_values(
             "real": None if real is None else round(real, 6),
             "n": len(dist),
             "non_finite_dropped": dropped,
+            "zero_trade_excluded": zero_excluded,
         }
         if not dist:
             row["note"] = "null dağılımı boş (sonlu değer yok)"
@@ -357,14 +505,17 @@ def compute_p_values(
             continue
 
         arr = np.asarray(dist, dtype=float)
-        row.update({
-            "null_mean": round(float(np.mean(arr)), 6),
-            "null_median": round(float(np.median(arr)), 6),
-            "null_p05": round(float(np.percentile(arr, 5)), 6),
-            "null_p95": round(float(np.percentile(arr, 95)), 6),
-            "null_min": round(float(np.min(arr)), 6),
-            "null_max": round(float(np.max(arr)), 6),
-        })
+        fin = arr[np.isfinite(arr)]
+        row["infinite_in_null"] = int(len(arr) - len(fin))
+        if len(fin):
+            row.update({
+                "null_mean": round(float(np.mean(fin)), 6),
+                "null_median": round(float(np.median(fin)), 6),
+                "null_p05": round(float(np.percentile(fin, 5)), 6),
+                "null_p95": round(float(np.percentile(fin, 95)), 6),
+                "null_min": round(float(np.min(fin)), 6),
+                "null_max": round(float(np.max(fin)), 6),
+            })
         if real is None:
             row["note"] = (
                 "gerçek değer sonlu değil (ör. profit_factor=inf) — p-değeri "
@@ -383,7 +534,21 @@ def compute_p_values(
         row["p_value"] = round((at_least_as_extreme + 1) / (n + 1), 6)
         out[metric] = row
 
-    return {"metrics": out, "skipped": skipped}
+    return {
+        "metrics": out,
+        "skipped": skipped,
+        "permutations": m_total,
+        "seed": seed,
+        "block_length": int(block_length),
+        "infinite_pf_nulls": inf_pf,
+        "zero_trade_null_fraction": (zero_rows / m_total) if m_total else 0.0,
+        "zero_trade_note": (
+            "sıfır işlemli null koşular winrate/PF/avg_* null'larından "
+            "dışlandı (tanımsız); PnL ve drawdown null'larında 0 olarak kaldı"
+        ),
+        "primary_metric": PRIMARY_METRIC,
+        "multiplicity_note": MULTIPLICITY_NOTE,
+    }
 
 
 def clamp_shift_report(

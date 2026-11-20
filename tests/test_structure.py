@@ -604,7 +604,10 @@ class TestHarnessStructureExit:
         trade = manage_position(pos, candles_5m, cfg, structure_feed=feed)
 
         assert trade.exit_reason == "STRUCT_BE"
-        assert trade.exit_price == pytest.approx(pos.breakeven_price)
+        # A1: STOP_MARKET çıkışı aleyhte çıkış kayması ile dolar.
+        assert trade.exit_price == pytest.approx(
+            pos.breakeven_price * (1.0 - pos.exit_realism.exit_slippage_rate)
+        )
 
     def test_feed_memoization_matches_direct_computation(self):
         cfg = _HarnessCfg(scalper_structure_exit="close")

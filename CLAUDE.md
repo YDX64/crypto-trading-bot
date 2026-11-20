@@ -105,7 +105,7 @@ Yeni sinyal kaynağı (haber botu vb.) eklemek: `docs/INTEGRATIONS.md`. Otomatik
 
 ## Nasıl çalıştırılır / test edilir / deploy edilir
 ```bash
-python3 -m pytest tests -q                      # 3363 test, ~60 sn — her değişiklikten önce
+python3 -m pytest tests -q                      # 3617 test (+3 atlanan), ~80 sn — her değişiklikten önce
 scripts/deploy.sh awa                           # push edilmiş main'i sunucuya uygula (test + restart + sağlık + otomatik geri alma)
 DEPLOY_NO_RESTART=1 scripts/deploy.sh awa       # yalnız kod/test; süreci yeniden başlatma
 scripts/deploy.sh awa <önceki-commit>           # geri alma (backups/commit.prev-*)
@@ -125,6 +125,15 @@ env $(ssh awa grep ^SCALPER_ /opt/tradingbot-v2/.env | xargs) python3 -m src.str
 ```
 Koşuları sıralı yap (paralel = Binance 429). Sonuç `docs/EXPERIMENTS.md`'ye log yoluyla girer.
 
+**Değerlendirme prosedürü (D41, 2026-11-20 — harness artık GERÇEKÇİ model varsayılan):** harness boşluk/çıkış kayması,
+maker trade-through, fonlama (`data/funding_cache`), likidasyon ve günlük kesiciyi varsayılan AÇIK uygular
+(`--disable-realism a,b`; `--legacy-model` = eski model, eski sayıları birebir üretir). RESMİ sayı gerçekçi modeldir;
+eski (E2…E13) sayılarla kıyas yalnız `--legacy-model` ile yapılır. Sweep kabul kuralı **P2-v2**'dir
+(`scripts/autoresearch.py`; eski P2 yalnız "P2-eski" olarak basılır): örneklem ≥ 60 işlem/pencere, eşleşmiş bootstrap
++ BH q ≤ 0.10, pencere zararı ≤ 0.20×scale, DD ≤ 1.2× taban, maliyet 2× ve 1 mum gecikme stresi. Örneklem-dışı sınama:
+`scripts/walk_forward.py` (yalnız kline önbelleğiyle). Pencere kullanımı `docs/holdout_registry.json` kaydındadır;
+mühürlü pencereye `--open-sealed "<amaç>"` olmadan koşu REDDEDİLİR. Ayrıntı: D41, `docs/AUTORESEARCH.md`, EXPERIMENTS E16.
+
 **Ölçüm/kanıt bayrakları (D24, hepsi VARSAYILAN KAPALI — motor davranışını değiştirmez):**
 `--permutations N` (+`--permutation-clamp-audit`) Monte-Carlo permütasyon p-değeri;
 `--fee-stress` komisyon+kayma 2×; `--entry-delay-candles N` giriş gecikmesi çürütme
@@ -134,7 +143,8 @@ Rapor artık `bar_max_drawdown` (bar-bazlı mark-to-market çöküş — kapanı
 `max_drawdown` gerçek çukuru SIĞ gösterir) ve konsantrasyon (tek sembol/işlem/gün kâr
 payı) satırlarını da içerir. Ayrıntı ve ölçülmüş etkiler: `docs/DECISIONS.md` D24.
 **`docs/EXPERIMENTS.md`'nin BAŞINDAKİ uyarı kutusunu oku:** E2…E9'un 36 varyantının
-tamamı aynı üç pencerede ölçüldü — dokunulmamış bir doğrulama penceremiz YOK.
+tamamı aynı üç pencerede ölçüldü — dokunulmamış bir doğrulama penceremiz YOK (Mart/Mayıs/Haziran/Çöküş/Nisan
+da `docs/holdout_registry.json`'da YANIK; yeni pencereler `VAL-2026Q4a` ve mühürlü `SEAL-2026Q4b`, D41).
 
 ## Yasaklar (ihlal = sistemi bozma)
 1. Kanıtsız parametre değişikliği yok: her `SCALPER_*` değişikliği önce 3 rejim

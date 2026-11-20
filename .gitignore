@@ -77,6 +77,8 @@ docker-compose.override.yml
 *.json
 # autoresearch aday listesi kod ile birlikte commit'lenir (uretim ciktisi degil)
 !scripts/autoresearch_candidates.json
+# saklı pencere kaydı (D41): tek kullanımlık sınav pencerelerinin açılış defteri, kod ile birlikte commit'lenir
+!docs/holdout_registry.json
 # Claude Code bulut oturumu kancası kaydı (D39; secret içermez)
 !.claude/settings.json
 
@@ -93,6 +95,8 @@ backups/
 data/klines_cache/
 # data.binance.vision zip indirme onbellegi (scripts/fill_klines_cache_from_vision.py)
 data/vision_cache/
+# Tarihsel funding oranlari (scripts/fill_funding_cache.py; backtest funding modeli)
+data/funding_cache/
 scripts/.scalper_env_snapshot.txt
 
 # D32 (2026-09-03): runtime durum dizini (cooldown/halt/pending) ve eski venv kopyaları

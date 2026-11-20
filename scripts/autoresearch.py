@@ -26,16 +26,23 @@ Bir ADAY canliya nasil gecer (insan karari, bu script otomatik yapmaz):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+# Yalniz stdlib'e bagli iki modul (config/.env YUKLEMEZ): P2-v2 istatistikleri.
+from src.strategies.scalper import montecarlo, multitest  # noqa: E402
 
 # docs/DECISIONS.md P2 + CLAUDE.md "Yasaklar #1" ile ayni pencereler.
 WINDOWS: List[Tuple[str, str, str]] = [
@@ -48,11 +55,66 @@ WINDOW_IDS: List[str] = [w[0] for w in WINDOWS]
 DEFAULT_SYMBOLS = "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,BNBUSDT,ADAUSDT,LTCUSDT"
 DEFAULT_CANDIDATES_PATH = Path(__file__).resolve().parent / "autoresearch_candidates.json"
 DEFAULT_CACHE_DIR = "data/klines_cache"
+DEFAULT_FUNDING_CACHE_DIR = REPO_ROOT / "data" / "funding_cache"
 
 # docs/DECISIONS.md #P2 karar kurali sabitleri.
 PF_THRESHOLD = 1.1
 MAX_BOGA_DROP_PCT = 0.20
 MIN_TRADES_PER_WINDOW = 60
+
+# P2-v2 (saglam kabul/red kurali) sabitleri.
+P2V2_MIN_TRADES = MIN_TRADES_PER_WINDOW
+P2V2_Q_MAX = 0.10               # BH sonrasi q esigi
+P2V2_BLOCK_DAYS = 3             # gun-blok bootstrap blok uzunlugu
+P2V2_N_PATHS = 5000
+P2V2_SEED = 12345
+P2V2_HARM_FRAC = 0.20           # pencere basina izin verilen zarar: scale_w'nin %20'si
+P2V2_SCALE_FLOOR_FRAC = 0.25    # scale_w tabani: brut hareketin %25'i
+P2V2_DD_TOLERANCE = 0.20        # havuz DD taban DD'den en fazla %20 kotu
+# Dayaniklilik (stres) kosulari: ad -> backtest.py bayraklari.
+STRESS_SCENARIOS: Dict[str, List[str]] = {
+    "maliyet2x": ["--fee-stress"],
+    "gecikme1": ["--entry-delay-candles", "1"],
+}
+
+BACKTEST_MODULE = "src.strategies.scalper.backtest"
+
+# Alt surece AKTARILAN (izin listesi) ortam degiskenleri: yalniz calismak icin
+# gerekenler. SCALPER_* ve BINANCE_* ASLA buradan gecmez (env-file + aday
+# override'lari + asagidaki sahte degerler disinda hicbir ayar sizmaz).
+_PASSTHROUGH_ENV = (
+    "PATH", "HOME", "USER", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TZ",
+    "PYTHONPATH", "VIRTUAL_ENV", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "no_proxy",
+)
+# Settings'in baslayabilmesi icin zorunlu, GERCEK OLMAYAN degerler (backtest
+# yalniz herkese acik kline verisi ceker; anahtar kullanmaz).
+_DUMMY_REQUIRED_ENV = {
+    "BINANCE_API_KEY": "autoresearch-dummy-key",
+    "BINANCE_API_SECRET": "autoresearch-dummy-secret",
+    "TELEGRAM_BOT_TOKEN": "autoresearch-dummy",
+    "TELEGRAM_CHAT_ID": "0",
+    "OPENAI_API_KEY": "autoresearch-dummy",
+    "GEMINI_API_KEY": "autoresearch-dummy",
+    "DEEPSEEK_API_KEY": "autoresearch-dummy",
+    "JWT_SECRET": "autoresearch-dummy-jwt-secret",
+}
+
+# `Settings` sinifi `model_config(env_file=".env")` ile cwd'deki yerel .env'i
+# okur (src/core/config.py). Alt surecte config import EDILMEDEN once
+# `SettingsConfigDict`i, env_file'i her zaman None yapacak sekilde sararak
+# yerel .env'i devre disi birakiriz (config.py'ye dokunmadan).
+NO_DOTENV_PRELUDE = (
+    "import pydantic_settings as _ps\n"
+    "_orig_scd = _ps.SettingsConfigDict\n"
+    "def _scd_no_env_file(*a, **kw):\n"
+    "    kw['env_file'] = None\n"
+    "    return _orig_scd(*a, **kw)\n"
+    "_ps.SettingsConfigDict = _scd_no_env_file\n"
+)
+
+_REPORT_PATH_RE = re.compile(r"Backtest raporu yaz\S+:\s*(\S+\.json)")
 
 
 # --------------------------------------------------------------------------
@@ -115,6 +177,79 @@ def load_candidates(path: Path) -> List[Candidate]:
     return candidates
 
 
+class EnvFileError(ValueError):
+    """`--env-file` kullanilamaz (yok / SCALPER_ anahtari icermiyor)."""
+
+
+def require_scalper_env(env: Dict[str, str], path: str) -> None:
+    """Taban env'de en az bir `SCALPER_*` anahtari yoksa REDDET: sunucu
+    snapshot'i olmadan koşu, baska bir stratejiyi olcer (bkz. parity-7)."""
+    if not any(k.upper().startswith("SCALPER_") for k in env):
+        raise EnvFileError(
+            f"env-file '{path}' hic SCALPER_* anahtari icermiyor — sunucu "
+            "snapshot'i gerekli: ssh awa grep ^SCALPER_ /opt/tradingbot-v2/.env > scalper_env.txt"
+        )
+
+
+def build_subprocess_env(env_vars: Dict[str, str], bot_log_dir: Path) -> Dict[str, str]:
+    """Backtest alt sureci icin IZOLE ortam: izin listesi + env-file/override
+    degerleri + sahte zorunlu degerler (anahtar/token). Ebeveyn ortamindaki SCALPER_* ve
+    gercek anahtarlar gecmez; sahte anahtarlar env-file'dakini de ezer."""
+    full_env = {k: os.environ[k] for k in _PASSTHROUGH_ENV if k in os.environ}
+    full_env.update(env_vars)
+    full_env.update(_DUMMY_REQUIRED_ENV)
+    full_env["TRADINGBOT_LOG_DIR"] = str(bot_log_dir)
+    return full_env
+
+
+def env_content_hash(path: str) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def backtest_flags(symbols: str) -> List[str]:
+    """Sonucu etkileyen sabit backtest bayraklari (pencere ve onbellek dizini
+    haric: pencere anahtarda ayri, cache-dir sonucu degistirmez)."""
+    return ["--strategies", "C", "--symbols", symbols]
+
+
+def funding_cache_fingerprint(cache_dir: Optional[Path] = None) -> str:
+    """Funding onbellegi (<SEMBOL>.json) iceriginin ozeti: backtest bu dosyalari okur ve sonucu
+    degistirir, bu yuzden sonuc anahtarinin parcasidir. Dizin yok/bos = bos-ozet."""
+    d = Path(cache_dir) if cache_dir is not None else DEFAULT_FUNDING_CACHE_DIR
+    h = hashlib.sha256()
+    if d.is_dir():
+        for f in sorted(d.glob("*.json")):
+            h.update(f.name.encode("utf-8") + b"\0")
+            h.update(hashlib.sha256(f.read_bytes()).digest())
+    return h.hexdigest()
+
+
+def compute_result_key(
+    git_sha: str,
+    dirty_fingerprint: str,
+    env_hash: str,
+    overrides: Dict[str, str],
+    windows: List[Tuple[str, str, str]],
+    flags: List[str],
+    baseline_source: str = "run",
+    funding_hash: str = "",
+) -> Dict[str, Any]:
+    """Bir sonucun yeniden kullanilabilirligini belirleyen anahtar. Bilesenler
+    denetim icin acik tutulur; `digest` hepsinin ozetidir."""
+    components: Dict[str, Any] = {
+        "git_sha": git_sha,
+        "dirty_fingerprint": dirty_fingerprint,
+        "env_hash": env_hash,
+        "overrides": {str(k): str(v) for k, v in sorted(overrides.items())},
+        "windows": [list(w) for w in windows],
+        "flags": list(flags),
+        "baseline_source": baseline_source,
+        "funding_hash": funding_hash,
+    }
+    blob = json.dumps(components, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return dict(components, digest=hashlib.sha256(blob).hexdigest())
+
+
 # --------------------------------------------------------------------------
 # Guvenlik: sadece commit'lenmis koda karsi degerlendir
 # --------------------------------------------------------------------------
@@ -135,6 +270,27 @@ def get_git_sha(repo_root: Path = REPO_ROOT) -> str:
         cwd=repo_root, capture_output=True, text=True, check=True,
     )
     return result.stdout.strip()
+
+
+def git_dirty_fingerprint(repo_root: Path = REPO_ROOT) -> str:
+    """`git diff HEAD -- src scripts` + izlenmeyen (untracked) src/scripts dosyalarinin sha256'si
+    (temiz = bos diff = sha256(b""))."""
+    result = subprocess.run(
+        ["git", "diff", "HEAD", "--", "src", "scripts"],
+        cwd=repo_root, capture_output=True, check=True,
+    )
+    untracked = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "--", "src", "scripts"],
+        cwd=repo_root, capture_output=True, text=True, check=True,
+    ).stdout.splitlines()
+    h = hashlib.sha256(result.stdout)
+    for name in sorted(untracked):          # git diff HEAD izlenmeyen dosyayi GORMEZ
+        h.update(b"\0untracked\0" + name.encode("utf-8") + b"\0")
+        try:
+            h.update((Path(repo_root) / name).read_bytes())
+        except OSError:
+            h.update(b"<unreadable>")
+    return h.hexdigest()
 
 
 def ensure_clean_src(repo_root: Path = REPO_ROOT) -> None:
@@ -168,15 +324,50 @@ def extract_metrics_from_json(payload: Dict[str, Any]) -> Optional[Dict[str, Any
     if not isinstance(overall, dict):
         return None
     try:
+        # backtest.py::_strict_json_value sonsuz PF'yi JSON null yazar
+        # (kayip yok + kar var). Anahtar VAR ama null/"inf" -> +inf.
+        pf_raw = overall["profit_factor"]
+        profit_factor = float("inf") if pf_raw is None else float(pf_raw)
         return {
             "trades": int(overall["trades"]),
             "winrate": float(overall["winrate"]),
             "total_pnl": float(overall["total_pnl"]),
-            "profit_factor": float(overall["profit_factor"]),
+            "profit_factor": profit_factor,
             "max_drawdown": float(overall["max_drawdown"]),
         }
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def extract_trade_series(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Rapordan P2-v2 icin gereken ek alanlar: islem basina [exit_time_ms,
+    net_pnl] listesi ve (varsa) bar-bazli max cokus. `trades` yoksa None."""
+    trades = payload.get("trades")
+    if not isinstance(trades, list):
+        return None
+    try:
+        pnls = [[int(t["exit_time"]), float(t["pnl"])] for t in trades]
+    except (KeyError, TypeError, ValueError):
+        return None
+    out: Dict[str, Any] = {"trade_pnls": pnls}
+    # Yon (LONG/SHORT) yalniz TUM islemlerde varsa eklenir (walk_forward.py yon kirilimi).
+    sides = [t.get("direction") for t in trades]
+    if sides and all(isinstance(x, str) for x in sides):
+        out["trade_sides"] = [x.upper() for x in sides]
+    bar_dd = (payload.get("overall") or {}).get("bar_max_drawdown")
+    if isinstance(bar_dd, (int, float)):
+        out["bar_max_drawdown"] = float(bar_dd)
+    return out
+
+
+def extract_report_path(output: str, repo_root: Path) -> Optional[Path]:
+    """Alt surecin YAZDIRDIGI "Backtest raporu yazildi: <yol>" satirindan bu
+    kosunun rapor yolunu doner (son eslesme). Goreli yol `repo_root`a gore."""
+    matches = _REPORT_PATH_RE.findall(output)
+    if not matches:
+        return None
+    path = Path(matches[-1])
+    return path if path.is_absolute() else repo_root / path
 
 
 def parse_report_text(text: str) -> Optional[Dict[str, Any]]:
@@ -229,6 +420,7 @@ def run_single_backtest(
     log_path: Path,
     bot_log_dir: Path,
     repo_root: Path = REPO_ROOT,
+    extra_flags: Optional[List[str]] = None,
 ) -> Tuple[bool, Optional[Dict[str, Any]]]:
     """`python3 -m src.strategies.scalper.backtest`'i alt surec olarak
     calistirir; ham ciktiyi `log_path`'e yazar, metrikleri doner.
@@ -238,22 +430,28 @@ def run_single_backtest(
     (`src/core/logger.py` bu degiskeni zaten destekliyor, testler de ayni
     deseni kullaniyor).
     """
-    logs_dir = repo_root / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    before = {p.name for p in logs_dir.glob("backtest_*.json")}
-
+    # `-c` sarmalayici: yerel .env'i devre disi birakir, sonra backtest'i
+    # `-m` ile ayni sekilde calistirir (bkz. NO_DOTENV_PRELUDE).
+    runner = (
+        NO_DOTENV_PRELUDE
+        + "import runpy\n"
+        + f"runpy.run_module({BACKTEST_MODULE!r}, run_name='__main__', alter_sys=True)\n"
+    )
+    flags = list(extra_flags or [])
+    if "--funding-cache-dir" not in flags:
+        # MUTLAK yol: backtest'in varsayilani cwd-goreceli ('data/funding_cache'); walk_forward is
+        # dizininde (cwd = <out>/_jobs/<id>) hic cozulmez ve funding sessizce sabit orana duserdi.
+        flags += ["--funding-cache-dir", str(DEFAULT_FUNDING_CACHE_DIR)]
     cmd = [
-        sys.executable, "-m", "src.strategies.scalper.backtest",
+        sys.executable, "-c", runner,
         "--strategies", "C",
         "--symbols", symbols,
         "--start", start,
         "--end", end,
         "--cache-dir", cache_dir,
-    ]
-    full_env = dict(os.environ)
-    full_env.update(env_vars)
+    ] + flags
     bot_log_dir.mkdir(parents=True, exist_ok=True)
-    full_env["TRADINGBOT_LOG_DIR"] = str(bot_log_dir)
+    full_env = build_subprocess_env(env_vars, bot_log_dir)
 
     proc = subprocess.run(
         cmd, cwd=repo_root, env=full_env, capture_output=True, text=True,
@@ -265,14 +463,17 @@ def run_single_backtest(
     if proc.returncode != 0:
         return False, None
 
-    after = {p.name for p in logs_dir.glob("backtest_*.json")}
-    new_files = after - before
+    # Rapor, "en yeni dosya" (mtime) diye DEGIL, bu kosunun yazdirdigi yoldan
+    # alinir: es zamanli/eski bir rapor yanlis atfedilemez.
     metrics: Optional[Dict[str, Any]] = None
-    if new_files:
-        newest = max((logs_dir / n for n in new_files), key=lambda p: p.stat().st_mtime)
+    report_path = extract_report_path(combined, repo_root)
+    if report_path is not None:
         try:
-            payload = json.loads(newest.read_text(encoding="utf-8"))
+            payload = json.loads(report_path.read_text(encoding="utf-8"))
             metrics = extract_metrics_from_json(payload)
+            series = extract_trade_series(payload)
+            if metrics is not None and series is not None:
+                metrics.update(series)
         except (OSError, json.JSONDecodeError):
             metrics = None
 
@@ -292,6 +493,8 @@ def run_variant(
     cache_dir: str,
     out_dir: Path,
     repo_root: Path = REPO_ROOT,
+    extra_flags: Optional[List[str]] = None,
+    tag: str = "",
 ) -> Tuple[str, Dict[str, Dict[str, Any]]]:
     """Bir varyanti 3 pencerede SIRALI kosar (paralel = Binance 429, bkz.
     CLAUDE.md). Ilk basarisiz pencerede DURUR ve "hata" doner.
@@ -304,11 +507,11 @@ def run_variant(
 
     windows_result: Dict[str, Dict[str, Any]] = {}
     for window_id, start, end in WINDOWS:
-        log_path = out_dir / f"{variant_id}_{window_id}.log"
+        log_path = out_dir / f"{variant_id}{tag}_{window_id}.log"
         ok, metrics = run_single_backtest(
             env_vars=env_vars, symbols=symbols, start=start, end=end,
             cache_dir=cache_dir, log_path=log_path, bot_log_dir=bot_log_dir,
-            repo_root=repo_root,
+            repo_root=repo_root, extra_flags=extra_flags,
         )
         if not ok:
             print(f"  [{variant_id}] {window_id}: HATA — bkz. {log_path}", file=sys.stderr)
@@ -385,6 +588,226 @@ def decide(
 
 
 # --------------------------------------------------------------------------
+# P2-v2 — saglam kabul/red kurali (eski P2 `decide` korunur, "P2-eski" gorunur)
+#
+# Aday ancak HEPSI saglanirsa: (1) her pencerede yeterli islem (taban + aday),
+# (2) eslesmis gun-blok bootstrap ile havuzlanmis delta>0 ve BH sonrasi q<=0.10,
+# (3) hicbir pencerede aday, tabandan scale_w'nin %20'sinden fazla geride degil,
+# (4) havuz max drawdown tabandan en fazla %20 kotu, (5) maliyet 2x ve giris
+# gecikmesi 1 mum stresinde de havuz delta > 0 (esit stresli tabana karsi).
+# --------------------------------------------------------------------------
+
+LABEL_ADAY = "ADAY"
+LABEL_REJECT = "REDDEDILDI"
+LABEL_LOW_SAMPLE = "YETERSIZ-ORNEK"
+LABEL_ERROR = "HATA"
+
+
+def _window_calendar() -> List[date]:
+    cal: List[date] = []
+    for _, start, end in WINDOWS:
+        d0, d1 = date.fromisoformat(start), date.fromisoformat(end)
+        # WINDOWS bitisleri HARIC ([start, end)); +1 her pencereye sahte bir sifir gun eklerdi
+        cal.extend(d0 + timedelta(days=i) for i in range((d1 - d0).days))
+    return cal
+
+
+def _series_trades(
+    metrics_by_window: Dict[str, Dict[str, Any]],
+) -> List[Tuple[datetime, float]]:
+    out: List[Tuple[datetime, float]] = []
+    for wid in WINDOW_IDS:
+        for exit_ms, pnl in metrics_by_window[wid]["trade_pnls"]:
+            out.append((datetime.fromtimestamp(exit_ms / 1000.0, tz=timezone.utc), float(pnl)))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def _has_series(metrics_by_window: Dict[str, Dict[str, Any]]) -> bool:
+    return all(
+        isinstance(metrics_by_window.get(w), dict)
+        and isinstance(metrics_by_window[w].get("trade_pnls"), list)
+        for w in WINDOW_IDS
+    )
+
+
+def _trade_level_drawdown(trades: List[Tuple[datetime, float]]) -> float:
+    cum = peak = dd = 0.0
+    for _, pnl in trades:
+        cum += pnl
+        peak = max(peak, cum)
+        dd = max(dd, peak - cum)
+    return dd
+
+
+def _pooled_drawdown(
+    metrics_by_window: Dict[str, Dict[str, Any]], bar_level: bool,
+) -> float:
+    if bar_level:
+        return sum(float(metrics_by_window[w]["bar_max_drawdown"]) for w in WINDOW_IDS)
+    return _trade_level_drawdown(_series_trades(metrics_by_window))
+
+
+def _pooled_net(metrics_by_window: Dict[str, Dict[str, Any]]) -> float:
+    return sum(
+        sum(float(p) for _, p in metrics_by_window[w]["trade_pnls"]) for w in WINDOW_IDS
+    )
+
+
+def p2v2_bh_qvalues(p_values: List[float], alpha: float = P2V2_Q_MAX) -> List[float]:
+    """Benjamini-Hochberg q-degerleri (multitest modulu), girdi sirasinda."""
+    return [r["q_value"] for r in multitest.benjamini_hochberg(p_values, alpha=alpha)]
+
+
+def p2v2_evaluate(
+    baseline: Dict[str, Dict[str, Any]], variant: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Tek aday icin BH-oncesi olcumler. Eski kuralin karari da eklenir."""
+    ev: Dict[str, Any] = {}
+    if not (_has_series(baseline) and _has_series(variant)):
+        ev["error"] = "islem serisi (trade_pnls) eksik — taban/aday yeniden kosulmali"
+        return ev
+    old_decision, old_reason, old_score = decide(baseline, variant)
+    ev.update(old_decision=old_decision, old_reason=old_reason, old_score=old_score)
+
+    ev["low_sample"] = [
+        w for w in WINDOW_IDS
+        if baseline[w]["trades"] < P2V2_MIN_TRADES or variant[w]["trades"] < P2V2_MIN_TRADES
+    ]
+
+    ab = montecarlo.paired_ab_test(
+        _series_trades(variant), _series_trades(baseline), _window_calendar(),
+        n_paths=P2V2_N_PATHS, block_days=P2V2_BLOCK_DAYS, seed=P2V2_SEED,
+    )
+    delta, se = float(ab["delta"]), float(ab["std_error"])
+    ev.update(delta=delta, se=se, p=float(ab["p_value"]))
+    if se > 0:
+        ev["score"] = delta / se
+    else:
+        ev["score"] = 0.0 if delta == 0 else (1e9 if delta > 0 else -1e9)
+
+    harm: Dict[str, Dict[str, float]] = {}
+    harmed: List[str] = []
+    for w in WINDOW_IDS:
+        pnls = [float(p) for _, p in baseline[w]["trade_pnls"]]
+        gp = sum(x for x in pnls if x > 0)
+        gl = abs(sum(x for x in pnls if x < 0))
+        scale = max(abs(sum(pnls)), P2V2_SCALE_FLOOR_FRAC * (gp + gl))
+        d = sum(float(p) for _, p in variant[w]["trade_pnls"]) - sum(pnls)
+        harm[w] = {"delta": d, "scale": scale, "limit": -P2V2_HARM_FRAC * scale}
+        if d < -P2V2_HARM_FRAC * scale - 1e-9:
+            harmed.append(w)
+    ev["window_harm"] = harm
+    ev["harmed_windows"] = harmed
+
+    bar = all(
+        "bar_max_drawdown" in m for m in list(baseline.values()) + list(variant.values())
+        if isinstance(m, dict)
+    )
+    ev["dd_source"] = "bar" if bar else "trade"
+    ev["base_dd"] = _pooled_drawdown(baseline, bar)
+    ev["cand_dd"] = _pooled_drawdown(variant, bar)
+    return ev
+
+
+def p2v2_stage1(evals: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """BH'yi TUM sweep adaylari uzerinden uygular, asama 1-4 kararini verir.
+    ADAY donenler `needs_stress=True` tasir (asama 5 `p2v2_apply_stress`)."""
+    family = [cid for cid, e in evals.items() if "error" not in e]
+    qs = p2v2_bh_qvalues([evals[c]["p"] for c in family])
+    q_by_id = dict(zip(family, qs))
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for cid, e in evals.items():
+        if "error" in e:
+            out[cid] = {"label": LABEL_ERROR, "reason": e["error"], "score": 0.0,
+                        "needs_stress": False}
+            continue
+        r = dict(e)
+        q = q_by_id[cid]
+        r["q"] = q
+        r["needs_stress"] = False
+        checks = {
+            "sample": not e["low_sample"],
+            "significance": e["delta"] > 0 and q <= P2V2_Q_MAX,
+            "no_harm": not e["harmed_windows"],
+            "drawdown": e["cand_dd"] <= e["base_dd"] * (1.0 + P2V2_DD_TOLERANCE) + 1e-9,
+        }
+        r["checks"] = checks
+        if not checks["sample"]:
+            r["label"] = LABEL_LOW_SAMPLE
+            r["reason"] = f"yetersiz ornek (islem<{P2V2_MIN_TRADES}: {e['low_sample']})"
+            r["score"] = e["score"]
+            out[cid] = r
+            continue
+        fails: List[str] = []
+        if not checks["significance"]:
+            fails.append(
+                f"anlamli degil (delta={e['delta']:+.2f}, p={e['p']:.4f}, "
+                f"q={q:.4f}>{P2V2_Q_MAX})"
+            )
+        if not checks["no_harm"]:
+            fails.append(
+                "pencere zarari: " + ", ".join(
+                    f"{w} {e['window_harm'][w]['delta']:+.2f}<{e['window_harm'][w]['limit']:.2f}"
+                    for w in e["harmed_windows"]
+                )
+            )
+        if not checks["drawdown"]:
+            fails.append(
+                f"DD ({e['dd_source']}) {e['cand_dd']:.2f} > taban {e['base_dd']:.2f} x "
+                f"{1 + P2V2_DD_TOLERANCE:.2f}"
+            )
+        if fails:
+            r["label"], r["reason"] = LABEL_REJECT, "; ".join(fails)
+        else:
+            r["label"] = LABEL_ADAY
+            r["reason"] = (
+                f"delta={e['delta']:+.2f} p={e['p']:.4f} q={q:.4f} (stres bekleniyor)"
+            )
+            r["needs_stress"] = True
+        r["score"] = e["score"]
+        out[cid] = r
+    return out
+
+
+def p2v2_apply_stress(
+    result: Dict[str, Any],
+    base_stress: Dict[str, Dict[str, Dict[str, Any]]],
+    cand_stress: Dict[str, Dict[str, Dict[str, Any]]],
+) -> Dict[str, Any]:
+    """Asama 5: her stres senaryosunda havuz net PnL farki (aday - esit stresli
+    taban) > 0 olmali. Eksik/okunamayan stres sonucu = DUSURULUR (fail-closed)."""
+    r = dict(result)
+    if r.get("label") != LABEL_ADAY:
+        return r
+    r["needs_stress"] = False
+    deltas: Dict[str, Optional[float]] = {}
+    fails: List[str] = []
+    for name in STRESS_SCENARIOS:
+        b, c = base_stress.get(name), cand_stress.get(name)
+        if not b or not c or not _has_series(b) or not _has_series(c):
+            deltas[name] = None
+            fails.append(f"stres {name}: sonuc yok")
+            continue
+        d = _pooled_net(c) - _pooled_net(b)
+        deltas[name] = d
+        if not d > 0:
+            fails.append(f"stres {name}: delta {d:+.2f}<=0")
+    r["stress"] = deltas
+    if fails:
+        r["label"] = LABEL_REJECT
+        r["reason"] = "; ".join(fails)
+    else:
+        r["reason"] = (
+            f"delta={r['delta']:+.2f} p={r['p']:.4f} q={r['q']:.4f}; stres "
+            + ", ".join(f"{n} {v:+.2f}" for n, v in deltas.items())
+        )
+    return r
+
+
+
+# --------------------------------------------------------------------------
 # docs/EXPERIMENTS.md — dated Autoresearch bolumune ekleme (saf metin fonksiyonu)
 # --------------------------------------------------------------------------
 
@@ -396,6 +819,7 @@ def experiments_heading(date_str: str) -> str:
 def format_variant_rows(
     variant_id: str, hypothesis: str, windows_result: Dict[str, Dict[str, Any]],
     decision: str, reason: str, score: float,
+    old_decision: Optional[str] = None,
 ) -> List[str]:
     rows: List[str] = []
     for window_id, _, _ in WINDOWS:
@@ -410,6 +834,8 @@ def format_variant_rows(
             f"{m['total_pnl']:+.2f} | {pf_str} | {m['max_drawdown']:.2f} | - |"
         )
     karar_hucre = f"{decision} ({reason})" if reason else decision
+    if old_decision:
+        karar_hucre += f" / P2-eski: {old_decision}"
     rows.append(
         f"| {variant_id} | KARAR | - | - | {score:+.2f} | - | - | {karar_hucre} |"
     )
@@ -492,13 +918,32 @@ def new_summary(git_sha: str, date_str: str) -> Dict[str, Any]:
     }
 
 
-def should_skip_candidate(summary: Dict[str, Any], candidate_id: str) -> bool:
-    """Yalniz BASARIYLA tamamlanmis (status == 'ok') kayitlar atlanir —
-    daha onceki bir 'hata' yeniden denenir (resumable, ama fail-open degil)."""
+def should_skip_candidate(
+    summary: Dict[str, Any], candidate_id: str, key: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Yalniz BASARIYLA tamamlanmis (status == 'ok') ve `key` ile BIREBIR ayni
+    anahtarla kosmus kayitlar atlanir — daha onceki bir 'hata' ya da farkli
+    sha / kirli-agac / env / override / pencere ile kosmus sonuc yeniden
+    kosulur (resumable, ama fail-open degil). `key` verilmezse (eski cagri)
+    yalniz durum bakilir."""
     entry = summary.get("candidates", {}).get(candidate_id)
     if entry is None:
         return False
-    return entry.get("status") == "ok"
+    if entry.get("status") != "ok":
+        return False
+    if key is None:
+        return True
+    stored = entry.get("key")
+    return isinstance(stored, dict) and stored.get("digest") == key["digest"]
+
+
+def baseline_reusable(summary: Dict[str, Any], key: Dict[str, Any]) -> bool:
+    """Taban sonucu yalniz status 'ok' ve anahtari BIREBIR ayniysa yeniden kullanilir."""
+    entry = summary.get("baseline", {})
+    if entry.get("status") != "ok":
+        return False
+    stored = entry.get("key")
+    return isinstance(stored, dict) and stored.get("digest") == key["digest"]
 
 
 # --------------------------------------------------------------------------
@@ -546,7 +991,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--cache-dir", type=str, default=DEFAULT_CACHE_DIR,
         help=f"backtest.py --cache-dir (varsayilan: {DEFAULT_CACHE_DIR})",
     )
+    parser.add_argument(
+        "--registry", type=str, default=None,
+        help="saklı pencere kaydi (varsayilan: docs/holdout_registry.json)",
+    )
+    parser.add_argument(
+        "--open-sealed", type=str, default=None, metavar="AMAC",
+        help="MUHURLU bir pencereye degen kosuyu bilincli ac (amac kayda yazilir)",
+    )
     return parser
+
+
+def registry_gate(args: argparse.Namespace, record: bool) -> Optional[int]:
+    """WINDOWS'u saklı pencere kaydina karsi denetler (her pencere AYRI; aradaki bosluklar
+    sayilmaz). Muhurlu pencereye degiyorsa ve --open-sealed yoksa 2 doner (ve mesaji basar);
+    aksi halde dokunulan pencerelerin acilis sayisini basar ve None doner."""
+    import walk_forward as wf
+
+    path = Path(args.registry) if args.registry else wf.DEFAULT_REGISTRY
+    try:
+        touched = wf.guard_windows(
+            path, [(s, e) for _, s, e in WINDOWS], by="autoresearch",
+            open_sealed=args.open_sealed, record=record,
+        )
+    except wf.RegistryError as exc:
+        print(f"HATA: {exc}", file=sys.stderr)
+        return 2
+    print(wf.format_touched(touched))
+    print(f"  kayit: {path} sha256={wf.registry_fingerprint(path)}")
+    return None
 
 
 def print_dry_run_plan(
@@ -583,7 +1056,14 @@ def print_dry_run_plan(
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
 
-    baseline_env = parse_env_file(args.env_file)
+    try:
+        if not args.env_file or not Path(args.env_file).is_file():
+            raise EnvFileError(f"env-file bulunamadi: '{args.env_file}' (--env-file zorunlu)")
+        baseline_env = parse_env_file(args.env_file)
+        require_scalper_env(baseline_env, args.env_file)
+    except EnvFileError as exc:
+        print(f"HATA: {exc}", file=sys.stderr)
+        return 1
     symbols = baseline_env.get("SCALPER_SYMBOL_ALLOWLIST", "").strip() or DEFAULT_SYMBOLS
 
     candidates = load_candidates(Path(args.candidates))
@@ -598,48 +1078,77 @@ def main(argv: Optional[List[str]] = None) -> int:
         candidates = candidates[: args.limit]
 
     if args.dry_run:
+        rc = registry_gate(args, record=False)
+        if rc is not None:
+            return rc
         print_dry_run_plan(candidates, symbols, baseline_env, args)
         return 0
 
     ensure_clean_src(REPO_ROOT)
+    rc = registry_gate(args, record=True)
+    if rc is not None:
+        return rc
     git_sha = get_git_sha(REPO_ROOT)
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     out_dir = REPO_ROOT / "logs" / "autoresearch" / date_str
     out_dir.mkdir(parents=True, exist_ok=True)
     summary_path = out_dir / "summary.json"
 
+    # Ust duzey git_sha yalniz ilk olusturmada yazilir; her sonucun KENDI
+    # anahtari (sha, kirli-agac, env hash, override...) kayitla birlikte saklanir
+    # ve eski bir sonucun sha'si asla ezilmez.
     summary = load_summary(summary_path) or new_summary(git_sha, date_str)
-    summary["git_sha"] = git_sha
+
+    dirty_fp = git_dirty_fingerprint(REPO_ROOT)
+    env_hash = env_content_hash(args.env_file)
+    flags = backtest_flags(symbols)
+    funding_hash = funding_cache_fingerprint()
+    baseline_source = (
+        "baseline-json:" + hashlib.sha256(Path(args.baseline_json).read_bytes()).hexdigest()
+        if args.baseline_json else "run"
+    )
+
+    def key_for(overrides: Dict[str, str]) -> Dict[str, Any]:
+        return compute_result_key(
+            git_sha, dirty_fp, env_hash, overrides, WINDOWS, flags, baseline_source,
+            funding_hash,
+        )
 
     any_failure = False
 
     # --- Taban ---
     if args.baseline_json:
         baseline_metrics = json.loads(Path(args.baseline_json).read_text(encoding="utf-8"))
-        summary["baseline"] = {"status": "ok", "source": args.baseline_json, "windows": baseline_metrics}
+        summary["baseline"] = {
+            "status": "ok", "source": args.baseline_json, "windows": baseline_metrics,
+            "key": key_for({}),
+        }
         save_summary(summary_path, summary)
         print(f"Taban --baseline-json'dan okundu: {args.baseline_json}")
-    elif summary.get("baseline", {}).get("status") == "ok":
+    elif baseline_reusable(summary, key_for({})) and _has_series(summary["baseline"]["windows"]):
         baseline_metrics = summary["baseline"]["windows"]
-        print("Taban zaten kosulmus (bugunun summary.json'undan devam), atlaniyor.")
+        print("Taban ayni anahtarla (sha/env/pencere) zaten kosulmus, atlaniyor.")
     else:
         print("Taban kosuluyor (cache warm-up, 3 pencere)...")
         status, baseline_metrics = run_variant(
             "BASELINE", {}, baseline_env, symbols, args.cache_dir, out_dir, REPO_ROOT,
         )
-        summary["baseline"] = {"status": status, "windows": baseline_metrics}
+        summary["baseline"] = {"status": status, "windows": baseline_metrics, "key": key_for({})}
         save_summary(summary_path, summary)
         if status != "ok":
             print("HATA: taban kosumu basarisiz oldu, devam edilemiyor.", file=sys.stderr)
             return 1
 
-    # --- Adaylar ---
-    decided: List[Tuple[str, str, str, float]] = []  # (id, hypothesis, decision, score)
+    # --- Adaylar, faz A: kosular ---
+    newly_run: set = set()
+    family: List[Candidate] = []
     for cand in candidates:
-        if should_skip_candidate(summary, cand.id):
+        if (
+            should_skip_candidate(summary, cand.id, key_for(cand.overrides))
+            and _has_series(summary["candidates"][cand.id].get("windows", {}))
+        ):
             print(f"[{cand.id}] daha once basariyla kosulmus, atlaniyor (resumable).")
-            entry = summary["candidates"][cand.id]
-            decided.append((cand.id, cand.hypothesis, entry.get("decision", "?"), entry.get("score", 0.0)))
+            family.append(cand)
             continue
 
         print(f"\n[{cand.id}] {cand.hypothesis}")
@@ -652,23 +1161,91 @@ def main(argv: Optional[List[str]] = None) -> int:
             summary["candidates"][cand.id] = {
                 "hypothesis": cand.hypothesis, "overrides": cand.overrides,
                 "status": "hata", "windows": windows_result,
+                "key": key_for(cand.overrides),
             }
             save_summary(summary_path, summary)
             rows = [f"| {cand.id} | HATA | - | - | - | - | - | harness kosumu basarisiz |"]
             append_experiments_rows(date_str, rows, REPO_ROOT)
             continue
 
-        decision, reason, score = decide(baseline_metrics, windows_result)
         summary["candidates"][cand.id] = {
             "hypothesis": cand.hypothesis, "overrides": cand.overrides,
             "status": "ok", "windows": windows_result,
-            "decision": decision, "reason": reason, "score": score,
+            "key": key_for(cand.overrides),
         }
         save_summary(summary_path, summary)
-        rows = format_variant_rows(cand.id, cand.hypothesis, windows_result, decision, reason, score)
-        append_experiments_rows(date_str, rows, REPO_ROOT)
-        print(f"  -> {decision}: {reason} (skor={score:+.2f})")
-        decided.append((cand.id, cand.hypothesis, decision, score))
+        newly_run.add(cand.id)
+        family.append(cand)
+
+    # --- faz B: P2-v2 (BH tum sweep uzerinden) ---
+    evals = {
+        c.id: p2v2_evaluate(baseline_metrics, summary["candidates"][c.id]["windows"])
+        for c in family
+    }
+    results = p2v2_stage1(evals)
+
+    # --- faz C: dayaniklilik (yalniz 1-4'u gecenler) ---
+    passers = [cid for cid, r in results.items() if r["label"] == LABEL_ADAY]
+    if passers:
+        print(f"\nStres kosulari: {passers} (maliyet 2x + giris gecikmesi 1 mum)")
+        base_entry = summary["baseline"]
+        base_stress = base_entry.setdefault("stress", {})
+        for name, flags_ in STRESS_SCENARIOS.items():
+            if name in base_stress and _has_series(base_stress[name]):
+                continue
+            st, res_ = run_variant(
+                "BASELINE", {}, baseline_env, symbols, args.cache_dir, out_dir,
+                REPO_ROOT, extra_flags=flags_, tag=f"_{name}",
+            )
+            if st == "ok":
+                base_stress[name] = res_
+            else:
+                any_failure = True
+        save_summary(summary_path, summary)
+        for cid in passers:
+            entry = summary["candidates"][cid]
+            cand_stress = entry.setdefault("stress", {})
+            for name, flags_ in STRESS_SCENARIOS.items():
+                if name in cand_stress and _has_series(cand_stress[name]):
+                    continue
+                st, res_ = run_variant(
+                    cid, entry["overrides"], baseline_env, symbols, args.cache_dir,
+                    out_dir, REPO_ROOT, extra_flags=flags_, tag=f"_{name}",
+                )
+                if st == "ok":
+                    cand_stress[name] = res_
+                else:
+                    any_failure = True
+            results[cid] = p2v2_apply_stress(results[cid], base_stress, cand_stress)
+        save_summary(summary_path, summary)
+
+    # --- faz D: kayit ---
+    decided: List[Tuple[str, str, str, float]] = []  # (id, hypothesis, decision, score)
+    for cand in family:
+        r = results[cand.id]
+        entry = summary["candidates"][cand.id]
+        entry.update({
+            "decision": r["label"], "reason": r["reason"], "score": r["score"],
+            "rule": "P2-v2",
+            "p_value": r.get("p"), "q_value": r.get("q"), "delta": r.get("delta"),
+            "std_error": r.get("se"), "checks": r.get("checks"),
+            "window_harm": r.get("window_harm"), "stress": entry.get("stress", {}),
+            "stress_delta": r.get("stress"),
+            "old_decision": r.get("old_decision"), "old_reason": r.get("old_reason"),
+            "old_score": r.get("old_score"),
+        })
+        if cand.id in newly_run:
+            rows = format_variant_rows(
+                cand.id, cand.hypothesis, entry["windows"], r["label"], r["reason"],
+                r["score"], old_decision=r.get("old_decision"),
+            )
+            append_experiments_rows(date_str, rows, REPO_ROOT)
+        print(
+            f"  [{cand.id}] -> {r['label']}: {r['reason']} (skor={r['score']:+.2f}) "
+            f"| P2-eski: {r.get('old_decision', '-')}"
+        )
+        decided.append((cand.id, cand.hypothesis, r["label"], r["score"]))
+    save_summary(summary_path, summary)
 
     # --- Ozet ---
     print("\n" + "=" * 72)
@@ -678,7 +1255,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         (d for d in decided if d[2] == "ADAY"), key=lambda d: d[3], reverse=True,
     )
     if adaylar:
-        print("ADAY (canliya aday, testnet soak >=5 gun onerilir):")
+        print("ADAY [P2-v2] (canliya aday, testnet soak >=5 gun onerilir):")
         for cid, hyp, _, score in adaylar:
             print(f"  {cid}  skor={score:+.2f}  — {hyp}")
     else:
@@ -688,7 +1265,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("\nREDDEDILDI:")
         for cid, hyp, _, score in reddedilenler:
             print(f"  {cid}  skor={score:+.2f}  — {hyp}")
-    hatalilar = [d for d in decided if d[2] not in ("ADAY", "REDDEDILDI")]
+    yetersiz = [d for d in decided if d[2] == LABEL_LOW_SAMPLE]
+    if yetersiz:
+        print("\nYETERSIZ-ORNEK (reddedilmedi; islem sayisi yetmedi):")
+        for cid, hyp, _, score in yetersiz:
+            print(f"  {cid}  skor={score:+.2f}  — {hyp}")
+    hatalilar = [d for d in decided if d[2] not in (LABEL_ADAY, LABEL_REJECT, LABEL_LOW_SAMPLE)]
     if hatalilar or any_failure:
         print("\nHATA (harness kosumu basarisiz oldu, log'lara bakin):")
         for cid, hyp, dec, _ in hatalilar:

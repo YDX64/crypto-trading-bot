@@ -48,6 +48,15 @@ from src.strategies.scalper.types import (
 )
 
 
+def _slip(pos, price):
+    """A1 (audit/eval-harness-fixes): market-tipi çıkışlar artık aleyhte
+    `exit_realism.exit_slippage_rate` kaymasıyla dolar; bu testlerin mum
+    senaryolarında açılış tetik seviyesinin ötesinde DEĞİL (boşluk yok), yani
+    beklenen dolum = seviye ± kayma (eskiden tam seviye)."""
+    rate = pos.exit_realism.exit_slippage_rate
+    return price * (1.0 - rate) if pos.direction == Direction.LONG else price * (1.0 + rate)
+
+
 # --------------------------------------------------------------------------
 # Yardımcılar
 # --------------------------------------------------------------------------
@@ -219,8 +228,8 @@ class TestSlBeforeTpRule:
         assert trade.legs[0]["label"] == "SL"
         assert trade.legs[0]["quantity"] == pytest.approx(trade.quantity)
         # The live stop moves with the actual fill; signal risk stays $1/unit.
-        assert trade.legs[0]["price"] == pytest.approx(trade.entry_price - 1.0)
-        assert trade.exit_price == pytest.approx(trade.entry_price - 1.0)
+        assert trade.legs[0]["price"] == pytest.approx(_slip(pos, trade.entry_price - 1.0))
+        assert trade.exit_price == pytest.approx(_slip(pos, trade.entry_price - 1.0))
 
     def test_sl_and_tp2_same_candle_after_tp1_sl_wins(self):
         # TP1 önceki mumda dolmuş (BE aktif); bu mumda hem BE-SL hem TP2 değiyor -> SL(TRAIL) kazanır
@@ -239,7 +248,7 @@ class TestSlBeforeTpRule:
         assert trade.exit_reason == "TRAIL"
         labels = [leg["label"] for leg in trade.legs]
         assert labels == ["TP1", "TRAIL"]
-        assert trade.legs[1]["price"] == pytest.approx(pos.breakeven_price)
+        assert trade.legs[1]["price"] == pytest.approx(_slip(pos, pos.breakeven_price))
 
 
 # --------------------------------------------------------------------------
@@ -272,13 +281,15 @@ class TestTp1BreakevenTrailFlow:
         tp1_leg, trail_leg = trade.legs
         assert tp1_leg["label"] == "TP1"
         assert tp1_leg["quantity"] == pytest.approx(trade.quantity * cfg.scalper_tp1_fraction)
-        assert tp1_leg["price"] == pytest.approx(pos.tp1_price)
+        assert tp1_leg["price"] == pytest.approx(_slip(pos, pos.tp1_price))
 
         assert trail_leg["label"] == "TRAIL"
         expected_runner_qty = trade.quantity * (1 - cfg.scalper_tp1_fraction - cfg.scalper_tp2_fraction) \
             + trade.quantity * cfg.scalper_tp2_fraction  # TP2 hiç dolmadı -> tp2+runner birlikte TRAIL'de kapanır
         assert trail_leg["quantity"] == pytest.approx(expected_runner_qty)
-        assert trail_leg["price"] == pytest.approx(pos.breakeven_price)
+        # A1: mum 3 BE'nin (~100.15) ALTINDA açılıyor (100.1) -> gap_fills tetik
+        # fiyatı = açılış, üstüne çıkış kayması.
+        assert trail_leg["price"] == pytest.approx(_slip(pos, 100.1))
 
         # SL gerçekten break-even'e taşınmış olmalı (yapısal stop 99.0'dan farklı)
         assert pos.breakeven_price > 99.0
@@ -330,7 +341,7 @@ class TestTp1BreakevenTrailFlow:
         trade = manage_position(pos, candles, cfg)
 
         assert [leg["label"] for leg in trade.legs] == ["TP1", "TP2", "TRAIL"]
-        assert trade.exit_price == pytest.approx(pos.tp1_price)
+        assert trade.exit_price == pytest.approx(_slip(pos, pos.tp1_price))
 
     def test_zero_tp2_fraction_does_not_raise_runner_floor(self):
         cfg = _Cfg(scalper_min_rr=0, scalper_tp2_fraction=0)
@@ -346,7 +357,7 @@ class TestTp1BreakevenTrailFlow:
 
         assert pos.tp2_filled is False
         assert [leg["label"] for leg in trade.legs] == ["TP1", "TRAIL"]
-        assert trade.exit_price == pytest.approx(pos.breakeven_price)
+        assert trade.exit_price == pytest.approx(_slip(pos, pos.breakeven_price))
 
     @pytest.mark.parametrize("direction", [Direction.LONG, Direction.SHORT])
     def test_tp2_bar_crossing_new_floor_cannot_escape_on_next_gap(self, direction):
@@ -372,7 +383,7 @@ class TestTp1BreakevenTrailFlow:
         assert closed is True
         assert pos.remaining_qty == pytest.approx(0)
         assert [leg["label"] for leg in pos.legs] == ["TP2", "TRAIL"]
-        assert pos.exit_price == pytest.approx(pos.tp1_price)
+        assert pos.exit_price == pytest.approx(_slip(pos, pos.tp1_price))
 
 
 class TestFillAnchoredStopParity:
@@ -430,7 +441,7 @@ class TestMaxHoldReaperParity:
         # 5m harness ancak mum kapanışında karar verebilir: 1 saatlik sınır
         # ilk kez idx13 kapanışında görülür, dolayısıyla süre yaklaşık65 dk.
         assert trade.duration_minutes == pytest.approx(65.0, abs=0.001)
-        assert trade.exit_price == pytest.approx(100.0)
+        assert trade.exit_price == pytest.approx(_slip(pos, 100.0))
 
 
 # --------------------------------------------------------------------------
@@ -457,7 +468,9 @@ class TestCommissionAndSlippage:
         # --- Elle hesap (spesifikasyondaki formüllerle, koddan bağımsız) ---
         qty_expected = (balance * cfg.scalper_risk_percentage / 100.0) / abs(entry_hint - stop_price)
         entry_price_expected = entry_hint * 1.0002  # LONG: kayma aleyhte (yukarı)
-        exit_price_expected = entry_price_expected - abs(entry_hint - stop_price)
+        exit_price_expected = (entry_price_expected - abs(entry_hint - stop_price)) * (
+            1.0 - pos.exit_realism.exit_slippage_rate  # A1: STOP_MARKET çıkış kayması
+        )
 
         gross_leg_pnl = (exit_price_expected - entry_price_expected) * qty_expected
         exit_commission = 0.0005 * qty_expected * exit_price_expected
@@ -922,7 +935,7 @@ class TestMakerEntryMode:
         # --- Elle hesap ---
         qty_expected = (10_000.0 * cfg.scalper_risk_percentage / 100.0) / abs(100.0 - 99.0)
         entry_price_expected = 100.0  # limit, kaymasız
-        exit_price_expected = 99.0    # yapısal stop
+        exit_price_expected = 99.0 * (1.0 - pos.exit_realism.exit_slippage_rate)  # yapısal stop + A1 çıkış kayması
 
         gross_leg_pnl = (exit_price_expected - entry_price_expected) * qty_expected
         exit_commission = (cfg.scalper_taker_fee_pct / 100.0) * qty_expected * exit_price_expected

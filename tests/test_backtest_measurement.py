@@ -438,7 +438,9 @@ class TestCliWiring:
         assert report["permutation"] is None
         # Varsayılan koşu ALTIN sayıları üretmeli (CLI yolu da parite içinde)
         assert report["overall"]["trades"] == 2
-        assert round(report["overall"]["total_pnl"], 2) == 23.79
+        # A1: gerçekçi çıkış dolumu varsayılan (eski model 23.79).
+        assert round(report["overall"]["total_pnl"], 2) == 25.17
+        assert report["provenance"]["realism"]["disabled"] == []
         assert report["overall"]["bar_max_drawdown"] > report["overall"]["max_drawdown"]
 
     @pytest.mark.asyncio
@@ -469,8 +471,10 @@ class TestCliWiring:
         )
         report = self._report(tmp_path)
         assert report["provenance"]["cost_model"]["entry_delay_candles"] == 2
-        # Gecikme dolum fiyatını değiştirir → altın sayılar artık geçerli DEĞİL
-        assert round(report["overall"]["total_pnl"], 2) != 26.77
+        # Gecikme dolum fiyatını değiştirir → varsayılan (gecikmesiz) koşunun
+        # altın sayısı 25.17 artık geçerli DEĞİL. (Eski 26.77 hiçbir koşunun
+        # üretmediği bayat bir sabitti; iddia boştu.)
+        assert round(report["overall"]["total_pnl"], 2) != 25.17
 
     @pytest.mark.asyncio
     async def test_permutations_flag_produces_report_block(self, monkeypatch, tmp_path):
@@ -487,9 +491,12 @@ class TestCliWiring:
         assert study["metrics"] == ["total_pnl", "bar_max_drawdown"]
         assert study["result"]["metrics"]["total_pnl"]["n"] == 3
         assert 0.0 < study["result"]["metrics"]["total_pnl"]["p_value"] <= 1.0
-        # Kelepçe ÖLÇÜLDÜ ve gerçekten iş yaptı
-        assert study["clamp"]["violated_bar_pct"] > 0.0
-        assert study["clamp"]["mean_abs_adjust_pct"] > 0.0
+        # C paketi: bar bütünü permütasyonda OHLC ihlali yapısal olarak 0 —
+        # bu, "bar bütünü ihlal üretmez" denetimidir; kelepçenin iş yaptığını
+        # KANITLAMAZ (eski bağımsız-OHLC karıştırmada > 0 idi). Kelepçenin
+        # düzeltme davranışı tests/test_permutation.py::test_clamp_enforces_ohlc_invariant'te.
+        assert study["clamp"]["violated_bar_pct"] == 0.0
+        assert study["clamp"]["mean_abs_adjust_pct"] == 0.0
         assert "KOŞULLU null" in study["null_scope"]
         assert "clamp_audit" not in study
 

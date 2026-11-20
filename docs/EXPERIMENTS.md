@@ -1,5 +1,11 @@
 # Deney defteri — backtest ve ölçüm kayıtları
 
+**20 Kas 2026 — E16 harness gerçekçiliği:** denetimin 46 ayakta bulgusuna göre harness'e boşluk/kayma, maker
+trade-through, fonlama, likidasyon ve günlük kesici eklendi (D41; hepsi varsayılan AÇIK). Aynı strateji, aynı 7
+pencere: **1124 işlem / +2679.50 → 751 işlem / +107.10**, havuz PF 1.04 → 1.00; en büyük katkı `daily_latch` ve
+`maker_trade_through`. Eski sayılar `--legacy-model` ile birebir üretilir. [Tablo ve özellik katkıları](#e16--harness-gerçeklik-paketi-7-pencerede-eski--yeni-model-2026-11-20-d41).
+Bu defterdeki E2…E13 sayıları ESKİ modelin sayılarıdır ve mutlak değer olarak yeni modelle karşılaştırılmaz.
+
 **7 Eyl 2026 — E15 miktar ölçeği:** kullanıcı talebiyle %0.5→%10 TESTNET
 marj tavanı. Altı cache-only koşuda üç bilinen rejimin PF/ROI/işlem sayısı
 değişmedi; PnL ve bar-DD 20× oldu. Sabit 1000 kasada %10 profilinin bar-DD'si
@@ -73,6 +79,13 @@ Golden iki işlem neti 26.77→23.79. Önceki strateji sıralamaları yeniden
 > (c) Bu kural, dış bir inceleme sırasında bu ölçüm boşluğunun teşhis
 > edilmesiyle yazıldı; ilgili depoda lisans YOKTUR, hiçbir metin kopyalanmadı
 > — buradaki formülasyon bize aittir.
+
+> **Not (2026-11-20, D41) — kayıt artık `docs/holdout_registry.json`.** Yukarıdaki "bugüne kadar: 0" sayacı ve
+> "dokunulmamış" etiketleri GÜNCEL DEĞİLDİR: Mart (`OOS_MART`, D28'de açıldı), Mayıs (`HOLD_MAY`), Haziran (`HOLD_JUN`),
+> Çöküş (`COKUS`), Nisan (`SAKLI_NISAN`, E13 yargıcında açıldı), Şubat sonu (`FRESH_SUBAT`) ve Temmuz sonu
+> (`FRESH_TEMMUZ`) pencerelerinin hepsi kayıtta YANIK; açılış sayıları kayıtta tutulur. Yeni pencereler:
+> `VAL-2026Q4a` (2026-09-04→10-15, doğrulama) ve `SEAL-2026Q4b` (2026-10-16→11-19, mühürlü, aday paketi başına tek açılış,
+> yalnız veto). Tarihsel metin aşağıda DEĞİŞTİRİLMEDİ; ilgili paragrafların yanına düşülen notlara bak.
 
 ### Saklı pencere açılışı 1 — D28 TP1 %8 adayı (2026-08-27, SONUÇTAN ÖNCE İLAN)
 
@@ -1474,6 +1487,8 @@ kazanç artar mı?
 8 majör, 7 pencere; tek fark `SCALPER_C_REQUIRE_DIVERGENCE=false`. Pencere sınıfları: SEÇİM (AYI/YATAY/BOĞA)
 ve DOKUNULMAMIŞ (Mart/Çöküş/Mayıs/Haziran).
 
+> *Not (2026-11-20, D41): bu paragraftaki "dokunulmamış" etiketi yanlıştı — Mart, Çöküş, Mayıs, Haziran `docs/holdout_registry.json`'da YANMIŞ pencerelerdir (E11-E13 seçim kümesi).*
+
 | Pencere | div=AÇIK (taban) | div=KAPALI | Log |
 |---|---|---|---|
 | AYI 01-23→02-13 | 161 / +334.4 / PF 2.07 / DD 80 | 593 / +345.3 / PF 1.19 / DD 315 | `logs/backtest_20260903_213418.json` |
@@ -1489,6 +1504,8 @@ RANGE LONG +28.1. Yani "kârlı hücrede diverjanssız daha çok giriş" fikri d
 diverjanssız yalnız BOĞA'da (+84) kazanıyor, dokunulmamış dört pencerenin dördünde daha kötü
 (Mart −366, Mayıs −249, Haziran −175, Çöküş −25).
 
+> *Not (2026-11-20, D41): bu paragraftaki "dokunulmamış" etiketi yanlıştı — Mart, Çöküş, Mayıs, Haziran `docs/holdout_registry.json`'da YANMIŞ pencerelerdir (E11-E13 seçim kümesi).*
+
 **Sonuç.** Diverjans şartı her rejimde ve her yönde kalır; işlem sayısını filtre gevşeterek artırmak
 her pencerede maksimum düşüşü 2-3× büyütüyor. "Daha çok işlem" ancak YENİ bilgi taşıyan bir sinyal
 kaynağıyla (mevcut filtreyi gevşeterek değil) düşünülebilir. Komut:
@@ -1500,12 +1517,16 @@ python3 -m src.strategies.scalper.backtest --strategies C --symbols <8 majör> -
 **Soru.** AI olmadan, yalnız giriş anında bilinen bilgiyle (saat/gün, rejim×yön, sembol, volatilite),
 C'nin dokunulmamış pencerelerdeki bozulmasını tutarlı biçimde düzelten bir kural var mı?
 
+> *Not (2026-11-20, D41): bu paragraftaki "dokunulmamış" etiketi yanlıştı — Mart, Çöküş, Mayıs, Haziran `docs/holdout_registry.json`'da YANMIŞ pencerelerdir (E11-E13 seçim kümesi).*
+
 **Kurulum.** 7 taban JSON (E11 ile aynı kod/env; taban `logs/backtest_20260903_{123200,123053,122725,
 123333,130010,141831,142233}.json`), 1.268 işlem. Pencere sınıfı: SEÇİM (AYI/YATAY/BOĞA — 21 Ağu'dan beri
 ayar seçiminde kullanıldı) vs DOKUNULMAMIŞ (Mart/Çöküş/Mayıs/Haziran). 5 mercek (saat-gün, rejim×yön,
 sembol, volatilite-süre, kapasite) ~305 kural taradı; yargıç + bağımsız yeniden hesap (aşağıdaki tablo).
 Karar kuralı: dokunulmamış 4'te toplam net ↑ ve ≥3/4 pencere kötüleşmez (tolerans brütün %5'i); seçim
 toplam kaybı ≤ %20; her pencerede kalan işlem ≥ %60; yalnız giriş-anı bilgisi; komşuluk sağlam.
+
+> *Not (2026-11-20, D41): bu paragraftaki "dokunulmamış" etiketi yanlıştı — Mart, Çöküş, Mayıs, Haziran `docs/holdout_registry.json`'da YANMIŞ pencerelerdir (E11-E13 seçim kümesi).*
 
 | Kural (post-hoc) | Δ dokunulmamış | Δ seçim | kötüleşen dok. | min kalan | Mart/Çöküş/May/Haz |
 |---|---|---|---|---|---|
@@ -1527,6 +1548,8 @@ likidite → LONG dip alımları 8 saatte çürüyor: engellenen hafta sonu LONG
 **Yapısal teşhis.** Dokunulmamış dört pencerede LONG tarafı sistematik zararda (UP LONG ve RANGE LONG
 ikisi de); DOWN SHORT 7 pencerenin 5'inde pozitif, en tutarlı hücre. Bu bir 2026 Mar–Ağu rejim
 özelliği olabilir; kural değil, izleme konusu.
+
+> *Not (2026-11-20, D41): bu paragraftaki "dokunulmamış" etiketi yanlıştı — Mart, Çöküş, Mayıs, Haziran `docs/holdout_registry.json`'da YANMIŞ pencerelerdir (E11-E13 seçim kümesi).*
 
 **Sonraki adım.** Post-hoc tarama kapasite/cooldown ikamesini görmez (E8.6). Genel kapılar
 (`SCALPER_C_BLOCKED_CELLS`, `SCALPER_ENTRY_BLOCK_HOURS_UTC`, `SCALPER_MIN/MAX_ATR_PCT`; D33) ile gerçek
@@ -1551,6 +1574,8 @@ dokunulmamış pencerede pozitif; ama bu dört pencere kuralın SEÇİM kümesid
 rastgelenin altında kaldı (doğrulayıcı hükmü) → kabul için ön-kayıtlı taze pencere şart. (3) Post-hoc
 tarama artık yalnız ön eleme; her aday gerçek harness'ta koşulur.
 
+> *Not (2026-11-20, D41): bu paragraftaki "dokunulmamış" etiketi yanlıştı — Mart, Çöküş, Mayıs, Haziran `docs/holdout_registry.json`'da YANMIŞ pencerelerdir (E11-E13 seçim kümesi).*
+
 ### E13.2 — Gerçek harness: hafta sonu LONG ve ADA LONG yasağı (2026-09-04 03:30, D33b kapıları)
 
 `scripts/run_windows.sh` ile 7 pencere (`logs/run_windows/run7_{hs_long,ada_long,combo}.txt`):
@@ -1564,6 +1589,8 @@ tarama artık yalnız ön eleme; her aday gerçek harness'ta koşulur.
 Okuma: hafta sonu LONG yasağının YATAY'daki gerçek kaybı (−96) post-hoc'un (−9) 10 katı — boşalan slotlar
 hafta içi daha kötü işlemlerle doldu (E8.6 ters yönde). Dokunulmamış etkinin %63'ü ÇÖKÜŞ (23/30 Ağu Pazar
 düşüşleri); Haziran kötüleşiyor. ADA LONG etkisi küçük ve sembol-özgü.
+
+> *Not (2026-11-20, D41): bu paragraftaki "dokunulmamış" etiketi yanlıştı — Mart, Çöküş, Mayıs, Haziran `docs/holdout_registry.json`'da YANMIŞ pencerelerdir (E11-E13 seçim kümesi).*
 
 **Son sınav (ÖN KAYIT, sonuç görülmeden yazıldı):** iki taze pencere 2026-02-13→03-01 ve 2026-07-21→08-07
 (taban `logs/backtest_20260904_011327.json`, `…_011624.json`; sayılarına bakılmadı). GEÇER = iki pencere
@@ -1585,3 +1612,107 @@ değişmiyor. Bu bir "kenar" değil, küçük bir fren. Kanıt disiplini gereği
 sonucunu ölçer. ADA LONG (sembol-özgü, ikisi birlikte seçim kaybı %26) alınmaz. Asıl sonuç
 değişmedi: C'nin 2026 Mar–Ağu penceresinde kalıcı kenarı yok; giriş filtreleri kaybı küçültür, kâra
 çevirmez. "Daha çok işlem" ancak yeni bilgi taşıyan sinyalle.
+
+> *Not (2026-11-20, D41): bu paragraftaki "dokunulmamış" etiketi yanlıştı — Mart, Çöküş, Mayıs, Haziran `docs/holdout_registry.json`'da YANMIŞ pencerelerdir (E11-E13 seçim kümesi).*
+
+## E16 — Harness gerçekçilik paketi: 7 pencerede eski / yeni model (2026-11-20, D41)
+
+*(D41 paketi bu deneyi "E15" diye anıyordu; E15 numarası dosya başındaki 7 Eyl miktar-ölçeği notunda zaten kullanılıyor, bu yüzden E16.)*
+
+**Soru.** Denetimin (63 bulgu, 46 ayakta; D41) bulduğu iyimserlik giderilince C'nin bilinen yedi penceredeki sonucu ne
+kadar, hangi özellik yüzünden değişiyor? Bu bir strateji deneyi DEĞİL; aynı strateji, aynı ayarlar, yalnız ölçüm modeli.
+
+**Kurulum.** ESKİ = `main` ağacının temiz kopyası (`git archive`, harness eski); YENİ = `audit/eval-harness-fixes`
+varsayılanı (dokuz anahtarın hepsi açık). İkisi de aynı komut ve ortamla, ağ kapalı (HTTP(S)_PROXY=127.0.0.1:9 tuzağı;
+önbellek 7 pencereyi tam kapsadı, `rc=0`), kline önbelleği `data/klines_cache`, fonlama önbelleği `data/funding_cache`
+(YENİ'de; 8 sembolün 7 pencerede yedek oran kullanımı 0):
+
+```bash
+env <sunucu env'inin 55 SCALPER_* satırı> BINANCE_API_KEY=… (sahte zorunlu değerler) HTTP(S)_PROXY=http://127.0.0.1:9 \
+.venv/bin/python -m src.strategies.scalper.backtest --strategies C \
+  --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,BNBUSDT,ADAUSDT,LTCUSDT --start S --end E --cache-dir data/klines_cache
+```
+
+Pencereler: AYI 2026-01-23→02-13 · MART 03-01→04-01 · MAYIS 05-04→05-25 · HAZİRAN 06-08→06-29 · YATAY 07-01→07-21 ·
+BOĞA 08-07→08-21 · ÇÖKÜŞ 08-21→09-03. Marj işlem başına sabit ~1000 USDT (PnL bu tabanda; harness sermayesi 10 000).
+Ortam kaynağı: `…/scratchpad/live/server_env_nonsecret.txt` (sunucu `.env`'inin gizli olmayan `SCALPER_*` satırları, tarih
+bu oturumdan doğrulanamadı); tam tarif `…/scratchpad/baseline_pre/RECIPE.txt`.
+**Doğrulama:** `--legacy-model` ile aynı yedi pencere ESKİ sayıları işlem işlem özdeş verdi (D41).
+
+| Pencere | Eski: işlem / WR / PF / net / DD | Yeni: işlem / WR / PF / net / DD | Δ net | Yeni DD % (10 000) |
+|---|---|---|---|---|
+| AYI | 149 / %87.3 / 2.03 / +5703.23 / 1237.83 | 92 / %84.8 / 1.62 / +2808.05 / 1143.84 | −2895.18 | %11.44 |
+| MART | 296 / %79.7 / 0.98 / −408.85 / 2896.84 | 204 / %77.0 / 0.84 / −2371.44 / 3048.95 | −1962.59 | %30.49 |
+| MAYIS | 168 / %68.5 / 0.60 / −6110.74 / 6651.94 | 107 / %71.0 / 0.70 / −2640.89 / 4481.61 | +3469.85 | %44.82 |
+| HAZİRAN | 158 / %75.3 / 1.02 / +175.49 / 1988.51 | 109 / %75.2 / 0.98 / −135.39 / 2661.75 | −310.88 | %26.62 |
+| YATAY | 136 / %72.8 / 1.50 / +2764.10 / 1562.66 | 95 / %72.6 / 1.96 / +2804.45 / 1084.36 | +40.35 | %10.84 |
+| BOĞA | 101 / %70.3 / 1.33 / +1276.58 / 1385.34 | 61 / %63.9 / 0.76 / −856.76 / 1685.88 | −2133.34 | %16.86 |
+| ÇÖKÜŞ | 116 / %75.0 / 0.90 / −720.32 / 2282.18 | 83 / %77.1 / 1.10 / +499.09 / 1540.14 | +1219.41 | %15.40 |
+| **Toplam** | **1124 / – / 1.04 / +2679.50 / –** | **751 / – / 1.00 / +107.10 / –** | **−2572.40** | – |
+
+(DD sütunu kapanış bazlı `max_drawdown`, USD; havuz PF = brüt kâr / brüt zarar, işlem listelerinden. Yeni model fonlama
+toplamı pencere başına −15.73…+21.50 USD, likidasyon her pencerede 0, maker dolum oranı %75–88.)
+
+**Yön ayrımı (net, USD; işlem sayısı parantezde):**
+
+| Pencere | Eski LONG | Eski SHORT | Yeni LONG | Yeni SHORT |
+|---|---|---|---|---|
+| AYI | +2061.45 (53) | +3641.78 (96) | +90.47 (24) | +2717.58 (68) |
+| MART | −2973.21 (145) | +2564.36 (151) | −4087.89 (115) | +1716.45 (89) |
+| MAYIS | −1285.36 (82) | −4825.38 (86) | −439.17 (52) | −2201.72 (55) |
+| HAZİRAN | −1071.16 (63) | +1246.65 (95) | −1886.55 (48) | +1751.15 (61) |
+| YATAY | +1753.72 (68) | +1010.38 (68) | +2176.88 (48) | +627.58 (47) |
+| BOĞA | +2289.67 (60) | −1013.09 (41) | +832.86 (38) | −1689.62 (23) |
+| ÇÖKÜŞ | +584.16 (42) | −1304.48 (74) | +1112.27 (27) | −613.19 (56) |
+| **Toplam** | **+1359.27 (513)** | **+1320.23 (611)** | **−2201.13 (352)** | **+2308.23 (399)** |
+
+**Özellik katkısı (AYI / BOĞA / ÇÖKÜŞ).** Her satır "tam gerçekçi modelde TEK özelliği kapat" koşusudur; katkı = tam
+gerçekçi net − o özellik kapalıyken net (negatif = özellik sonucu AŞAĞI çekiyor). Etkiler toplanmaz (etkileşim var).
+Tam gerçekçi net: AYI +2808.05 (92 işlem), BOĞA −856.76 (61), ÇÖKÜŞ +499.09 (83); eski: +5703.23 / +1276.58 / −720.32.
+
+| Özellik | AYI katkı (kapalıyken işlem / net) | BOĞA katkı | ÇÖKÜŞ katkı |
+|---|---|---|---|
+| `daily_latch` | **−1862.49** (131 / +4670.54) | **−434.42** (81 / −422.34) | **+247.52** (107 / +251.57) |
+| `maker_trade_through` | **−929.40** (109 / +3737.45) | **−1093.14** (78 / +236.38) | **+644.76** (78 / −145.67) |
+| `exit_slippage` | −367.40 (92 / +3175.45) | −317.87 (62 / −538.89) | −332.30 (83 / +831.39) |
+| `intrabar_path` | +561.39 (92 / +2246.66) | 0.00 (61 / −856.76) | +237.38 (84 / +261.71) |
+| `funding` | −19.88 (92 / +2827.93) | −58.18 (62 / −798.58) | +15.73 (83 / +483.36) |
+| `single_pending` | −30.04 (93 / +2838.09) | 0.00 | 0.00 |
+| `gap_fills` | 0.00 | −5.86 (61 / −850.90) | −18.48 (83 / +517.57) |
+| `maker_fill_bar` | 0.00 | 0.00 | 0.00 |
+| `liquidation` | 0.00 | 0.00 | 0.00 |
+
+**Okuma.**
+1. **Sayının büyük kısmı iki anahtardan geliyor: `daily_latch` ve `maker_trade_through`.** İkisi de PnL'i "fiyatlamaktan"
+   çok HANGİ işlemlerin yapıldığını değiştirir: kesici pencere başına 20–67 işlemi düşürür (7 pencerede toplam 252 işlem,
+   8/14/11/9/5/8/4 kilitli gün; düşenlerin net toplamı AYI +1862, MAYIS −3543, YATAY −450, ÇÖKÜŞ −248, BOĞA +434),
+   maker kuralı dolum oranını %75–88'e çeker. İşaretleri pencereye göre değişir (AYI/BOĞA'da aşağı, ÇÖKÜŞ'te yukarı) —
+   "gerçekçi = hep kötümser" değil. MAYIS'in −6111 → −2641 iyileşmesi neredeyse tamamen kesicinin kayıp günlerini kesmesi.
+2. **`exit_slippage` ikinci**: üç pencerede de tutarlı −320…−370 USD (işlem başına yaklaşık −4…−5 USD; düz 2 bp).
+3. **`funding` küçük** (pencere başına −16…+22 USD toplam, katkı en fazla −58) ve **`liquidation` sıfır** (7 pencerede 0
+   likidasyon; stoplar likidasyonun içinde kalıyor). `gap_fills` ≤ 18, `single_pending` ≤ 30, `maker_fill_bar` 0.
+4. **`intrabar_path` tek "iyimser yönde düzelten" özellik** (+561 / 0 / +237): eski harness koşucuyu TP1 mumunda BE'de
+   öldürüyordu (exit-logic-1).
+5. **Sonuç:** 1124 → 751 işlem (−%33), havuz net +2679.50 → +107.10, havuz PF 1.04 → 1.00; 7 pencerenin 4'ü PF < 1
+   (MART 0.84, MAYIS 0.70, HAZİRAN 0.98, BOĞA 0.76). AYI'nin PF'i 2.03 → 1.62. Kenarın
+   yokluğu zaten D28/E13'ün sonucuydu; bu ölçüm onu güçlendirir, yeni bir kenar göstermez.
+6. **Sınırlar:** (a) kesici sermaye tabanı harness'in 10 000'i; eşik −100 USD (canlıda sanal 1000 → −10 USD) — yüzde aynı,
+   dolar farklı, mutlak değerler canlıyla birebir okunmaz. (b) Tek-özellik-kapat koşuları yalnız üç pencerede; MART/MAYIS/
+   HAZİRAN/YATAY için katkı ayrımı koşulmadı. (c) 7 pencerenin tamamı yanık (D41 kayıt): bu sayılar OOS değildir.
+
+**Canlı defter (TESTNET — simülasyon parası; salt-okunur kopya, 2026-08-07→2026-11-20).** `ledger_report.py` skalper
+başlığı: **670 işlem, PnL −228.56, PF 0.92**; doğrulanmış PnL 646 işlem −483.41 (PF 0.82), doğrulanmamış 24 işlem +254.85
+(PF 3.09; 18 tahmini + 6 etiketsiz). LONG 304 / +251.61 / PF 1.19; SHORT 366 / −480.16 / PF 0.65. Takipçi (AP) 22 işlem,
+ayrı satır (≈ −9.7). `montecarlo --source ledger` (692 kapalı işlem = 670 + 22 AP, 105 gün, başlangıç 1000, 5000 yol,
+blok 3 gün, tohum 12345): net −238.29, PF 0.92, WR %60, işlem başına beklenti −0.34. %95 GA: net **[−1512, +1433]**,
+PF **[0.50, 1.52]** → kenar sıfırdan ayırt edilemiyor. Toplamsal modelde medyan maks. DD 836 USDT (%83.6), 1000'den 500'e
+batma olasılığı 0.572; günlük %1 kayıp eşiği 105 günün beklenen 41'inde aşılıyor (en az bir gün: 1.00). Uyarılar:
+gerçekleşen PnL'i 0.0 olan `CLOSED` satırlar işlem sayılıyor (araştırılmadı); BTC günlük kline önbelleği 2026-09-02'de bittiği
+için 79 günün rejimi `?` (rejim/DOWN-günü maddeleri ölçülmedi). Harness yön ayrımıyla defter yönleri aynı işareti
+vermiyor (harness: LONG −2201 / SHORT +2308; defter: LONG +252 / SHORT −480); farklı dönem ve ölçek, sebep araştırılmadı.
+
+**Rapor yolları** (oturum scratchpad'i; kalıcı değildir — saklanacaksa kopyala):
+`/private/tmp/claude-501/-Users-max--claude-spares-spare-P1tX49/d71025dd-013a-45ad-8c24-0b51f485282a/scratchpad/`
+`baseline_pre/<PENCERE>.json|.txt` (eski) · `baseline_post/<PENCERE>.json|.txt` + `timings.txt` (yeni) ·
+`legacy_eq/` (`--legacy-model` doğrulaması) · `attrib/<PENCERE>_<özellik>.json` (tek-özellik-kapat) ·
+`live/ledger_report_full.md` (defter). Çalıştırıcı: `run_cand.sh`.

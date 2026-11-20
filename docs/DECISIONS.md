@@ -7,6 +7,147 @@ Pencereler: AYI 2026-01-23→02-13 (BTC −30%) · YATAY 2026-07-01→07-21 · B
 
 ## Aktif kararlar
 
+### D41 — Değerlendirme harness'i gerçekçilik paketi: boşluk/kayma, maker dolumu, fonlama, likidasyon, günlük kesici, P2-v2 kabul kuralı, walk-forward, saklı pencere kaydı · 2026-11-20 · KOD VAR (dal `audit/eval-harness-fixes`) — canlı davranış DEĞİŞMEDİ
+
+**Talep:** "backtest sayılarına güvenebilir miyiz" sorusu için 10 boyutlu (maliyet modeli, look-ahead, walk-forward/OOS,
+parametre taraması, Monte Carlo, parite, metrik, çıkış mantığı, canlı risk, sinyal mantığı) düşmanca doğrulamalı bir
+denetim koşuldu: **63 bulgu → 46 ayakta, 16 olası, 1 çürütülen** (`montecarlo-6`). Ayakta kalan 46'nın 31'i "iyimser", 3'ü
+"kötümser", 4'ü nötr, 8'i yönü bilinmeyen; 6'sı yüksek önem (`cost-model-1`, `lookahead-1`, `metrics-1`,
+`walkforward-oos-1/2`, `param-sweep-2`). Bu paket (E16'da ölçüldü) **yalnız
+ölçüm aracını** düzeltir: harness ve onu çağıran betikler. Strateji parametresi, giriş/çıkış kuralı ve canlı süreç
+DEĞİŞMEDİ (CLAUDE.md yasak #1 ve "sinyal önce" kararı geçerli).
+
+**DÜRÜST ÇERÇEVE (önce bunu oku):** bu paket PF'yi YÜKSELTMEZ; tersine, eski sayıları ucuz gösteren iyimserliği alır.
+Aynı 7 pencerede C'nin sonucu **1124 işlem / +2679.50 net → 751 işlem / +107.10 net** (havuz PF 1.04 → 1.00) oldu; 7
+pencerenin 4'ünde PF < 1 (E16). Yani bugüne dek defterdeki mutlak sayılar ÜST SINIRDI; göreli karşılaştırma için hâlâ
+kullanılırlar ama eski sayıyla yeni sayı yan yana okunmaz. Bu yeni sayılar da OOS değildir (7 pencerenin tamamı yanık).
+Canlı defter (TESTNET, simülasyon parası) bu sonucu destekler: 670 skalper işlemi, PnL −228.56, PF 0.92 (E16).
+
+**Ne** (her madde: ne yapar · hangi bulguyu kapatır):
+
+1. **Gerçekçilik anahtarları** (`src/strategies/scalper/backtest.py`, `REALISM_FEATURES`; dokuzu de **VARSAYILAN AÇIK**):
+
+| Anahtar | Ne yapar | Bulgu |
+|---|---|---|
+| `gap_fills` | Stop-tipi çıkışlar (SL/STRUCT_BE, BE, TRAIL) mum açılışı stopun ötesindeyse AÇILIŞTA dolar; TP bacakları da (canlıda `TAKE_PROFIT_MARKET`) lehte boşlukta açılışta dolar. Aynı mumda TP sonrası taşınan stop açılışa boşluk yapmaz | cost-model-1, exit-logic-2, parity-6 |
+| `exit_slippage` | LONG çıkışı `fiyat×(1−s)`, SHORT `×(1+s)`; stop, TP1/TP2 bacakları ve mum-kapanışı çıkışları (CHOCH, STALE_TP, REAPER, EOD). Varsayılan `s` = giriş kayması = %0.02 (2 bp), SABİT; `--exit-slippage-pct`, `--fee-stress` bunu da çarpar | cost-model-1/5, exit-logic-2 |
+| `intrabar_path` | Mum içi yol: kapanış ≥ açılış ise O,L,H,C aksi halde O,H,L,C. TP1/TP2 sonrası taşınan stop (BE / TP1 tabanı) YALNIZ TP'den sonraki yolda sınanır; TP1 giriş mumunda iken koşucu lehte mumda kalır, aleyhte mumda kaybolur. İlk stop-TP1 beraberliği SL-önce (bilinçli muhafazakâr) kalır | exit-logic-1 (pessimistic) |
+| `maker_trade_through` | Limit emir YALNIZ fiyat limitin ötesine %0.01 geçince dolar (`--maker-trade-through-pct`); dolum fiyatı limit, maker ücreti aynı. Yalnız `scalper_entry_mode=maker` | lookahead-1, parity-4, cost-model-4 |
+| `maker_fill_bar` | Dolum mumunda TP/stop/MFE/MAE yalnız dolumdan SONRAKİ yoldan sayılır | lookahead-4, exit-logic-5 |
+| `single_pending` | Bekleyen maker emir varken aynı sembole ikinci emir yok; zaman aşımından sonra devam | parity-5 |
+| `funding` | 00/08/16 UTC fonlama kalan miktar üzerinden tahsil edilir; oranlar `data/funding_cache/<SEMBOL>.json` (`scripts/fill_funding_cache.py`), yoksa 8 saatte sabit %0.01 (`--funding-fallback-pct`); net PnL/ROI/equity işaretlerine girer | metrics-1, cost-model-2 |
+| `liquidation` | İzole marj yaklaşımı: likidasyon fiyatı `giriş×(1∓(1/kaldıraç−mmr))`, mmr BTC 0.004 / ETH 0.005 / diğer 0.0065 (kademe-1). Mum açılışı ötedeyse ya da stop likidasyonun ötesindeyken ters uç ona değerse `LIQUIDATION` (kayıp = kalan miktarın marjı) | cost-model-3, exit-logic-3, live-risk-3 |
+| `daily_latch` | Canlı `engine._update_kill_switch` aynası: `scalper_daily_loss_limit_pct>0` iken UTC günü gerçekleşmiş PnL ≤ −limit% olunca o günün sonraki sinyalleri düşer. Sermaye tabanı harness'in sabit 10 000'i (limit 1 → eşik −100). Kapasite kapısıyla TEK kronolojik geçişte (kesici önce; düşen işlem slot tutmaz) | parity-1, live-risk-4 |
+
+   Anahtarlar: `--disable-realism a,b` (bilinmeyen ad `ValueError`), `--legacy-model` (hepsi kapalı = eski model).
+   Kütüphane: elle kurulan `OpenPosition` eski modelde kalır; `open_position()`/`simulate_symbol`/`run_backtest` tam
+   gerçekçilikte. JSON `provenance.realism = {enabled, disabled, parameters}` her raporda; ek bloklar `maker_orders`,
+   `funding`, `liquidation`, `daily_latch`. Her zaman açık ek ölçüm: yüzde tabanlı DD (`max_drawdown_pct_initial/_peak`,
+   `bar_max_drawdown_pct_*`) ve bar içi ters uçla işaretlenen `bar_max_drawdown_adverse` (tepe kapanış işaretinden,
+   çukur ters uçtan) — `metrics-4`.
+2. **P2-v2 kabul kuralı** (`scripts/autoresearch.py`; eski P2 `decide()` DEĞİŞMEDİ, "P2-eski" olarak yan yana basılır).
+   Aday ancak **beşi birden** sağlanırsa ADAY: **(1) örneklem** — 3 pencerenin her birinde taban VE aday ≥ 60 işlem
+   (aksi `YETERSIZ-ORNEK`); **(2) anlamlılık** — havuzlanmış günlük PnL farkında eşleşmiş gün-blok bootstrap (blok 3,
+   5000 yol, tohum 12345; takvim 55 gün) `delta>0` VE tüm sweep üzerinden Benjamini-Hochberg `q ≤ 0.10`; **(3) pencere
+   zararı yok** — hiçbir pencerede aday tabandan `0.20×scale_w`'den fazla geride değil (`scale_w = max(|taban net|,
+   0.25×(brüt kâr+|brüt zarar|))`); **(4) DD** — havuz DD (pencere bar-DD toplamı; yoksa işlem-düzeyi) ≤ 1.2× taban;
+   **(5) stres** — maliyet 2× (`--fee-stress`) ve giriş gecikmesi 1 mum'da havuz net farkı > 0 (eş stresli tabana
+   karşı; eksik sonuç = düşürülür, fail-closed). Etiketler `ADAY / REDDEDILDI / YETERSIZ-ORNEK / HATA`; sıralama
+   puanı `delta / bootstrap SE`. Kapatır: param-sweep-3/4/5, walkforward-oos-4/5, metrics-5. Eski kural şunu
+   yapıyordu: AYI PF ≥ 1.1 ise YATAY'a bakmaz, "ikisi iyileşir" şartı epsilon'u da kabul eder, çoklu-test düzeltmesi yok.
+3. **Autoresearch tesisatı:** sonuç önbelleği artık TAM anahtarlı (git HEAD + kirli-ağaç parmak izi (izlenmeyen `src`/
+   `scripts` dosyaları dahil) + env dosyası özeti + override'lar + pencereler + bayraklar + fonlama önbelleği özeti;
+   eşleşmeyen veya anahtarsız eski kayıt YENİDEN koşulur) — param-sweep-2, walkforward-oos-7. Alt süreç ortamı izin
+   listesi + env dosyası + aday override'ları + sahte zorunlu değerler; üst süreç `SCALPER_*` ve yerel `.env` SIZMAZ
+   (param-sweep-1). `--env-file` zorunlu ve `SCALPER_` anahtarı içermek zorunda (parity-7). Rapor yolu "Backtest raporu
+   yazıldı" satırından alınır, en yeni dosyadan değil (param-sweep-7). `profit_factor=null` → +inf (metrics-8).
+   `scripts/run_windows.sh`: boş pencere yok, başarısız pencerede çıkış kodu ≠ 0 (walkforward-oos-8).
+4. **Walk-forward** (`scripts/walk_forward.py`, yeni): kayan/çapa katlar, `--train-days/--test-days/--step-days`,
+   `--embargo-hours` (yukarı yuvarlanır), `step<test` reddedilir; her katta aday EĞİTİMDE seçilir (≥ 60 işlem ve eşleşmiş
+   puan ≥ 1.0, en yüksek puan, yoksa TABAN), seçilen ve taban DONDURULMUŞ parametreyle TEST'te koşar. Çıktı: havuzlu
+   OOS işlem/WR/PF/net/DD, LONG/SHORT, WFE, eşleşmiş bootstrap delta + %95 GA. Yalnız önbellekle çalışır (ağ yok);
+   eksik seri varsa çıkış 3 ve liste. Kapatır: walkforward-oos-1, -6 (embargo).
+5. **Saklı pencere kaydı** (`docs/holdout_registry.json`, yeni): 12 pencere. **Yanık (10):** AYI, YATAY, BOGA, OOS_MART,
+   COKUS, HOLD_MAY, HOLD_JUN, FRESH_SUBAT, FRESH_TEMMUZ, SAKLI_NISAN (Nisan, E13 yargıcı tarafından açılıp yandı);
+   **doğrulama:** `VAL-2026Q4a` 2026-09-04→10-15 (walk-forward OOS katına izin, parametre seçimi YOK); **mühürlü:**
+   `SEAL-2026Q4b` 2026-10-16→11-19 (aday paketi başına TEK açılış, yalnız VETO eder, terfi ettirmez). Kayıtta `end`
+   KAPSAYICIDIR (koşu pencereleri `[start,end)`). Mühürlü pencereye değen koşu `--open-sealed "<amaç>"` olmadan
+   REDDEDİLİR (`walk_forward` 2, `autoresearch` 2, `run_windows.sh` 2; kayıt yoksa da fail-closed) ve açılış
+   `opens`'a yazılır; yanık/doğrulama kullanımı da kalıcı sayılır. Kapatır: walkforward-oos-2/3, lookahead-3.
+6. **Permütasyon düzeltmeleri** (`permutation.py` + `backtest.py` sürücüsü): +inf null çekilişleri atılmaz, "≥ gerçek"
+   sayılır (montecarlo-1); mumlar ortak permüte edilir (her mumun `(high−open, low−open, close−open)` üçlüsü korunur,
+   boşluklar ayrı permüte; log-uzayda ortalama aralık gerçeğe EŞİT) ve `--permutation-block-length` (varsayılan 1 =
+   bağımsız-mum sıfırı; > 1 bloklarla volatilite kümelenmesini korur) — montecarlo-3; TEK permütasyon indeksi tüm
+   semboller ve lider serisine uygulanır (montecarlo-4); sıfır-işlemli null koşuları WR/PF/ROI/MFE/MAE'den hariç
+   (PnL/DD'de 0 kalır), tohum/blok/çoklu-test notu sonuca yazılır (montecarlo-2/5). Gerçek +inf PF artık p-değeri alır.
+7. **Monte Carlo modülü** (`src/strategies/scalper/montecarlo.py`, yeni, stdlib): UTC-gün dairesel blok bootstrap
+   (blok 3, 5000 yol) ile eşitlik yolu (DD, kayıp serisi, batma, günlük kayıp ihlali), güven aralıkları ve
+   `paired_ab_test`; CLI `python3 -m src.strategies.scalper.montecarlo --source ledger --db <db>`.
+8. **`ledger_report.py`:** `pnl_source` ayrımı (doğrulanmış / doğrulanmamış), AP (takipçi) varsayılan HARİÇ ve ayrı
+   satırda (`--include-ap`), LONG/SHORT bölünmesi, soak yalnız TAM UTC günlerini sayar, toplam PnL ≤ 0 iken
+   `up_pnl_share_pct` "n/a" (metrics-2, -7).
+
+**Kanıt:**
+- **Eski model birebir üretiliyor:** `--legacy-model` ile 7 pencerenin 7'sinde işlem listesi (sembol, yön, giriş/çıkış
+  zamanı ve fiyatı) ve net PnL ESKİ koşuyla özdeş (AYI 149 / +5703.23, MART 296 / −408.85, MAYIS 168 / −6110.74,
+  HAZIRAN 158 / +175.49, YATAY 136 / +2764.10, BOĞA 101 / +1276.58, ÇÖKÜŞ 116 / −720.32). Altın fixture: eski 23.79,
+  gerçekçi 25.17 (yeni test `test_golden_legacy_model_reproduces_pre_a1_numbers`).
+- **Tam test:** `.venv/bin/python -m pytest tests -q -p no:cacheprovider` → **3617 passed, 3 skipped**, 0 failed
+  (~82 sn, Python 3.12); öncesi 3363 (D40).
+- Yeni test dosyaları: `test_bt_exit_fills`, `test_bt_maker_fills`, `test_bt_funding_liquidation`, `test_bt_daily_latch`,
+  `test_bt_permutation_driver`, `test_fill_funding_cache`, `test_montecarlo`, `test_walk_forward`,
+  `test_autoresearch_decision`, `test_autoresearch_plumbing`.
+- Her uygulama paketi bağımsız incelemeden geçti; bulunan kusurlar (bar-DD tepe tanımı, kesici-kapasite sırası, aynı
+  mumda TP2, takvim 58→55 gün, fonlama önbelleğinin walk-forward alt dizininde yüklenmemesi) AYNI paketle düzeltildi.
+
+**Resmi sayılara etkisi** (C-only, 8 majör, sunucu env'i; eski = ana dal harness'i, yeni = bu dal varsayılan; tam tablo ve
+LONG/SHORT E16'da):
+
+| Pencere | Eski işlem / PF / net | Yeni işlem / PF / net | Δ net |
+|---|---|---|---|
+| AYI 01-23→02-13 | 149 / 2.03 / +5703.23 | 92 / 1.62 / +2808.05 | −2895.18 |
+| MART 03-01→04-01 | 296 / 0.98 / −408.85 | 204 / 0.84 / −2371.44 | −1962.59 |
+| MAYIS 05-04→05-25 | 168 / 0.60 / −6110.74 | 107 / 0.70 / −2640.89 | +3469.85 |
+| HAZİRAN 06-08→06-29 | 158 / 1.02 / +175.49 | 109 / 0.98 / −135.39 | −310.88 |
+| YATAY 07-01→07-21 | 136 / 1.50 / +2764.10 | 95 / 1.96 / +2804.45 | +40.35 |
+| BOĞA 08-07→08-21 | 101 / 1.33 / +1276.58 | 61 / 0.76 / −856.76 | −2133.34 |
+| ÇÖKÜŞ 08-21→09-03 | 116 / 0.90 / −720.32 | 83 / 1.10 / +499.09 | +1219.41 |
+| **Toplam** | **1124 / 1.04 / +2679.50** | **751 / 1.00 / +107.10** | **−2572.40** |
+
+**Bundan sonra:** resmi sayı = gerçekçi (varsayılan) model; eski sayılarla kıyas yalnız `--legacy-model` ile.
+P2 (CLAUDE.md yasak #1) ve P2-v2 sayıları artık gerçekçi modelde okunur. Dikkat: gerçekçi modelde BOĞA tabanı ZARARDA
+(−856.76); P2-v2'nin pencere-zararı şartı (3) bu yüzden taban netine değil brüt harekete (`scale_w` tabanı) ölçeklenir.
+
+**Neye DOKUNULMADI:** `src/strategies/scalper/{engine,executor,exits,setups,entry_gates,indicators,tracker}.py`,
+`src/trading`, `src/services`, `src/core/config.py`; hiçbir `SCALPER_*` değeri; sunucu, `.env`, deploy, restart. Canlı
+karar yolu bayt bayt aynı. Bu paket yalnız ölçer; "artık kazanıyor/kaybediyor" hükmü vermez ve D40'ın deploy durumunu
+DEĞİŞTİRMEZ.
+
+**Geri alma:** (a) ölçümde: `--legacy-model` eski sayıları birebir üretir (yukarıda kanıtlı); tek özelliği kapatmak için
+`--disable-realism <ad>`. (b) kodda: bu paketin commit'i `git revert` edilir (yalnız `src/strategies/scalper/{backtest,
+permutation,montecarlo,funding}.py`, `scripts/`, `tests/`, `docs/`; veri `data/funding_cache/` git'te DEĞİL). Sunucu
+etkilenmediği için restart/deploy GEREKMEZ.
+
+**Bilinen kalan boşluklar (kasıtlı, yapılmadı):**
+- Semboller hâlâ BAĞIMSIZ simüle edilir; kapasite kapısı ve günlük kesici **sonradan (post-hoc)** uygulanır — sembol-içi
+  cooldown/sinyaller düşen işlemden habersizdir (parity-3). Fonlama/likidasyon sayıları yalnız kapıdan geçen işlemleri sayar.
+- Borsa filtreleri YOK (`stepSize/tickSize/minNotional`); boyutlama canlı equity'ye değil sabit 10 000'e göre (cost-model-6,
+  parity-2).
+- Kayma DÜZ %0.02; oynaklık/likiditeyle ölçeklenmez.
+- Likidasyon kademe-1 yaklaşımı: tüm notional için tek mmr, likidasyon ücreti yok. Şu 7 pencerede likidasyon sayısı 0.
+- **Sermaye tabanı:** harness 10 000 ile boyutlar, canlı sanal sermaye 1000 (`scalper_virtual_capital_usdt`). Günlük kesici
+  yüzde olarak aynıdır ama dolar eşiği −100 (canlıda −10). Kesici bu paketin EN BÜYÜK tek etkisidir (E16): mutlak
+  değerler canlıyla birebir okunmamalı.
+- Maker modeli: harness limiti sinyal-mumu kapanışı, canlı birkaç sn–60 sn sonraki bid/ask; harness %100 dolar (canlı
+  kısmi dolar, kalanı iptal), gecikme yok; chandelier izi dolum mumunun tamamını görür. %0.01 trade-through yalnız
+  yaklaşık bir vekil.
+- Fonlama oranları gerçek (8 sembolün her biri 969 satır, 2026-01-01→11-19; 7 pencerede yedek oran 0 kez kullanıldı);
+  önbellek dışı dönemde sabit %0.01 yedek.
+- Evren bugünün 8 majörü (lookahead-2); karar anı tam mum kapanışı (lookahead-5); sinyal mantığı bulguları
+  (signal-logic-1/2/4), canlı-risk bulguları (live-risk-1/2/5/6) ve `lookahead-6` bu pakette YOK.
+- `VAL-2026Q4a` ve `SEAL-2026Q4b` için kline önbelleği yok; `walk_forward` yalnız önbellekle koşar (eksikte çıkış 3), önce
+  normal bir backtest koşusuyla veri çekilmesi gerekir (ağ).
+
 ### D40 — Hata avı paketi A: saat dilimi, TP sınıflaması, ölçüm etiketleri, karşı-olgu süpürmesi, rejim önbelleği, reaper dayanıklılığı, kurtarma stop seçimi · 2026-10-10 · KOD VAR — deploy bekliyor
 
 **Talep:** kullanıcı panosu (TESTNET) 169 işlemde PF 0,47 gösteriyor; "panodaki kırmızıların arkasında hata var mı"
@@ -3691,7 +3832,16 @@ fark yaratmamıştı). Bilinen sapmalar `_apply_capacity_gate` docstring'inde.
 ### P2 — Karar kuralı · 2026-08-21
 Aday = AYI PF ≥ 1.1 (veya AYI ve YATAY PnL birlikte iyileşir) VE BOĞA PnL kaybı ≤ %20.
 Tek pencerede parlayan reddedilir. **Ölçek notu (2026-08-23):** boyutlama gibi doğrusal değişikliklerde (marj/risk yüzdesi) PnL kuralı mekanik olarak RED verir; bu adaylar PF/DD oranıyla okunur (E6b negatif kontrol). Terfi: backtest → testnet ≥5 gün (en az 1 düşüş günü) → mainnet.
+**Not (2026-11-20, D41):** `scripts/autoresearch.py` artık bu kuralı yalnız "P2-eski" olarak basar; sweep kararı P2-v2'dir.
 
 ### P3 — Simülatör ölçeği · 2026-08-21
 Boğa penceresinde canlı defterin şeklini birebir üretir (LONG baskın), ölçek ~3× (boyutlama).
 Kararlar göreli farkla; canlı defter nihai hakem.
+
+### P2-v2 — Sweep kabul kuralı · 2026-11-20
+Yerine geçtiği: P2'nin AYI-PF / "ikisi de iyileşir" mantığı (epsilon'u kabul ediyor, çoklu test yok). Aday ancak beş şartın
+HEPSİNDE ADAY: örneklem (her pencerede taban+aday ≥ 60 işlem), anlamlılık (havuz günlük PnL farkı, eşleşmiş gün-blok
+bootstrap, BH q ≤ 0.10 tüm sweep üzerinden), pencere zararı yok (≤ 0.20×scale_w), DD ≤ 1.2× taban, stres (maliyet 2× ve
+giriş gecikmesi 1 mum'da delta > 0). Ayrıntı, sabitler ve kanıt: D41; kod: `scripts/autoresearch.py` `p2v2_*`.
+ADAY hâlâ yalnız ÖNERİDİR: testnet ≥5 gün (en az 1 düşüş günü) → insan kararı → mainnet; saklı pencere yalnız veto eder
+(`docs/holdout_registry.json`, D41).

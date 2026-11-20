@@ -1251,6 +1251,12 @@ veya dosyayı silmek yeterlidir.
 **Degraded ama hata yok + tarama bayat:** dashboard açıkken /api/status force-fresh çağrısı
 limiter'ı doyuruyordu (düzeltildi). Belirti imzası aynıysa önce dashboard'u kapat.
 
+**`/health` "degraded", orchestrator `recovery_ready=false` (2026-11-20):** `src/services/orchestrator.py:95`
+(`start()`) açılışta `_recovery_ready = await recover_open_positions()` atar ve bu değer BAŞKA yerde yeniden atanmaz —
+başarısız bir açılış kurtarması restart'a kadar KİLİTLİ kalır; kendiliğinden temizlenmez. Skalper yolu bundan
+etkilenmez (kendi readiness'i var; `/scalper/status` ayrıca bak). Restart'tan ÖNCE 418/ban var mı kontrol et (ban
+aktifken restart YASAK, yukarıdaki "Binance 418" maddesi); sonra `RESTART_LABEL=<etiket> scripts/restart_safe.sh`.
+
 **Pozisyon korumasız uyarısı / -4120:** koşullu emirler `/fapi/v1/algoOrder`'da; `openOrders`
 onları göstermez, `allOpenOrders` iptal etmez.
 
