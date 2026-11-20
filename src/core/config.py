@@ -204,6 +204,10 @@ class Settings(BaseSettings):
     # Scalper
     scalper_enabled: bool = True
     scalper_strategies: str = "A,B,C,D"        # virgülle: hangi varyantlar aktif
+    # Strateji M (D44/E18 ön-kayıtlı momentum deneyi; varsayılan KAPALI — yalnız
+    # SCALPER_STRATEGIES içinde "M" varsa çalışır). breakout|pullback ve regime|context.
+    scalper_m_trigger: str = "breakout"
+    scalper_m_trend: str = "regime"
     scalper_top_n: int = 12
     scalper_scan_interval_seconds: int = 30
     # Pozisyon/çıkış ve bekleyen maker dolumları, uzun sembol
@@ -905,6 +909,22 @@ class Settings(BaseSettings):
                 "MARKET_DATA_ALLOWED_HOSTS demetine bilinçli olarak ekleyin)."
             )
         return value
+
+    @field_validator("scalper_m_trigger", "scalper_m_trend")
+    @classmethod
+    def _validate_m_modes(cls, value: str, info) -> str:
+        """Strateji M modları: yazım hatası sessizce 'sinyal yok' üretmesin."""
+        allowed = {
+            "scalper_m_trigger": ("breakout", "pullback"),
+            "scalper_m_trend": ("regime", "context"),
+        }[info.field_name]
+        v = str(value).strip().lower()
+        if v not in allowed:
+            raise ValueError(
+                f"{info.field_name.upper()} {allowed} değerlerinden biri olmalı "
+                f"(verilen: {value!r})"
+            )
+        return v
 
     @field_validator("scalper_slippage_rate")
     @classmethod
