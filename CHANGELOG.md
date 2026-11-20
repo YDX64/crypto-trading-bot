@@ -1,5 +1,16 @@
 # Değişiklik Günlüğü
 
+## v2.1.2 - Orkestratör açılış kurtarması da scalper ön koşuluna bağlandı (D45, 2026-11-20)
+
+### 🐛 Düzeltilen Hatalar
+
+- Orkestratörün AÇILIŞ kurtarması (`start()`) scalper ön koşuluna bakmıyordu (D44 yalnız izleme döngüsündeki yeniden denemeyi
+  bağlamıştı): scalper'ın ilk borsa yoklaması başarısız olup orkestratörün sorgusu saniyeler sonra başarılı olursa, OPEN `scalp_trades`
+  satırı olmayan bir scalper pozisyonu "yetim" diye sahiplenilebilirdi (stop yoksa acil kapatma; stop varsa scalper'ın sonraki
+  kurtarması sahiplik çakışması görüp kalıcı entry-halt yazar). Artık scalper kendi kurtarmasını bitirmediyse açılış kurtarması ATLANIR
+  ve D44 döngüsü scalper hazır olunca kurtarır. Ön koşul yoksa ya da sağlanıyorsa açılış davranışı değişmez. Scalper ve takipçi kodu,
+  ayarlar ve giriş/çıkış kuralları değişmedi (`docs/DECISIONS.md` D45, `docs/RUNBOOK.md` "Sorun giderme")
+
 ## v2.1.1 - Orkestratör açılış kurtarması kendini onarır (D44, 2026-11-20)
 
 ### 🐛 Düzeltilen Hatalar

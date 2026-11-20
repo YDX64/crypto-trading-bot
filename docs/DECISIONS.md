@@ -7,6 +7,92 @@ Pencereler: AYI 2026-01-23→02-13 (BTC −30%) · YATAY 2026-07-01→07-21 · B
 
 ## Aktif kararlar
 
+### D45 — Orkestratörün AÇILIŞ kurtarması da scalper ön koşuluna bağlandı: scalper kurtarması bitmeden borsadaki pozisyonlar sahiplenilmez · 2026-11-20 · KOD HAZIR — TESTNET deploy'u kullanıcı onayını bekliyor
+
+**Sorun (D44 "Bilinmeyenler"deki boşluk; kodda doğrulandı).** D44 ön koşulu (`recovery_precondition = _scalper_recovery_settled`) yalnız
+izleme döngüsündeki YENİDEN denemede sorulur; `TradingOrchestrator.start()` `recover_open_positions()`'ı koşulsuz çağırıyordu.
+`ScalperEngine.start()` kendi kurtarmasını yalnız ilk borsa yoklaması başarılıysa koşar (`if await self._probe_exchange(): ...
+await self._attempt_recovery()`), sembol rezervasyonları `_attempt_recovery()`'nin sonunda yapılır ve `main.py` lifespan sırası
+`scalper_engine.start()` → `orchestrator.start()`'tır. Scalper'ın yoklaması başarısız olup orkestratörün sorgusu saniyeler sonra
+başarılı olursa: scalper kurtarması hiç koşmamış, bekleyen maker sembolleri rezerve değil, `scalp_trades`'te OPEN satırı olmayan
+(ör. çökme anında dolmuş maker niyeti) bir scalper pozisyonu orkestratöre "yetim" görünür. Orkestratör sahiplenir: stop yoksa
+`reduceOnly` MARKET ile acil kapatır; stop varsa `telegram` rezervasyonunu koyar ve scalper'ın sonraki kurtarması sahiplik
+çakışmasını görüp kalıcı entry-halt dosyası yazar (insan müdahalesi ister). Canlıda gözlenmedi: yalnız scalper'ın ilk yoklaması
+başarısız olan bir açılışta ortaya çıkar. Kodda doğrulandı ve kırmızı testle yeniden üretildi (eski açılış borsaya sordu).
+
+**Karar.** `start()` AYNI ön koşulu sorar; başlatma ve yeniden deneme tek yardımcıyı kullanır (`_recovery_precondition_pending()`).
+Ön koşul bağlı ve sağlanmıyorsa açılış kurtarması ATLANIR: borsaya sorgu yok, pozisyon sahiplenme yok, `_recovery_ready=False`, ilk
+yeniden deneme D44 aralığıyla (30 sn) planlanır ve `Açılış kurtarması ATLANDI` uyarısı yazılır. Scalper hazır olunca D44 döngüsü
+kurtarmayı kendisi koşar ve `/health` o zaman düzelir.
+
+| Durum | Açılışta | Not |
+|---|---|---|
+| Ön koşul yok (`scalper_engine is None`, yani `SCALPER_ENABLED=false`) | kurtarma bugünkü gibi | davranış birebir aynı |
+| Scalper hazır (`_recovery_ready=True`; normal açılış) | kurtarma bugünkü gibi | davranış birebir aynı |
+| Scalper'ın ilk yoklaması başarısız ya da kurtarması bitmedi | kurtarma ATLANIR | bu kararın konusu |
+| Scalper kurtarması denendi ama başarısız (ör. kalıcı entry-halt) | kurtarma ATLANIR | D44'ün yeniden deneme kuralıyla aynı; ilk "Bilinmeyenler" maddesi |
+
+**Sağlık kapısı etkisi (kodda hesaplandı; sunucuda ölçülmedi).** `scripts/server_deploy.sh` ve `scripts/restart_safe.sh` AYNI kapıyı
+kullanır: `HEALTH_TIMEOUT=240` sn, 5 sn aralıkla yoklar, `status=healthy` VE `core_healthy=true` ister; `core_healthy` = orkestratör
+sağlıklı VE scalper sağlıklı (`src/main.py` `health_check`), orkestratör sağlığı da `_recovery_ready`'ye bağlıdır. Etki yalnız
+scalper'ın ilk borsa yoklamasının (ya da kurtarmasının) açılışta başarısız olduğu durumda vardır; normal açılışta değişen bir şey yok.
+
+| Bileşen | En kötü süre | Kaynak |
+|---|---|---|
+| Scalper'ın sonraki borsa yoklaması/kurtarması | 30 sn | `ScalperEngine._EXCHANGE_PROBE_INTERVAL` |
+| Orkestratörün ilk yeniden deneme vadesi | 30 sn | `RECOVERY_RETRY_INITIAL_SECONDS` |
+| Vade ve ön koşuldan sonra izleme turu | 30 sn | `CHECK_INTERVAL_SECONDS` |
+| Kaba toplam (üst sınır) | 90 sn | bileşenler büyük ölçüde üst üste biner; ek gecikme genelde ≤ ~60 sn |
+
+Karşılaştırma: gözlenen açılış → sağlıklı süreleri 25-92 sn (deploy kayıtları; D44 deploy'unda 45 sn; RUNBOOK ≈ 90 sn). En kötü açılış
+(92 sn) + en kötü ek gecikme (90 sn) = 182 sn < 240 sn: pay 58 sn; D44 deploy'undaki 45 sn ile pay 105 sn. Pencere YETER. Yetmeyecek
+durum: aynı açılışta hem scalper'ın ilk yoklaması başarısız hem açılış süresi ≥ 150 sn olursa (betik yorumu açılışın 3 dk'ya
+çıkabildiğini söyler). Bu iki olay muhtemelen ilişkilidir (Binance bağlantısı yavaşken ikisi de uzar); ilişki ölçülmedi. Yetmezse
+deploy kendiliğinden geri alınır (ayar/veri göçü yok). `scripts/server_deploy.sh` ve `scripts/restart_safe.sh` DEĞİŞTİRİLMEDİ. Not:
+yerel `scripts/deploy.sh` `HEALTH_TIMEOUT`'u sunucuya İLETMEZ (yalnız `DEPLOY_SKIP_TESTS`, `DEPLOY_NO_RESTART` ve halka
+değişkenleri); pencereyi büyütmek betik değişikliği ister. Sunucuda doğrudan `restart_safe.sh` çalıştırırken `HEALTH_TIMEOUT=300`
+verilebilir.
+
+**Değişen dosyalar.** `src/services/orchestrator.py` (`start()`, yeni `_recovery_precondition_pending()`; `_retry_recovery_if_due`
+aynı yardımcıyı kullanır), `tests/test_orchestrator_recovery_retry.py` (+6 test), `docs/DECISIONS.md`, `docs/RUNBOOK.md`,
+`CHANGELOG.md`, `CLAUDE.md` (test sayısı). `src/main.py` DEĞİŞMEDİ (bağlama D44'te yapılmıştı). Ayar (`.env`) değişmez;
+scalper/takipçi kodu değişmez; giriş/çıkış/boyutlama kuralı değişmez.
+
+**Kanıt.** `tests/test_orchestrator_recovery_retry.py` (25 test: önceki 19 + yeni 6). Kırmızı → yeşil: yalnız testler eklenip kod
+eskiyken `3 failed, 22 passed` (üç davranış testi `assert 1 == 0` ile düştü: açılış borsaya sordu; üç davranış-koruma testi baştan
+geçiyordu), kod sonrası `25 passed`. Orkestratöre dokunan dört dosya birlikte (`test_orchestrator_recovery_retry`,
+`test_orchestrator_safety`, `test_runtime_liveness`, `test_container`): 126 geçti / 1 atlandı.
+
+| Davranış | Test |
+|---|---|
+| Ön koşul `False` iken açılışta borsa sorgusu yok; STOP'suz scalper pozisyonu sahiplenilmez/kapatılmaz (emir yok, DB satırı yok, rezervasyon yok); bayrak `False`; ilk deneme 30 sn'ye planlı | `test_start_skips_initial_recovery_while_precondition_false` |
+| Atlanan açılış: vade geldiğinde ön koşul `False` ise deneme yok ve hak harcanmaz; `True` olunca kurtarma koşar | `test_skipped_initial_recovery_heals_once_precondition_turns_true` |
+| GERÇEK `_monitoring_loop` + `main._scalper_recovery_settled`: scalper hazır olana dek kurtarma koşmaz, sonra koşar ve `health_snapshot()["healthy"]` `True` olur | `test_real_loop_recovers_and_health_heals_after_scalper_settles` |
+| Ön koşul yok ya da sağlanıyorsa açılış bugünkü gibi (tek sorgu, pozisyon izlemede, rezervasyon) | `test_start_recovers_immediately_when_precondition_missing_or_true` (2 parametre) |
+| Ön koşul sağlanıyor ve borsa erişilemiyorsa D44 başarısızlık yolu (ATLAMA değil) | `test_start_with_precondition_true_and_unreachable_exchange_keeps_failure_path` |
+
+Üç ortam (son ağaç): yerel `.env` ile 4071 geçti / 85 atlandı, 165 sn (önceki 4065 + 6 yeni test); temiz kopya + sunucunun secret olmayan ayarları (`scripts/preflight_server_env.sh awa`)
+4070 geçti / 86 atlandı, 165 sn (66 ayar satırı, "ÖN SINAV GEÇTİ"); CI `test` işi (`env.example`) bu kararı taşıyan PR'dadır. Deploy kaydı deploy'dan sonra buraya eklenir.
+
+**Bilinmeyenler / sınırlar (açıkça).**
+- Scalper kurtarması DENENDİ ama başarısız kaldıysa (ör. kalıcı entry-halt, `_recovery_ready=False`) açılış kurtarması da atlanır.
+  Eskiden orkestratör o durumda yine de bir kez denerdi ve Telegram'a ait bir pozisyonu sahiplenebilirdi; artık scalper hazır olana
+  dek sahiplenmez: o pozisyonların borsadaki stopları durur ama trailing/break-even çalışmaz. Bilinçli: çift yönetim (D20b'nin
+  kritik sınıfı) bu kararın kapattığı risktir ve D44'ün yeniden deneme kapısı zaten aynı kuralı koyuyordu. Kalıcı scalper halt'ı zaten
+  insan müdahalesi ister. Canlıda gözlenmedi, ölçülmedi.
+- Ön koşul scalper'ın `_recovery_ready` bayrağıdır. `_attempt_recovery()` bayrağı önce `True` atar, rezervasyonları sonra yapar;
+  rezervasyonlar arasında `await` yoktur, ama sahiplik çakışması bulursa `await _latch_entry_halt(...)` sırasında bayrak kısa süre
+  `True` görünebilir. Kod okumasından çıkarıldı, tetiklenmedi; scalper kodu kapsam dışı (bu karar yalnız bayrağı okur). D44 yeniden
+  denemesi de aynı bayrağa bakar.
+- Atlanan açılışta izleme döngüsünün ilk turu bir hazır-olma yoklaması (`get_all_positions`, ağırlık 5) atar: yalnız okur,
+  `_exchange_ready` işaretler, pozisyon sahiplenmez.
+- D44'ün diğer sınırları (gömülü takipçi sırası, listeyi okuduktan sonraki yarış, `_entry_halted` kendiliğinden temizlenmez, loguru
+  süslü parantez tuzağı) aynen geçerlidir.
+- Canlıda (TESTNET) gözlenmedi: ancak scalper'ın ilk yoklaması başarısız olan bir açılışta görülebilir.
+
+**Geri alma.** `scripts/deploy.sh awa <önceki-commit>`; ayar ya da veri göçü yok. Kod geri alınınca açılış yine ön koşula bakmaz
+(D44 sonrası durum).
+
 ### D44 — Orkestratörün açılış kurtarması kendini onarır: başarısız kurtarma izleme döngüsünde geri çekilmeli aralıklarla yeniden denenir · 2026-11-20 · TESTNET'TE CANLI (2026-11-20 deploy, `4f0c159`)
 
 **Sorun.** `TradingOrchestrator.start()` açılışta `_recovery_ready = await recover_open_positions()` atıyor ve bu bayrak başka hiçbir
@@ -99,7 +185,8 @@ kusur bulunmadı. Deploy kaydı deploy'dan sonra buraya eklenir.
   gecikir (tazelik sınırı 180 sn).
 - Açılış çağrısı (`start()`) ön koşula BAKMAZ; bugünkü davranış korunur. Scalper'ın ilk yoklaması başarısız olup orkestratörün
   sorgusu saniyeler sonra başarılı olursa "Sıra kuralı"ndaki risk açılış yolunda bu karardan önce de vardı ve duruyor. Kapsam
-  dışı bırakıldı (açılış davranışını değiştirir, kendi kararını ister).
+  dışı bırakıldı (açılış davranışını değiştirir, kendi kararını ister). Sonradan: D45'te kapatıldı (açılış çağrısı da aynı ön
+  koşula bağlandı).
 - Önceden beri var, doğrulandı: günlükleyici loguru'dur; `exc_info=True` ya da `extra={...}` ile yazılan bir mesajda `{...}`
   geçerse log çağrısı `KeyError` fırlatır. `_monitoring_loop`'un genel hata yakalayıcısı bu kalıbı kullanır; metninde süslü
   parantez olan bir hata oraya ulaşırsa döngü ölür. Yeni yol etkilenmez (kwargs'sız çağrı ya da `opt(exception=)`; süslü
