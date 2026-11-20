@@ -1,5 +1,16 @@
 # Değişiklik Günlüğü
 
+## v2.1.1 - Orkestratör açılış kurtarması kendini onarır (D44, 2026-11-20)
+
+### 🐛 Düzeltilen Hatalar
+
+- Orkestratörün `_recovery_ready` bayrağı başarısız bir açılış kurtarmasından sonra yeniden başlatmaya kadar `False` kalıyordu
+  (2026-11-17..20: `/health` üç gün HTTP 503 "degraded", Telegram giriş yolu kapalı). İzleme döngüsü artık kurtarmayı 30 sn'den
+  başlayıp 5 dk tavanına çıkan aralıklarla yeniden dener; başarıda `/health` kendiliğinden düzelir. Ban (418) aktifken, entry-halt
+  varken ve scalper kendi kurtarmasını bitirmeden deneme yapılmaz; deneme başına tek imzalı sorgu, uyarı en fazla 30 dakikada bir.
+  `/health` → `orchestrator_details` iki yeni alan: `recovery_retry_attempts`, `recovery_next_retry_in_seconds`. Scalper ve takipçi
+  kodu, ayarlar ve giriş/çıkış kuralları değişmedi (`docs/DECISIONS.md` D44, `docs/RUNBOOK.md` "Sorun giderme")
+
 ## v2.1.0 - Değerlendirme harness'i gerçekçilik paketi (D41, 2026-11-20)
 
 ### 🎉 Yeni Özellikler
