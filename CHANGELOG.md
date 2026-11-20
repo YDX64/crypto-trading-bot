@@ -1,5 +1,21 @@
 # Değişiklik Günlüğü
 
+## v2.1.2 - Log çağrıları kendi istisnasını fırlatmaz (D45, 2026-11-20)
+
+### 🐛 Düzeltilen Hatalar
+
+- `exc_info=True` ya da `extra={...}` ile yazılan log çağrılarında mesajda süslü parantez (Binance JSON hata gövdesi, dict metni)
+  varsa loguru çağrının KENDİSİNDE `KeyError`/`IndexError`/`ValueError` fırlatıyordu: `except` içinde güvenlik eyleminden önce patlarsa
+  eylem atlanıyor (ör. takipçide dolum okunamayınca koruma emri, orkestratörde giriş mandalı), döngü yakalayıcısında patlarsa görev ölüyordu
+  (`_monitoring_loop`). `exc_info=True` ayrıca traceback üretmiyordu. `src/core/logger.py` loguru'nun tek çıkış noktasına bir koruma takar:
+  `exc_info` gerçek traceback olur, `extra` kayda `bind` gibi eklenir (`trades.log` yönlendirmesi aynı), biçimlendirme gerektirmeyen mesaj
+  biçimlendirilmez, biçimlendirme yine de patlarsa satır aynen yazılır. Çağrı yerleri (116 kwargs'lı çağrı), log metinleri ve seviyeleri değişmedi;
+  ayar, giriş/çıkış kuralı ve deploy betikleri değişmedi.
+- Traceback YALNIZ `errors.log`'a yazılır (27 `exc_info=True` çağrısı artık traceback üretir); konsol, `bot.log` ve `trades.log` kayıt başına tek satırlı
+  kalır, çünkü `restart_safe.sh`/`server_deploy.sh`/`docker_run.sh` 418 ban kapısı `bot.log`'u satır başındaki zaman damgasına bakarak süzer. Tüm
+  sink'lerde `diagnose=False` (traceback değişken değeri basmaz); `errors.log` traceback'i artık iki kez basmaz ve kayıtlar arasında boş satır bırakmaz
+  (`docs/DECISIONS.md` D45, `docs/audits/2026-11-20-loguru-kwargs/`)
+
 ## v2.1.1 - Orkestratör açılış kurtarması kendini onarır (D44, 2026-11-20)
 
 ### 🐛 Düzeltilen Hatalar
