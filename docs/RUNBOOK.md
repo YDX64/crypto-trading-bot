@@ -1279,11 +1279,27 @@ veya dosyayı silmek yeterlidir.
 **Degraded ama hata yok + tarama bayat:** dashboard açıkken /api/status force-fresh çağrısı
 limiter'ı doyuruyordu (düzeltildi). Belirti imzası aynıysa önce dashboard'u kapat.
 
-**`/health` "degraded", orchestrator `recovery_ready=false` (2026-11-20):** `src/services/orchestrator.py:95`
-(`start()`) açılışta `_recovery_ready = await recover_open_positions()` atar ve bu değer BAŞKA yerde yeniden atanmaz —
-başarısız bir açılış kurtarması restart'a kadar KİLİTLİ kalır; kendiliğinden temizlenmez. Skalper yolu bundan
-etkilenmez (kendi readiness'i var; `/scalper/status` ayrıca bak). Restart'tan ÖNCE 418/ban var mı kontrol et (ban
-aktifken restart YASAK, yukarıdaki "Binance 418" maddesi); sonra `RESTART_LABEL=<etiket> scripts/restart_safe.sh`.
+**`/health` "degraded", orchestrator `recovery_ready=false` (D44, 2026-11-20):** açılış kurtarması (`start()` →
+`recover_open_positions()`) başarısız olursa bayrak artık KİLİTLİ kalmaz. İzleme döngüsü kurtarmayı 30 sn sonra, ardından
+60 / 120 / 240 / 300 sn aralıklarla (tavan 5 dk) yeniden dener; başarıda bayrak `true` olur ve `/health` kendiliğinden düzelir.
+**Restart gerekmez.** Bakılacak yer `/health` → `orchestrator_details`:
+
+| Alan | Anlamı |
+|---|---|
+| `recovery_retry_attempts` | yapılan yeniden deneme sayısı; artıyorsa döngü deniyor |
+| `recovery_next_retry_in_seconds` | sıradaki denemeye kalan süre (`null` = kurtarma tamam ya da planlı deneme yok) |
+| `last_exchange_error` | son borsa sorgusu hatası (neden) |
+| `entry_halted` | `true` ise deneme YAPILMAZ (aşağıya bak) |
+
+Deneme şu durumlarda YAPILMAZ, sayaç da ilerlemez: (1) `entry_halted=true` — korumasız pozisyon, insan müdahalesi ister; nedeni
+çöz, sonra restart. (2) 418/ban kesicisi aktif — ban bitince ilk turda kendiliğinden dener. (3) Scalper kendi kurtarmasını
+bitirmedi (`scalper_details.recovery_ready=false`) — açılıştaki "scalper önce recover edilir" sırası gecikmiş denemede de korunur
+(D44 "Sıra kuralı"); önce scalper'ın neden hazır olmadığına bak. Döngü turu `CHECK_INTERVAL_SECONDS` (30 sn) olduğu için deneme
+anları bu ızgaraya oturur. `logs/bot.log`'da "Açılış kurtarması" satırlarını ara: başarısızlık uyarısı ilk denemede ve sonra en
+fazla 30 dakikada bir yazılır, başarı tek satırdır. Restart yine son çaredir: bayrak uzun süre `false` ve sayaç artmıyorsa
+yukarıdaki üç kapıdan biri kapalıdır. Restart'tan ÖNCE 418/ban var mı kontrol et (ban aktifken restart YASAK, yukarıdaki
+"Binance 418" maddesi); sonra `RESTART_LABEL=<etiket> scripts/restart_safe.sh`. Skalper yolu bu bayraktan etkilenmez (kendi
+readiness'i var; `/scalper/status` ayrıca bak).
 
 **Pozisyon korumasız uyarısı / -4120:** koşullu emirler `/fapi/v1/algoOrder`'da; `openOrders`
 onları göstermez, `allOpenOrders` iptal etmez.

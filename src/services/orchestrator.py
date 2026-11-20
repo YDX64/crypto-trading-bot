@@ -15,7 +15,7 @@ TASARIM NOTLARI:
 import asyncio
 import json
 import time
-from typing import Optional, Dict
+from typing import Callable, Dict, Optional
 from datetime import datetime
 
 from sqlalchemy import select
@@ -47,6 +47,11 @@ class TradingOrchestrator:
     MAX_MARGIN_UTILISATION = 0.5
     RESERVATION_OWNER = "telegram"
     EXCHANGE_PROBE_INTERVAL_SECONDS = 60.0
+    # D44: açılış kurtarması başarısız olursa izleme döngüsü yeniden dener.
+    # Denemeler arası bekleme 30, 60, 120, 240, 300, 300, ... saniyedir.
+    RECOVERY_RETRY_INITIAL_SECONDS = 30.0
+    RECOVERY_RETRY_MAX_SECONDS = 300.0
+    RECOVERY_RETRY_LOG_INTERVAL_SECONDS = 1800.0
 
     def __init__(self):
         self.parser = TelegramSignalParser()
@@ -75,6 +80,14 @@ class TradingOrchestrator:
         self._last_monitoring_success_monotonic: Optional[float] = None
         self._last_monitoring_success_at: Optional[str] = None
 
+        # D44: gecikmeli kurtarma yeniden denemesi durumu. `main.py` ön koşulu
+        # bağlar (scalper kendi kurtarmasını bitirmiş olmalı); None = ön koşul yok.
+        self.recovery_precondition: Optional[Callable[[], bool]] = None
+        self._recovery_retry_delay = self.RECOVERY_RETRY_INITIAL_SECONDS
+        self._recovery_retry_due_monotonic: Optional[float] = None
+        self._recovery_retry_attempts = 0
+        self._recovery_retry_last_log_monotonic: Optional[float] = None
+
     # ------------------------------------------------------------------
     # Yaşam döngüsü
     # ------------------------------------------------------------------
@@ -94,6 +107,21 @@ class TradingOrchestrator:
 
         self._recovery_ready = await self.recover_open_positions()
         self._exchange_ready = self._recovery_ready and self._exchange_ready
+
+        # D44: açılış kurtarması başarısızsa (ör. Binance açılışta erişilemezdi)
+        # bayrak bir sonraki süreç yeniden başlatmasına kadar False kalıyordu.
+        self._recovery_retry_delay = self.RECOVERY_RETRY_INITIAL_SECONDS
+        self._recovery_retry_attempts = 0
+        self._recovery_retry_last_log_monotonic = None
+        self._recovery_retry_due_monotonic = None
+        if not self._recovery_ready:
+            first_delay = self._recovery_retry_delay
+            self._schedule_recovery_retry()
+            self.logger.warning(
+                "⚠️ Açılış kurtarması tamamlanamadı; izleme döngüsü "
+                f"{first_delay:.0f} sn sonra geri çekilmeyle (backoff) yeniden "
+                "deneyecek. Telegram girişleri ve /health o zamana dek kapalı."
+            )
 
         self._running = True
         if not self.monitoring_task or self.monitoring_task.done():
@@ -123,7 +151,7 @@ class TradingOrchestrator:
     # Yeniden başlatma sonrası kurtarma
     # ------------------------------------------------------------------
 
-    async def recover_open_positions(self) -> bool:
+    async def recover_open_positions(self, *, log_query_failure: bool = True) -> bool:
         """Borsadaki açık pozisyonları belleğe ve veritabanına geri yükle.
 
         Bot yeniden başladığında active_positions boştur. Borsada gerçekten
@@ -133,7 +161,8 @@ class TradingOrchestrator:
         try:
             exchange_positions = await self.binance.get_all_positions()
         except Exception as e:
-            self.logger.error(f"⚠️ Açık pozisyonlar borsadan sorgulanamadı: {e}")
+            if log_query_failure:
+                self.logger.error(f"⚠️ Açık pozisyonlar borsadan sorgulanamadı: {e}")
             self._exchange_ready = False
             self._last_exchange_error = f"{type(e).__name__}: {e}"
             return False
@@ -245,6 +274,11 @@ class TradingOrchestrator:
                     continue
 
                 if protection is False:
+                    # D44: önceki bir denemede koruması okunamadığı için izlemeye
+                    # alınmış olabilir. Acil kapatılan pozisyon listede bayat
+                    # kalırsa, rezervasyon bırakıldıktan sonra başka motorun aynı
+                    # sembolde açtığı pozisyon orchestrator'ınki sanılırdı.
+                    self.active_positions.pop(symbol, None)
                     symbol_reservations.release(symbol, self.RESERVATION_OWNER)
                     continue
                 if protection is None:
@@ -305,6 +339,7 @@ class TradingOrchestrator:
 
         while self._running:
             try:
+                await self._retry_recovery_if_due()
                 await self._refresh_exchange_readiness_if_due()
                 if self.active_positions:
                     async with AsyncSessionLocal() as session:
@@ -325,6 +360,93 @@ class TradingOrchestrator:
             except Exception as e:
                 self.logger.error(f"❌ İzleme döngüsü hatası: {e}", exc_info=True)
                 await asyncio.sleep(10)
+
+    def _schedule_recovery_retry(self) -> None:
+        """Bir sonraki kurtarma denemesinin zamanını ayarla ve beklemeyi ikiye katla."""
+        delay = self._recovery_retry_delay
+        self._recovery_retry_due_monotonic = time.monotonic() + delay
+        self._recovery_retry_delay = min(delay * 2.0, self.RECOVERY_RETRY_MAX_SECONDS)
+
+    @staticmethod
+    def _rest_ban_active() -> bool:
+        """Binance REST 418/-1003 ban devre kesicisi şu an açık mı?"""
+        return time.time() < float(getattr(BinanceClient, "_rest_blocked_until", 0.0) or 0.0)
+
+    def _log_recovery_retry_failure(
+        self,
+        now: float,
+        reason: str,
+        *,
+        exc: Optional[BaseException] = None,
+    ) -> None:
+        """Başarısız deneme uyarısını RECOVERY_RETRY_LOG_INTERVAL_SECONDS'ta bir yaz."""
+        last = self._recovery_retry_last_log_monotonic
+        if last is not None and now - last < self.RECOVERY_RETRY_LOG_INTERVAL_SECONDS:
+            return
+        self._recovery_retry_last_log_monotonic = now
+        next_in = max(0.0, (self._recovery_retry_due_monotonic or now) - now)
+        message = (
+            f"⚠️ Açılış kurtarması yeniden denemesi #{self._recovery_retry_attempts} "
+            f"başarısız; sonraki deneme {next_in:.0f} sn sonra. Neden: {reason}"
+        )
+        # loguru: kwargs verilirse mesaj `str.format`'lanır ve istisna metnindeki
+        # `{...}` (Binance JSON hata gövdesi) patlatırdı; stack için `opt` kullan.
+        if exc is not None:
+            self.logger.opt(exception=exc).warning(message)
+        else:
+            self.logger.warning(message)
+
+    async def _retry_recovery_if_due(self) -> None:
+        """Başarısız açılış kurtarmasını izleme döngüsünden geri çekilmeyle yeniden dene (D44).
+
+        Dört kapı vardır; hiçbiri geçilmezse deneme yapılmaz:
+        (a) `_entry_halted`: insan müdahalesi gerekir; yeniden deneme acil
+            kapatma girişimini tekrarlardı.
+        (b) REST ban'ı açıkken (418/-1003) hiçbir istek atılmaz.
+        (c) `recovery_precondition`: scalper önce kendi kurtarmasını bitirmeli
+            (main.py başlangıç sırasıyla aynı); aksi hâlde scalper'a ait ama
+            OPEN `scalp_trades` satırı henüz olmayan pozisyon benimsenebilirdi.
+        (d) Backoff: sonraki deneme çağrıdan ÖNCE planlanır; istisna da
+            geri çekilir. Ban/ön koşul beklemesi deneme hakkı tüketmez.
+
+        Bu deneme o turun imzalı hesap probu sayılır (tek imzalı sorgu).
+        """
+        if self._recovery_ready or self._entry_halted:
+            return
+        due = self._recovery_retry_due_monotonic
+        now = time.monotonic()
+        if due is None or now < due:
+            return
+        if self._rest_ban_active():
+            return
+        if self.recovery_precondition is not None and not self.recovery_precondition():
+            return
+
+        self._schedule_recovery_retry()
+        self._recovery_retry_attempts += 1
+        self._last_exchange_probe_monotonic = now
+
+        unexpected: Optional[BaseException] = None
+        failure = ""
+        try:
+            recovered = await self.recover_open_positions(log_query_failure=False)
+        except Exception as e:  # başarısız deneme pozisyon izlemeyi atlatmamalı
+            recovered = False
+            unexpected = e
+            failure = f"{type(e).__name__}: {e}"
+        self._recovery_ready = recovered
+
+        if recovered:
+            self._recovery_retry_due_monotonic = None
+            self.logger.warning(
+                f"✅ Açılış kurtarması yeniden deneme #{self._recovery_retry_attempts} "
+                "ile tamamlandı; Telegram girişleri ve /health yeniden açık."
+            )
+            return
+
+        if unexpected is None:
+            failure = self._last_exchange_error or "kurtarma güvenliği kanıtlanamadı"
+        self._log_recovery_retry_failure(now, failure, exc=unexpected)
 
     async def _refresh_exchange_readiness_if_due(self) -> None:
         """Periodically prove that signed Futures account access still works."""
@@ -605,6 +727,14 @@ class TradingOrchestrator:
             ),
             "exchange_ready": self._exchange_ready,
             "recovery_ready": self._recovery_ready,
+            "recovery_retry_attempts": self._recovery_retry_attempts,
+            "recovery_next_retry_in_seconds": (
+                None
+                if self._recovery_ready or self._recovery_retry_due_monotonic is None
+                else round(
+                    max(0.0, self._recovery_retry_due_monotonic - time.monotonic()), 1
+                )
+            ),
             "entry_halted": self._entry_halted,
             "entry_halt_reason": self._entry_halt_reason,
             "last_exchange_success_at": self._last_exchange_success_at,

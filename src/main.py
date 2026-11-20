@@ -204,6 +204,20 @@ def _foreign_tracked_symbols() -> set:
     return symbols
 
 
+def _scalper_recovery_settled() -> bool:
+    """Orchestrator'un GECİKMELİ kurtarma denemesi için ön koşul (D44).
+
+    Başlangıçtaki "Scalper önce recover edilir" kuralını yeniden denemede de
+    korur. Scalper açılış probu başarısız olduysa `ScalperEngine.start()`
+    `_attempt_recovery()`'yi hiç çalıştırmaz; journal/pending sembolleri henüz
+    rezerve edilmemiştir ve erken bir orchestrator denemesi scalper'ın
+    pozisyonunu benimseyebilirdi.
+    """
+    if scalper_engine is None:
+        return True
+    return bool(getattr(scalper_engine, "_recovery_ready", False))
+
+
 def _risk_engines() -> list:
     """`/risk-event`'in uygulanacağı TÜM motorlar (D20b).
 
@@ -403,6 +417,9 @@ async def lifespan(app: FastAPI):
                 "borsadaki pozisyonlar sahiplenilmez (canlı halkanın işleri)"
             )
         else:
+            # D44: açılış kurtarması başarısız olursa orchestrator onu izleme
+            # döngüsünden yeniden dener; scalper kurtarması bitmeden denemez.
+            orchestrator.recovery_precondition = _scalper_recovery_settled
             await orchestrator.start()
             app_logger.info("✅ Trading Orchestrator başlatıldı")
 

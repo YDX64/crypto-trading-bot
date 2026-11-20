@@ -7,6 +7,108 @@ Pencereler: AYI 2026-01-23→02-13 (BTC −30%) · YATAY 2026-07-01→07-21 · B
 
 ## Aktif kararlar
 
+### D44 — Orkestratörün açılış kurtarması kendini onarır: başarısız kurtarma izleme döngüsünde geri çekilmeli aralıklarla yeniden denenir · 2026-11-20 · KOD HAZIR — TESTNET deploy'u kullanıcı onayını bekliyor
+
+**Sorun.** `TradingOrchestrator.start()` açılışta `_recovery_ready = await recover_open_positions()` atıyor ve bu bayrak başka hiçbir
+yerde yeniden atanmıyordu. 2026-11-17 06:34 UTC'de süreç yeniden başlarken Binance'e ulaşılamadı; kurtarma `False` döndü ve bayrak
+2026-11-20 07:41 UTC deploy'una kadar (üç gün) `False` kaldı: `/health` HTTP 503 "degraded", orkestratörün (Telegram sinyali) giriş
+yolu kapalı, deploy/restart betiklerinin sağlık kapısı aynı koşula bağlı (D43 "Bilinmeyenler"). Scalper ve takipçi etkilenmedi:
+ikisinin de kendi yeniden deneme döngüsü var (`_exchange_loop`: yoklama başarılı ve kurtarma hazır değilse `_attempt_recovery()`);
+orkestratörde yoktu.
+
+**Karar.** İzleme döngüsü (`_monitoring_loop`) her turun başında `_retry_recovery_if_due()` çağırır. Bayrak `False` iken kurtarma
+30 sn sonra, ardından 60, 120, 240 ve 300 sn aralıklarla (tavan 5 dk) yeniden denenir; başarılı olunca bayrak `True` olur ve `/health`
+kendiliğinden düzelir. Yeniden başlatma gerekmez. Denemeyi dört kapı durdurur:
+
+| Kapı | Davranış | Neden |
+|---|---|---|
+| `_entry_halted` | deneme yok | korumasız pozisyon insan müdahalesi ister; yeniden deneme acil kapatmayı tekrarlardı, üstelik bayrak düzelse de sağlık `entry_halted` yüzünden kırmızı kalırdı |
+| Ban (418/-1003 kesicisi) aktif | deneme yok, sayaç ilerlemez | ban sırasında REST yasak (`ImprovedBinanceClient._rest_blocked_until`); ban bitince ilk turda dener |
+| Scalper kurtarması hazır değil | deneme yok, sayaç ilerlemez | aşağıdaki "Sıra kuralı" |
+| Aralık dolmadı | deneme yok | geri çekilme |
+
+**Sıra kuralı (incelemede bulunan tuzak).** `main.py` açılışta scalper'ı orkestratörden ÖNCE kurtarır; böylece dolmuş bir maker
+niyeti orkestratör tarafından "yetim" sayılmaz. Ama borsa yoklaması açılışta başarısızsa `ScalperEngine.start()` kendi kurtarmasını
+HİÇ çalıştırmaz (`if await self._probe_exchange(): ... _attempt_recovery()`), yani günlükteki bekleyen semboller henüz rezerve
+edilmemiştir. Borsa geri geldiğinde orkestratörün gecikmiş denemesi scalper'ınkinden önce koşarsa, `scalp_trades`'te OPEN satırı
+olmayan bir scalper pozisyonunu sahiplenebilirdi (stop yoksa acil kapatır; stop varsa scalper kendi kurtarmasında sahiplik çakışması
+görüp kalıcı entry-halt yazar). Bu yüzden `main.py` orkestratöre `recovery_precondition = _scalper_recovery_settled` bağlar: scalper
+`_recovery_ready` olmadan orkestratör yeniden denemez. Scalper koduna dokunulmadı; yalnız bayrağı okunur.
+
+**Yeniden çağırmanın güvenliği (kod okuması + test).** `recover_open_positions()` ikinci kez çalıştığında:
+
+| Soru | Yanıt | Dayanak |
+|---|---|---|
+| Çift koruma emri? | Olamaz: kurtarma yolu koruma emri KOYMAZ, yalnız okur (`get_open_algo_orders`). Yolun emir üreten tek çağrısı `emergency_close`'dur: pozisyonu taze okur, miktar 0 ise emir göndermez, gönderdiği emir `reduceOnly` MARKET'tir | `orchestrator.py` `_ensure_protected`; `position_manager.py` `_emergency_close` |
+| Çift veritabanı kaydı? | Olmaz: sembolün kapanmamış `PositionModel` satırı aranır, varsa borsayla senkronlanır; yeni satır yalnız yoksa eklenir | `recover_open_positions` içindeki sorgu |
+| Çift izleme? | Olmaz: `active_positions` sembol anahtarlı sözlüktür (aynı satırın yeni örneği eskisinin yerine geçer); `symbol_reservations.reserve` aynı sahip için idempotenttir | `symbol_reservations.py` `reserve` |
+| Bayat izleme? | İncelemede bulundu, düzeltildi: ilk denemede koruması okunamadığı için izlemeye alınan pozisyon ikinci denemede stop'suz çıkıp acil kapatılırsa rezervasyon bırakılıyor ama pozisyon `active_positions`'ta kalıyordu. Artık aynı dalda listeden de düşürülür (açılışta etkisiz: sembol henüz listede değildir) | `recover_open_positions`, `protection is False` dalı |
+| Başka motorun pozisyonu? | Atlanır: OPEN `scalp_trades` satırı (scalper ve `strategy='AP'` takipçi) ya da başka sahibin rezervasyonu | `recover_open_positions` |
+
+Bayrak `False` iken orkestratör yeni pozisyon açmaz (`_process_signal_locked` kapısı); yeniden deneme anında orkestratörün durumunda
+yalnız önceki kurtarma denemesinin sahiplendikleri bulunur. Bu yüzden dar yol ("yalnız borsa sorgusu başarısız olduysa yeniden dene")
+yerine tam yeniden çağırma seçildi: koruma durumu okunamamış (bilinmeyen) bir pozisyon da sonraki denemede doğrulanır.
+
+**Kalıcı hatada.** Deneme başına TEK imzalı sorgu (`get_all_positions`, ağırlık 5): deneme o turun 60 sn'lik hazır-olma yoklamasının
+yerine geçer (yoklama saatini damgalar), yani toplam sorgu hızı bugünkü yaklaşık dakikada 1'i aşmaz. Uyarı her denemede yazılmaz:
+ilk başarısız denemede ve sonra en fazla 30 dakikada bir (`RECOVERY_RETRY_LOG_INTERVAL_SECONDS`). Beklenmeyen istisna döngüyü
+öldürmez ve o turun pozisyon izlemesini atlatmaz; sıradaki deneme çağrıdan ÖNCE planlandığı için hata sıkı döngüye dönmez.
+
+**Değişen dosyalar.** `src/services/orchestrator.py` (`_retry_recovery_if_due`, `_schedule_recovery_retry`, `_rest_ban_active`,
+`recover_open_positions(log_query_failure=)` ve acil kapatma dalında `active_positions.pop`; `health_snapshot` iki yeni alan:
+`recovery_retry_attempts`, `recovery_next_retry_in_seconds`), `src/main.py` (`_scalper_recovery_settled` ve bağlanması),
+`tests/test_orchestrator_recovery_retry.py`.
+Ayar (`.env`) değişmez; scalper/takipçi kodu değişmez; giriş/çıkış/boyutlama kuralı değişmez.
+
+**Kanıt.** `tests/test_orchestrator_recovery_retry.py` (19 test):
+
+| Davranış | Test |
+|---|---|
+| Başarısız açılış, sonraki turda başarı; `/health` 503 → 200 | `test_startup_failure_heals_on_due_tick_and_health_goes_503_to_200`, `test_real_monitoring_loop_heals_recovery_flag_and_stays_alive` |
+| Kalıcı hata: bayrak `False`, döngü yaşıyor, aralıklar 30/60/120/240/300/300 sn; 8 denemede 1 uyarı | `test_persistent_failure_backs_off_and_logs_sparsely`, `test_failure_log_is_single_inside_one_window`, `test_real_loop_survives_persistent_failures_and_keeps_stamping` |
+| Deneme başına tek imzalı sorgu (deneme başarılı ya da başarısız) | `test_one_signed_query_per_attempt` |
+| Başarılı açılışta ek kurtarma çağrısı yok | `test_successful_startup_never_retries` |
+| Ban, entry-halt ya da scalper ön koşulu varken deneme yok, sayaç ilerlemez | `test_rest_ban_blocks_attempt_without_consuming_it_then_heals`, `test_entry_halt_blocks_retry_even_when_due`, `test_precondition_false_waits_then_true_attempts`, `test_scalper_recovery_settled_follows_engine_flag` |
+| Ön koşul `main.py`'de `start()`'tan ÖNCE bağlanır | `test_lifespan_wires_scalper_precondition_before_orchestrator_start` |
+| Yeniden denemede acil kapatılan pozisyon izlemede bayat kalmaz (düzeltme kapalıyken test kalır) | `test_retry_that_emergency_closes_drops_previously_tracked_position` |
+| Beklenmeyen istisna dışarı sızmaz, aralık yine büyür | `test_unexpected_exception_in_retry_backs_off_and_does_not_raise` |
+| Açık pozisyon varken ikinci kurtarma: tek satır, tek izleme, sıfır emir (gerçek `recover_open_positions`, gerçek sqlite, gerçek `PositionManager`, sahte borsa) | `test_recovery_twice_with_open_position_is_idempotent`, `test_recovery_retry_after_unreadable_algo_orders_does_not_duplicate`, `test_recovery_skips_scalper_owned_position_on_every_attempt`, `test_recovery_without_stop_closes_once_and_stale_snapshot_adds_no_orders` |
+
+Üç ortam (son ağaç): yerel `.env` ile 4065 geçti / 85 atlandı, 167 sn (önceki 4046 + 19 yeni test); temiz kopya + sunucunun secret
+olmayan ayarları (`scripts/preflight_server_env.sh awa`, 66 ayar satırı) 4064 geçti / 86 atlandı; CI `test` işi (`env.example`) bu
+kararı taşıyan PR'dadır. Kod ayrıca bağımsız bir düşmanca incelemeden geçti: yukarıdaki "Bayat izleme" kusuru orada bulundu
+(yeniden üretildi, düzeltildi); sahiplenme, çift emir/satır, döngü ölümü, REST ağırlığı ve açılış davranışı sorularında başka
+kusur bulunmadı. Deploy kaydı deploy'dan sonra buraya eklenir.
+
+**Bilinmeyenler / sınırlar (açıkça).**
+- Gömülü takipçi (D20b) açılışta orkestratörden SONRA başlar; gecikmiş yolda bu sıra garanti değildir. Takipçinin gecikmiş yetim
+  denetimi orkestratörün gecikmiş kurtarmasından önce koşarsa orkestratöre ait bir pozisyonu "sahipsiz" görebilir. Düzeltmeden önce
+  de böyleydi (orkestratör hiç kurtarmıyordu); yalnız borsada orkestratör (Telegram) pozisyonu varken ve açılışta borsaya
+  ulaşılamazken ortaya çıkar. Ölçülmedi.
+- Kurtarma, pozisyon listesini okuduktan sonra sembolleri sırayla işler; o arada scalper bir pozisyonunu kapatıp satırını kapatırsa
+  orkestratör o sembolü yetim sanabilir. `emergency_close` taze okuyup miktar 0 görünce emir göndermez; sonuç emirsiz bir CLOSED
+  `positions` satırı ve yanıltıcı iki CRITICAL log satırıdır. Aynı yarış açılışta da vardır (scalper döngüleri orkestratör
+  kurtarmasından önce başlar). Canlıda gözlenmedi.
+- `_entry_halted` kendiliğinden temizlenmez (bilinçli); o durumda yeniden başlatma hâlâ gerekir.
+- Seyreltme (30 dakikada bir) yalnız yeniden deneme uyarısını kapsar. Borsa erişilebilir ama sahiplenme kanıtlanamıyorsa (başka
+  motorun rezervasyonu ya da okunamayan koruma) her deneme `recover_open_positions` içindeki sembol satırlarını yeniden yazar
+  (ör. CRITICAL "başka bir motor tarafından sahiplenilmiş"). Üst sınır 5 dk tavanıyla saatte en çok 12 denemedir; neden görünür
+  kalsın diye böyle bırakıldı. Borsaya ulaşılamayan durumda (2026-11-17 olayı) bu satırlar hiç yazılmaz.
+- Deneme izleme döngüsünün İÇİNDE koşar (ayrı görev değil: kurtarma ile izleme aynı pozisyon nesnesine eşzamanlı dokunamaz).
+  Stop'suz bir pozisyonda `emergency_close` üç denemede yaklaşık 9 sn ve HTTP zaman aşımı kadar sürebilir; o turun izlemesi o kadar
+  gecikir (tazelik sınırı 180 sn).
+- Açılış çağrısı (`start()`) ön koşula BAKMAZ; bugünkü davranış korunur. Scalper'ın ilk yoklaması başarısız olup orkestratörün
+  sorgusu saniyeler sonra başarılı olursa "Sıra kuralı"ndaki risk açılış yolunda bu karardan önce de vardı ve duruyor. Kapsam
+  dışı bırakıldı (açılış davranışını değiştirir, kendi kararını ister).
+- Önceden beri var, doğrulandı: günlükleyici loguru'dur; `exc_info=True` ya da `extra={...}` ile yazılan bir mesajda `{...}`
+  geçerse log çağrısı `KeyError` fırlatır. `_monitoring_loop`'un genel hata yakalayıcısı bu kalıbı kullanır; metninde süslü
+  parantez olan bir hata oraya ulaşırsa döngü ölür. Yeni yol etkilenmez (kwargs'sız çağrı ya da `opt(exception=)`; süslü
+  parantezli hata metniyle test edildi). Yakalayıcının kendisi bu kararda değiştirilmedi.
+- Canlıda (TESTNET) kendini onarma henüz gözlenmedi: ancak bir açılış kurtarması başarısız olduğunda görülebilir.
+
+**Geri alma.** `scripts/deploy.sh awa <önceki-commit>`; ayar ya da veri göçü yok. Kod geri alınınca davranış bu karardan öncesine
+döner (başarısız açılış kurtarması yeniden başlatmaya kadar kilitli).
+
 ### D43 — 2026-11-20 ölçüm hükmü: strateji C'nin örneklem-dışı kenarı gösterilemedi, başka kurulumda da yok, kayıp-örüntü korumaları geçmedi · 2026-11-20 · HİÇBİR AYAR DEĞİŞMEDİ — mainnet NO-GO teyit
 
 **Soru.** D41 ölçüm zincirini gerçekçi yaptı; bunun üstüne üç soru kaldı: (1) C, görülmemiş bir pencerede ve kesintisiz geçmişte
@@ -86,7 +188,7 @@ canlı defterdeki işaretler örneklem-içidir ve ~25 kesitin taranmasından gel
   orkestratörün (Telegram sinyal) giriş yolu reddediyor, scalper giriş yolu etkilenmiyor. Neden `logs/bot.log`'da gözlendi:
   o başlangıçta Binance bağlantı testi başarısız oldu ve `recover_open_positions` "Açık pozisyonlar borsadan sorgulanamadı"
   yazdı (sunucu saatiyle 07:35-07:36, UTC+1). Kod düzeltmesi yapılmadı (yeniden başlatma bayrağı temizler); deploy sağlık kapısı
-  aynı koşula bağlı. Hata kipi RUNBOOK "Sorun giderme"de belgelidir (D41 ile eklendi).
+  aynı koşula bağlı. Hata kipi RUNBOOK "Sorun giderme"de belgelidir (D41 ile eklendi). Sonradan: kod düzeltmesi D44'tedir.
 - Hiçbir yönün (with-trend, maker TP, TV) kenarı bu ölçümde gösterilmedi; yalnız izlenecek yönler olarak listelendi.
 - Bu dal, çekilmemiş (fetch yapılmamış) eski bir yerel main'den başladı; E16/E17 sonradan birleştirildi.
 - E16/E17 gerçekçi modelde yeniden koşulmadı (2025 verisi yerel önbellekte yok).
