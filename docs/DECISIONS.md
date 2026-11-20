@@ -101,10 +101,19 @@ yapılandırması `.env`'den `SCALPER_STOP_MODE=fixed_roi` ve dinamik kaldırac�
 kurulur hâle getirildi ve dört D42 alanı `tests/conftest.py` izolasyon listesine eklendi (D33c dersi). Betik ve kullanım: RUNBOOK
 "Deploy öncesi sunucu-benzeri ön sınav".
 
-**Geri alma:** değişen davranış yok (yalnız dokümantasyon ve `docs/holdout_registry.json` notları); geri alınacak şey yok.
-Bu, kararın kendisi için geçerlidir. Birleştirme ayrıca D40'ın takip düzeltmelerini (Reaper/STALE_TP yaşlı-kapanış yolu) taşır; bunlar
-2026-10-10/11'den beri main'de durur, sunucu hâlâ ea1631b'dedir ve ilk kez bir sonraki deploy ile sunucuya ulaşır (D40'ta belgeli).
-Deploy'un geri alınması: `scripts/deploy.sh awa ea1631b`.
+**Deploy (2026-11-20 07:38-07:41 UTC, TESTNET).** `scripts/deploy.sh awa`: `ea1631b` → `2a3c721` (PR #10, main ileri sarıldı; CI `test`
+işi yeşil). Sunucu testleri 4046 geçti / 85 atlandı (127 sn); `tradingbot_v2` yeniden başlatıldı (pid 511263, başlangıç 07:40:44 UTC);
+sağlık kapısı 25 sn sonra yeşil. Deploy sonrası 120 sn boyunca 13 yoklamanın 13'ü `status=healthy`, `core_healthy=true`,
+`recovery_ready=true`: 2026-11-17'den beri takılı duran bayrak temizlendi (açılışta "Borsada açık pozisyon yok"). Yeniden başlangıçtan
+beri ERROR/CRITICAL satırı 0; `/scalper/status`: `entries_blocked_by=null`, `kill_switch_active=false`, tarama taze. Deploy öncesi ve
+sonrası açık pozisyon ve bekleyen giriş 0. `.env` değişmedi (yedek `backups/env.bak-20261120-073826-deploy`).
+Bu deploy'un sunucuya İLK KEZ çıkardıkları: (a) D40 takip düzeltmeleri (Reaper/STALE_TP gönderim-sonrası 30 sn bekleme, damga yalnız
+etiket, etiket son göndereni gösterir; `mae_upper_bound`) = canlı davranış DEĞİŞİKLİĞİ, 2026-10-10/11'den beri main'de bekliyordu;
+(b) D42 koruma kodu, dört ayar KAPALI = davranış aynı; (c) harness ve ölçüm kodu, canlı süreç kullanmaz. İzleme: D40 "İzleme"
+maddeleri (yaşlı kapanışta aynı pozisyona ikinci emir / −2022 gürültüsü olmamalı; REAPER/STALE_TP etiketi son göndereni göstermeli).
+
+**Geri alma:** bu kararın kendisi davranış değiştirmez (yalnız dokümantasyon ve `docs/holdout_registry.json` notları). Yukarıdaki
+deploy'un geri alınması: `scripts/deploy.sh awa ea1631b` (D40 takip düzeltmeleri de geri gider; `.env` değişmediği için ek adım yok).
 Kanıt klasörü yerel ve git'te izlenmez: `logs/audit_20261120/` (README.txt; ham raporlar, betikler, beş sonuç JSON'u).
 
 ### D42 — Strateji C giriş korumaları: bağlam-RSI koruması + ATR% bandı (ölçülebilir hâle getirildi) · 2026-11-20 · KOD VAR, VARSAYILAN KAPALI — canlı davranış DEĞİŞMEDİ

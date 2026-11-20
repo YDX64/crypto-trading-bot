@@ -13,8 +13,8 @@
 - D43: 2026-11-20 ölçüm hükmü (E19-E22; hiçbir ayar değişmez, mainnet NO-GO teyit) ve `docs/audits/2026-11-20-olcum-denetimi.md` raporu
 - `scripts/preflight_server_env.sh`: deploy öncesi temiz kopya + sunucu ayarlarıyla test
 - origin/main ile birleştirme: E16/E17 ölçüm eklentileri korundu; `--legacy-model` origin/main'in modeliyle aynı sonucu verir
-  (EXPERIMENTS E19 "Birleştirme sonrası eşdeğerlik"); main'deki D40 takip düzeltmeleri (Reaper/STALE_TP) ilk kez bir sonraki deploy ile
-  sunucuya ulaşır
+  (EXPERIMENTS E19 "Birleştirme sonrası eşdeğerlik"); main'deki D40 takip düzeltmeleri (Reaper/STALE_TP) sunucuya ilk kez 2026-11-20 deploy'uyla
+  ulaştı (TESTNET; `docs/DECISIONS.md` D43 "Deploy")
 
 ### 🐛 Düzeltilen Hatalar
 

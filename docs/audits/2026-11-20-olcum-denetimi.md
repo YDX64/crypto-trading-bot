@@ -1,7 +1,7 @@
 # 2026-11-20 ölçüm denetimi — "backtest sayılarına güvenebilir miyiz?"
 
-Kapsam: yalnız ölçüm zinciri (harness, kabul kuralları, canlı defterin okunması). Strateji ayarı ve sunucu `.env` DEĞİŞMEDİ; bu belge yazılırken kod sunucuya deploy edilmemişti
-(deploy kaydı: D43'ün sonu). Tüm "canlı" sayılar TESTNET defterinden (simülasyon parası, gerçek para değil); backtest sayıları geçmiş
+Kapsam: yalnız ölçüm zinciri (harness, kabul kuralları, canlı defterin okunması). Strateji ayarı ve sunucu `.env` DEĞİŞMEDİ; kod aynı gün TESTNET'e deploy edildi
+(2026-11-20 07:41 UTC, sağlık yeşil; kayıt: D43 "Deploy"). Tüm "canlı" sayılar TESTNET defterinden (simülasyon parası, gerçek para değil); backtest sayıları geçmiş
 piyasa verisi üzerinde simülasyondur. Kararlar: D41, D42 (sonuç eklendi), D43. Deneyler: EXPERIMENTS E19-E22.
 Denetim, 2026-10-10/11 tarihli iki commit'ten (E16, E17) yoksun bir main'den başladı; bunlar sonradan birleştirildi ve bu raporla
 uyuşur (bölüm 7).
@@ -116,7 +116,9 @@ yanlış toplamdı; doğrusu −66.0.)
   Kök neden `logs/bot.log`'da gözlendi: o başlangıçta Binance bağlantı testi başarısız oldu ve `recover_open_positions` "Açık
   pozisyonlar borsadan sorgulanamadı" yazdı (sunucu saatiyle 07:35-07:36, UTC+1). Kod düzeltmesi YAPILMADI (yeniden başlatma
   bayrağı temizler); `restart_safe.sh` ve `server_deploy.sh` aynı sağlık koşulunu kullandığı için deploy sağlık kapısı da buna
-  bağlı. Bu hata kipi RUNBOOK "Sorun giderme"de belgelidir (D41 ile eklendi).
+  bağlı. Bu hata kipi RUNBOOK "Sorun giderme"de belgelidir (D41 ile eklendi). Güncelleme: 2026-11-20 07:41 UTC deploy'undaki
+  yeniden başlatma bayrağı temizledi (`recovery_ready=true`, `/health` 200 healthy); kod düzeltmesi hâlâ yok, aynı durum bir sonraki
+  başarısız açılışta yeniden oluşabilir.
 
 ## 6. Para nerede kaybediliyor
 
