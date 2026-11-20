@@ -1,0 +1,1100 @@
+{
+  "schema": "e18-devscreen/1",
+  "lock_sha256": "3607e392161efa0ca0584f73d44760fd2efd2936617d683d77f8a5cf84ce67e6",
+  "m": 6,
+  "arms": {
+    "K15R": {
+      "metrics": {
+        "n": 1434,
+        "n_long": 524,
+        "n_short": 910,
+        "wr_pct": 47.559274755927476,
+        "pf": 0.7072543385800416,
+        "sum_r": -241.64805868970618,
+        "mean_r": -0.16851329057859565,
+        "dd_usd": 22430.766055632652,
+        "risk_median": 89.98209940052536,
+        "dd_r": 249.28031469669946,
+        "calmar_r": -0.9693828370833073,
+        "eod": 0,
+        "silent_ratio": 0.0,
+        "silent_drops": 0,
+        "raw_signals": 2880,
+        "lev20_share": 0.07182705718270571,
+        "lev3_share": 0.02580195258019526,
+        "missed": {
+          "daily_latch": 1307,
+          "capacity": 139
+        },
+        "windows_full": {
+          "2025Q1": {
+            "n": 402,
+            "sum_r": -63.144551425159676,
+            "pf": 0.7124518252943722
+          },
+          "2025Q2": {
+            "n": 347,
+            "sum_r": -34.093372500672835,
+            "pf": 0.8261636390576045
+          },
+          "2025Q3": {
+            "n": 297,
+            "sum_r": -73.23888545848278,
+            "pf": 0.5938132288884383
+          },
+          "2025Q4": {
+            "n": 388,
+            "sum_r": -71.17124930539089,
+            "pf": 0.6897852559205712
+          }
+        },
+        "windows_partial": {},
+        "full_months": [
+          "2025-01",
+          "2025-02",
+          "2025-03",
+          "2025-04",
+          "2025-05",
+          "2025-06",
+          "2025-07",
+          "2025-08",
+          "2025-09",
+          "2025-10",
+          "2025-11",
+          "2025-12"
+        ],
+        "partial_months": []
+      },
+      "t_obs": -4.16144198424157,
+      "p7_raw": 0.99975,
+      "p7_used": 0.99975,
+      "p7_refined": false,
+      "p28": 1.0,
+      "q": 1.0,
+      "pf_ci": [
+        0.6028464771917008,
+        0.819296976873646
+      ],
+      "eligible_for_bh": true,
+      "gates": {
+        "G0": [
+          {
+            "gate": "G0",
+            "name": "check-run geçti (ledger)",
+            "value": 1,
+            "op": ">=",
+            "threshold": 1,
+            "pass": true,
+            "borderline": false,
+            "note": ""
+          },
+          {
+            "gate": "G0",
+            "name": "sessiz düşüş / ham sinyal",
+            "value": 0.0,
+            "op": "<=",
+            "threshold": 0.1,
+            "pass": true,
+            "borderline": false,
+            "note": ""
+          },
+          {
+            "gate": "G0",
+            "name": "EOD işlem sayısı",
+            "value": 0,
+            "op": "<=",
+            "threshold": 8,
+            "pass": true,
+            "borderline": false,
+            "note": ""
+          }
+        ],
+        "G1": [
+          {
+            "gate": "G1",
+            "name": "pencere başına en az N",
+            "value": 297,
+            "op": ">=",
+            "threshold": 60,
+            "pass": true,
+            "borderline": false,
+            "note": "{\"2025Q1\": 402, \"2025Q2\": 347, \"2025Q3\": 297, \"2025Q4\": 388}"
+          }
+        ],
+        "G2": [
+          {
+            "gate": "G2",
+            "name": "havuz PF",
+            "value": 0.7072543385800416,
+            "op": ">=",
+            "threshold": 1.15,
+            "pass": false,
+            "borderline": false,
+            "note": ""
+          }
+        ],
+        "G3": [
+          {
+            "gate": "G3",
+            "name": "BH q",
+            "value": 1.0,
+            "op": "<=",
+            "threshold": 0.1,
+            "pass": false,
+            "borderline": false,
+            "note": ""
+          }
+        ],
+        "G4": [
+          {
+            "gate": "G4",
+            "name": "ΣR>0 olan tam pencere",
+            "value": 0,
+            "op": ">=",
+            "threshold": 3,
+            "pass": false,
+            "borderline": false,
+            "note": "toplam 4"
+          }
+        ],
+        "G5": [
+          {
+            "gate": "G5",
+            "name": "PF (en iyi ay hariç)",
+            "value": 0.6721022683951654,
+            "op": ">=",
+            "threshold": 1.0,
+            "pass": false,
+            "borderline": false,
+            "note": "en iyi ay 2025-10"
+          },
+          {
+            "gate": "G5",
+            "name": "ΣR (en iyi 5 işlem hariç)",
+            "value": -274.6735782940947,
+            "op": ">",
+            "threshold": 0.0,
+            "pass": false,
+            "borderline": false,
+            "note": ""
+          }
+        ]
+      },
+      "pass_g0_g5": false,
+      "trigger": "breakout",
+      "entry_tf": "15m",
+      "report_sha256": "8c590cbbf63cc187591520281acabe3579bf40385078cd9d860585e8b61dde0b"
+    },
+    "K30R": {
+      "metrics": {
+        "n": 1073,
+        "n_long": 408,
+        "n_short": 665,
+        "wr_pct": 47.34389561975769,
+        "pf": 0.8801836509365317,
+        "sum_r": -64.05884817288897,
+        "mean_r": -0.05970069727203073,
+        "dd_usd": 15548.484057117363,
+        "risk_median": 129.97519585599017,
+        "dd_r": 119.62654839423948,
+        "calmar_r": -0.5354902321663381,
+        "eod": 0,
+        "silent_ratio": 0.0,
+        "silent_drops": 0,
+        "raw_signals": 1678,
+        "lev20_share": 0.08387698042870456,
+        "lev3_share": 0.0195712954333644,
+        "missed": {
+          "daily_latch": 483,
+          "capacity": 122
+        },
+        "windows_full": {
+          "2025Q1": {
+            "n": 263,
+            "sum_r": 21.326606855683085,
+            "pf": 1.172223735396145
+          },
+          "2025Q2": {
+            "n": 242,
+            "sum_r": -3.1062076656657434,
+            "pf": 0.9756837781074448
+          },
+          "2025Q3": {
+            "n": 288,
+            "sum_r": -32.841020378282444,
+            "pf": 0.7544604491778175
+          },
+          "2025Q4": {
+            "n": 280,
+            "sum_r": -49.438226984623874,
+            "pf": 0.6689075839452057
+          }
+        },
+        "windows_partial": {},
+        "full_months": [
+          "2025-01",
+          "2025-02",
+          "2025-03",
+          "2025-04",
+          "2025-05",
+          "2025-06",
+          "2025-07",
+          "2025-08",
+          "2025-09",
+          "2025-10",
+          "2025-11",
+          "2025-12"
+        ],
+        "partial_months": []
+      },
+      "t_obs": -1.0897658396662981,
+      "p7_raw": 0.8201,
+      "p7_used": 0.8201,
+      "p7_refined": false,
+      "p28": 0.83125,
+      "q": 1.0,
+      "pf_ci": [
+        0.7007537063208036,
+        1.0812630064552209
+      ],
+      "eligible_for_bh": true,
+      "gates": {
+        "G0": [
+          {
+            "gate": "G0",
+            "name": "check-run geçti (ledger)",
+            "value": 1,
+            "op": ">=",
+            "threshold": 1,
+            "pass": true,
+            "borderline": false,
+            "note": ""
+          },
+          {
+            "gate": "G0",
+            "name": "sessiz düşüş / ham sinyal",
+            "value": 0.0,
+            "op": "<=",
+            "threshold": 0.1,
+            "pass": true,
+            "borderline": false,
+            "note": ""
+          },
+          {
+            "gate": "G0",
+            "name": "EOD işlem sayısı",
+            "value": 0,
+            "op": "<=",
+            "threshold": 8,
+            "pass": true,
+            "borderline": false,
+            "note": ""
+          }
+        ],
+        "G1": [
+          {
+            "gate": "G1",
+            "name": "pencere başına en az N",
+            "value": 242,
+            "op": ">=",
+            "threshold": 60,
+            "pass": true,
+            "borderline": false,
+            "note": "{\"2025Q1\": 263, \"2025Q2\": 242, \"2025Q3\": 288, \"2025Q4\": 280}"
+          }
+        ],
+        "G2": [
+          {
+            "gate": "G2",
+            "name": "havuz PF",
+            "value": 0.8801836509365317,
+            "op": ">=",
+            "threshold": 1.15,
+            "pass": false,
+            "borderline": false,
+            "note": ""
+          }
+        ],
+        "G3": [
+          {
+            "gate": "G3",
+            "name": "BH q",
+            "value": 1.0,
+            "op": "<=",
+            "threshold": 0.1,
+            "pass": false,
+            "borderline": false,
+            "note": ""
+          }
+        ],
+        "G4": [
+          {
+            "gate": "G4",
+            "name": "ΣR>0 olan tam pencere",
+            "value": 1,
+            "op": ">=",
+            "threshold": 3,
+            "pass": false,
+            "borderline": false,
+            "note": "toplam 4"
+          }
+        ],
+        "G5": [
+          {
+            "gate": "G5",
+            "name": "PF (en iyi ay hariç)",
+            "value": 0.8031975951173494,
+            "op": ">=",
+            "threshold": 1.0,
+            "pass": false,
+            "borderline": false,
+            "note": "en iyi ay 2025-02"
+          },
+          {
+            "gate": "G5",
+            "name": "ΣR (en iyi 5 işlem hariç)",
+            "value": -97.71014471582896,
+            "op": ">",
+            "threshold": 0.0,
+            "pass": false,
+            "borderline": false,
+            "note": ""
+          }
+        ]
+      },
+      "pass_g0_g5": false,
+      "trigger": "breakout",
+      "entry_tf": "30m",
+      "report_sha256": "b3945433b60971a954b2f7174f28026f618a1a0206b567b7799ea1241ea4505d"
+    },
+    "K15B": {
+      "metrics": {
+        "n": 1635,
+        "n_long": 772,
+        "n_short": 863,
+        "wr_pct": 44.89296636085627,
+        "pf": 0.6421655756519276,
+        "sum_r": -353.2071051350018,
+        "mean_r": -0.21602881048012343,
+        "dd_usd": 32491.258065018377,
+        "risk_median": 89.99002407704654,
+        "dd_r": 361.05399902105165,
+        "calmar_r": -0.9782667027443939,
+        "eod": 0,
+        "silent_ratio": 0.0,
+        "silent_drops": 0,
+        "raw_signals": 4155,
+        "lev20_share": 0.07767584097859327,
+        "lev3_share": 0.026299694189602447,
+        "missed": {
+          "daily_latch": 2324,
+          "capacity": 196
+        },
+        "windows_full": {
+          "2025Q1": {
+            "n": 416,
+            "sum_r": -92.57840134427633,
+            "pf": 0.6273556604820791
+          },
+          "2025Q2": {
+            "n": 432,
+            "sum_r": -58.058584970061105,
+            "pf": 0.7723986374834094
+          },
+          "2025Q3": {
+            "n": 414,
+            "sum_r": -85.47035361126305,
+            "pf": 0.6447864431972381
+          },
+          "2025Q4": {
+            "n": 373,
+            "sum_r": -117.09976520940135,
+            "pf": 0.5179620874866984
+          }
+        },
+        "windows_partial": {},
+        "full_months": [
+          "2025-01",
+          "2025-02",
+          "2025-03",
+          "2025-04",
+          "2025-05",
+          "2025-06",
+          "2025-07",
+          "2025-08",
+          "2025-09",
+          "2025-10",
+          "2025-11",
+          "2025-12"
+        ],
+        "partial_months": []
+      },
+      "t_obs": -6.040016731830738,
+      "p7_raw": 1.0,
+      "p7_used": 1.0,
+      "p7_refined": false,
+      "p28": 1.0,
+      "q": 1.0,
+      "pf_ci": [
+        0.543622340483509,
+        0.7532669024024605
+      ],
+      "eligible_for_bh": true,
+      "gates": {
+        "G0": [
+          {
+            "gate": "G0",
+            "name": "check-run geçti (ledger)",
+            "value": 1,
+            "op": ">=",
+            "threshold": 1,
+            "pass": true,
+            "borderline": false,
+            "note": ""
+          },
+          {
+            "gate": "G0",
+            "name": "sessiz düşüş / ham sinyal",
+            "value": 0.0,
+            "op": "<=",
+            "threshold": 0.1,
+            "pass": true,
+            "borderline": false,
+            "note": ""
+          },
+          {
+            "gate": "G0",
+            "name": "EOD işlem sayısı",
+            "value": 0,
+            "op": "<=",
+            "threshold": 8,
+            "pass": true,
+            "borderline": false,
+            "note": ""
+          }
+        ],
+        "G1": [
+          {
+            "gate": "G1",
+            "name": "pencere başına en az N",
+            "value": 373,
+            "op": ">=",
+            "threshold": 60,
+            "pass": true,
+            "borderline": false,
+            "note": "{\"2025Q1\": 416, \"2025Q2\": 432, \"2025Q3\": 414, \"2025Q4\": 373}"
+          }
+        ],
+        "G2": [
+          {
+            "gate": "G2",
+            "name": "havuz PF",
+            "value": 0.6421655756519276,
+            "op": ">=",
+            "threshold": 1.15,
+            "pass": false,
+            "borderline": false,
+            "note": ""
+          }
+        ],
+        "G3": [
+          {
+            "gate": "G3",
+            "name": "BH q",
+            "value": 1.0,
+            "op": "<=",
+            "threshold": 0.1,
+            "pass": false,
+            "borderline": false,
+            "note": ""
+          }
+        ],
+        "G4": [
+          {
+            "gate": "G4",
+            "name": "ΣR>0 olan tam pencere",
+            "value": 0,
+            "op": ">=",
+            "threshold": 3,
+            "pass": false,
+            "borderline": false,
+            "note": "toplam 4"
+          }
+        ],
+        "G5": [
+          {
+            "gate": "G5",
+            "name": "PF (en iyi ay hariç)",
+            "value": 0.601590091383855,
+            "op": ">=",
+            "threshold": 1.0,
+            "pass": false,
+            "borderline": false,
+            "note": "en iyi ay 2025-04"
+          },
+          {
+            "gate": "G5",
+            "name": "ΣR (en iyi 5 işlem hariç)",
+            "value": -389.31087342309104,
+            "op": ">",
+            "threshold": 0.0,
+            "pass": false,
+            "borderline": false,
+            "note": ""
+          }
+        ]
+      },
+      "pass_g0_g5": false,
+      "trigger": "breakout",
+      "entry_tf": "15m",
+      "report_sha256": "cb928bb1bd986757baba846e4de459ce8400032dceb3181592d1e2c245d6ec37"
+    },
+    "K30B": {
+      "metrics": {
+        "n": 1148,
+        "n_long": 511,
+        "n_short": 637,
+        "wr_pct": 47.29965156794425,
+        "pf": 0.8642619188493298,
+        "sum_r": -79.13340751130676,
+        "mean_r": -0.06893153964399543,
+        "dd_usd": 13963.218642408146,
+        "risk_median": 129.98192163481195,
+        "dd_r": 107.42431306438307,
+        "calmar_r": -0.7366433654910075,
+        "eod": 0,
+        "silent_ratio": 0.0,
+        "silent_drops": 0,
+        "raw_signals": 1923,
+        "lev20_share": 0.09233449477351917,
+        "lev3_share": 0.01916376306620209,
+        "missed": {
+          "daily_latch": 636,
+          "capacity": 139
+        },
+        "windows_full": {
+          "2025Q1": {
+            "n": 281,
+            "sum_r": -0.44003843338079984,
+            "pf": 0.9968719150642865
+          },
+          "2025Q2": {
+            "n": 273,
+            "sum_r": -26.320372857308943,
+            "pf": 0.8183644696177881
+          },
+          "2025Q3": {
+            "n": 322,
+            "sum_r": -36.05764376183052,
+            "pf": 0.7706907423241892
+          },
+          "2025Q4": {
+            "n": 272,
+            "sum_r": -16.315352458786503,
+            "pf": 0.8835951277490793
+          }
+        },
+        "windows_partial": {},
+        "full_months": [
+          "2025-01",
+          "2025-02",
+          "2025-03",
+          "2025-04",
+          "2025-05",
+          "2025-06",
+          "2025-07",
+          "2025-08",
+          "2025-09",
+          "2025-10",
+          "2025-11",
+          "2025-12"
+        ],
+        "partial_months": []
+      },
+      "t_obs": -1.307136820988265,
+      "p7_raw": 0.85735,
+      "p7_used": 0.85735,
+      "p7_refined": false,
+      "p28": 0.8758,
+      "q": 1.0,
+      "pf_ci": [
+        0.6867251620207439,
+        1.064168261339183
+      ],
+      "eligible_for_bh": true,
+      "gates": {
+        "G0": [
+          {
+            "gate": "G0",
+            "name": "check-run geçti (ledger)",
+            "value": 1,
+            "op": ">=",
+            "threshold": 1,
+            "pass": true,
+            "borderline": false,
+            "note": ""
+          },
+          {
+            "gate": "G0",
+            "name": "sessiz düşüş / ham sinyal",
+            "value": 0.0,
+            "op": "<=",
+            "threshold": 0.1,
+            "pass": true,
+            "borderline": false,
+            "note": ""
+          },
+          {
+            "gate": "G0",
+            "name": "EOD işlem sayısı",
+            "value": 0,
+            "op": "<=",
+            "threshold": 8,
+            "pass": true,
+            "borderline": false,
+            "note": ""
+          }
+        ],
+        "G1": [
+          {
+            "gate": "G1",
+            "name": "pencere başına en az N",
+            "value": 272,
+            "op": ">=",
+            "threshold": 60,
+            "pass": true,
+            "borderline": false,
+            "note": "{\"2025Q1\": 281, \"2025Q2\": 273, \"2025Q3\": 322, \"2025Q4\": 272}"
+          }
+        ],
+        "G2": [
+          {
+            "gate": "G2",
+            "name": "havuz PF",
+            "value": 0.8642619188493298,
+            "op": ">=",
+            "threshold": 1.15,
+            "pass": false,
+            "borderline": false,
+            "note": ""
+          }
+        ],
+        "G3": [
+          {
+            "gate": "G3",
+            "name": "BH q",
+            "value": 1.0,
+            "op": "<=",
+            "threshold": 0.1,
+            "pass": false,
+            "borderline": false,
+            "note": ""
+          }
+        ],
+        "G4": [
+          {
+            "gate": "G4",
+            "name": "ΣR>0 olan tam pencere",
+            "value": 0,
+            "op": ">=",
+            "threshold": 3,
+            "pass": false,
+            "borderline": false,
+            "note": "toplam 4"
+          }
+        ],
+        "G5": [
+          {
+            "gate": "G5",
+            "name": "PF (en iyi ay hariç)",
+            "value": 0.7962797622814058,
+            "op": ">=",
+            "threshold": 1.0,
+            "pass": false,
+            "borderline": false,
+            "note": "en iyi ay 2025-02"
+          },
+          {
+            "gate": "G5",
+            "name": "ΣR (en iyi 5 işlem hariç)",
+            "value": -117.7488310680036,
+            "op": ">",
+            "threshold": 0.0,
+            "pass": false,
+            "borderline": false,
+            "note": ""
+          }
+        ]
+      },
+      "pass_g0_g5": false,
+      "trigger": "breakout",
+      "entry_tf": "30m",
+      "report_sha256": "6408e1c74581d9a5cfd2af051378fab06519451f59ed1b6f88c76f38d3faaaf1"
+    },
+    "G15B": {
+      "metrics": {
+        "n": 2268,
+        "n_long": 1128,
+        "n_short": 1140,
+        "wr_pct": 50.66137566137566,
+        "pf": 0.8363626357343485,
+        "sum_r": -196.8924641485993,
+        "mean_r": -0.08681325579744237,
+        "dd_usd": 22590.158222676295,
+        "risk_median": 89.99665851823232,
+        "dd_r": 251.01107746239023,
+        "calmar_r": -0.7843975100186577,
+        "eod": 0,
+        "silent_ratio": 0.0,
+        "silent_drops": 0,
+        "raw_signals": 5133,
+        "lev20_share": 0.06613756613756613,
+        "lev3_share": 0.0427689594356261,
+        "missed": {
+          "daily_latch": 2527,
+          "capacity": 338
+        },
+        "windows_full": {
+          "2025Q1": {
+            "n": 652,
+            "sum_r": 35.532470339274376,
+            "pf": 1.117466054804283
+          },
+          "2025Q2": {
+            "n": 542,
+            "sum_r": -53.99699407875483,
+            "pf": 0.8175660539564231
+          },
+          "2025Q3": {
+            "n": 557,
+            "sum_r": -48.73274589260637,
+            "pf": 0.8351383640841823
+          },
+          "2025Q4": {
+            "n": 517,
+            "sum_r": -129.69519451651246,
+            "pf": 0.5804836046414956
+          }
+        },
+        "windows_partial": {},
+        "full_months": [
+          "2025-01",
+          "2025-02",
+          "2025-03",
+          "2025-04",
+          "2025-05",
+          "2025-06",
+          "2025-07",
+          "2025-08",
+          "2025-09",
+          "2025-10",
+          "2025-11",
+          "2025-12"
+        ],
+        "partial_months": []
+      },
+      "t_obs": -2.7771514350727786,
+      "p7_raw": 0.98175,
+      "p7_used": 0.98175,
+      "p7_refined": false,
+      "p28": 0.9594,
+      "q": 1.0,
+      "pf_ci": [
+        0.7275344809810945,
+        0.9541470759686742
+      ],
+      "eligible_for_bh": true,
+      "gates": {
+        "G0": [
+          {
+            "gate": "G0",
+            "name": "check-run geçti (ledger)",
+            "value": 1,
+            "op": ">=",
+            "threshold": 1,
+            "pass": true,
+            "borderline": false,
+            "note": ""
+          },
+          {
+            "gate": "G0",
+            "name": "sessiz düşüş / ham sinyal",
+            "value": 0.0,
+            "op": "<=",
+            "threshold": 0.1,
+            "pass": true,
+            "borderline": false,
+            "note": ""
+          },
+          {
+            "gate": "G0",
+            "name": "EOD işlem sayısı",
+            "value": 0,
+            "op": "<=",
+            "threshold": 8,
+            "pass": true,
+            "borderline": false,
+            "note": ""
+          }
+        ],
+        "G1": [
+          {
+            "gate": "G1",
+            "name": "pencere başına en az N",
+            "value": 517,
+            "op": ">=",
+            "threshold": 60,
+            "pass": true,
+            "borderline": false,
+            "note": "{\"2025Q1\": 652, \"2025Q2\": 542, \"2025Q3\": 557, \"2025Q4\": 517}"
+          }
+        ],
+        "G2": [
+          {
+            "gate": "G2",
+            "name": "havuz PF",
+            "value": 0.8363626357343485,
+            "op": ">=",
+            "threshold": 1.15,
+            "pass": false,
+            "borderline": false,
+            "note": ""
+          }
+        ],
+        "G3": [
+          {
+            "gate": "G3",
+            "name": "BH q",
+            "value": 1.0,
+            "op": "<=",
+            "threshold": 0.1,
+            "pass": false,
+            "borderline": false,
+            "note": ""
+          }
+        ],
+        "G4": [
+          {
+            "gate": "G4",
+            "name": "ΣR>0 olan tam pencere",
+            "value": 1,
+            "op": ">=",
+            "threshold": 3,
+            "pass": false,
+            "borderline": false,
+            "note": "toplam 4"
+          }
+        ],
+        "G5": [
+          {
+            "gate": "G5",
+            "name": "PF (en iyi ay hariç)",
+            "value": 0.7756411863387588,
+            "op": ">=",
+            "threshold": 1.0,
+            "pass": false,
+            "borderline": false,
+            "note": "en iyi ay 2025-02"
+          },
+          {
+            "gate": "G5",
+            "name": "ΣR (en iyi 5 işlem hariç)",
+            "value": -226.0839307797105,
+            "op": ">",
+            "threshold": 0.0,
+            "pass": false,
+            "borderline": false,
+            "note": ""
+          }
+        ]
+      },
+      "pass_g0_g5": false,
+      "trigger": "pullback",
+      "entry_tf": "15m",
+      "report_sha256": "900e3084b4633f3d99d3d05e1424e091d1ac04e6fd80600e5839eb4a1eba29ad"
+    },
+    "G30B": {
+      "metrics": {
+        "n": 1353,
+        "n_long": 623,
+        "n_short": 730,
+        "wr_pct": 45.824094604582406,
+        "pf": 0.7514661098948964,
+        "sum_r": -169.63451683652397,
+        "mean_r": -0.1253765830277339,
+        "dd_usd": 22284.633047671807,
+        "risk_median": 129.98467372916153,
+        "dd_r": 171.44046608221274,
+        "calmar_r": -0.9894660269715859,
+        "eod": 0,
+        "silent_ratio": 0.0,
+        "silent_drops": 0,
+        "raw_signals": 2382,
+        "lev20_share": 0.07464892830746489,
+        "lev3_share": 0.021433850702143386,
+        "missed": {
+          "daily_latch": 902,
+          "capacity": 127
+        },
+        "windows_full": {
+          "2025Q1": {
+            "n": 339,
+            "sum_r": -40.57384116416279,
+            "pf": 0.7744482192486651
+          },
+          "2025Q2": {
+            "n": 312,
+            "sum_r": -81.59586673604726,
+            "pf": 0.5223693607277177
+          },
+          "2025Q3": {
+            "n": 374,
+            "sum_r": -12.75903323766355,
+            "pf": 0.9228390496353323
+          },
+          "2025Q4": {
+            "n": 328,
+            "sum_r": -34.70577569865036,
+            "pf": 0.791510573155176
+          }
+        },
+        "windows_partial": {},
+        "full_months": [
+          "2025-01",
+          "2025-02",
+          "2025-03",
+          "2025-04",
+          "2025-05",
+          "2025-06",
+          "2025-07",
+          "2025-08",
+          "2025-09",
+          "2025-10",
+          "2025-11",
+          "2025-12"
+        ],
+        "partial_months": []
+      },
+      "t_obs": -3.4087913736219844,
+      "p7_raw": 0.99875,
+      "p7_used": 0.99875,
+      "p7_refined": false,
+      "p28": 0.9993,
+      "q": 1.0,
+      "pf_ci": [
+        0.6410320784430504,
+        0.8722350739411624
+      ],
+      "eligible_for_bh": true,
+      "gates": {
+        "G0": [
+          {
+            "gate": "G0",
+            "name": "check-run geçti (ledger)",
+            "value": 1,
+            "op": ">=",
+            "threshold": 1,
+            "pass": true,
+            "borderline": false,
+            "note": ""
+          },
+          {
+            "gate": "G0",
+            "name": "sessiz düşüş / ham sinyal",
+            "value": 0.0,
+            "op": "<=",
+            "threshold": 0.1,
+            "pass": true,
+            "borderline": false,
+            "note": ""
+          },
+          {
+            "gate": "G0",
+            "name": "EOD işlem sayısı",
+            "value": 0,
+            "op": "<=",
+            "threshold": 8,
+            "pass": true,
+            "borderline": false,
+            "note": ""
+          }
+        ],
+        "G1": [
+          {
+            "gate": "G1",
+            "name": "pencere başına en az N",
+            "value": 312,
+            "op": ">=",
+            "threshold": 60,
+            "pass": true,
+            "borderline": false,
+            "note": "{\"2025Q1\": 339, \"2025Q2\": 312, \"2025Q3\": 374, \"2025Q4\": 328}"
+          }
+        ],
+        "G2": [
+          {
+            "gate": "G2",
+            "name": "havuz PF",
+            "value": 0.7514661098948964,
+            "op": ">=",
+            "threshold": 1.15,
+            "pass": false,
+            "borderline": false,
+            "note": ""
+          }
+        ],
+        "G3": [
+          {
+            "gate": "G3",
+            "name": "BH q",
+            "value": 1.0,
+            "op": "<=",
+            "threshold": 0.1,
+            "pass": false,
+            "borderline": false,
+            "note": ""
+          }
+        ],
+        "G4": [
+          {
+            "gate": "G4",
+            "name": "ΣR>0 olan tam pencere",
+            "value": 0,
+            "op": ">=",
+            "threshold": 3,
+            "pass": false,
+            "borderline": false,
+            "note": "toplam 4"
+          }
+        ],
+        "G5": [
+          {
+            "gate": "G5",
+            "name": "PF (en iyi ay hariç)",
+            "value": 0.7169222677188505,
+            "op": ">=",
+            "threshold": 1.0,
+            "pass": false,
+            "borderline": false,
+            "note": "en iyi ay 2025-02"
+          },
+          {
+            "gate": "G5",
+            "name": "ΣR (en iyi 5 işlem hariç)",
+            "value": -208.07965605742638,
+            "op": ">",
+            "threshold": 0.0,
+            "pass": false,
+            "borderline": false,
+            "note": ""
+          }
+        ]
+      },
+      "pass_g0_g5": false,
+      "trigger": "pullback",
+      "entry_tf": "30m",
+      "report_sha256": "4e3d1effc454cee01f7c6f5bf95df381bd67b84d982db7c2f8835474c758d596"
+    }
+  },
+  "need_stress": []
+}
