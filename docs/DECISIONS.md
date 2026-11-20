@@ -131,7 +131,7 @@ bu kayıtla düzeltildi; ayrıntı tablonun altındaki "İnceleme düzeltmeleri"
 | Lifespan testi `_check_disabled_follower_open_trades`'i gerçek veritabanı yolunda bırakıyor | Geçerli (test izolasyonu) | Yalnız test. Düzeltildi (`e9c2dd8`) |
 | Ön koşul gömülü takipçinin kurtarmasını da beklemeli | Geçersiz | Takipçinin canlı pozisyonları `scalp_trades`'te OPEN satırdır (atlama sorgusu strateji süzmez) ve uçuştaki girişi emirden önce rezerve eder. Tasarım sırası orkestratör → takipçidir; tersine bağlamak takipçinin yetim denetimini bozar |
 
-**İnceleme düzeltmeleri (2026-11-20, `e9c2dd8`, PR #14; TESTNET'e henüz deploy EDİLMEDİ).** Yalnız `recover_open_positions` ve iki
+**İnceleme düzeltmeleri (2026-11-20, `e9c2dd8` + `5d2a8ad`, PR #14; TESTNET'e henüz deploy EDİLMEDİ).** Yalnız `recover_open_positions` ve iki
 yeni özel yardımcı değişti; `start()`, yeniden deneme zamanlaması, sinyal yolu, scalper ve takipçi kodu, ayarlar aynı.
 
 - **Artakalan rezervasyon.** Kurtarma sembolü önce sahiplenir, sonra izlemeye alır; arada beklenmeyen bir istisna olursa
@@ -141,17 +141,25 @@ yeni özel yardımcı değişti; `start()`, yeniden deneme zamanlaması, sinyal 
   kilidi tutulurken (uçuştaki giriş sembolü izlemeden önce sahiplenir). İzlenen ama listede olmayan pozisyona kurtarma dokunmaz:
   onu izleme döngüsü aynı turda kapanış muhasebesiyle kapatır.
 - **Çift CLOSED satır.** Veritabanında açık kaydı olmayan (yetim) pozisyon için satır açılmadan önce canlı miktar
-  `get_position_risk(force_fresh=True)` ile okunur. Miktar 0 ise ya da kayıt dönmezse pozisyon kapanmış sayılır: satır açılmaz,
-  sembol izlemeden düşer, rezervasyon bırakılır (izleme döngüsünün `is_position_still_open` kuralının aynısı; tek-yön mod
-  varsayılır). Okuma başarısızsa ya da miktar eksik/bozuksa pozisyon eskisi gibi benimsenir. Ek REST yükü yetim adayı başına bir
-  weight-5 çağrıdır; veritabanı kaydı olan pozisyonlarda ek çağrı yoktur.
-- **Kabul edilen artık risk.** Hesap listesi pozisyonu açık gösterirken taze `positionRisk` 0 dönerse hüküm `positionRisk`'e göre
-  verilir. `positionRisk` yanlış olsaydı canlı bir yetim pozisyon orkestratörce yönetilmeden kalırdı; bundan emir ya da çift
-  yönetim doğmaz, izleme döngüsü ve acil kapatma da aynı kaynağa güvenir. Olay WARNING olarak loglanır (`docs/RUNBOOK.md`).
-- **Kanıt.** `tests/test_orchestrator_recovery_retry.py` 19 → 28 test (9 yeni, 1 sıkılaştırılmış: bayat listede ikinci deneme artık
-  tek satır şartını da ölçer). Her yeni test ya önce kırmızı görüldü ya da mutasyonla doğrulandı (izlemeden düşürme, "listede"
-  koşulu, taze okuma şartı). Tam paket yerel: 4074 geçti / 85 atlandı. İki bağımsız inceleme (üretim kodu, testler) gerçek hata
-  bulmadı; test incelemesinin üç boşluğu (miktarsız yanıt, "listede" koşulu, doğrulamanın gerçekten denendiği) kapatıldı.
+  `get_position_risk(force_fresh=True)` ile okunur. Miktar 0 ise ya da kayıt dönmezse iki taze okuma çelişiyor demektir (hesap
+  listesi: açık, `positionRisk`: kapalı) ve hangisinin bayat olduğu o anda bilinemez. Bu durumda KARAR VERİLMEZ: satır açılmaz,
+  sembol izlemeden düşürülmez, rezervasyon bırakılmaz, deneme tamamlanmamış sayılır (`recovery_ready=false`) ve sonraki deneme
+  yeniden bakar. Hesap listesi yetişirse süpürme rezervasyonu bırakır; `positionRisk` yetişirse pozisyon benimsenir. Okuma
+  başarısızsa ya da miktar eksik/bozuksa pozisyon eskisi gibi benimsenir. Tek-yön mod varsayılır. Ek REST yükü yetim adayı başına
+  bir weight-5 çağrıdır; veritabanı kaydı olan pozisyonlarda ek çağrı yoktur. Olay WARNING olarak loglanır (`docs/RUNBOOK.md`).
+- **İlk sürümün hatası ve PR #14 incelemesi.** İlk sürüm (`e9c2dd8`) çelişkide pozisyonu kapanmış sayıyor, izlemeden düşürüp
+  rezervasyonu bırakıyor ve kurtarmayı başarılı bitiriyordu; `positionRisk` yanlış olsaydı canlı bir pozisyon başka hiçbir işaret
+  olmadan yönetimsiz kalırdı (kurtarma bitince yeniden deneme yapılmaz). Bunu hem bağımsız kod incelemesi (artık risk olarak) hem
+  cubic (P1) işaret etti; `5d2a8ad` kuralı yukarıdaki "karar verilmez" hâline getirdi. cubic'in PR #14'teki diğer iki bulgusu:
+  miktarsız yanıt testi taze okumanın yapıldığını ölçmüyordu (geçerli, `5d2a8ad` ile düzeltildi); benimsenen yetimin miktar ve
+  giriş değerleri taze kayıttan alınsın (reddedildi: iki okuma art arda yapılır ve ikisi de tazedir, aradaki pencere
+  milisaniyedir; veritabanı kaydı olan dalda da değerler hesap listesinden alınır, tutarlı bir çözüm bu değişikliğin kapsamını
+  aşar).
+- **Kanıt.** `tests/test_orchestrator_recovery_retry.py` 19 → 29 test (10 yeni, 1 sıkılaştırılmış: bayat listede ikinci deneme artık
+  tek satır şartını da ölçer). Her yeni test ya önce kırmızı görüldü ya da mutasyonla doğrulandı ("listede" koşulu, taze okuma
+  şartı). Tam paket yerel: 4075 geçti / 85 atlandı (`5d2a8ad`). İlk sürümü iki bağımsız inceleme (üretim kodu, testler) okudu:
+  test incelemesinin üç boşluğu (miktarsız yanıt, "listede" koşulu, doğrulamanın gerçekten denendiği) kapatıldı; kod incelemesinin
+  işaret ettiği artık risk `5d2a8ad` ile giderildi.
 
 ### D43 — 2026-11-20 ölçüm hükmü: strateji C'nin örneklem-dışı kenarı gösterilemedi, başka kurulumda da yok, kayıp-örüntü korumaları geçmedi · 2026-11-20 · HİÇBİR AYAR DEĞİŞMEDİ — mainnet NO-GO teyit
 

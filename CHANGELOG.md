@@ -10,12 +10,12 @@
   varken ve scalper kendi kurtarmasını bitirmeden deneme yapılmaz; deneme başına tek imzalı sorgu, uyarı en fazla 30 dakikada bir.
   `/health` → `orchestrator_details` iki yeni alan: `recovery_retry_attempts`, `recovery_next_retry_in_seconds`. Scalper ve takipçi
   kodu, ayarlar ve giriş/çıkış kuralları değişmedi (`docs/DECISIONS.md` D44, `docs/RUNBOOK.md` "Sorun giderme")
-- D44 inceleme düzeltmeleri (takip değişikliği `e9c2dd8`): (1) yarım kalan bir kurtarma denemesinin aldığı "telegram" sembol
+- D44 inceleme düzeltmeleri (takip değişikliği, PR #14): (1) yarım kalan bir kurtarma denemesinin aldığı "telegram" sembol
   rezervasyonu, pozisyon sonradan kapanırsa yeniden başlatmaya kadar kilitli kalıyordu; artık her başarılı hesap okumasında,
   izlemede olmayan ve borsada açık pozisyonu bulunmayan rezervasyon bırakılır (`entry_halted` iken ve sinyal işlenirken
   dokunulmaz). (2) Hesap listesi bayatken her yeniden deneme emirsiz bir CLOSED `positions` satırı ekliyordu; yetim satırı
-  açılmadan önce canlı miktar taze okunur, 0 ise satır açılmaz. Emir, boyut, giriş/çıkış kuralı ve ayar değişmedi
-  (`docs/DECISIONS.md` D44 "İnceleme düzeltmeleri")
+  açılmadan önce canlı miktar taze okunur; hesap listesiyle çelişirse satır açılmaz, sembol kilitli kalır ve kurtarma bir sonraki
+  denemede yeniden bakar. Emir, boyut, giriş/çıkış kuralı ve ayar değişmedi (`docs/DECISIONS.md` D44 "İnceleme düzeltmeleri")
 
 ## v2.1.0 - Değerlendirme harness'i gerçekçilik paketi (D41, 2026-11-20)
 

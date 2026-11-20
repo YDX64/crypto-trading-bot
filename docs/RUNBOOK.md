@@ -1301,11 +1301,13 @@ yukarıdaki üç kapıdan biri kapalıdır. Restart'tan ÖNCE 418/ban var mı ko
 "Binance 418" maddesi); sonra `RESTART_LABEL=<etiket> scripts/restart_safe.sh`. Skalper yolu bu bayraktan etkilenmez (kendi
 readiness'i var; `/scalper/status` ayrıca bak).
 
-Kurtarma sırasında görülebilen iki WARNING satırı kendi başına iş gerektirmez: "önceki kurtarma denemesinden kalan rezervasyon
-bırakıldı" (yarım kalan denemenin sembol kilidi temizlendi) ve "hesap listesinde açık görünüyor ama taze positionRisk miktarı 0"
-(kapanmış pozisyon için kayıt açılmadı). İkincisi aynı sembolde yineleniyorsa borsada o sembolü elle kontrol et: pozisyon
-gerçekten AÇIKSA `positionRisk` yanlış dönüyor demektir ve pozisyonu orkestratör yönetmiyordur (stop emrine bak, gerekirse
-elle kapat, sonra restart).
+Kurtarma sırasında iki WARNING satırı görülebilir. (1) "önceki kurtarma denemesinden kalan rezervasyon bırakıldı": yarım kalan
+bir denemenin sembol kilidi temizlendi; iş gerektirmez. (2) "hesap listesinde açık görünüyor ama taze positionRisk miktarı 0":
+iki borsa okuması çelişti. Kayıt açılmadı, sembol "telegram" adına kilitli kaldı ve kurtarma tamamlanmış SAYILMADI
+(`recovery_ready=false`); döngü kendiliğinden yeniden dener, okumalar uzlaşınca ya kilidi bırakır ya pozisyonu benimser. Bu
+satırı HER gördüğünde borsada o sembolün pozisyonuna ve stop emrine bak: o sırada pozisyonu orkestratör YÖNETMİYOR. Pozisyon
+açık ve stop'suzsa elle koru ya da kapat. Aynı satır birkaç denemedir yineleniyorsa borsa uçlarından biri bayat dönüyordur;
+pozisyonu elle yönet, düzelmezse restart.
 
 **Pozisyon korumasız uyarısı / -4120:** koşullu emirler `/fapi/v1/algoOrder`'da; `openOrders`
 onları göstermez, `allOpenOrders` iptal etmez.
