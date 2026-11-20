@@ -1,4 +1,5 @@
-"""scripts/deploy.sh, scripts/server_deploy.sh, scripts/ring_env_diff.sh testleri.
+"""scripts/deploy.sh, scripts/server_deploy.sh, scripts/ring_env_diff.sh ve
+scripts/preflight_server_env.sh (D43) testleri.
 
 Sözleşme (bkz. CLAUDE.md, docs/MAINNET_PLAN.md §1, §5): iki halka — testnet (bugünkü
 davranış, DEĞİŞMEDEN) ve mainnet (yalnız `vX.Y.Z` etiketi, origin'de var olmalı, açık
@@ -21,13 +22,16 @@ SCRIPTS = REPO_ROOT / "scripts"
 DEPLOY_SH = SCRIPTS / "deploy.sh"
 SERVER_DEPLOY_SH = SCRIPTS / "server_deploy.sh"
 RING_ENV_DIFF_SH = SCRIPTS / "ring_env_diff.sh"
+PREFLIGHT_SH = SCRIPTS / "preflight_server_env.sh"
 
 
 # ── Sözdizimi (bash -n) ──────────────────────────────────────────────────────
 
 
 @pytest.mark.parametrize(
-    "script", [DEPLOY_SH, SERVER_DEPLOY_SH, RING_ENV_DIFF_SH], ids=lambda p: p.name
+    "script",
+    [DEPLOY_SH, SERVER_DEPLOY_SH, RING_ENV_DIFF_SH, PREFLIGHT_SH],
+    ids=lambda p: p.name,
 )
 def test_bash_syntax_ok(script):
     assert script.exists(), f"beklenen script yok: {script}"
@@ -38,7 +42,7 @@ def test_bash_syntax_ok(script):
 
 
 def test_scripts_are_executable():
-    for script in (DEPLOY_SH, SERVER_DEPLOY_SH, RING_ENV_DIFF_SH):
+    for script in (DEPLOY_SH, SERVER_DEPLOY_SH, RING_ENV_DIFF_SH, PREFLIGHT_SH):
         mode = script.stat().st_mode
         assert mode & stat.S_IXUSR, f"{script.name} çalıştırılabilir değil"
 
@@ -976,3 +980,519 @@ class TestRestartSafe:
         ):
             assert needle in restart_text, needle
             assert needle in deploy_text, needle
+
+
+# ── preflight_server_env.sh (D43) ────────────────────────────────────────────
+# Gerçek ağ/ssh YOK: sunucu ayarları PREFLIGHT_ENV_FILE ile ya da sahte ssh ile gelir,
+# pytest yerine sahte yorumlayıcı (PREFLIGHT_PYTHON) çalışır, depo olarak küçük bir
+# sahte git deposu (PREFLIGHT_REPO) kullanılır. Gerçek paket koşulmaz.
+
+PREFLIGHT_ENV_EXAMPLE = "# env.example ilk satir\nSCALPER_LEVERAGE=10\nAPI_PORT=9091\n"
+PREFLIGHT_REPO_ENV_MARKER = "REPO_OWN_ENV_MARKER_9f3a"
+
+PREFLIGHT_SETTINGS = (
+    "SCALPER_STOP_MODE=atr\n"  # izinli aile, secret değil
+    "SCALPER_DYNAMIC_LEVERAGE=true\n"  # izinli aile, secret değil
+    "TV_WEBHOOK_SECRET=real-tv-secret-1\n"  # aile içi ama SECRET
+    "BINANCE_API_KEY=real-binance-key-2\n"  # aile içi ama KEY
+    "BINANCE_API_SECRET=real-binance-secret-3\n"
+    "BINANCE_BIND_IP=203.0.113.7\n"  # BIND_IP
+    "RISK_EVENT_TOKEN=real-risk-token-4\n"  # TOKEN
+    "FOLLOWER_DB_PASS=real-pass-5\n"  # PASS
+    "TELEGRAM_CHAT_ID=out-of-family-6\n"  # aile dışı
+    "DATABASE_URL=sqlite:///out-of-family-7\n"  # aile dışı
+)
+PREFLIGHT_SECRET_VALUES = (
+    "real-tv-secret-1",
+    "real-binance-key-2",
+    "real-binance-secret-3",
+    "203.0.113.7",
+    "real-risk-token-4",
+    "real-pass-5",
+)
+PREFLIGHT_OUT_OF_FAMILY_VALUES = ("out-of-family-6", "out-of-family-7")
+
+
+def _preflight_make_repo(tmp_path: Path) -> Path:
+    """Küçük sahte git deposu: izlenen + izlenmeyen + silinmiş + ignore edilen dosyalar."""
+    repo = tmp_path / "fake_repo"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "src").mkdir()
+    (repo / "logs").mkdir()
+    (repo / "env.example").write_text(PREFLIGHT_ENV_EXAMPLE)
+    (repo / ".gitignore").write_text(".env\nlogs/\n.venv/\n")
+    (repo / "src" / "tracked.py").write_text("tracked = 1\n")
+    (repo / "src" / "will_be_deleted.py").write_text("gone = 1\n")
+    (repo / "tests" / "test_x.py").write_text("def test_x():\n    pass\n")
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    # çalışma ağacında silinmiş ama indekste olan izlenen dosya → atlanmalı
+    (repo / "src" / "will_be_deleted.py").unlink()
+    # izlenmeyen ama ignore EDİLMEYEN dosya → kopyalanmalı
+    (repo / "src" / "untracked_new.py").write_text("new = 1\n")
+    # ignore edilenler → kopyalanMAMALI
+    (repo / ".env").write_text(f"SCALPER_LEVERAGE=99\nSOME_SECRET={PREFLIGHT_REPO_ENV_MARKER}\n")
+    (repo / "logs" / "bot.log").write_text(f"log {PREFLIGHT_REPO_ENV_MARKER}\n")
+    return repo
+
+
+def _preflight_fake_python(tmp_path: Path) -> Path:
+    """Kopyanın .env'ini, argv'sini ve cwd'sini kaydeden sahte yorumlayıcı."""
+    py = tmp_path / "fake_python"
+    _write_executable(
+        py,
+        r"""#!/usr/bin/env bash
+: "${FAKE_PY_OUT:?}"
+printf '%s\n' "$@" > "$FAKE_PY_OUT/argv"
+cp .env "$FAKE_PY_OUT/dotenv"
+pwd -P > "$FAKE_PY_OUT/cwd"
+env | sort > "$FAKE_PY_OUT/environ"
+exit "${FAKE_PY_RC:-0}"
+""",
+    )
+    return py
+
+
+def _preflight_setup(tmp_path: Path, settings: str = PREFLIGHT_SETTINGS):
+    repo = _preflight_make_repo(tmp_path)
+    py = _preflight_fake_python(tmp_path)
+    env_file = tmp_path / "server_env.txt"
+    env_file.write_text(settings)
+    out = tmp_path / "py_out"
+    out.mkdir()
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+    return repo, py, env_file, out, tmpdir
+
+
+def _preflight_env(tmp_path, repo, py, out, tmpdir, **extra):
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path),
+        "TMPDIR": str(tmpdir),
+        "PREFLIGHT_REPO": str(repo),
+        "PREFLIGHT_PYTHON": str(py),
+        "FAKE_PY_OUT": str(out),
+    }
+    env.update({k: str(v) for k, v in extra.items()})
+    return env
+
+
+def _run_preflight(tmp_path, env, args=(), cwd=None):
+    return subprocess.run(
+        ["bash", str(PREFLIGHT_SH), *args],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(cwd or tmp_path),
+        timeout=60,
+    )
+
+
+class TestPreflightServerEnv:
+    def test_filters_secrets_and_builds_env_from_file(self, tmp_path):
+        repo, py, env_file, out, tmpdir = _preflight_setup(tmp_path)
+        env = _preflight_env(
+            tmp_path, repo, py, out, tmpdir, PREFLIGHT_ENV_FILE=env_file
+        )
+        proc = _run_preflight(tmp_path, env)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        dotenv = (out / "dotenv").read_text()
+        # env.example'ın içeriği EN BAŞTA ve bütün
+        assert dotenv.startswith(PREFLIGHT_ENV_EXAMPLE)
+        lines = dotenv.splitlines()
+        # izinli satırlar var
+        assert "SCALPER_STOP_MODE=atr" in lines
+        assert "SCALPER_DYNAMIC_LEVERAGE=true" in lines
+        # sahte secret satırları ikisi de var ve EN SONDA
+        assert lines[-2:] == [
+            "TV_WEBHOOK_SECRET=dummy-preflight",
+            "RISK_EVENT_SECRET=dummy-preflight",
+        ]
+        # ayar satırları env.example'dan SONRA geliyor
+        assert dotenv.index("SCALPER_STOP_MODE=atr") > dotenv.index(PREFLIGHT_ENV_EXAMPLE)
+        # gerçek secret değerleri ve aile dışı satırlar kopyanın .env'inde YOK
+        for val in PREFLIGHT_SECRET_VALUES + PREFLIGHT_OUT_OF_FAMILY_VALUES:
+            assert val not in dotenv, val
+        assert "TELEGRAM_CHAT_ID" not in dotenv
+        assert "DATABASE_URL" not in dotenv
+        assert "BINANCE_API_KEY" not in dotenv
+        # çıktıya hiçbir değer basılmaz
+        for val in PREFLIGHT_SECRET_VALUES + PREFLIGHT_OUT_OF_FAMILY_VALUES:
+            assert val not in proc.stdout + proc.stderr, val
+        assert "2 ayar satırı" in proc.stdout
+
+    def test_mixed_case_secret_names_are_filtered(self, tmp_path):
+        """Bot .env'i büyük/küçük harf farksız okur: 'SCALPER_api_key' da secret'tır."""
+        leaks = ("leak-mc-1", "leak-mc-2", "leak-mc-3", "leak-mc-4", "leak-mc-5")
+        settings = (
+            "SCALPER_STOP_MODE=atr\n"
+            "scalper_dynamic_leverage=true\n"  # küçük harfli ama secret değil → alınır
+            f"SCALPER_api_key={leaks[0]}\n"
+            f"BINANCE_Secret={leaks[1]}\n"
+            f"SCALPER_Token={leaks[2]}\n"
+            f"tv_webhook_secret={leaks[3]}\n"
+            f"FOLLOWER_db_Pass={leaks[4]}\n"
+        )
+        repo, py, env_file, out, tmpdir = _preflight_setup(tmp_path, settings=settings)
+        env = _preflight_env(
+            tmp_path, repo, py, out, tmpdir, PREFLIGHT_ENV_FILE=env_file
+        )
+        proc = _run_preflight(tmp_path, env)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        dotenv = (out / "dotenv").read_text()
+        for val in leaks:
+            assert val not in dotenv, val
+            assert val not in proc.stdout + proc.stderr, val
+        lines = dotenv.splitlines()
+        assert "SCALPER_STOP_MODE=atr" in lines
+        assert "scalper_dynamic_leverage=true" in lines
+        assert "2 ayar satırı" in proc.stdout
+
+    def test_pytest_arguments_exact_and_extra_args_passed(self, tmp_path):
+        repo, py, env_file, out, tmpdir = _preflight_setup(tmp_path)
+        env = _preflight_env(
+            tmp_path, repo, py, out, tmpdir, PREFLIGHT_ENV_FILE=env_file
+        )
+        proc = _run_preflight(tmp_path, env)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert (out / "argv").read_text().splitlines() == [
+            "-m", "pytest", "tests", "-q", "-x", "-p", "no:cacheprovider",
+        ]
+        # '--' sonrası ek argümanlar aynen eklenir (host verilmeden de olur)
+        proc = _run_preflight(tmp_path, env, ["--", "-k", "maker fills", "-vv"])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert (out / "argv").read_text().splitlines() == [
+            "-m", "pytest", "tests", "-q", "-x", "-p", "no:cacheprovider",
+            "-k", "maker fills", "-vv",
+        ]
+        # host + '--' birlikte
+        proc = _run_preflight(tmp_path, env, ["somehost", "--", "-k", "x"])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert (out / "argv").read_text().splitlines()[-2:] == ["-k", "x"]
+
+    def test_runs_inside_copy_not_in_repo_or_cwd(self, tmp_path):
+        repo, py, env_file, out, tmpdir = _preflight_setup(tmp_path)
+        env = _preflight_env(
+            tmp_path, repo, py, out, tmpdir,
+            PREFLIGHT_ENV_FILE=env_file, PREFLIGHT_KEEP="1",
+        )
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        proc = _run_preflight(tmp_path, env, cwd=elsewhere)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        cwd = Path((out / "cwd").read_text().strip())
+        assert cwd.name == "copy"
+        assert str(cwd).startswith(str(tmpdir.resolve()))
+        assert cwd != repo.resolve() and cwd != elsewhere.resolve()
+        # çalışma ağacı kopyalandı: izlenen + izlenmeyen var, silinmiş izlenen atlandı
+        assert (cwd / "src" / "tracked.py").exists()
+        assert (cwd / "src" / "untracked_new.py").exists()
+        assert not (cwd / "src" / "will_be_deleted.py").exists()
+        assert (cwd / "tests" / "test_x.py").exists()
+        # repoya bir şey yazılmadı (yeni dosya yok)
+        assert not (repo / "src" / "will_be_deleted.py").exists()
+        assert sorted(p.name for p in repo.iterdir() if p.name != ".git") == sorted(
+            [".env", ".gitignore", "env.example", "logs", "src", "tests"]
+        )
+
+    def test_exit_status_is_pytest_status(self, tmp_path):
+        repo, py, env_file, out, tmpdir = _preflight_setup(tmp_path)
+        for rc in (0, 1, 5):
+            env = _preflight_env(
+                tmp_path, repo, py, out, tmpdir,
+                PREFLIGHT_ENV_FILE=env_file, FAKE_PY_RC=rc,
+            )
+            proc = _run_preflight(tmp_path, env)
+            assert proc.returncode == rc, proc.stdout + proc.stderr
+            if rc == 0:
+                assert "ÖN SINAV GEÇTİ" in proc.stdout
+            else:
+                assert "ÖN SINAV KALDI" in proc.stdout
+                assert f"çıkış kodu {rc}" in proc.stdout
+
+    def test_zero_settings_fails_without_running_python(self, tmp_path):
+        # yalnız secret ve aile-dışı satırlar → süzgeçten sonra sıfır satır
+        repo, py, env_file, out, tmpdir = _preflight_setup(
+            tmp_path,
+            settings="TV_WEBHOOK_SECRET=x\nTELEGRAM_CHAT_ID=y\n# yorum\n",
+        )
+        env = _preflight_env(
+            tmp_path, repo, py, out, tmpdir, PREFLIGHT_ENV_FILE=env_file
+        )
+        proc = _run_preflight(tmp_path, env)
+        assert proc.returncode != 0
+        assert "pytest ÇALIŞTIRILMADI" in proc.stderr
+        assert not (out / "argv").exists(), "yorumlayıcı çağrılmamalıydı"
+        # boş dosya da aynı
+        env_file.write_text("")
+        proc = _run_preflight(tmp_path, env)
+        assert proc.returncode != 0
+        assert not (out / "argv").exists()
+        # hata yolunda da geçici dizin temizlenir
+        assert list(tmpdir.iterdir()) == []
+
+    def test_missing_env_file_fails(self, tmp_path):
+        repo, py, _env_file, out, tmpdir = _preflight_setup(tmp_path)
+        env = _preflight_env(
+            tmp_path, repo, py, out, tmpdir,
+            PREFLIGHT_ENV_FILE=tmp_path / "yok.txt",
+        )
+        proc = _run_preflight(tmp_path, env)
+        assert proc.returncode != 0
+        assert not (out / "argv").exists()
+
+    def test_tmp_removed_by_default_and_kept_with_keep(self, tmp_path):
+        repo, py, env_file, out, tmpdir = _preflight_setup(tmp_path)
+        env = _preflight_env(
+            tmp_path, repo, py, out, tmpdir, PREFLIGHT_ENV_FILE=env_file
+        )
+        proc = _run_preflight(tmp_path, env)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert list(tmpdir.iterdir()) == [], "geçici kopya silinmeliydi"
+
+        env["PREFLIGHT_KEEP"] = "1"
+        proc = _run_preflight(tmp_path, env)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        kept = list(tmpdir.iterdir())
+        assert len(kept) == 1
+        assert str(kept[0] / "copy") in proc.stdout
+        assert (kept[0] / "copy" / ".env").is_file()
+        # başarısız pytest'te de (varsayılan) temizlenir
+        env.pop("PREFLIGHT_KEEP")
+        for p in kept:
+            subprocess.run(["rm", "-rf", str(p)], check=True)
+        env["FAKE_PY_RC"] = "1"
+        proc = _run_preflight(tmp_path, env)
+        assert proc.returncode == 1
+        assert list(tmpdir.iterdir()) == []
+
+    def test_cleanup_only_removes_own_directory(self, tmp_path):
+        """TMPDIR'deki başka içerik ve boş/ayarsız yol hedef alınamaz."""
+        repo, py, env_file, out, tmpdir = _preflight_setup(tmp_path)
+        bystander = tmpdir / "baska-dizin"
+        bystander.mkdir()
+        (bystander / "dosya.txt").write_text("dokunma")
+        env = _preflight_env(
+            tmp_path, repo, py, out, tmpdir, PREFLIGHT_ENV_FILE=env_file
+        )
+        proc = _run_preflight(tmp_path, env)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert (bystander / "dosya.txt").read_text() == "dokunma"
+        text = PREFLIGHT_SH.read_text()
+        # rm yalnız sahiplik işareti + boş olmayan TMP korumasıyla çağrılır
+        assert '[ -n "${TMP:-}" ]' in text
+        assert ".preflight-owned" in text
+
+    def test_ssh_filters_server_side_and_uses_batchmode(self, tmp_path):
+        repo, py, _env_file, out, tmpdir = _preflight_setup(tmp_path)
+        bin_dir = tmp_path / "fake_ssh_bin"
+        bin_dir.mkdir()
+        ssh_log = tmp_path / "ssh_args.log"
+        canned = tmp_path / "canned_remote_output.txt"
+        # sahte sunucu süzmeyi YAPMAZ (kötü niyetli/hatalı sunucu): yerel savunma da sınanır
+        canned.write_text(PREFLIGHT_SETTINGS)
+        _write_executable(
+            bin_dir / "ssh",
+            r"""#!/usr/bin/env bash
+{ echo "=== ssh call ==="; for a in "$@"; do printf '%s\n' "$a"; done; } >> "$SSH_CALL_LOG"
+cat "$CANNED_REMOTE_OUTPUT"
+exit 0
+""",
+        )
+        env = _preflight_env(
+            tmp_path, repo, py, out, tmpdir,
+            SSH_CALL_LOG=ssh_log, CANNED_REMOTE_OUTPUT=canned,
+            REMOTE_ENV="/srv/test/.env",
+        )
+        env["PATH"] = f"{bin_dir}:{os.environ['PATH']}"
+        proc = _run_preflight(tmp_path, env, ["myhost"])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        calls = ssh_log.read_text().splitlines()
+        assert calls[0] == "=== ssh call ==="
+        assert calls[1:3] == ["-o", "BatchMode=yes"]
+        assert calls[3] == "myhost"
+        remote_cmd = "\n".join(calls[4:])
+        # anahtar-aile süzgeci ve secret-adı süzgeci UZAK komutun içinde
+        assert "(BINANCE_|SCALPER_|TV_|RISK_|FOLLOWER_|BOT_MODE)" in remote_cmd
+        assert "(SECRET|KEY|TOKEN|PASS|BIND_IP)" in remote_cmd
+        # büyük/küçük harf farksız süzgeç (-i) sunucu tarafında da var
+        assert "grep -iE" in remote_cmd and "grep -viE" in remote_cmd
+        assert "/srv/test/.env" in remote_cmd
+        # salt okunur: uzak komut yazma/silme içermez
+        for bad in (" rm ", " mv ", " cp ", " tee ", ">>", " > "):
+            assert bad not in remote_cmd, bad
+        # sunucu süzmese bile yerel ikinci süzgeç secret'ları atar
+        dotenv = (out / "dotenv").read_text()
+        for val in PREFLIGHT_SECRET_VALUES + PREFLIGHT_OUT_OF_FAMILY_VALUES:
+            assert val not in dotenv, val
+        assert "SCALPER_STOP_MODE=atr" in dotenv
+        assert "host myhost" in proc.stdout
+
+    def test_ssh_default_host_is_awa_and_failure_stops(self, tmp_path):
+        repo, py, _env_file, out, tmpdir = _preflight_setup(tmp_path)
+        bin_dir = tmp_path / "fake_ssh_bin"
+        bin_dir.mkdir()
+        ssh_log = tmp_path / "ssh_args.log"
+        _write_executable(
+            bin_dir / "ssh",
+            r"""#!/usr/bin/env bash
+{ echo "=== ssh call ==="; for a in "$@"; do printf '%s\n' "$a"; done; } >> "$SSH_CALL_LOG"
+exit 255
+""",
+        )
+        env = _preflight_env(tmp_path, repo, py, out, tmpdir, SSH_CALL_LOG=ssh_log)
+        env["PATH"] = f"{bin_dir}:{os.environ['PATH']}"
+        proc = _run_preflight(tmp_path, env)
+        assert proc.returncode != 0
+        assert ssh_log.read_text().splitlines()[3] == "awa"
+        assert not (out / "argv").exists(), "ssh hatasında pytest koşmamalı"
+        assert list(tmpdir.iterdir()) == []
+
+    def test_ssh_not_called_when_env_file_given(self, tmp_path):
+        repo, py, env_file, out, tmpdir = _preflight_setup(tmp_path)
+        bin_dir = tmp_path / "fake_ssh_bin"
+        bin_dir.mkdir()
+        ssh_log = tmp_path / "ssh_args.log"
+        ssh_log.write_text("")
+        _write_executable(
+            bin_dir / "ssh",
+            "#!/usr/bin/env bash\necho called >> \"$SSH_CALL_LOG\"\nexit 0\n",
+        )
+        env = _preflight_env(
+            tmp_path, repo, py, out, tmpdir,
+            PREFLIGHT_ENV_FILE=env_file, SSH_CALL_LOG=ssh_log,
+        )
+        env["PATH"] = f"{bin_dir}:{os.environ['PATH']}"
+        proc = _run_preflight(tmp_path, env)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert ssh_log.read_text() == ""
+
+    def test_repo_own_env_and_ignored_dirs_never_copied(self, tmp_path):
+        repo, py, env_file, out, tmpdir = _preflight_setup(tmp_path)
+        env = _preflight_env(
+            tmp_path, repo, py, out, tmpdir,
+            PREFLIGHT_ENV_FILE=env_file, PREFLIGHT_KEEP="1",
+        )
+        proc = _run_preflight(tmp_path, env)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        copy = Path((out / "cwd").read_text().strip())
+        assert PREFLIGHT_REPO_ENV_MARKER not in (out / "dotenv").read_text()
+        assert not (copy / "logs").exists()
+        for p in copy.rglob("*"):
+            if p.is_file():
+                assert PREFLIGHT_REPO_ENV_MARKER not in p.read_text(errors="ignore"), p
+        # kopyanın .env'i repo .env'inin değil, script'in kurduğu dosyadır
+        assert "SCALPER_LEVERAGE=99" not in (out / "dotenv").read_text()
+
+    def test_repo_env_not_copied_even_if_tracked(self, tmp_path):
+        """Biri .env'i yanlışlıkla izlese bile içeriği kopyaya GİRMEZ."""
+        repo, py, env_file, out, tmpdir = _preflight_setup(tmp_path)
+        subprocess.run(["git", "-C", str(repo), "add", "-f", ".env"], check=True)
+        env = _preflight_env(
+            tmp_path, repo, py, out, tmpdir, PREFLIGHT_ENV_FILE=env_file
+        )
+        proc = _run_preflight(tmp_path, env)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert PREFLIGHT_REPO_ENV_MARKER not in (out / "dotenv").read_text()
+
+    def test_caller_environment_settings_are_scrubbed(self, tmp_path):
+        """Çağıranın kabuğundaki SCALPER_* vb. .env'i ezmemeli (sunucu adımı çıplak oturum)."""
+        repo, py, env_file, out, tmpdir = _preflight_setup(tmp_path)
+        env = _preflight_env(
+            tmp_path, repo, py, out, tmpdir,
+            PREFLIGHT_ENV_FILE=env_file,
+            SCALPER_LEVERAGE="77", BINANCE_API_KEY="callerkey", BOT_MODE="follower",
+            KEEP_ME="yes",
+        )
+        proc = _run_preflight(tmp_path, env)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        environ = (out / "environ").read_text()
+        for name in ("SCALPER_LEVERAGE=", "BINANCE_API_KEY=", "BOT_MODE="):
+            assert name not in environ, name
+        assert "KEEP_ME=yes" in environ
+        assert "PYTHONDONTWRITEBYTECODE=1" in environ
+
+    def test_caller_log_dir_is_scrubbed(self, tmp_path):
+        """TRADINGBOT_LOG_DIR dışa aktarılmışsa testler çağıranın dizinine log yazardı."""
+        repo, py, env_file, out, tmpdir = _preflight_setup(tmp_path)
+        env = _preflight_env(
+            tmp_path, repo, py, out, tmpdir,
+            PREFLIGHT_ENV_FILE=env_file,
+            TRADINGBOT_LOG_DIR=tmp_path / "caller_logs",
+        )
+        proc = _run_preflight(tmp_path, env)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "TRADINGBOT_LOG_DIR=" not in (out / "environ").read_text()
+
+    def test_host_starting_with_dash_is_rejected_before_ssh(self, tmp_path):
+        """'-oProxyCommand=…' gibi bir host ssh'a SEÇENEK olarak geçmemeli."""
+        repo, py, _env_file, out, tmpdir = _preflight_setup(tmp_path)
+        bin_dir = tmp_path / "fake_ssh_bin"
+        bin_dir.mkdir()
+        ssh_log = tmp_path / "ssh_args.log"
+        _write_executable(
+            bin_dir / "ssh",
+            '#!/usr/bin/env bash\necho called >> "$SSH_CALL_LOG"\nexit 0\n',
+        )
+        env = _preflight_env(tmp_path, repo, py, out, tmpdir, SSH_CALL_LOG=ssh_log)
+        env["PATH"] = f"{bin_dir}:{os.environ['PATH']}"
+        proc = _run_preflight(tmp_path, env, ["-oProxyCommand=true"])
+        assert proc.returncode == 2, proc.stdout + proc.stderr
+        assert "host" in proc.stderr
+        assert not ssh_log.exists(), "ssh çağrılmamalıydı"
+        assert not (out / "argv").exists(), "yorumlayıcı çalışmamalıydı"
+
+    def test_env_file_source_is_never_copied_raw_nor_deleted(self, tmp_path):
+        """PREFLIGHT_ENV_FILE süzülmeden geçici dizine yazılmaz ve kaynağın kendisi silinmez."""
+        repo, py, env_file, out, tmpdir = _preflight_setup(tmp_path)
+        env = _preflight_env(
+            tmp_path, repo, py, out, tmpdir,
+            PREFLIGHT_ENV_FILE=env_file, PREFLIGHT_KEEP="1",
+        )
+        proc = _run_preflight(tmp_path, env)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        kept = [p for p in tmpdir.rglob("*") if p.is_file()]
+        assert kept, "KEEP=1 iken geçici kopya kalmalı"
+        for path in kept:
+            text = path.read_text(errors="replace")
+            for val in PREFLIGHT_SECRET_VALUES + PREFLIGHT_OUT_OF_FAMILY_VALUES:
+                assert val not in text, (str(path), val)
+        assert env_file.read_text() == PREFLIGHT_SETTINGS
+
+    def test_real_repo_copy_has_no_env_venv_data_logs(self, tmp_path):
+        """Gerçek ağaç (PREFLIGHT_REPO'suz): kopyada .venv/data/logs yok; .env script'in kurduğu."""
+        # Ön sınavın kendi temiz kopyasında .git YOKTUR (kasıtlı); orada bu test atlanır,
+        # sunucudaki deploy testinde ve yerelde koşar.
+        inside = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+        )
+        if inside.returncode != 0:
+            pytest.skip("repo kökü git çalışma ağacı değil (ön sınav kopyası)")
+        py = _preflight_fake_python(tmp_path)
+        env_file = tmp_path / "server_env.txt"
+        env_file.write_text("SCALPER_STOP_MODE=atr\n")
+        out = tmp_path / "py_out"
+        out.mkdir()
+        tmpdir = tmp_path / "tmp"
+        tmpdir.mkdir()
+        env = _preflight_env(
+            tmp_path, REPO_ROOT, py, out, tmpdir,
+            PREFLIGHT_ENV_FILE=env_file, PREFLIGHT_KEEP="1",
+        )
+        env.pop("PREFLIGHT_REPO")  # gerçek varsayılan yol
+        proc = _run_preflight(tmp_path, env)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        copy = Path((out / "cwd").read_text().strip())
+        for name in (".venv", "data", "logs", ".git"):
+            assert not (copy / name).exists(), name
+        assert (copy / "scripts" / "preflight_server_env.sh").exists()
+        dotenv = (out / "dotenv").read_text()
+        assert dotenv.startswith((REPO_ROOT / "env.example").read_text())
+        assert dotenv.splitlines()[-2:] == [
+            "TV_WEBHOOK_SECRET=dummy-preflight",
+            "RISK_EVENT_SECRET=dummy-preflight",
+        ]
+        assert "SCALPER_STOP_MODE=atr" in dotenv.splitlines()

@@ -18,7 +18,7 @@
 ### ⚠️ Breaking Changes
 
 - Resmi backtest sayıları düşer (7 pencerede 1124 → 751 işlem, +2679.50 → +107.10); eski sayılar için `--legacy-model`
-- Canlı davranış ve sunucu DEĞİŞMEDİ; ayrıntı `docs/DECISIONS.md` D41, `docs/EXPERIMENTS.md` E16
+- Canlı davranış ve sunucu DEĞİŞMEDİ; ayrıntı `docs/DECISIONS.md` D41, `docs/EXPERIMENTS.md` E19
 
 ## v2.0.0 - Çoklu Sinyal Yönetimi ve Yeni Format Desteği
 

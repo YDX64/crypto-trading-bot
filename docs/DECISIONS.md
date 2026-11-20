@@ -7,6 +7,80 @@ Pencereler: AYI 2026-01-23→02-13 (BTC −30%) · YATAY 2026-07-01→07-21 · B
 
 ## Aktif kararlar
 
+### D43 — 2026-11-20 ölçüm hükmü: strateji C'nin örneklem-dışı kenarı gösterilemedi, başka kurulumda da yok, kayıp-örüntü korumaları geçmedi · 2026-11-20 · HİÇBİR AYAR DEĞİŞMEDİ — mainnet NO-GO teyit
+
+**Soru.** D41 ölçüm zincirini gerçekçi yaptı; bunun üstüne üç soru kaldı: (1) C, görülmemiş bir pencerede ve kesintisiz geçmişte
+(2026-01-23..08-21, 191 gün) de tutuyor mu? Bu dönem yanık standart pencerelerin altısını içerir; C'nin ayarları için bağımsız
+DEĞİLDİR, yalnız D42 koruma hipotezlerinden bağımsızdır. (2) Motordaki başka kurulumlardan (A, B, D, E) kenarı olan var mı? (3) Canlı defterin zarar
+örüntülerinden türetilen korumalar (D42) bağımsız geçmişte işe yarıyor mu? Üçü de bu gün ölçüldü (E20, E21, E22).
+
+**Hüküm.**
+
+| # | Soru | Ölçüm | Sonuç | Kanıt |
+|---|---|---|---|---|
+| 1 | C örneklem dışında | VAL-2026Q4a (2026-09-04..10-15), 231 işlem | PF **0.576**, net −8631 (10 000 taban); %95 GA PF [0.339, 0.981] | E21 |
+| 1 | C kesintisiz geçmiş (örneklem-içi sayılır) | 2026-01-23..08-21, 191 kapsanan gün, 996 işlem | PF **0.85**, net −10296.7; 7 pencerenin 5'i negatif | E22 (taban) |
+| 1 | C canlı defter (TESTNET) | id ≥ 278, 367 işlem, 83 gün | PF **0.43**, net −834.5 (hesap geneli sanal sermaye 1000 → ~169); PF %95 GA [0.267, 0.673] | E21 (Monte Carlo) |
+| 2 | Başka kurulum | A, B, D, E tek başına, 7 standart pencere | PF 0.79 / 0.81 / 0.84 / 0.80 (C 1.00); denge filtresi kapalıyken de negatif | E20 |
+| 3 | Kayıp-örüntü korumaları | K1..K8, P2-v2 | hiçbiri geçmedi (en iyi p 0.143, q 0.349) | E22 |
+
+Harness canlıyla AYNI işareti verir ama iyimserdir (kazanma oranı 9-19 puan, TP1'e ulaşan %66 vs %54; çıkış başına ROI ±1 puan
+içinde tutar): E21. Yani "gerçekçi harness'te +107" sayısı kenar kanıtı DEĞİL; örneklem dışı tüm ölçümler negatif.
+
+**Karar (sonuç).**
+1. **Hiçbir ayar değişmez.** Ne `SCALPER_*` değeri, ne boyutlama, ne giriş/çıkış kuralı, ne D42 koruması (dördü KAPALI kalır).
+   Bu karar hiçbir `.env` değişikliği gerektirmez; D41/D42 kodunun
+   (korumalar KAPALI) testnet'e deploy'u davranışı değiştirmez (kayıt: bu kararın sonundaki 'Deploy'). Sinyal-önce kararı (boyut/TP1/stop ile kayıp küçültme YASAK)
+   aynen geçerli.
+2. **Mainnet NO-GO teyit edildi** (`docs/MAINNET_PLAN.md` §2'nin 3. şartı karşılanmıyor (canlı defterin rejime
+   bölünmüş raporu pozitif ya da başabaş değil: C PF 0.43); ayrıca örneklem dışı PF < 1 iken terfi ettirilecek bir aday yok).
+3. **"Kazanıyor" iddiası yok.** Testnet sonuçları simülasyondur (gerçek para değil); mevcut boyutlamada 90 günde tepeden ≥ %50
+   düşme olasılığı harness havuzundan 0.36-0.65, canlı defter C için 0.86 (bileşik boyutlama;
+   toplamsal modelde 0.39-0.68 ve 0.96; E21).
+4. D42 kodu ölçüm aracı olarak kalır; aynı sekiz adayı aynı pencerelerde ikinci kez koşmak YENİ bilgi vermez. Bu adayların
+   türediği canlı dönem (2026-08-23..11-19) `VAL-2026Q4a` ve `SEAL-2026Q4b` ile kesişir; registry'ye not düşüldü.
+
+**Açık araştırma yönleri** (hepsi HİPOTEZ; her biri kullanılmadan önce walk-forward / P2-v2 ile yargılanır, kanıtsız ayar yok;
+canlı defterdeki işaretler örneklem-içidir ve ~25 kesitin taranmasından gelir):
+1. **Trend-yönlü (with-trend) giriş ailesi.** 4 saatlik rejim tanımıyla trendle aynı yönlü işlemler (UP-LONG + DOWN-SHORT,
+   n=308) PF 1.29, +340; kârın tamamı Ağustos UP-LONG'undan. EMA50/200 farkı tanımıyla trendle aynı yönlü işlemler (n=223) ise
+   −550. İki tanım TERS sonuç veriyor: 'trend yönlü giriş daha iyi' kanıtı sağlam değil, hipotez düzeyinde. TV trend yönlü
+   girişleri (n=78, PF 2.13) fade'lerden iyi görünüyor. Ham sinyal kaynağı henüz tanımlı değil.
+2. **Maker (limit) kâr-al emirleri:** ücretler brüt kârın %31.5'ini yiyor (387 vs 1229 USDT, 464 işlem); 20x'te gidiş-dönüş
+   1.4-2.0 ROI = tipik +8 kazancın %17-25'i. Harness çıkış tarafında maker modeli yok; önce modellenmeli.
+3. **Giriş gecikmesi / kovalama-yok kuralı (maker girişler):** kötü dolumlar (kitap sinyalden > %0.03 kötü, 198 işlem) −525 USDT,
+   ROI −7.6 vs −3.4; emrin dolduğunun gözlenmesi medyan 43 sn (ort. 61 sn, n=321); sinyalden giriş
+   kaydına medyan 60 sn (ort. 79 sn, n=399). Harness-canlı TP1 farkının olası bir bileşeni (E21, ÖLÇÜLMEDİ).
+4. **TradingView kaynağını canlandırmak:** TV kaynağı 2026-09-13'ten beri sessiz (son TV işlemi 2026-09-13 01:36 UTC; 124 TV işlemi,
+   +208.7, hepsi o tarihe kadar). TV-LONG PF 2.09 (n=75) ama TV-SHORT PF 0.45 (n=49); kanıt Ağustos rallisine yaslanıyor.
+   Neden (aynı gün incelendi): sunucuya `/tv-signal` isteği ulaşmıyor (bot erişim günlüğü 2026-11-13..20 ve nginx günlükleri
+   2026-11-06..20: sıfır POST; son 30 günün 945 niyetinin hepsi `source=scan`), bot ve nginx yolu sağlam. RUNBOOK takvimindeki
+   '2026-09-14: 49 alarm expire oluyor → yenile' işi yapılmamış; en olası neden alarmların süresinin dolması (kesin teyit
+   TradingView Alarmlar panelinden; açılmadı). Canlandırma kullanıcı işidir (alarm URL'si secret taşır; LuxAlgo aboneliği
+   takvime göre 2026-11-21'de 'iptal ediliyor'). Kanıt: `logs/audit_20261120/tv_silence/README.txt`; teşhis: RUNBOOK 'TV kaynağı
+   sessizse'.
+5. **Korele aynı-yön maruziyet bütçesi:** SL'in %25'i 15 çok-sembollü aynı-yön kümeden (43 işlem, −529 USDT); en kötü 10 gün
+   69 işlem, −857.5 USDT (toplam net kaybın 3.6 katı). Mevcut günlük %1 limit ve sembol-cooldown bu kümelere kördür.
+6. **Korumalar için gölge mod:** ileri-yönlü (forward) kanıt toplamak için korumanın hangi sinyali engelleyeceğini davranışı
+   değiştirmeden kaydetmek. Mevcut DEĞİL; D27 karşı-olgu defteri yalnız kapı AKTİFKEN reddedilen niyeti ölçer.
+
+**Bilinmeyenler / yapılmayanlar (açıkça):**
+- Harness-canlı TP1 farkının NEDENİ ölçülmedi (gecikme, testnet taban farkı, TV slotları, %87 maker dolum varsayımı: hipotez).
+- Mühürlü `SEAL-2026Q4b` AÇILMADI; yeni bir aday paketi için kullanılabilir durumda.
+- Mainnet'te davranış bilinmiyor; tüm sayılar testnet defteri ve geçmiş veri simülasyonudur.
+- Yedi standart pencere yanık; kline önbelleğindeki delikler yüzünden E22 191/210 günü kapsıyor (delikler aynı gün sonradan
+  dolduruldu; E22 bu 19 günle yeniden koşulmadı).
+- Canlı sistemde bilinen açık sorun (bu kararın konusu değil): orkestratörün `_recovery_ready` bayrağı başlangıç kurtarması `False`
+  dönünce yeniden doğrulanmıyor; süreç 2026-11-17 06:34 UTC'de yeniden başladığından beri `/health` HTTP 503 degraded ve
+  orkestratörün (Telegram sinyal) giriş yolu reddediyor, scalper giriş yolu etkilenmiyor. Neden `logs/bot.log`'da gözlendi:
+  o başlangıçta Binance bağlantı testi başarısız oldu ve `recover_open_positions` "Açık pozisyonlar borsadan sorgulanamadı"
+  yazdı (sunucu saatiyle 07:35-07:36, UTC+1). Kod düzeltmesi yapılmadı (yeniden başlatma bayrağı temizler); deploy sağlık kapısı
+  aynı koşula bağlı. Hata kipi RUNBOOK "Sorun giderme"de belgelidir (D41 ile eklendi).
+- Hiçbir yönün (with-trend, maker TP, TV) kenarı bu ölçümde gösterilmedi; yalnız izlenecek yönler olarak listelendi.
+
+**Geri alma:** değişen davranış yok (yalnız dokümantasyon ve `docs/holdout_registry.json` notları); geri alınacak şey yok.
+Kanıt klasörü yerel ve git'te izlenmez: `logs/audit_20261120/` (README.txt; ham raporlar, betikler, beş sonuç JSON'u).
+
 ### D42 — Strateji C giriş korumaları: bağlam-RSI koruması + ATR% bandı (ölçülebilir hâle getirildi) · 2026-11-20 · KOD VAR, VARSAYILAN KAPALI — canlı davranış DEĞİŞMEDİ
 
 **Soru.** Canlı testnet defterinin (399 strateji-C işlemi, giriş bağlamı kayıtlı, 2026-08-23..2026-11-19) iki zarar
@@ -58,21 +132,30 @@ aynı karar, look-ahead yok, config doğrulaması); varsayılanlarda golden back
 
 **Geri alma.** Dört ayarı `.env`'den sil (ya da kapalı değerlere çek) ve restart; kod değişmez, davranış anında eski.
 
+**Sonuç (2026-11-20, E22): bağımsız geçmişte sınandı, hiçbir aday kabul edilmedi, ayarlar KAPALI KALIR.** Sekiz aday (K1 bağlam-RSI, K2 ATR üst, K3 ATR alt, K4 = K2+K3, K5 `RANGE:LONG` engeli, K6 `DOWN:SHORT` engeli, K7 gün kapısı 0.8, K8 = K1+K2)
+canlı defterin ÖNCESİNDEKİ 2026-01-23..08-21 geçmişinde (191 kapsanan gün, 7 bitişik pencere, gerçekçi model, P2-v2) ölçüldü:
+taban PF 0.85 / net −10296.7 / 996 işlem; en iyi p 0.143 (K5), BH q 0.349'dan 0.742'ye, hepsi 0.10'un üstünde; kazanç ağırlıkla
+W2'den (K1, K2, K4, K5, K8 için W2 kazancı +2981…+5328; K5'te 5328 / 5682; K1 ayrıca W3, W5 ve W7'de kazanıyor; K3 ve K7
+W2'den kazanmıyor), ve ctx-RSI/ATR-üst korumaları iki kârlı pencerede (W1, W6) kazananları kesiyor. Hiçbir adayın neti
+pozitif değil (en iyi PF 0.91). Eski P2 K6'yı kabul ederdi, P2-v2 reddetti. Güç uyarısı: sınav ≥ +5300…+17 500'lük farkları
+yakalayacak güçte değil; "anlamlı değil" "etki yok" demek değildir, ama nokta tahmin de etki göstermez. Kod yerinde kalır
+(ölçüm aracı olarak); bu dört ayar `.env`'e GİRMEZ. Ayrıntı: EXPERIMENTS E22. Yeni hükümde bağlam: D43.
+
 ### D41 — Değerlendirme harness'i gerçekçilik paketi: boşluk/kayma, maker dolumu, fonlama, likidasyon, günlük kesici, P2-v2 kabul kuralı, walk-forward, saklı pencere kaydı · 2026-11-20 · KOD VAR (dal `audit/eval-harness-fixes`) — canlı davranış DEĞİŞMEDİ
 
 **Talep:** "backtest sayılarına güvenebilir miyiz" sorusu için 10 boyutlu (maliyet modeli, look-ahead, walk-forward/OOS,
 parametre taraması, Monte Carlo, parite, metrik, çıkış mantığı, canlı risk, sinyal mantığı) düşmanca doğrulamalı bir
 denetim koşuldu: **63 bulgu → 46 ayakta, 16 olası, 1 çürütülen** (`montecarlo-6`). Ayakta kalan 46'nın 31'i "iyimser", 3'ü
 "kötümser", 4'ü nötr, 8'i yönü bilinmeyen; 6'sı yüksek önem (`cost-model-1`, `lookahead-1`, `metrics-1`,
-`walkforward-oos-1/2`, `param-sweep-2`). Bu paket (E16'da ölçüldü) **yalnız
+`walkforward-oos-1/2`, `param-sweep-2`). Bu paket (E19'da ölçüldü) **yalnız
 ölçüm aracını** düzeltir: harness ve onu çağıran betikler. Strateji parametresi, giriş/çıkış kuralı ve canlı süreç
 DEĞİŞMEDİ (CLAUDE.md yasak #1 ve "sinyal önce" kararı geçerli).
 
 **DÜRÜST ÇERÇEVE (önce bunu oku):** bu paket PF'yi YÜKSELTMEZ; tersine, eski sayıları ucuz gösteren iyimserliği alır.
 Aynı 7 pencerede C'nin sonucu **1124 işlem / +2679.50 net → 751 işlem / +107.10 net** (havuz PF 1.04 → 1.00) oldu; 7
-pencerenin 4'ünde PF < 1 (E16). Yani bugüne dek defterdeki mutlak sayılar ÜST SINIRDI; göreli karşılaştırma için hâlâ
+pencerenin 4'ünde PF < 1 (E19). Yani bugüne dek defterdeki mutlak sayılar ÜST SINIRDI; göreli karşılaştırma için hâlâ
 kullanılırlar ama eski sayıyla yeni sayı yan yana okunmaz. Bu yeni sayılar da OOS değildir (7 pencerenin tamamı yanık).
-Canlı defter (TESTNET, simülasyon parası) bu sonucu destekler: 670 skalper işlemi, PnL −228.56, PF 0.92 (E16).
+Canlı defter (TESTNET, simülasyon parası) bu sonucu destekler: 670 skalper işlemi, PnL −228.56, PF 0.92 (E19).
 
 **Ne** (her madde: ne yapar · hangi bulguyu kapatır):
 
@@ -152,7 +235,7 @@ Canlı defter (TESTNET, simülasyon parası) bu sonucu destekler: 670 skalper i�
   mumda TP2, takvim 58→55 gün, fonlama önbelleğinin walk-forward alt dizininde yüklenmemesi) AYNI paketle düzeltildi.
 
 **Resmi sayılara etkisi** (C-only, 8 majör, sunucu env'i; eski = ana dal harness'i, yeni = bu dal varsayılan; tam tablo ve
-LONG/SHORT E16'da):
+LONG/SHORT E19'da):
 
 | Pencere | Eski işlem / PF / net | Yeni işlem / PF / net | Δ net |
 |---|---|---|---|
@@ -187,7 +270,7 @@ etkilenmediği için restart/deploy GEREKMEZ.
 - Kayma DÜZ %0.02; oynaklık/likiditeyle ölçeklenmez.
 - Likidasyon kademe-1 yaklaşımı: tüm notional için tek mmr, likidasyon ücreti yok. Şu 7 pencerede likidasyon sayısı 0.
 - **Sermaye tabanı:** harness 10 000 ile boyutlar, canlı sanal sermaye 1000 (`scalper_virtual_capital_usdt`). Günlük kesici
-  yüzde olarak aynıdır ama dolar eşiği −100 (canlıda −10). Kesici bu paketin EN BÜYÜK tek etkisidir (E16): mutlak
+  yüzde olarak aynıdır ama dolar eşiği −100 (canlıda −10). Kesici bu paketin EN BÜYÜK tek etkisidir (E19): mutlak
   değerler canlıyla birebir okunmamalı.
 - Maker modeli: harness limiti sinyal-mumu kapanışı, canlı birkaç sn–60 sn sonraki bid/ask; harness %100 dolar (canlı
   kısmi dolar, kalanı iptal), gecikme yok; chandelier izi dolum mumunun tamamını görür. %0.01 trade-through yalnız

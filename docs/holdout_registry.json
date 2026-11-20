@@ -118,15 +118,21 @@
     "start": "2026-09-04",
     "end": "2026-10-15",
     "status": "validation",
-    "note": "Doğrulama: walk-forward örneklem-dışı katlara izin verilir (parametre seçimi bu pencerede YAPILMAZ). 'end' kapsayıcıdır.",
-    "opens": []
+    "note": "Doğrulama: walk-forward örneklem-dışı katlara izin verilir (parametre seçimi bu pencerede YAPILMAZ). 'end' kapsayıcıdır. Not (2026-11-20): D42 koruma hipotezleri canlı defterin 2026-08-23..2026-11-19 işlemlerinden türetildi; bu pencere o dönemin içinde kaldığı için bu hipotezler için bağımsız kanıt SAYILMAZ.",
+    "opens": [
+      {
+        "at": "2026-11-20T03:02:33Z",
+        "by": "E21",
+        "purpose": "taban C ölçümü ve canlı parite karşılaştırması, aday seçilmedi (docs/EXPERIMENTS.md E21)"
+      }
+    ]
   },
   {
     "name": "SEAL-2026Q4b",
     "start": "2026-10-16",
     "end": "2026-11-19",
     "status": "sealed",
-    "note": "Final sınavı: aday paketi başına BİR kez açılır, yalnız VETO eder (terfi ettirmez). Açılış --open-sealed \"<amaç>\" ile yapılır ve opens'a yazılır.",
+    "note": "Final sınavı: aday paketi başına BİR kez açılır, yalnız VETO eder (terfi ettirmez). Açılış --open-sealed \"<amaç>\" ile yapılır ve opens'a yazılır. Not (2026-11-20): D42 koruma hipotezleri canlı defterin 2026-08-23..2026-11-19 işlemlerinden türetildi; bu pencere o dönemin içinde kaldığı için bu hipotezler için bağımsız kanıt SAYILMAZ (mühür yine de açılmadı).",
     "opens": []
   }
 ]

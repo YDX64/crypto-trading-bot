@@ -1,9 +1,9 @@
 # Deney defteri — backtest ve ölçüm kayıtları
 
-**20 Kas 2026 — E16 harness gerçekçiliği:** denetimin 46 ayakta bulgusuna göre harness'e boşluk/kayma, maker
+**20 Kas 2026 — E19 harness gerçekçiliği:** denetimin 46 ayakta bulgusuna göre harness'e boşluk/kayma, maker
 trade-through, fonlama, likidasyon ve günlük kesici eklendi (D41; hepsi varsayılan AÇIK). Aynı strateji, aynı 7
 pencere: **1124 işlem / +2679.50 → 751 işlem / +107.10**, havuz PF 1.04 → 1.00; en büyük katkı `daily_latch` ve
-`maker_trade_through`. Eski sayılar `--legacy-model` ile birebir üretilir. [Tablo ve özellik katkıları](#e16--harness-gerçeklik-paketi-7-pencerede-eski--yeni-model-2026-11-20-d41).
+`maker_trade_through`. Eski sayılar `--legacy-model` ile birebir üretilir. [Tablo ve özellik katkıları](#e19--harness-gerçekçilik-paketi-7-pencerede-eski--yeni-model-2026-11-20-d41).
 Bu defterdeki E2…E13 sayıları ESKİ modelin sayılarıdır ve mutlak değer olarak yeni modelle karşılaştırılmaz.
 
 **7 Eyl 2026 — E15 miktar ölçeği:** kullanıcı talebiyle %0.5→%10 TESTNET
@@ -1615,9 +1615,12 @@ değişmedi: C'nin 2026 Mar–Ağu penceresinde kalıcı kenarı yok; giriş fil
 
 > *Not (2026-11-20, D41): bu paragraftaki "dokunulmamış" etiketi yanlıştı — Mart, Çöküş, Mayıs, Haziran `docs/holdout_registry.json`'da YANMIŞ pencerelerdir (E11-E13 seçim kümesi).*
 
-## E16 — Harness gerçekçilik paketi: 7 pencerede eski / yeni model (2026-11-20, D41)
+## E19 — Harness gerçekçilik paketi: 7 pencerede eski / yeni model (2026-11-20, D41)
 
-*(D41 paketi bu deneyi "E15" diye anıyordu; E15 numarası dosya başındaki 7 Eyl miktar-ölçeği notunda zaten kullanılıyor, bu yüzden E16.)*
+*(Numara notu: D41 paketi bu deneyi önce "E15", sonra "E16" diye anıyordu. E15 dosya başındaki 7 Eyl miktar-ölçeği notunda
+kullanılıyor; E16 ve E17, 2026-10-10/11'de main'e giren iki ön-kayıtlı deneye verilmişti (bu dal o iki commit'ten ÖNCEKİ
+main'den ayrıldığı için görülmedi); E18 ise E17'nin kilitli planında "yeni fikir = E18, yeni veri" diye ayrılmış. Bu yüzden
+bu günün dört kaydı E19-E22 oldu.)*
 
 **Soru.** Denetimin (63 bulgu, 46 ayakta; D41) bulduğu iyimserlik giderilince C'nin bilinen yedi penceredeki sonucu ne
 kadar, hangi özellik yüzünden değişiyor? Bu bir strateji deneyi DEĞİL; aynı strateji, aynı ayarlar, yalnız ölçüm modeli.
@@ -1635,8 +1638,8 @@ env <sunucu env'inin 55 SCALPER_* satırı> BINANCE_API_KEY=… (sahte zorunlu d
 
 Pencereler: AYI 2026-01-23→02-13 · MART 03-01→04-01 · MAYIS 05-04→05-25 · HAZİRAN 06-08→06-29 · YATAY 07-01→07-21 ·
 BOĞA 08-07→08-21 · ÇÖKÜŞ 08-21→09-03. Marj işlem başına sabit ~1000 USDT (PnL bu tabanda; harness sermayesi 10 000).
-Ortam kaynağı: `…/scratchpad/live/server_env_nonsecret.txt` (sunucu `.env`'inin gizli olmayan `SCALPER_*` satırları, tarih
-bu oturumdan doğrulanamadı); tam tarif `…/scratchpad/baseline_pre/RECIPE.txt`.
+Ortam kaynağı: sunucu `.env`'inin gizli olmayan 55 `SCALPER_*` satırı (tarih bu oturumdan doğrulanamadı; satırların kopyası
+kalıcı klasöre KONMADI — sunucu env dosyası kalıcı kanıta girmez); tam tarif `logs/audit_20261120/baseline_pre/RECIPE.txt`.
 **Doğrulama:** `--legacy-model` ile aynı yedi pencere ESKİ sayıları işlem işlem özdeş verdi (D41).
 
 | Pencere | Eski: işlem / WR / PF / net / DD | Yeni: işlem / WR / PF / net / DD | Δ net | Yeni DD % (10 000) |
@@ -1711,8 +1714,234 @@ gerçekleşen PnL'i 0.0 olan `CLOSED` satırlar işlem sayılıyor (araştırıl
 için 79 günün rejimi `?` (rejim/DOWN-günü maddeleri ölçülmedi). Harness yön ayrımıyla defter yönleri aynı işareti
 vermiyor (harness: LONG −2201 / SHORT +2308; defter: LONG +252 / SHORT −480); farklı dönem ve ölçek, sebep araştırılmadı.
 
-**Rapor yolları** (oturum scratchpad'i; kalıcı değildir — saklanacaksa kopyala):
-`/private/tmp/claude-501/-Users-max--claude-spares-spare-P1tX49/d71025dd-013a-45ad-8c24-0b51f485282a/scratchpad/`
-`baseline_pre/<PENCERE>.json|.txt` (eski) · `baseline_post/<PENCERE>.json|.txt` + `timings.txt` (yeni) ·
-`legacy_eq/` (`--legacy-model` doğrulaması) · `attrib/<PENCERE>_<özellik>.json` (tek-özellik-kapat) ·
-`live/ledger_report_full.md` (defter). Çalıştırıcı: `run_cand.sh`.
+**Rapor yolları** (yerel ve kalıcı klasör `logs/audit_20261120/`; `logs/` git'te izlenmez, yani yalnız bu makinede durur):
+`logs/audit_20261120/baseline_pre/<PENCERE>.json|.txt` (eski) · `logs/audit_20261120/baseline_post/<PENCERE>.json|.txt` +
+`timings.txt` (yeni) · `logs/audit_20261120/ledger_report_full.md` (defter). Çalıştırıcı: `logs/audit_20261120/run_bt.sh`.
+`legacy_eq/` (`--legacy-model` doğrulaması) ve `attrib/` (tek-özellik-kapat koşuları) sonradan kopyalandı:
+`logs/audit_20261120/legacy_eq/` ve `logs/audit_20261120/attrib/`.
+
+## E20 — Kurulum sayımı: A, B, C, D, E tek başına, 7 standart pencere, gerçekçi model (2026-11-20)
+
+**Soru.** (a) Motorda tanımlı beş giriş kurulumundan (A-E) C dışında kenarı olan var mı? (b) Denetimin "A'nın kötü sicili
+denge (equilibrium) filtresinin yan etkisi" şüphesi doğru mu? (c) Büyük BTC günlerinde (|günlük hareket| ≥ %3) hangi
+kurulum kazanıyor? Bu bir strateji AYARI deneyi değil: kurulum başına hiçbir parametre oynatılmadı, yalnız
+`SCALPER_USE_EQUILIBRIUM_FILTER` açık / kapalı denendi.
+
+**Kurulumlar** (kodda okunan tanım): **A** = 5m Donchian(20) kırılımı + hacim > 1.5× ort., yalnız 4s rejim UP (LONG) / DOWN
+(SHORT), stop son salınım · **B** = trend içi geri çekilme ucu (5m RSI < 35 / > 65 + BB teması + salınım + dönüş mumu + 15m
+RSI bağlamı) · **C** = trendsiz ters yön fade (RSI ucu + BB taşması + RSI diverjansı, stop 40 mum ucu) · **D** = smart-money
+(EQH/EQL süpürmesi + CHoCH/FVG/OB + MFI/CMF akış dönüşü, rejime karşı yok) · **E** = S/R seviyesi (≥ 2 dokunuş, 0.75 ATR içi) +
+StochRSI K/D kesişimi + MACD hist toparlanması, yapısal stop.
+
+**Kurulum.** D41 harness'i (gerçekçi model, dokuz anahtarın hepsi açık), sunucu env'i (55 `SCALPER_*` satırı; kopyası kalıcı
+klasörde YOK), ağ kapalı, E19 ile AYNI yedi pencere ve sekiz sembol. Her kurulum için bir koşu:
+
+```bash
+# logs/audit_20261120/eval_out/census/census.sh  (pencere başına: run_bt.sh <kod> <çıktı> <ad> --strategies X --start S --end E)
+census.sh X X                                             # kurulum X, denge filtresi AÇIK (sunucu varsayılanı)
+census.sh X_eqoff X SCALPER_USE_EQUILIBRIUM_FILTER=false  # denge filtresi KAPALI
+```
+
+Pencereler: AYI 01-23→02-13 · MART 03-01→04-01 · MAYIS 05-04→05-25 · HAZİRAN 06-08→06-29 · YATAY 07-01→07-21 · BOĞA
+08-07→08-21 · ÇÖKÜŞ 08-21→09-03 (hepsi YANIK, `docs/holdout_registry.json`; bu yüzden hiçbir sonuç OOS kanıtı değil).
+Referans doğrulaması: C koşusu E19 sayısını 2 hane aynen üretti (751 işlem, +107.10, yedi pencere de özdeş).
+Raporlar: `logs/audit_20261120/eval_out/census/raw/<KOŞU>/<PENCERE>.json|.txt`; analiz `logs/audit_20261120/eval_out/census/analyze.py`;
+özet `logs/audit_20261120/measure_result.json` (`census`).
+
+| Koşu | Denge filtresi | İşlem | WR % | PF | Net | LONG net | SHORT net | Büyük gün net (işlem) | Normal gün net* |
+|---|---|---|---|---|---|---|---|---|---|
+| **C** (referans) | açık | 751 | 75.2 | 1.00 | +107.1 | −2201.1 | +2308.2 | −1085.5 (119) | +1192.6 |
+| A | açık | 736 | 71.9 | 0.79 | −11045.1 | −4616.9 | −6428.1 | +1077.6 (102) | −12122.7 |
+| B | açık | 459 | 68.2 | 0.81 | −6148.3 | −6189.1 | +40.8 | −2089.1 (67) | −4059.2 |
+| D | açık | 1266 | 71.7 | 0.84 | −14179.5 | −15092.1 | +912.7 | −2956.9 (179) | −11222.6 |
+| E | açık | 1591 | 70.1 | 0.80 | −24235.1 | −16102.8 | −8132.3 | +5298.5 (268) | −29533.6 |
+| A | KAPALI | 1775 | 73.6 | 0.81 | −26120.0 | −22339.1 | −3781.0 | +6744.2 (413) | −32864.2 |
+| B | KAPALI | 469 | 68.7 | 0.84 | −5373.6 | −5982.4 | +608.8 | −1947.3 (68) | −3426.3 |
+| D | KAPALI | 1442 | 71.1 | 0.83 | −17776.7 | −13813.2 | −3963.5 | +2705.8 (205) | −20482.5 |
+| E | KAPALI | 1703 | 70.3 | 0.76 | −31916.2 | −15083.3 | −16832.9 | +9645.5 (299) | −41561.7 |
+| C | KAPALI | 763 | 75.5 | 1.01 | +569.6 | −1901.2 | +2470.8 | −962.3 (121) | +1531.9 |
+
+\* Normal gün neti = toplam net − büyük gün neti (tablodan hesaplandı). PF ve WR havuzlanmış işlem listelerinden. Marj işlem
+başına sabit ~1000 USDT, taban 10 000 (E19 ile aynı ölçek). Kurulum başına işlem/gün: C 5.33, A 5.22, B 3.26, D 8.98, E 11.28.
+Havuz maks. DD (yedi pencere zincirli, 10 000 tabanının yüzdesi): C 69.8 · A 151.1 · B 87.3 · D 168.3 · E 271.1.
+
+Pencere başına net (denge filtresi açık): C AYI +2808 / MART −2371 / MAYIS −2641 / HAZ −135 / YATAY +2804 / BOĞA −857 / ÇÖKÜŞ +499 ·
+A +2297 / −4736 / −3767 / −1516 / +583 / −399 / −3506 · B −358 / −1599 / −4484 / −839 / +1848 / −536 / −181 · D −5671 / −769 /
+−3134 / −2989 / −724 / −1635 / +742 · E −4974 / −5110 / −7963 / −3860 / −2666 / +1961 / −1623.
+
+**Okuma.**
+1. **Hiçbir kurulumun tek başına kenarı yok.** A 0.79, B 0.81, D 0.84, E 0.80 PF; C 1.00 (sıfır kenar). PF ≥ 1.05 eşiğine
+   hiçbiri varmadı, bu yüzden "C + X birleşik defter" koşuları YAPILMADI (kapı tetiklenmedi).
+2. **A'nın kötü sicili denge filtresinin yan etkisi DEĞİL.** Önceki şüphe ("A PF 0.35 filtre artefaktı"; A PF 0.35: DECISIONS D1) bu ölçümde
+   desteklenmedi: filtre açıkken A 736 işlem (sıfıra yakın değil) PF 0.79; kapalıyken 1775 işlem PF 0.81, net −26120. Filtre
+   yalnız hacmi değiştiriyor (−%58), işareti değil. B/D/E de filtre kapalıyken kaybediyor (PF 0.84 / 0.83 / 0.76). Filtre C'yi de
+   etkiliyor ama kapalıyken fark küçük (763 işlem, PF 1.01, +570).
+3. **LONG her kurulumda kaybediyor.** On koşunun hepsinde LONG negatif (PF 0.63-0.92); SHORT yalnız C, B ve D'de (zar zor)
+   pozitif (denge filtresi açık koşularda; D filtre kapalıyken SHORT −3963.5), A ve E iki yönde de kaybediyor. İki yönde birden kazanan kurulum yok.
+4. **Kayıp yapısı kurulumdan bağımsız:** TRAIL kazançları (+26k…+93k; filtre açık beş koşu, filtre kapalı koşularda +108k'ya
+   kadar) REAPER (8 sa) ve SL tarafından yeniyor
+   (örn. E: REAPER −54.9k, SL −62.2k). Daha çok işlem (E 11.3/gün, D 9.0/gün; C 5.3/gün) yalnız kaybı büyütüyor.
+5. **Büyük BTC günleri (|günlük hareket| ≥ %3, C'nin 119/751 işlemi):** C burada KAYBEDİYOR (−1085.5, PF 0.88; LONG −902 / 70
+   işlem). Kırılım/momentum tipi kurulumlar büyük günde kazanıyor: E +5298 (PF 1.34, SHORT +4565), A_eqoff +6744 (SHORT +9799),
+   E_eqoff +9646 (PF 1.61). Ama hepsi normal günlerde bundan çok daha fazla kaybediyor (E −29.5k, A_eqoff −32.9k): büyük gün
+   kârı tek başına bir defter yapmaz. Günlük PnL korelasyonu C ile: A 0.06, B 0.29, D 0.24, E 0.27 (D-E 0.64); düşük ama ortak
+   defterin değeri ölçülmedi (kapı geçilmedi).
+6. **Sınırlar:** 7 pencerenin tamamı yanık; büyük gün sayısı az (tek örneklem). Büyük gün yönü (BTC yukarı/aşağı) ayrı
+   tablolanmadı. Büyük gün bölünmesi BTCUSDT 1d önbelleği (|kapanış/açılış−1| ≥ %3), giriş zamanının UTC günü ile; eksik gün yok.
+   "Büyük günde yalnız SHORT E/A dilimi" fikri tek örneklemde post-hoc bir kesittir; kullanılmadan önce OOS doğrulanmalı.
+   Hiçbir parametre ayarlanmadı; B, D, E ve C-denge-kapalı koşuları görev dışı ekti.
+
+## E21 — Doğrulama penceresi VAL-2026Q4a: C, canlı defterle karşılaştırma, Monte Carlo (2026-11-20)
+
+**Soru.** Gerçekçi harness'in 7 yanık pencerede verdiği +107 / PF 1.00, hiç görülmemiş bir pencerede tutuyor mu? Harness canlı
+defterle aynı tarihlerde aynı işareti ve büyüklüğü veriyor mu? Mevcut boyutlamada drawdown olasılıkları ne?
+
+**Kurulum.** Pencere `VAL-2026Q4a` = 2026-09-04..10-15 (koşu `[09-04, 10-16)`), YALNIZ C, gerçekçi model, sunucu env'i, ağ
+kapalı. Bu pencere için kline önbelleği yoktu; `scripts/walk_forward.ensure_cache` ile 10-16 00:00'da biten tam aralık
+dosyaları türetildi (mühürlü `SEAL-2026Q4b` verisine DOKUNULMADI; betik `logs/audit_20261120/eval_out/val/mkcache.py`). Pencere
+kayıtta "validation" (parametre seçimi yok); bu açılış `docs/holdout_registry.json` `VAL-2026Q4a.opens`'a E21 olarak yazıldı
+(amaç: taban C ölçümü ve canlı parite; aday seçilmedi). Koşu 85 sn, `rc=0`.
+
+```bash
+# run_bt.sh <kod> <çıktı> VALQ4a --strategies C --start 2026-09-04 --end 2026-10-16   (EXTRA_ENV boş; sunucu env'i)
+```
+
+Rapor: `logs/audit_20261120/eval_out/val/VALQ4a.json|.txt`; analiz `…/val/analyze.py`; Monte Carlo `…/val/mc.py`, `mc2.py`,
+çıktılar `mc_out.txt`, `mc2_out.txt`; özet `logs/audit_20261120/measure_result.json` (`val`).
+
+**Sonuç (harness, geçmiş piyasa verisi üzerinde SİMÜLASYON; gerçek para değil):**
+
+| Ölçü | Değer |
+|---|---|
+| İşlem / WR / PF / net (10 000 taban) | 231 / %67.1 / **0.576** / **−8631** |
+| ROI ortalama / medyan | −3.74 / +5.24 |
+| Maks. DD (kapanış bazlı) | 9623 = %96.2 (bar bazlı 9685); en uzun kayıp serisi 9 |
+| LONG | 81 işlem, WR %67.9, PF 0.587, net −3162 |
+| SHORT | 150 işlem, WR %66.7, PF 0.570, net −5469 |
+| Çıkışlar | TRAIL 153 (+11692, %100 kazanç) · SL 27 (−13995) · REAPER 51 (−6329, %4 kazanç) |
+| Maker dolum / fonlama / likidasyon | 343/393 = %87.3 (50 zaman aşımı) · −28.4 (101 uğrama) · 0 |
+| Elenen sinyal | rejim 875 · hafta içi 208 · günlük kesici 110 · market_gate_day 68 · maker kaçırma 50 · kapasite 2 |
+| Rejim PF | DOWN 63 işlem 0.54 · RANGE 129 işlem 0.54 · UP 39 işlem 0.77 |
+| Haftalık net (09-04'ten) | +186 · −1520 · +1665 · −1265 · −1945 · −5752 |
+
+**Canlı defterle aynı tarihler** (canlı C, açılış 09-04..10-15, id 337-528, hepsi CLOSED; TESTNET simülasyon parası. USDT
+rakamları harness ile aynı ölçekte DEĞİL — canlı marj sanal sermayenin ~%10'u (medyan %9.9-10.0, n=367) ama sanal sermaye 1000'den ~169'a düştü; taban 10 000 değil — bu yüzden ROI ve oranlar karşılaştırılır):
+
+| Ölçü | Canlı | Harness |
+|---|---|---|
+| İşlem (gün başı) | 174 (4.14) | 231 (5.50); canlı sayı harness'inkinin %75'i |
+| Kazanma oranı (pnl > 0) | %53.4 | %67.1 |
+| ROI ort. / medyan (marj üzerinden) | −7.02 / +3.02 | −3.74 / +5.24 |
+| PF | 0.411 (net −613 USDT) | 0.576 |
+| TRAIL(+TRAIL_MARKET) / SL / REAPER payı | %54.0 / %13.8 / %31.0 (+2 BE_MARKET) | %66.2 / %11.7 / %22.1 |
+| TP1'e ulaşan | %54.0 | %66.2 |
+| Çıkış başına ort. ROI: TRAIL / SL / REAPER | +7.86 / −51.65 / −13.33 | +7.64 / −51.83 / −12.41 |
+
+**Okuma.**
+1. **Örneklem dışında C açıkça negatif:** PF 0.576 (bootstrap %95 GA [0.339, 0.981]; işlem başına beklenti GA [−82.8, −1.1], tamamen
+   sıfırın altında). 7 yanık pencerede +107 / PF 1.00 olan taban, görülmemiş pencerede tutmadı. Kayıp ağırlıkla son iki haftada
+   (Ekim; −7697 / −8631). Tek bir rejim parçası (Eylül-Ekim) olduğu için "C hep böyle" demek de yanlış; "kenar kanıtlanamadı" doğrudur.
+2. **Harness canlıyla AYNI işareti veriyor ama hâlâ iyimser:** kazanma oranında 9-19 puan (tüm pencere 67.1 vs 53.4 = 13.7; 09-24'e
+   kadar girişlerde 75.2 vs 65.9 = 9.3; 09-25'ten sonra 58.2 vs 39.8 = 18.4). ROI ortalamasında fark tüm pencerede 3.3, 09-24'e kadar
+   1.2, sonrasında 5.5 puan. İkisi de aynı dönemde çöküyor (piyasa evresi, yalnız harness etkisi değil).
+3. **Boşluk aritmetik olarak çıkış karışımından geliyor (karışımın NEDENİ ölçülmedi); çıkış fiyatı modeli değil:** çıkış başına ROI'ler canlı ile harness arasında yaklaşık bir
+   puan içinde tutuyor; canlı çıkış karışımı harness'in çıkış başına ROI'lerine uygulanınca ortalama ≈ −6.9, canlı −7.02. Fark,
+   TP1'e ulaşan işlem payında (%66 vs %54) ve TP2'de (%7.8 vs %5.2). Neden TP1'e daha az ulaşıldığı ÖLÇÜLMEDİ; adaylar
+   (hipotez): sinyalden dolguya ~1 dk gecikme (canlı: sinyalden giriş kaydına medyan 59 sn), testnet fiyat tabanı farkı, TV işlemlerinin kapasite
+   slotları, harness'in %87 maker dolumu. Ayrıca canlıda 7 TRAIL çıkışı pnl ≤ 0 (harness'te 153/153 pozitif) ve TRAIL_MARKET /
+   BE_MARKET çıkışları harness'te karşılığı olmayan yollar.
+4. **Giriş örtüşmesi:** canlı 174 işlemin 125'inin (%72) 15 dk içinde aynı sembol-yönde harness girişi var; harness'in 231'inin
+   yalnız 125'inin (%54) canlı karşılığı var. Canlı girişler hep maker; dolum ort. 59 sn (medyan 43; `fill_observed_latency_sec`, n=157; sinyalden giriş kaydına medyan 59 sn, ort. 76 sn, n=174) sonra, giriş kayması ort.
+   %0.043; hepsinde `risk_multiplier` 0.5 (kayıtlı marj/sermaye oranı yine ~%10).
+
+**Monte Carlo** (`src/strategies/scalper/montecarlo.py`, UTC gün-blok bootstrap, blok 3 gün, tohum 12345, 20 000 yol; 8 pencere
+boşlukları kaldırılarak ardışık sentetik takvime dizildi: 183 gün, 982 işlem; betik `…/val/mc.py`, kütüphanenin `simulate_path`'iyle
+eşitliği kontrol edildi). Sermaye 10 000 (canlı defter için 1000):
+
+| Küme | İşlem / gün | PF (%95 GA) | Beklenti / işlem (GA) | Net p5 / p50 / p95 (bileşik) | Batma olasılığı (≤ %50) |
+|---|---|---|---|---|---|
+| 7 yanık pencere | 751 / 141 | 1.002 [0.768, 1.328] | +0.14 [−17.4, +16.4] | −6971 / −995 / +16184 | 0.32 (bileşik), 0.40 (toplamsal) |
+| 7 pencere + VAL | 982 / 183 | 0.873 [0.680, 1.130] | −8.68 [−26.1, +7.3] | −9100 / −6359 / +4025 | 0.78 (bileşik), 0.82 (toplamsal) |
+| Yalnız VAL | 231 / 42 | 0.576 [0.339, 0.981] | [−82.8, −1.1] | – | 0.71 (bileşik), 0.83 (toplamsal) |
+| Canlı C, id ≥ 278 (367 işlem, 83 gün, başlangıç 1000) | 367 / 83 | 0.433 [0.267, 0.673] | −2.27 [−3.78, −0.99] | −722 / −571 / −368 | 0.76 (bileşik), 0.93 (toplamsal) |
+
+**Mevcut boyutlamada drawdown** (marj %10, stop −%5 sermaye, sermayeyle orantılı = bileşik; 90 takvim günü ≈ 480 işlem, 20 000 yol,
+3 günlük bloklar, havuz = harness işlemleri): tepeden ≥ %30 düşüş olasılığı **0.86** (7 pencere, 751 işlem), **0.95** (7 pencere +
+VAL, 982 işlem), canlı defter C için 0.996; tepeden ≥ %50: **0.36 / 0.65 / 0.859**. Başlangıç sermayesinden ölçülünce ≥ %30: 0.98 / 0.99,
+≥ %50: 0.70 / 0.83. 90 günün medyan sonu (10 000 üzerinde): −561 (7 pencere) / −3869 (VAL ile). Toplamsal (sabit 1000 marj): tepeden ≥ %30
+0.75 / 0.91, ≥ %50 0.39 / 0.68. Günlük kayıp ihlali: tek bir SL (−%5.2) tek başına %5 çizgisini aştığı için "en az bir ihlal günü"
+olasılığı ≈ 1.0 (canlı defter yollarında 0.9986-0.9998); anlamlı ölçü ihlal günü payı: günlük ≤ −%1 günlerin payı ≈ %43, ≤ −%5 günlerin payı ≈ %18 (183 günlük
+yollarda; işlemler harness'in %1 kesicisini zaten içeriyor).
+
+**Sınırlar.** (a) VAL tek bir rejim parçası (Eylül-Ekim); son iki hafta kaybın büyük bölümünü taşıyor. (b) Pencere havuzu 8 pencere;
+Monte Carlo blokları bağımsız ve havuzu durağan varsayar, havuzda olmayan rejimi (uzun trend) üretemez. (c) Yedi standart pencere
+yanık, VAL ilk doğrulama kullanımı; havuzlu küme yanık + doğrulamayı karıştırır. (d) `max_drawdown` kapanış bazlı ve 10 000 tabanının
+yüzdesi; toplamsal modelde DD > %100 çıkabilir (hata değil, özsermaye negatife iner); risk cümlelerinde tepeden-çukura rakamlar
+kullanıldı. (e) Canlı defter MC'si gerçekleşen USDT PnL'ini 1000 sanal sermayeye oranlar; canlı marj sanal sermayenin ~%10'udur (harness ile
+aynı oran), fark taban sermayeden gelir.
+(f) Bu pencere D42 hipotezlerinin türetildiği canlı dönemle (2026-08-23..11-19) KESİŞİR; bu yüzden VAL, D42 korumaları için bağımsız
+kanıt sayılmaz (registry notu).
+
+## E22 — D42 koruma adayları K1..K8: bağımsız geçmişte P2-v2 sınavı (2026-11-20)
+
+**Soru.** Canlı defterin (2026-08-23..11-19) zarar kümelerinden türetilen sekiz giriş koruması, ondan ÖNCEKİ bağımsız geçmişte
+(2026-01-23..08-21) C'nin sonucunu kanıtla iyileştiriyor mu? Kabul kuralı P2-v2 (D41): örneklem ≥ 60 işlem/pencere, eşleşmiş gün-blok
+bootstrap + BH q ≤ 0.10, pencere zararı ≤ 0.20×scale_w, DD ≤ 1.2× taban, maliyet 2× ve 1 mum gecikme stresi. Adaylar önceden
+beyan edildi: K1 bağlam-RSI (SHORT < 60, LONG > 40), K2 ATR% ≤ 0.12, K3 ATR% ≥ 0.05, K4 = K2+K3, K5 `RANGE:LONG` engeli,
+K6 `DOWN:SHORT` engeli, K7 `SCALPER_MARKET_GATE_DAY_PCT=0.8`, K8 = K1+K2.
+
+**Kurulum.** D42 kod kopyası (korumalar kodda, varsayılan kapalı), gerçekçi model, sunucu env'i + adayın tek-iki ayarı, ağ kapalı,
+YALNIZ C. Yedi bitişik pencere (P2-v2 için `WINDOWS` yamalandı, sabitler aynı: MIN_TRADES 60, q ≤ 0.10, blok 3 gün, 5000 yol, tohum
+12345): W1 01-23→02-22 · W2 02-22→03-24 · W3 03-24→04-23 · W4 04-23→05-23 · W5 05-23→06-22 · W6 06-22→07-22 · W7 07-22→08-21.
+**Veri boşluğu sapması:** kline önbelleğinde delikler var (1m: 05-01..05-03, 05-25..06-07, 06-29..06-30; E22 koşulurken önbellekte yoktu, ağ kapalı koşu; sonradan dolduruldu, E22 yeniden koşulmadı),
+bu yüzden W4, W5, W6 boşluksuz alt parçalar olarak koşulup pencere başına toplandı (W4a 04-23..05-01 + W4b 05-04..05-23 = 27 gün;
+W5a 05-23..05-25 + W5b 06-08..06-22 = 16 gün; W6a 06-22..06-29 + W6b 07-01..07-22 = 28 gün); W1, W2, W3, W7 tam 30 gün. Kapsanan
+toplam **191 / 210 gün**. Eski P2 ayrıca AYI/YATAY/BOĞA üzerinde 27 ek koşuyla yan yana basıldı. Toplam 117 koşu (taban + 8 aday × 13
+parça), hepsi `rc=0`; her raporda ayar yankısı niyetlenen değerlerle doğrulandı, eşleşmeyen yok.
+
+Raporlar, betikler, kayıtlar: `logs/audit_20261120/eval_out/guards/` (`BASE_*`, `K1_*`…`K8_*` `.json|.txt`, `analyze.py`, `report.py`,
+`jobs.sh`, `drive.py`, `mkcache*.py`, `segments.json`, `configs.json`, `s1.json`, `timings.txt`); özet ve bağımsız yeniden hesap
+`logs/audit_20261120/guards_result.json` (`res`, `check`).
+
+**Taban (BASE, 191 kapsanan gün, 7 pencere):** 996 işlem (5.21/gün), WR %73.2, **PF 0.85, net −10296.7** (LONG −7573.1, SHORT −2723.6);
+çıkışlar TRAIL 720 · REAPER 197 · SL 75 · EOD 4. Pencere başına net (işlem, PF): W1 +3856.6 (132, 1.61) · W2 −6285.0 (187, 0.63) ·
+W3 −3499.4 (160, 0.74) · W4 −3236.5 (147, 0.71) · W5 −1788.5 (76, 0.71) · W6 +3067.4 (138, 1.52) · W7 −2411.2 (156, 0.76). Yani
+kesintisiz geçmişte taban kaybediyor, yedi pencerenin beşi negatif; kâr yalnız W1 ve W6'da.
+
+| Aday | Ayar | İşlem (gün başı) | PF | Net | Δ net | p / q | Düşen şart | Karar |
+|---|---|---|---|---|---|---|---|---|
+| K1 | bağlam-RSI 60/40 | 559 (2.93) | 0.89 | −4211.3 | +6085.4 | 0.164 / 0.349 | örneklem (W5 41), anlamlılık, zarar (W1 −2870, W6 −2132) | YETERSİZ-ÖRNEK |
+| K2 | ATR% ≤ 0.12 | 767 (4.02) | 0.88 | −6355.4 | +3941.2 | 0.221 / 0.349 | örneklem (W5 52), anlamlılık, zarar (W1 −1300) | YETERSİZ-ÖRNEK |
+| K3 | ATR% ≥ 0.05 | 879 (4.60) | 0.86 | −8572.0 | +1724.7 | 0.262 / 0.349 | yalnız anlamlılık | REDDEDİLDİ |
+| K4 | ATR% 0.05..0.12 | 663 (3.47) | 0.88 | −5499.6 | +4797.0 | 0.196 / 0.349 | örneklem (W5 46), anlamlılık, zarar (W1 −1892) | YETERSİZ-ÖRNEK |
+| K5 | `RANGE:LONG` engeli | 805 (4.21) | 0.91 | −4614.3 | +5682.3 | 0.143 / 0.349 | anlamlılık, zarar (W6 −1136) | REDDEDİLDİ |
+| K6 | `DOWN:SHORT` engeli | 842 (4.41) | 0.83 | −10375.4 | −78.7 | 0.506 / 0.579 | anlamlılık, zarar (W1, W4, W6) | REDDEDİLDİ |
+| K7 | gün kapısı 0.8 | 914 (4.79) | 0.82 | −11678.3 | −1381.6 | 0.742 / 0.742 | anlamlılık, zarar (W6 −1482) | REDDEDİLDİ |
+| K8 | K1 + K2 | 437 (2.29) | 0.84 | −4760.0 | +5536.7 | 0.212 / 0.349 | örneklem (W1 44, W5 35), anlamlılık, zarar (W1 −1947, W6 −2977) | YETERSİZ-ÖRNEK |
+
+DD şartı (havuz bar-DD, taban 35 695 = %357 / 10 000) tüm adaylarda geçti (0.48× K8 … 0.97× K7) ama bu çoğunlukla işlem azlığından
+gelir, kenar kanıtı değildir (net hep negatif). Maliyet-gecikme stresi koşulmadı: kural gereği yalnız 1-4. aşamaları geçen aday
+için koşulur ve geçen yok. Eski P2 K6'yı ADAY sayardı (AYI PF 1.69) — havuzda Δ −79 olmasına ve üç pencereye zarar vermesine rağmen;
+diğer yedisini yalnız "AYI/YATAY/BOĞA'da < 60 işlem" kuralıyla reddederdi.
+
+**Bağımsız yeniden hesap** (ikinci hesaplayıcı, kendi tohumu 20261120, 20 000 yol): sekiz adayın havuz Δ'ları birebir aynı; p/q yalnız tohum
+farkıyla oynadı (q 0.354 K1-K5 ve K8, 0.576 K6, 0.742 K7; 191 kapsanan günle q 0.347, sıra aynı); sekiz kararın hepsi aynı. Taban net
+−10296.7 / 996 işlem teyit edildi.
+
+**Okuma.**
+1. **Hiçbir aday P2-v2'yi geçmiyor.** En iyi p 0.143 (K5); BH sonrası altısında q 0.349, K6/K7'de 0.579/0.742 — hepsi 0.10'un üstünde.
+2. **Kazanç ağırlıkla tek pencereden (W2) geliyor ve korumalar kârlı pencerelere zarar veriyor.** K1, K2, K4, K5, K8'in kazancı
+   W2'de (+2981…+5328; K5'te 5328 / 5682; K1 ayrıca W3, W5 ve W7'de kazanıyor; K3 ve K7 W2'den kazanmıyor); K1/K5'te W2 çıkarılınca havuz kazancı kabaca +0.4k…+0.8k'ye iner. Örneklemi yeterli ve işe yarar görünen her koruma
+   en az bir pencerede sınırı aşıyor: ctx-RSI ve ATR-üst korumaları iki KÂRLI pencerede (W1 +3857, W6 +3067) kazananları kesiyor.
+3. **Hiçbiri tabanı kârlı yapmıyor:** en iyi PF 0.91 (K5), hiçbir adayın neti pozitif değil. K3 yalnız anlamlılıkta düşüyor ama Δ yalnız
+   +1725, PF 0.86.
+4. **İstatistiksel güç sınırlı (bağımsız hesaptan):** havuz Δ'nın bootstrap SE'si 2100-7100; %80 güçle tespit edilebilecek asgari Δ ≈ 5300 (K7)
+   … 17 500 (K8). Gözlenen +4000…+6100 bu eşiklerin altında: "anlamlı değil" "etki yok" demek DEĞİL, ama nokta tahmini de bir
+   etki göstermiyor. Adaylar bağımlı (K4 = K2+K3, K8 = K1+K2, beşi W2'den kazanıyor), yani sekiz bağımsız kanıt yok; ilk 10 gün
+   günlük farkın mutlak toplamının %23-43'ünü taşıyor.
+5. **Sınırlar:** (a) 19/210 günlük veri deliği; parçalar ayrı koşulup toplandığından pozisyonlar boşluklar boyunca taşınmadı, alt parça
+   uçları işlem ve günlük kesiciyi kesti; W5 16 gün olduğundan ≥ 60 işlem şartı orada sertleşti (K1/K2/K4/K8 ağırlıkla bu yüzden
+   YETERSİZ-ÖRNEK; K3/K5/K6/K7 etkilenmedi). (b) Adayların işlemlerinin çoğu tabanın alt kümesi (ortak işlemlerin PnL'i aynı); geri kalanlar
+   kapasite/kesici kaymasıyla gelen yeni girişler ve her adayda net negatif (−994…−4742). (c) Hipotezler canlı defterden (08-23'ten sonra)
+   türetildi, test geçmişi 08-21'de bitiyor: hipotez için bağımsız; ama pencerelerin çoğu başka deneylerde yanık (E19), yani strateji
+   seçimi için taze değil. (d) Mühürlü `SEAL-2026Q4b` açılmadı.

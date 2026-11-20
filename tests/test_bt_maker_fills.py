@@ -13,6 +13,8 @@ import json
 
 import pytest
 
+from pydantic_core import PydanticUndefined
+
 from src.core.config import settings
 from src.strategies.scalper.backtest import (
     DEFAULT_MAKER_TRADE_THROUGH_PCT,
@@ -41,8 +43,28 @@ def _c(i, o, h, l, c) -> Candle:
                   volume=1.0, close_time=ot + 299_999)
 
 
+def _declared_scalper_defaults():
+    """Tüm `scalper_*` alanları + `risk_percentage` için DECLARED varsayılanlar.
+
+    `settings.model_copy(update=...)` sabitlenmeyen her alanı global `settings`
+    nesnesinden (= süreç ortamı / `.env`) devralır. Sunucu `.env`'i dinamik
+    kaldıracı, ücretleri, marjin yüzdesini, stop modunu, TP kesirlerini vb.
+    değiştirdiği için main'den sabitlenmiş sayılar (-7.0, 268.159064) sunucuda
+    kayıyordu. Bu yüzden her test yapılandırması önce sınıf varsayılanlarından
+    kurulur, sonra açık güncellemeler uygulanır: sonuç `.env`'den bağımsızdır."""
+    pinned = {}
+    for name, field in type(settings).model_fields.items():
+        if not (name.startswith("scalper_") or name == "risk_percentage"):
+            continue
+        if field.default is PydanticUndefined:
+            continue
+        pinned[name] = field.default
+    return pinned
+
+
 def _cfg(mode="maker", timeout=3, **extra):
-    updates = dict(
+    updates = _declared_scalper_defaults()
+    updates.update(
         scalper_entry_mode=mode,
         scalper_maker_fill_timeout_candles=timeout,
         scalper_min_rr=0.0,

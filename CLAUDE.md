@@ -105,7 +105,8 @@ Yeni sinyal kaynağı (haber botu vb.) eklemek: `docs/INTEGRATIONS.md`. Otomatik
 
 ## Nasıl çalıştırılır / test edilir / deploy edilir
 ```bash
-python3 -m pytest tests -q                      # 3617 test (+3 atlanan), ~80 sn — her değişiklikten önce
+python3 -m pytest tests -q                      # 3658 test (+3 atlanan), ~80 sn — her değişiklikten önce
+scripts/preflight_server_env.sh awa             # deploy ÖNCESİ: temiz kopya + sunucu ayarlarıyla test (D43)
 scripts/deploy.sh awa                           # push edilmiş main'i sunucuya uygula (test + restart + sağlık + otomatik geri alma)
 DEPLOY_NO_RESTART=1 scripts/deploy.sh awa       # yalnız kod/test; süreci yeniden başlatma
 scripts/deploy.sh awa <önceki-commit>           # geri alma (backups/commit.prev-*)
@@ -132,7 +133,7 @@ eski (E2…E13) sayılarla kıyas yalnız `--legacy-model` ile yapılır. Sweep 
 (`scripts/autoresearch.py`; eski P2 yalnız "P2-eski" olarak basılır): örneklem ≥ 60 işlem/pencere, eşleşmiş bootstrap
 + BH q ≤ 0.10, pencere zararı ≤ 0.20×scale, DD ≤ 1.2× taban, maliyet 2× ve 1 mum gecikme stresi. Örneklem-dışı sınama:
 `scripts/walk_forward.py` (yalnız kline önbelleğiyle). Pencere kullanımı `docs/holdout_registry.json` kaydındadır;
-mühürlü pencereye `--open-sealed "<amaç>"` olmadan koşu REDDEDİLİR. Ayrıntı: D41, `docs/AUTORESEARCH.md`, EXPERIMENTS E16.
+mühürlü pencereye `--open-sealed "<amaç>"` olmadan koşu REDDEDİLİR. Ayrıntı: D41, `docs/AUTORESEARCH.md`, EXPERIMENTS E19.
 
 **Ölçüm/kanıt bayrakları (D24, hepsi VARSAYILAN KAPALI — motor davranışını değiştirmez):**
 `--permutations N` (+`--permutation-clamp-audit`) Monte-Carlo permütasyon p-değeri;
@@ -163,6 +164,12 @@ da `docs/holdout_registry.json`'da YANIK; yeni pencereler `VAL-2026Q4a` ve müh�
   defter aritmetiğiyle verilir. Canlı defter nihai hakemdir.
 - Başabaş kazanma oranı ≈ %85 (SL ort −514 vs TRAIL ort +88 birim); kenar incedir —
   "kazanıyor" iddiası rejime (UP/FLAT/DOWN gün) bölünmeden kabul edilmez.
+- **Ölçüm hükmü (2026-11-20, D43, EXPERIMENTS E20-E22):** gerçekçi harness'te C yanık 7 pencerede PF 1.00; örneklem-dışı kanıt yalnız
+  görülmemiş doğrulama penceresi `VAL-2026Q4a` PF 0.58 ve canlı testnet defteri C id ≥ 278 PF 0.43. Kesintisiz geçmişte
+  (2026-01-23..08-21, 191 gün; örneklem-içi sayılır) PF 0.85: bu dönem yanık standart pencerelerin altısını içerir; C'nin
+  ayarları için bağımsız DEĞİLDİR, yalnız D42 koruma hipotezlerinden bağımsızdır.
+- Başka kurulumlar (A, B, D, E) PF 0.76-0.84, kenarı yok; sekiz D42 koruması P2-v2'yi geçmedi (en iyi p 0.14). Ayarlar KAPALI
+  kalır, mainnet NO-GO; harness canlıdan kazanma oranında 9-19 puan iyimser (TP1'e ulaşma %66 vs %54).
 - Sürpriz bir şey görürsen önce `docs/DECISIONS.md`'de denenmiş mi bak; sonra
   `docs/RUNBOOK.md` tuzaklarına; sonra kodu oku. Uydurma; "kodda doğrulanamadı" de.
 

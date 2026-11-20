@@ -269,6 +269,30 @@ temiz ağaç, yerel HEAD == origin/main, **`.env` `BOT_MODE`'u halkayla uyumlu**
 `BOT_MODE=follower` YOKSA da reddedilir). `RING` artık `REPO_DIR`/`PROGRAM`/`HEALTH_URL`/
 entry-halt dosyasının TEK KAYNAĞIDIR; uyumsuz override `die` eder.
 
+### Deploy öncesi sunucu-benzeri ön sınav (D43, 2026-11-20)
+`scripts/server_deploy.sh` testleri **sunucuda, sunucunun `.env`'iyle** koşar ve test
+kalırsa `rollback()` canlı süreci yeniden başlatır. 2026-11-20'de
+`tests/test_bt_maker_fills.py`'deki iki test yerelde ve CI'da geçti, sunucu ayarlarıyla
+kaldı: yapılandırmaları `.env`'den stop modunu ve dinamik kaldıracı devralıyordu. Bunu
+yalnız elle temiz kopyada yakaladık; artık tek komut:
+```bash
+scripts/preflight_server_env.sh awa             # her deploy'dan ÖNCE; çıkış kodu = pytest'in çıkış kodu
+scripts/preflight_server_env.sh awa -- -k maker # '--' sonrası ek pytest argümanları
+```
+Script çalışma ağacının (izlenen + izlenmeyen-ignore-edilmeyen dosyalar) geçici temiz
+kopyasını çıkarır (`.env`, `.venv`, `data/`, `logs/` GİRMEZ), kopyanın `.env`'ini
+`env.example` + sunucunun `BINANCE_/SCALPER_/TV_/RISK_/FOLLOWER_/BOT_MODE` satırları + iki
+sahte secret olarak kurar ve orada `pytest tests -q -x` koşar. Adında
+`SECRET/KEY/TOKEN/PASS/BIND_IP` geçen anahtarlar sunucuda süzülür (değer sunucudan çıkmaz,
+hiçbir değer yazdırılmaz); repoya ve sunucuya yazmaz; çevrimdışı: `PREFLIGHT_ENV_FILE=<dosya>`.
+Sıfır ayar satırı gelirse pytest koşmadan hata verir. Çıkış kodu 2 (kullanım / ssh / dosya hatası) ve 3 (sıfır ayar satırı)
+kurulum hatasıdır, pytest hiç koşmamıştır. Sınanan şey O ANKİ ÇALIŞMA AĞACIDIR (commit'lenmemiş düzenlemeler dahil), push
+edilmiş `main` değil: deploy'a güvenmeden önce commit + push et. Kopyada `.git` yoktur; git ağacı isteyen testler orada atlanır.
+Sınırlar: adında `TOKEN/KEY/PASS` geçen secret OLMAYAN ayarlar da (ör. `SCALPER_AI_GATE_MAX_TOKENS`) alınmaz; gerçek API
+anahtarları kopyada yoktur, iki webhook secret'ı hep doludur. **Yeni bir ayar alanı kapı (gate)
+işlevi görüyorsa `tests/conftest.py`'deki izolasyon listesine de eklenmeli** (D33c);
+yoksa o alanı sunucu `.env`'inden devralan test yine yalnız sunucuda kalır.
+
 ### Güvenli yeniden başlatma (`scripts/restart_safe.sh`)
 `.env` değişikliği deploy'dan AYRI bir adımdır ve **çıplak `supervisorctl restart`
 KULLANILMAZ** — o yol ban penceresini, entry-halt kilidini, `.env` yedeğini ve sağlık
@@ -815,7 +839,7 @@ kanaldan gelir. 8 sembol (BTC, ETH, SOL, XRP, DOGE, BNB, ADA, LTC) × **1 dakika
 |---|---|
 | Koşul | AlgoPro V1.6 → **Herhangi bir alert() fonksiyonu çağrısı** |
 | Grafik | ilgili sembol, **1 dakika** |
-| Webhook URL | `http://<sunucu>:9091/tv-signal?secret=<TV_WEBHOOK_SECRET>&src=algopro` (BUGÜNKÜ URL — DEĞİŞMEZ) |
+| Webhook URL | `http://<sunucu>:9091/tv-signal?secret=<TV_WEBHOOK_SECRET>&src=algopro` (BUGÜNKÜ URL — DEĞİŞMEZ) — **2026-11-20 notu:** bu biçim 2026-08-24'ten beri dışarıdan ulaşılmaz (süreç yalnız `127.0.0.1` dinler); geçerli dış yol `https://<sunucu>/tv-signal?…`, bkz. "Sinyal hattı (TradingView)" → "Dış yol" |
 | Mesaj | boş bırak (script üretir) |
 
 2026-08-23'te TV Desktop sondasıyla doğrulanan gerçek gövdeler (iki yön de):
@@ -1264,8 +1288,10 @@ onları göstermez, `allOpenOrders` iptal etmez.
 Daima `supervisorctl`.
 
 ## Takvim
-- **2026-09-14:** TradingView alarmları (49 adet) expire oluyor → yenile; aynı anda webhook
-  secret rotasyonu + erişim logu maskesi + alan adı/TLS işiyle birleştir.
+- **2026-09-14 — YAPILMADI (2026-11-20 tespiti, D43):** TradingView alarmlarının (49 adet) süresi bu tarihte doldu ve
+  yenilenmedi; TV giriş kaynağı o günden beri SESSİZ (son TV işlemi 2026-09-13 01:36 UTC). Sunucuya `/tv-signal` isteği
+  gelmiyor; bot ve nginx yolu sağlam (bkz. aşağıda "TV kaynağı sessizse"). Yenileme hâlâ AÇIK İŞ: alarmları yeniden kur;
+  aynı anda webhook secret rotasyonu + erişim logu maskesi + alan adı/TLS işiyle birleştir.
 - **2026-11-21:** LuxAlgo aboneliği "iptal ediliyor" görünüyor — kullanıcı kararı.
 - Her .env değişikliği → `docs/DECISIONS.md` satırı + yedek dosyası.
 
@@ -1280,6 +1306,29 @@ TV Desktop MCP ile ölçüm reçetesi: awa-brain `ops-gotchas/tradingview-deskto
 `kind=exit|choch|trend|tp1` olan istekler GİRİŞ OYU DEĞİLDİR, sağlamaya hiç girmez —
 bkz. aşağıdaki "TV olay kanalı". Bu 49 alarmın hiçbirinin mesajında `kind` yoktur,
 davranışları değişmedi.
+
+**Dış yol (2026-11-20'de doğrulandı).** Süreç 2026-08-24'ten beri yalnız `127.0.0.1:9091` dinler. TradingView
+`https://<sunucu>/tv-signal?secret=…&src=<kaynak>` adresine POST atar → nginx sitesi `tradingbot-tv-webhook` (443/tcp, yalnız
+`location = /tv-signal`, yalnız POST, 30 istek/dk; başka her yol 404) → `127.0.0.1:9091/tv-signal`. `http://<sunucu>:9091/…`
+biçimi dışarıdan ULAŞILMAZ; 80/tcp yalnız sertifika yenilemesi içindir (404). IP sertifikası kısa ömürlüdür (gözlenen:
+2026-11-18'de verilmiş, 2026-11-25'te bitiyor; yenilemenin sürdüğü bundan çıkarıldı) ve yalnız SNI = IP gönderen istemciye
+sunulur; SNI göndermeyen istemci (ör. `curl`) 443'ün varsayılan sitesinin sertifikasını görür. TradingView bu düzenle
+(site dosyası 2026-08-27, süreç `127.0.0.1` 2026-08-24) 2026-09-13'e kadar teslim edebildi (son TV işlemi); yine de uçtan
+uca teslimat yalnız gerçek bir alarm ateşlenince doğrulanır.
+
+**TV kaynağı sessizse** (belirti: defterde yeni `TV` işlemi yok; `logs/trades-*.jsonl` niyetlerinde `source` hep `scan`).
+Erişim günlüğü secret taşır: SATIR BASMA, yalnız say.
+```bash
+# 1) Bota istek ulaşıyor mu? (dosya başına sayı)
+ssh awa 'cd /opt/tradingbot-v2/logs && for f in supervisor.log*; do echo "$f: $(zgrep -a -c "POST /tv-signal" "$f")"; done'
+# 2) nginx'e ulaşıyor mu? (yalnız tarih + HTTP durum kodu)
+ssh awa 'zgrep -a -h "tv-signal" /var/log/nginx/*access* | awk "{print substr(\$4,2,11), \$9}" | sort | uniq -c'
+# 3) Yol sağlam mı? Secret'sız yoklama uygulamadan 403 dönmeli (404 / 000 = nginx, sertifika ya da süreç sorunu)
+curl -sk -o /dev/null -w "%{http_code}\n" -X POST --data probe https://<sunucu>/tv-signal
+```
+Üçü birlikte "istek yok, yol sağlam" diyorsa sorun TradingView tarafındadır: alarmların süresi dolmuş ya da durmuş olabilir
+(Alarmlar paneli). Hatırlatma: sağlama 2 FARKLI kaynak ister (`TV_CONFLUENCE_REQUIRED=2`, 420 sn) ve `algopro` giriş kaynağı
+karantinadadır (`TV_ENTRY_SOURCE_BLOCKLIST`); tek kaynak kalırsa alarmlar ateşlense de giriş açılmaz.
 
 ## Risk-olayı kanalı (haber/olay botları, D10)
 `POST /risk-event` — TV webhook'undan AYRI amaç (yön DEĞİL, giriş durdur/devam et/her-şeyi-

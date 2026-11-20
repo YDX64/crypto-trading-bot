@@ -107,6 +107,11 @@ _D33_GATE_FIELDS = (
     "scalper_symbol_direction_block",
     "scalper_min_atr_pct",
     "scalper_max_atr_pct",
+    # D42 strateji C giriş korumaları (aynı türden kapılar; tests/test_c_entry_guards.py)
+    "scalper_c_ctx_rsi_short_max",
+    "scalper_c_ctx_rsi_long_min",
+    "scalper_c_atr_pct_max",
+    "scalper_c_atr_pct_min",
 )
 _ISOLATED_ENV_NAMES = (
     "BOT_MODE",
