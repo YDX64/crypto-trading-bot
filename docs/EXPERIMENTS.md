@@ -1795,7 +1795,7 @@ G4 (≥ 3 pozitif çeyrek) ve G5 (en iyi ay / en iyi 5 işlem hariç) altı kold
 2. Sonuç çıkış geometrisine, giriş kipine ya da günlük kesiciye bağlı değil: dört teşhisin hiçbiri net PF'yi 1'in üstüne
    taşımadı. Günlük kesici kaldırılınca işlem sayısı artar ve zarar büyür (kesici burada koruyor).
 3. LONG ve SHORT ayrı: on iki (kol, yön) hücresinin hepsinde ΣR < 0; en iyisi K30R LONG PF 0.95.
-4. Şok günleri (BTC 1d |getiri| ≥ %3): altı kolda da şok günü işlemleri PF > 1 (1.11–2.09), normal günler PF 0.63–0.70
+4. Şok günleri (BTC 1d |getiri| ≥ %3): altı kolda da şok günü işlemleri PF > 1 (1.11–2.09), normal günler PF 0.55–0.77
    düzeyinde. Bu ayrım günün KAPANIŞINI kullanır (ileri bakış) ve yalnız betimleyicidir: "büyük hareket gününde trend
    yönlü giriş kazanır" işlem anında bilinemeyen bir koşuldur, sınanmış bir kural DEĞİLDİR. Ayrı bir numara ve yeni veri ister.
 5. Güç: tasarım net PF ≈ 1.2 düzeyinde bir kenarı görecek güçteydi (PLAN §7); PF %90 güven aralıklarının üst ucu en iyi iki
