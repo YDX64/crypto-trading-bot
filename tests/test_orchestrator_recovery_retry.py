@@ -634,32 +634,71 @@ async def test_recovery_without_stop_closes_once_and_stale_snapshot_adds_no_orde
     assert symbol_reservations.snapshot() == {}
 
     # Hesap anlık görüntüsü BAYAT: hâlâ listeliyor; ama get_position_risk 0.
+    # İki taze okuma çelişiyor: karar verilmez, kurtarma tamamlanmış sayılmaz.
     assert fake.risk_amounts["BTCUSDT"] == 0.0
-    assert await orch.recover_open_positions() is True
+    assert await orch.recover_open_positions() is False
 
     assert len(fake.orders) == 1  # ikinci denemede EK emir yok
     assert orch.active_positions == {}
+    assert symbol_reservations.snapshot() == {"BTCUSDT": "telegram"}
+    rows = await _position_rows(db_sessionmaker)
+    assert len(rows) == 1 and rows[0].status == PositionStatus.CLOSED
+
+    # Hesap listesi yetişti: süpürme rezervasyonu bırakır, kurtarma tamamlanır.
+    fake.positions = []
+    assert await orch.recover_open_positions() is True
+
     assert symbol_reservations.snapshot() == {}
+    assert len(fake.orders) == 1
     rows = await _position_rows(db_sessionmaker)
     assert len(rows) == 1 and rows[0].status == PositionStatus.CLOSED
 
 
-async def test_listed_orphan_without_live_record_is_skipped(db_sessionmaker, monkeypatch):
-    """Bayat listede görünen ama canlıda olmayan pozisyon için yetim satır açılmaz."""
+async def test_listed_orphan_reported_flat_is_not_adopted_and_recovery_stays_unsettled(
+    db_sessionmaker, monkeypatch
+):
+    """Liste "açık", taze positionRisk "kapalı": yetim satır açılmaz ama pozisyon
+    kapanmış da sayılmaz; rezervasyon tutulur, kurtarma tamamlanmaz."""
     fake = FakeExchange()
     fake.positions = [_btc_position()]
     fake.algo_orders = []
     orch = _make_orchestrator(fake, monkeypatch)
 
-    assert await orch.recover_open_positions() is True
+    assert await orch.recover_open_positions() is False
 
     assert await _position_rows(db_sessionmaker) == []
     assert orch.active_positions == {}
-    assert symbol_reservations.snapshot() == {}
+    assert symbol_reservations.snapshot() == {"BTCUSDT": "telegram"}
     assert fake.orders == []
     # Kurtarma kararı önbellekten verilmez: 5 sn'lik anlık görüntü sıfır olmayan
     # bayat bir miktarı doğrulamadan döndürür ve bu kontrolü boşa çıkarırdı.
     assert fake.risk_calls == [("BTCUSDT", {"force_fresh": True})]
+
+    fake.positions = []  # hesap listesi yetişti
+    assert await orch.recover_open_positions() is True
+    assert symbol_reservations.snapshot() == {}
+
+
+async def test_orphan_is_adopted_once_position_risk_agrees_with_the_list(
+    db_sessionmaker, monkeypatch
+):
+    fake = FakeExchange()
+    fake.positions = [_btc_position()]
+    fake.algo_orders = [dict(STOP_ORDER)]
+    orch = _make_orchestrator(fake, monkeypatch)
+
+    assert await orch.recover_open_positions() is False
+    assert await _position_rows(db_sessionmaker) == []
+    assert symbol_reservations.snapshot() == {"BTCUSDT": "telegram"}
+
+    fake.risk_amounts["BTCUSDT"] = 0.01  # positionRisk yetişti
+    assert await orch.recover_open_positions() is True
+
+    rows = await _position_rows(db_sessionmaker)
+    assert len(rows) == 1 and rows[0].status == PositionStatus.OPEN
+    assert set(orch.active_positions) == {"BTCUSDT"}
+    assert symbol_reservations.snapshot() == {"BTCUSDT": "telegram"}
+    assert fake.orders == []
 
 
 async def test_orphan_is_adopted_when_live_amount_cannot_be_verified(
@@ -691,7 +730,10 @@ async def test_orphan_is_adopted_when_live_record_has_no_amount(db_sessionmaker,
     fake.algo_orders = [dict(STOP_ORDER)]
     orch = _make_orchestrator(fake, monkeypatch)
 
-    async def no_amount(symbol: str, **_kwargs: Any) -> Dict[str, Any]:
+    calls: List[tuple] = []
+
+    async def no_amount(symbol: str, **kwargs: Any) -> Dict[str, Any]:
+        calls.append((symbol, dict(kwargs)))
         return {"symbol": symbol}
 
     monkeypatch.setattr(fake, "get_position_risk", no_amount)
@@ -702,13 +744,15 @@ async def test_orphan_is_adopted_when_live_record_has_no_amount(db_sessionmaker,
     assert len(rows) == 1 and rows[0].status == PositionStatus.OPEN
     assert set(orch.active_positions) == {"BTCUSDT"}
     assert symbol_reservations.snapshot() == {"BTCUSDT": "telegram"}
+    assert calls == [("BTCUSDT", {"force_fresh": True})]  # taze kontrol gerçekten yapıldı
 
 
-async def test_stale_listing_drops_position_tracked_by_a_rolled_back_attempt(
+async def test_disagreeing_reads_leave_tracked_position_to_the_monitor(
     db_sessionmaker, monkeypatch
 ):
     """BTC izlemeye alındı, ETH'te istisna -> oturum geri alındı (satır yok).
-    Sonraki denemede BTC listede bayat: izlemeden düşmeli, rezervasyon gitmeli."""
+    Sonraki denemede liste "açık", positionRisk "kapalı": izlemedeki pozisyon
+    izleme döngüsünün işidir; kurtarma ne düşürür ne rezervasyonunu bırakır."""
     fake = FakeExchange()
     fake.positions = [_btc_position(), _eth_position()]
     fake.algo_orders = [dict(STOP_ORDER)]
@@ -733,10 +777,10 @@ async def test_stale_listing_drops_position_tracked_by_a_rolled_back_attempt(
     fake.positions = [_btc_position()]
     fake.risk_amounts["BTCUSDT"] = 0.0
 
-    assert await orch.recover_open_positions() is True
+    assert await orch.recover_open_positions() is False
 
-    assert orch.active_positions == {}
-    assert symbol_reservations.snapshot() == {}
+    assert set(orch.active_positions) == {"BTCUSDT"}
+    assert symbol_reservations.snapshot() == {"BTCUSDT": "telegram"}  # ETH süpürüldü
     assert await _position_rows(db_sessionmaker, "BTCUSDT") == []
     assert await _position_rows(db_sessionmaker, "ETHUSDT") == []
     assert fake.orders == []

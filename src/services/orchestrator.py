@@ -232,17 +232,20 @@ class TradingOrchestrator:
                     )
                 else:
                     # Kayıt yok — muhtemelen eski bir çökmeden kalan yetim pozisyon.
-                    # Hesap listesi bayat olabilir: canlıda miktar 0 ise hayalet bir
-                    # CLOSED satır eklemeyelim (her yeniden denemede bir tane daha).
-                    if await self._listed_position_is_gone(symbol):
-                        # Önceki başarısız bir denemeden izlemede kalmış olabilir
-                        # (aşağıdaki `protection is False` dalıyla aynı gerekçe).
-                        self.active_positions.pop(symbol, None)
-                        symbol_reservations.release(symbol, self.RESERVATION_OWNER)
+                    if await self._position_risk_reports_flat(symbol):
+                        # İki taze okuma çelişiyor (liste "açık", positionRisk "kapalı")
+                        # ve hangisinin bayat olduğu burada bilinemez. Satır açılmaz
+                        # (her deneme emirsiz bir CLOSED satır daha eklerdi) ama pozisyon
+                        # kapanmış da sayılmaz: rezervasyon kalır (fail-closed), kurtarma
+                        # tamamlanmış sayılmaz; sonraki deneme karar verir (liste
+                        # yetişirse süpürme rezervasyonu bırakır, positionRisk yetişirse
+                        # pozisyon benimsenir). Önceki denemeden izlemede kalmış bir
+                        # pozisyon izleme döngüsüne bırakılır.
+                        recovery_ok = False
                         self.logger.warning(
-                            f"  ⏭️ {symbol}: hesap listesinde açık görünüyor ama taze "
-                            "positionRisk miktarı 0; kapanmış sayıldı, yetim satır "
-                            "açılmadı, rezervasyon bırakıldı"
+                            f"  ⏸️ {symbol}: hesap listesinde açık görünüyor ama taze "
+                            "positionRisk miktarı 0; yetim satır açılmadı, rezervasyon "
+                            "tutuluyor, kurtarma sonraki denemede yeniden bakacak"
                         )
                         continue
                     entry = float(raw.get("entryPrice") or 0)
@@ -334,12 +337,11 @@ class TradingOrchestrator:
                 "(borsada açık pozisyon yok, izlemede de değil)."
             )
 
-    async def _listed_position_is_gone(self, symbol: str) -> bool:
-        """Listelenen pozisyonun canlıda gerçekten kalmadığını (miktar 0) doğrula.
+    async def _position_risk_reports_flat(self, symbol: str) -> bool:
+        """Taze `positionRisk` okuması sembolü kapalı mı gösteriyor (miktar 0 / kayıt yok)?
 
-        Hüküm taze `positionRisk` okumasına dayanır; izleme döngüsünün
-        (`is_position_still_open`) kullandığı kuralın aynısıdır (tek-yön mod
-        varsayılır).
+        Bu bir hüküm değildir: hesap listesiyle çelişebilir; çağıran karar vermez,
+        yalnızca yetim satır açmaktan kaçınır. Tek-yön mod varsayılır.
 
         Doğrulanamazsa (hata, eksik ya da bozuk miktar) False döner: yetim pozisyon
         eskisi gibi benimsenir; belirsizlikte korumasız bırakmaktan iyidir.
