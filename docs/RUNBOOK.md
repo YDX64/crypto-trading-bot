@@ -1293,7 +1293,7 @@ limiter'ı doyuruyordu (düzeltildi). Belirti imzası aynıysa önce dashboard'u
 
 Deneme şu durumlarda YAPILMAZ, sayaç da ilerlemez: (1) `entry_halted=true` — korumasız pozisyon, insan müdahalesi ister; nedeni
 çöz, sonra restart. (2) 418/ban kesicisi aktif — ban bitince ilk turda kendiliğinden dener. (3) Scalper kendi kurtarmasını
-bitirmedi (`scalper_details.recovery_ready=false`) — açılıştaki "scalper önce recover edilir" sırası gecikmiş denemede de korunur
+bitirmedi (`scalper_details.exchange.recovery_ready=false`) — açılıştaki "scalper önce recover edilir" sırası gecikmiş denemede de korunur
 (D44 "Sıra kuralı"); önce scalper'ın neden hazır olmadığına bak. Döngü turu `CHECK_INTERVAL_SECONDS` (30 sn) olduğu için deneme
 anları bu ızgaraya oturur. `logs/bot.log`'da "Açılış kurtarması" satırlarını ara: başarısızlık uyarısı ilk denemede ve sonra en
 fazla 30 dakikada bir yazılır, başarı tek satırdır. Restart yine son çaredir: bayrak uzun süre `false` ve sayaç artmıyorsa

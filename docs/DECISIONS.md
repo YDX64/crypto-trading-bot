@@ -7,7 +7,7 @@ Pencereler: AYI 2026-01-23→02-13 (BTC −30%) · YATAY 2026-07-01→07-21 · B
 
 ## Aktif kararlar
 
-### D44 — Orkestratörün açılış kurtarması kendini onarır: başarısız kurtarma izleme döngüsünde geri çekilmeli aralıklarla yeniden denenir · 2026-11-20 · KOD HAZIR — TESTNET deploy'u kullanıcı onayını bekliyor
+### D44 — Orkestratörün açılış kurtarması kendini onarır: başarısız kurtarma izleme döngüsünde geri çekilmeli aralıklarla yeniden denenir · 2026-11-20 · TESTNET'TE CANLI (2026-11-20 deploy, `4f0c159`)
 
 **Sorun.** `TradingOrchestrator.start()` açılışta `_recovery_ready = await recover_open_positions()` atıyor ve bu bayrak başka hiçbir
 yerde yeniden atanmıyordu. 2026-11-17 06:34 UTC'de süreç yeniden başlarken Binance'e ulaşılamadı; kurtarma `False` döndü ve bayrak
@@ -108,6 +108,27 @@ kusur bulunmadı. Deploy kaydı deploy'dan sonra buraya eklenir.
 
 **Geri alma.** `scripts/deploy.sh awa <önceki-commit>`; ayar ya da veri göçü yok. Kod geri alınınca davranış bu karardan öncesine
 döner (başarısız açılış kurtarması yeniden başlatmaya kadar kilitli).
+
+**Deploy (2026-11-20 10:57-11:00 UTC, TESTNET).** `scripts/deploy.sh awa`: `2ce462e` → `4f0c159` (PR #11, main ileri sarıldı; CI `test`
+işi yeşil, 4065 geçti / 85 atlandı). Sunucu testleri 4065 geçti / 85 atlandı (108 sn); `tradingbot_v2` yeniden başlatıldı (pid 2227760,
+başlangıç 10:59:41 UTC); sağlık kapısı 45 sn sonra yeşil. Deploy sonrası 130 sn boyunca 13 yoklamanın 13'ü HTTP 200, `status=healthy`,
+`core_healthy=true`, `recovery_ready=true`; yeni alanlar görünür (`recovery_retry_attempts=0`, `recovery_next_retry_in_seconds=null`).
+Yeniden başlangıçtan beri ERROR/CRITICAL satırı 0; `/scalper/status`: `entries_blocked_by=null`, `kill_switch_active=false`, tarama `ok`,
+bekleyen giriş 0. Deploy anında scalper'ın 1 açık pozisyonu vardı (XRPUSDT SHORT): scalper yeniden başlangıçta onu izlemeye aldı
+(`order_health` temiz, rezervasyon `scalper`); orkestratör "Borsada 1 açık pozisyon bulundu" yazıp sahiplenmedi ("0 pozisyon izlemeye
+alındı"). `.env` değişmedi (yedek `backups/env.bak-20261120-105745-deploy`). Geri alma hedefi `2ce462e`. Bu deploy'un DOĞRULAMADIĞI:
+kendini onarma yolu; açılış kurtarması başarılı olduğu için yeniden deneme hiç tetiklenmedi.
+
+**Birleştirmeden sonra gelen inceleme (cubic, PR #11).** Beş bulgu kodda tek tek doğrulandı. Hiçbiri emir ya da çift yönetim riski
+taşımıyor; kod düzeltmeleri bu deploy'a KATILMADI, takip işidir.
+
+| Bulgu | Hüküm | Etki |
+|---|---|---|
+| Yeniden denemede döngü ortasında beklenmeyen bir istisna olur ve pozisyon sonraki denemeden önce kapanırsa "telegram" rezervasyonu izlemesiz kalır | Geçerli (dar) | Fail-closed: o sembol yeniden başlatmaya kadar başka motora kapalı; emir riski yok. Düzeltme: her başarılı hesap okumasından sonra izlenmeyen "telegram" rezervasyonlarını bırak |
+| Bayat hesap listesi denemeler boyunca sürerse her deneme emirsiz bir CLOSED `positions` satırı ekler | Geçerli (düşük olasılık: liste her zaman taze okunur) | Kozmetik, emir yok. Düzeltme: yetim satırı eklemeden önce canlı miktarı doğrula |
+| RUNBOOK'ta scalper alan yolu yanlıştı | Geçerli | Bu kayıtla düzeltildi: `scalper_details.exchange.recovery_ready` |
+| Lifespan testi `_check_disabled_follower_open_trades`'i gerçek veritabanı yolunda bırakıyor | Geçerli (test izolasyonu) | Yalnız test |
+| Ön koşul gömülü takipçinin kurtarmasını da beklemeli | Geçersiz | Takipçinin canlı pozisyonları `scalp_trades`'te OPEN satırdır (atlama sorgusu strateji süzmez) ve uçuştaki girişi emirden önce rezerve eder. Tasarım sırası orkestratör → takipçidir; tersine bağlamak takipçinin yetim denetimini bozar |
 
 ### D43 — 2026-11-20 ölçüm hükmü: strateji C'nin örneklem-dışı kenarı gösterilemedi, başka kurulumda da yok, kayıp-örüntü korumaları geçmedi · 2026-11-20 · HİÇBİR AYAR DEĞİŞMEDİ — mainnet NO-GO teyit
 
