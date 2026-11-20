@@ -1799,7 +1799,8 @@ def build_report(ctx: Ctx) -> Tuple[str, List[Dict[str, Any]]]:
     out += ["## Teşhis koşuları (karar vermez)", ""]
     drows = []
     for arm in arms:
-        for ov in ("DIAG_Z0", "DIAG_MAKER", "DIAG_T"):
+        # Teşhis kaplamaları variants.json'dan okunur (role == "diag"); listeye eklenen teşhis rapora da girer.
+        for ov in [o["id"] for o in ctx.variants["overlays"] if o.get("role") == "diag"]:
             r = load_run(ctx, C.make_label("DEV", arm, [ov]), require=False)
             if r is not None:
                 m = basic_metrics(r, ctx.labels)

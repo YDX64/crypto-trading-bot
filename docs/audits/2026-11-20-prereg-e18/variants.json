@@ -69,7 +69,9 @@
     {"id": "DIAG_T", "role": "diag", "cli": [], "S": 50,
      "env": {"SCALPER_DYN_LEV_STOP_ATR_MULT": "3.0", "SCALPER_FIXED_STOP_ROI_PCT": "50",
              "SCALPER_TP1_ROI": "10", "SCALPER_TP2_ROI": "25"},
-     "note": "sunucu cikis geometrisi (stop ROI 50, TP1 ROI 10); karar vermez"}
+     "note": "sunucu cikis geometrisi (stop ROI 50, TP1 ROI 10); karar vermez"},
+    {"id": "DIAG_NOLATCH", "role": "diag", "cli": [], "env": {"SCALPER_DAILY_LOSS_LIMIT_PCT": "0"},
+     "note": "gunluk zarar siniri kapali (gunluk kesici dusurmez); karar vermez"}
   ],
   "sets": {
     "CAL": ["2026-03-01", "2026-06-01"],
