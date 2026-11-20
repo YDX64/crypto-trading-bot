@@ -7,7 +7,7 @@ Pencereler: AYI 2026-01-23→02-13 (BTC −30%) · YATAY 2026-07-01→07-21 · B
 
 ## Aktif kararlar
 
-### D46 — Orkestratörün AÇILIŞ kurtarması da scalper ön koşuluna bağlandı: scalper kurtarması bitmeden borsadaki pozisyonlar sahiplenilmez · 2026-11-20 · KOD HAZIR — TESTNET deploy'u kullanıcı onayını bekliyor
+### D46 — Orkestratörün AÇILIŞ kurtarması da scalper ön koşuluna bağlandı: scalper kurtarması bitmeden borsadaki pozisyonlar sahiplenilmez · 2026-11-20 · TESTNET'TE CANLI (2026-11-20 deploy, `b8c18de`)
 
 **Sorun (D44 "Bilinmeyenler"deki boşluk; kodda doğrulandı).** D44 ön koşulu (`recovery_precondition = _scalper_recovery_settled`) yalnız
 izleme döngüsündeki YENİDEN denemede sorulur; `TradingOrchestrator.start()` `recover_open_positions()`'ı koşulsuz çağırıyordu.
@@ -107,7 +107,24 @@ bıraktı:
 **Geri alma.** `scripts/deploy.sh awa <önceki-commit>`; ayar ya da veri göçü yok. Kod geri alınınca açılış yine ön koşula bakmaz
 (D44 sonrası durum).
 
-### D45 — Loguru çağrıları kendi istisnasını fırlatmaz: stdlib tarzı `exc_info=`/`extra=` kwargs'ı `src/core/logger.py`'de merkezi bir korumayla çevrilir · 2026-11-20 · KOD HAZIR — TESTNET deploy'u kullanıcı onayını bekliyor
+**Deploy (2026-11-20 16:23-16:25 UTC, TESTNET; D44 inceleme düzeltmeleri + D45 + D46 TEK deploy, kullanıcı onayıyla).** Üç PR yerelde
+tek dalda birleştirildi (#14 → #12 → #13; birleştirme commit'leri `fa5088b` ve `b8c18de`; çakışma yalnız `CHANGELOG.md` ve
+`docs/DECISIONS.md` başındaydı, kod ve test dosyaları otomatik birleşti) ve main ileri sarıldı: `75c7040` → `b8c18de`. Birleştirmeden
+önce PR #12 ve PR #13 birer bağımsız incelemeden geçti (engel yok; D45 ve bu kayıttaki sınırlar). Birleşik ağaçta tam paket 4121
+geçti / 85 atlandı; sunucu ayarlı ön sınav (66 ayar satırı) 4120 geçti / 86 atlandı. `scripts/deploy.sh awa`: sunucu `4f0c159` →
+`b8c18de`; sunucu testleri 4121 geçti / 85 atlandı (108 sn); `tradingbot_v2` yeniden başlatıldı (pid 769473, başlangıç 16:25:02 UTC);
+sağlık kapısı 25 sn sonra yeşil. Deploy sonrası 130 sn boyunca 13 yoklamanın 13'ü HTTP 200, `status=healthy`, `core_healthy=true`,
+`recovery_ready=true` (`recovery_retry_attempts=0`, `entry_halted=false`). Yeniden başlangıçtan beri `bot.log`'da ERROR/CRITICAL
+satırı 0 ve zaman damgasız (traceback) satır 0; supervisor çıktılarında `RuntimeWarning` ya da "koruması KAPALI" izi yok. Açılış
+normal yoldan geçti ("Açılış kurtarması ATLANDI" yok; "Borsada açık pozisyon yok"). Deploy anında üç motorda da açık pozisyon
+yoktu; `/scalper/status`: `entries_blocked_by=null`, `kill_switch_active=false`, tarama `ok`. `.env` değişmedi (yedek
+`backups/env.bak-20261120-162305-deploy`). Geri alma hedefi `4f0c159`. Bu deploy'un DOĞRULAMADIĞI: (1) bu kararın atlama yolu ve
+D44'ün yeniden deneme yolu (açılış kurtarması yine ilk denemede başarılı oldu); (2) D44 inceleme düzeltmelerinin iki yolu
+(artakalan rezervasyon, okuma çelişkisi) canlıda tetiklenmedi; (3) D45 korumasının canlı süreçte kurulu olduğu dolaylı kanıta
+dayanır (sunucu testleri kurulumu doğrular, uyarı izi yok): deploy'dan sonra `extra=` ya da `exc_info=` taşıyan bir satır henüz
+yazılmadı.
+
+### D45 — Loguru çağrıları kendi istisnasını fırlatmaz: stdlib tarzı `exc_info=`/`extra=` kwargs'ı `src/core/logger.py`'de merkezi bir korumayla çevrilir · 2026-11-20 · TESTNET'TE CANLI (2026-11-20 deploy, `b8c18de`)
 
 **Sorun.** Günlükleyici loguru'dur. loguru, çağrıya konumsal argüman ya da kwargs verilirse mesajı `str.format(*args, **kwargs)` ile
 biçimlendirir; `exc_info=` ise loguru'da tanınmaz (yok sayılır, traceback eklemez). Kod tabanında yaygın kalıp stdlib `logging`
@@ -250,6 +267,11 @@ iş parçacığı/asyncio yarışları ve `enqueue` altında başka kusur bulunm
 **Geri alma.** `scripts/deploy.sh awa <önceki-commit>`; ayar ya da veri göçü yok. Kod geri alınınca log çağrıları eski davranışa döner:
 süslü parantezli hata metni yine log çağrısını patlatır, `exc_info` yine traceback yazmaz, `diagnose` ve `errors.log` biçimi eskiye döner.
 
+**Deploy.** 2026-11-20 16:23-16:25 UTC, TESTNET, `b8c18de`: D46 kaydındaki ortak deploy paragrafı. Birleştirme öncesi bağımsız
+incelemenin not ettiği sınır: `opt(exception=...)` ile WARNING düzeyinde yazılan tek çağrının (D44 yeniden deneme uyarısı,
+`src/services/orchestrator.py`) traceback'i artık hiçbir dosyaya yazılmaz (`bot.log` ve konsol tek satır, `errors.log` ERROR ve
+üstü); mesaj istisna türünü ve metnini taşımaya devam eder.
+
 ### D44 — Orkestratörün açılış kurtarması kendini onarır: başarısız kurtarma izleme döngüsünde geri çekilmeli aralıklarla yeniden denenir · 2026-11-20 · TESTNET'TE CANLI (2026-11-20 deploy, `4f0c159`)
 
 **Sorun.** `TradingOrchestrator.start()` açılışta `_recovery_ready = await recover_open_positions()` atıyor ve bu bayrak başka hiçbir
@@ -375,7 +397,7 @@ bu kayıtla düzeltildi; ayrıntı tablonun altındaki "İnceleme düzeltmeleri"
 | Lifespan testi `_check_disabled_follower_open_trades`'i gerçek veritabanı yolunda bırakıyor | Geçerli (test izolasyonu) | Yalnız test. Düzeltildi (`e9c2dd8`) |
 | Ön koşul gömülü takipçinin kurtarmasını da beklemeli | Geçersiz | Takipçinin canlı pozisyonları `scalp_trades`'te OPEN satırdır (atlama sorgusu strateji süzmez) ve uçuştaki girişi emirden önce rezerve eder. Tasarım sırası orkestratör → takipçidir; tersine bağlamak takipçinin yetim denetimini bozar |
 
-**İnceleme düzeltmeleri (2026-11-20, `e9c2dd8` + `5d2a8ad`, PR #14; TESTNET'e henüz deploy EDİLMEDİ).** Yalnız `recover_open_positions` ve iki
+**İnceleme düzeltmeleri (2026-11-20, `e9c2dd8` + `5d2a8ad`, PR #14; TESTNET'TE CANLI: 2026-11-20 16:25 UTC, `b8c18de`, D46 kaydındaki ortak deploy paragrafı).** Yalnız `recover_open_positions` ve iki
 yeni özel yardımcı değişti; `start()`, yeniden deneme zamanlaması, sinyal yolu, scalper ve takipçi kodu, ayarlar aynı.
 
 - **Artakalan rezervasyon.** Kurtarma sembolü önce sahiplenir, sonra izlemeye alır; arada beklenmeyen bir istisna olursa
