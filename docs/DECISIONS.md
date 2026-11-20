@@ -7,6 +7,149 @@ Pencereler: AYI 2026-01-23→02-13 (BTC −30%) · YATAY 2026-07-01→07-21 · B
 
 ## Aktif kararlar
 
+### D45 — Loguru çağrıları kendi istisnasını fırlatmaz: stdlib tarzı `exc_info=`/`extra=` kwargs'ı `src/core/logger.py`'de merkezi bir korumayla çevrilir · 2026-11-20 · KOD HAZIR — TESTNET deploy'u kullanıcı onayını bekliyor
+
+**Sorun.** Günlükleyici loguru'dur. loguru, çağrıya konumsal argüman ya da kwargs verilirse mesajı `str.format(*args, **kwargs)` ile
+biçimlendirir; `exc_info=` ise loguru'da tanınmaz (yok sayılır, traceback eklemez). Kod tabanında yaygın kalıp stdlib `logging`
+alışkanlığıdır: `logger.error(f"... {e}", exc_info=True)` ve `logger.critical(f"... {e}", extra={"trade": True})`. Mesajda `{`/`}` varsa
+(Binance JSON hata gövdesi `{"code":-1021,...}`, HTML hata sayfası, dict metni) log çağrısının KENDİSİ istisna fırlatır. Pinli
+sürümde (`loguru==0.7.2`) denendi: `logger.error('x {"a":1}', exc_info=True)` → `KeyError: '"a"'`; `'x {}'` + `extra=` →
+`IndexError`; `'x }'` → `ValueError`; çift parantez (`{{404}}`) hata vermez ama mesajı sessizce `{404}` yapar (mesaj bozulur).
+Aynı mesaj kwargs'sız yazılınca sorunsuzdur. Mevcut testlerin çoğu `logger`'ı `MagicMock` ile değiştirdiği için tuzak hiç görülmedi.
+
+Zarar yeri çağrının konumudur: `except` bloğunda log çağrısı bir güvenlik eyleminden ÖNCE gelirse eylem atlanır; bir döngü
+yakalayıcısında gelirse görev ölür; blok log ile biterse asıl istisna `KeyError` ile DEĞİŞİR (çağıranın tür kontrolü yanlış dala düşer).
+
+**Envanter** (AST taraması, `src/` 956 log çağrısı; betik ve satır satır döküm `docs/audits/2026-11-20-loguru-kwargs/`):
+
+| Ölçüt | Sayı |
+|---|---|
+| kwargs'lı çağrı | **116** (89 `extra=`, 27 `exc_info=`; başka kwarg yok; 111'i f-string, 2 birleştirme, 3 sabit metin) |
+| bunlardan serbest metin taşıyan (istisna, neden, webhook/olay metni gömülü) | **53** (kalan 63'ü sayı, sembol ya da kod içi etiket gömer; süslü parantez taşıması beklenmez. Sınıflandırma değişken adına göredir, sezgiseldir) |
+| `except` içinde | **39**; 38'i serbest metinli |
+| `except` içinde + serbest metin + ardından güvenlik eylemi (koruma emri, `_entry_halted` mandalı, tmp dosya temizliği, `set_status`) | **7** |
+| `except` içinde + serbest metin + ardından yalnız çıkış (`raise`/`return`/`continue`/`break`: log patlarsa asıl istisna ya da dönüş değeri değişir) | **9** (+1: çıkış ve başka ifade) |
+| `except` içinde + serbest metin + döngü içinde (log patlarsa görev ölür) | **18** |
+| `except` içinde + serbest metin + log işleyicinin son ifadesi (istisna çağırana kaçar, türü değişir) | 16 |
+| konumsal argümanlı çağrı (mesajdan sonra) | 1 (sabit metin: güvenli) |
+
+Öncelikli dosyalar (kwargs'lı / serbest metin / `except`+serbest): `scalper/executor.py` 4/0/0, `scalper/exits.py` 6/1/0,
+`scalper/engine.py` 32/23/14, `trading/position_manager.py` 8/1/0, `services/orchestrator.py` 8/5/5; diğerleri
+`follower/engine.py` 20/12/8, `follower/executor.py` 8/2/2, `main.py` 4/3/3, `signal_queue.py` 3/2/2, `waiting_mode/monitor.py` 2/2/2.
+En tehlikeli örnekler (satır numaraları 75c7040 ağacına göredir):
+- `follower/executor.py:271` `open_position`: dolum bilgisi okunamayınca CRITICAL log, SONRA `place_stop_loss_or_close`. Log patlarsa
+  koruma emri hiç konmaz: pozisyon korumasız kalır ve çağıran `KeyError` görür.
+- `orchestrator.py:681` `_process_signal_locked`: `UnprotectedPositionError` → log, SONRA `_entry_halted = True`. Log patlarsa giriş
+  mandalı kurulmaz ve `UnprotectedPositionError` yerine `KeyError` yükselir.
+- `orchestrator.py:361` `_monitoring_loop` genel yakalayıcısı: log patlarsa izleme döngüsü ölür, pozisyon izleme durur.
+- `orchestrator.py:269` `recover_open_positions` (döngü içinde `continue`): log patlarsa kalan pozisyonların kurtarması atlanır ve istisna çağırana kaçar.
+- `scalper/engine.py:670,818`, `follower/engine.py:309`, `follower/risk_halt.py:199` (mandal dosyası yazılamadı): tmp dosya temizliği
+  (ve varsa `return False`) atlanır.
+Taramada `scalper/executor.py`, `scalper/exits.py` ve `position_manager.py`'de `except` içinde serbest metinli kwargs'lı çağrı
+çıkmadı; `position_manager.py:699` (acil kapatmadan önce) yalnız `{symbol}` gömer, süslü parantez taşıyamaz.
+
+**Karar.** Merkezi çözüm (a): `src/core/logger.py` loguru'nun tek çıkış noktasına (`Logger._log`: `info/error/critical/log` hepsi
+buradan geçer) bir koruma takar. Çağrı yerleri DEĞİŞMEDİ (`git diff src/` yalnız `src/core/logger.py`); log metinleri ve seviyeleri aynıdır.
+Dört kural:
+1. `exc_info=` (bool, istisna, 3'lü demet, `None`) → loguru `exception` seçeneği: kayda GERÇEK traceback girer. İşlenen istisna
+   yokken `exc_info=True` hiçbir şey eklemez (`NoneType: None` satırı yok).
+2. `extra={...}` → kayda `bind(**extra)` gibi eklenir: `record["extra"]["trade"]`. `_is_trade_record` değişmedi ve `trades.log` yönlendirmesi aynı
+   çalışır (iç içe eski biçimi de kabul etmeye devam eder).
+3. Bu ikisi çıkarıldıktan sonra geriye konumsal argüman ya da gerçek yer tutucu kwarg'ı kalmazsa mesaj BİÇİMLENDİRİLMEZ (zaten
+   biçimlenmiş bir f-string'dir). `logger.info("a {} b {c}", 1, c=2)` gibi gerçek şablonlar eskisi gibi biçimlenir.
+4. Biçimlendirme yine de patlarsa (f-string + konumsal argüman gibi) satır aynen, biçimlendirmeden yazılır; bu yedek yazma `except`
+   bloğunun DIŞINDA koşar (içeride `exception=True` çağıranın istisnası yerine biçimlendirme hatasını kaydederdi) ve `record`/`colors`
+   seçeneklerini kapatır. Biçimlendirme olmayan hata (ör. olmayan seviye adı) ve bir sink'in kendi hatası (`catch=False`) yutulmaz.
+5. Traceback YALNIZ `errors.log`'a gider; konsol, `bot.log` ve `trades.log` kayıt başına TEK satırlı kalır (aşağıya bak).
+
+**Neden (b) değil.** (b) 116 çağrıyı `opt(exception=e)` / `bind(...)` biçimine çevirmekti. Reddedildi: (1) kalıp stdlib alışkanlığıdır
+ve yeni kod yazan her oturum onu yeniden yazar; (b) yalnız bugünkü çağrıları düzeltir, yarınkini CI'ya bırakır (lint/test gerekir),
+(a) ikisini birden kapatır. (2) (b) 17 dosyaya, güvenlik açısından en kritik motor dosyalarına (`scalper/engine.py` 32,
+`follower/engine.py` 20 çağrı) dokunur; `orchestrator.py`'de aynı anda iki başka dal çalışıyor ve "log metinleri aynı kalır"
+kanıtı büyük bir farkta zayıflar. (3) Bedeli (a) öder: koruma loguru'nun İÇ fonksiyonuna takılır. Önlem: `loguru==0.7.2` pini,
+takmadan önce imza kontrolü (kayarsa HİÇBİR ŞEYE dokunulmaz, `RuntimeWarning`), imza ve davranış için CI testleri (aşağıda).
+Ölçülen maliyet: argümansız çağrıda ≈ +0.1 µs, kwargs'lı çağrıda ≈ +0.3-0.6 µs (bastırılmış debug çağrısı 0.14 → 0.29 µs); boş sink'li
+tam bir çağrı ≈ 20 µs (girişimli medyan, 7×30 000 çağrı; ikinci bir bağımsız ölçüm aynı mertebeyi verdi).
+
+**Log çıktısındaki değişiklikler (bilinçli).**
+- `exc_info=True` kullanan 27 çağrı artık traceback yazar (önce hiçbiri yazmıyordu), YALNIZ `errors.log`'a. Konsol (`logs/supervisor.log`), `bot.log` ve
+  `trades.log` kayıt başına tek satırlı KALIR: loguru metin biçimlerinin sonuna `\n{exception}` ekler, bu üç sink fonksiyon biçimleyici
+  (`_one_line`) kullanır. Neden: `scripts/restart_safe.sh:115`, `scripts/server_deploy.sh:135` ve `scripts/docker_run.sh:242` 418 ban kapısı için
+  `tail -n 2000 logs/bot.log | awk '($1" "substr($2,1,5))>=since' | grep -E 'HTTP 418|banned'` çalıştırır, yani her satırın başında zaman damgası
+  varsayar. Damgasız traceback satırlarında `$1` "Traceback"/"File"/istisna adıdır ve dizge karşılaştırmasında her tarihten büyük çıkar: süzgeçten HER
+  ZAMAN geçer. Kaynak satırında ya da istisna metninde `banned`/`HTTP 418` geçen her traceback eski bir ban izini sonsuza kadar "taze" gösterir ve
+  restart/deploy kapısını kilitlerdi (fail-closed ama kalıcı yanlış alarm). Bu hata kodun ilk sürümünde VARDI; bağımsız düşmanca inceleme buldu,
+  `test_real_sinks_...` artık tek satır sözleşmesini (her `bot.log`/`trades.log`/konsol satırı zaman damgasıyla başlar, traceback yok) kilitliyor.
+- Dört sink'in hepsinde `diagnose=False`: loguru traceback'e DEĞİŞKEN DEĞERLERİNİ basar (`api_secret = '...'`; deneyle doğrulandı) ve `diagnose`
+  varsayılanı `True`'dur. Traceback artık üretildiği için değerler log dosyasına sızardı (CLAUDE.md yasak 5). Eskiden yalnız `errors.log` açıkça
+  `diagnose=True` idi ama kayıt hiç üretilmediği için işlemiyordu. Pratikte yalnız `errors.log` istisna yazar; diğer üçünde ayar savunma amaçlıdır.
+- `errors.log` biçiminden açık `\n{exception}` kaldırıldı: loguru metin biçiminin sonuna onu kendisi ekler, ikisi birlikte traceback'i İKİ kez
+  basıyordu (deneyle doğrulandı). Yan etki: `errors.log` kayıtları artık aralarında boş satır olmadan yazılır (önceden her kayıt iki satır
+  sonu taşıyordu). `errors.log`'u okuyan betik yok (`scripts/`, `src/`, `tests/` tarandı; yalnız log dizini yalıtımından söz eden yorumlar çıktı). Biçimi/`diagnose`'u anlatan tek belge
+  `docs/vault/50-veri/loglar.md`'dir ve bu kararla güncellendi. `bot.log`'u okuyan tek makine tüketicisi yukarıdaki üç betiktir.
+- `extra={"trade": True}` kaydı artık `record["extra"]["trade"]` (üst seviye); önceden `record["extra"]["extra"]["trade"]` idi. `record["extra"]`'ı
+  `_is_trade_record` dışında okuyan kod yok (tarandı).
+
+**Değişen dosyalar.** `src/core/logger.py` (koruma + sink ayarları), `tests/test_logger_kwargs_safety.py` (yeni), `tests/test_follower_executor.py`
+ve `tests/test_orchestrator_safety.py` (birer gerçek-logger regresyonu), `docs/vault/50-veri/loglar.md`, `docs/audits/2026-11-20-loguru-kwargs/` (envanter), bu kayıt, `CHANGELOG.md`.
+Ayar (`.env`) değişmez; giriş/çıkış/boyutlama kuralı değişmez; `src/services/orchestrator.py`, diğer çağrı yerleri ve deploy betikleri (`restart_safe.sh` vb.) değişmez.
+
+**Kanıt.** `tests/test_logger_kwargs_safety.py` (38 test, GERÇEK loguru çekirdeği, sink `catch=False`):
+
+| Davranış | Test |
+|---|---|
+| 9 düşmanca metin (JSON gövde, dict metni, `{}`, tek `{`/`}`, `{0}`/`{name}`, `{a.b}`, `{:d}`, çift parantez) `extra=` ile AYNEN yazılır | `test_extra_kwarg_with_braces_is_logged_verbatim` |
+| aynı 9 metin `exc_info=True` ile aynen yazılır ve kayıt gerçek traceback taşır | `test_exc_info_kwarg_with_braces_is_logged_verbatim_with_a_real_traceback` |
+| `exc_info=` istisna örneği / `sys.exc_info()` demeti; aktif istisna yokken `True`/`False`/`None` istisna eklemez | `test_exc_info_accepts_an_exception_instance_and_an_exc_info_tuple`, `test_exc_info_without_an_active_exception_adds_no_exception_record` |
+| `extra` kayda `bind` gibi birleşir; `trades.log` süzgeci `extra=`, `bind(trade=True)` ve düşmanca metinli çağrıyı yönlendirir | `test_extra_mapping_is_merged_into_record_extra_like_bind`, `test_trade_filter_routes_extra_form_bind_form_and_hostile_text` |
+| gerçek şablon (`"sym={s}", s=...`) hâlâ biçimlenir; kwargs'sız süslü metin aynen kalır | `test_template_message_with_genuine_kwargs_is_still_formatted`, `test_regular_loguru_formatting_is_untouched` |
+| f-string + konumsal argüman istisna fırlatmaz; olmayan seviye adı hâlâ fırlatır | `test_message_with_braces_and_positional_args_is_logged_verbatim_instead_of_raising`, `test_a_non_formatting_failure_still_raises` |
+| bir sink'in kendi hatası (`catch=False`) yutulmaz ve satır önceki sink'lere ikinci kez yazılmaz | `test_a_failing_sink_is_not_retried_so_the_record_is_not_written_twice` |
+| yedek yazma çağıranın istisnasını kaydeder (`logger.exception`/`exc_info=True`, `ZeroDivisionError`), biçimlendirme hatasını (`KeyError`) değil; `opt(record=True)`/`opt(colors=True)` altında da çalışır | `test_fallback_write_records_the_callers_exception_not_the_formatting_error`, `test_fallback_write_also_turns_off_the_record_and_colors_options` |
+| kayıt çağıran satırı gösterir (`function`/`line`/`name`), sarmalayıcıyı değil | `test_record_points_at_the_call_site_not_the_guard` |
+| koruma tek sefer takılır; `_log` ya da `Logger.__init__` imzası (seçenek dizilimi) kayarsa takılmaz; pinli loguru kwargs'ı hâlâ biçimlendiriyor (kanarya) | `test_guard_is_installed_and_installing_again_changes_nothing`, `test_guard_refuses_to_patch_when_the_loguru_internal_signature_changed`, `test_guard_refuses_to_patch_when_the_options_layout_may_have_changed`, `test_canary_pinned_loguru_still_formats_kwargs_so_the_guard_is_still_needed` |
+| GERÇEK sink'ler (ayrı süreç, gerçek dosyadan): trade satırı `trades.log`'a gider; traceback YALNIZ `errors.log`'ta (istisna başına bir); `bot.log`/`trades.log`/konsolun her satırı zaman damgasıyla başlar (418 ban kapısı sözleşmesi); hiçbir çıktıda değişken değeri yok | `test_real_sinks_route_trade_line_and_write_one_traceback_without_variable_values` |
+| izleme döngüsü süslü parantezli hatada ÖLMEZ, yakalayıcı dalı çalışır ve kayıt traceback taşır | `test_monitoring_loop_survives_an_exception_whose_text_has_braces` |
+| takipçide dolum okunamayınca (süslü parantezli hata) koruma emri YİNE konur | `test_follower_executor.py::TestUnreadableFillWithBraceLadenError` |
+| `UnprotectedPositionError` süslü parantezli metinle de türünü korur ve giriş mandalı kurulur | `test_orchestrator_safety.py::test_unprotected_error_with_brace_text_still_latches_and_keeps_its_type` |
+
+Düzeltme KAPALIYKEN testler düşer: `origin/main`'in `logger.py`'siyle 40 yeni testten **37**'si düşer (kalan üçü davranışın DEĞİŞMEDİĞİNİ kilitler:
+`test_regular_loguru_formatting_is_untouched`, `test_a_non_formatting_failure_still_raises`, `test_a_failing_sink_is_not_retried_so_the_record_is_not_written_twice`);
+koruma hiç takılmazsa 35'i düşer. Her koruma parçası ayrı ayrı bozularak da denendi (17 bozma): `errors.log` `diagnose` açık, `errors.log` çift `{exception}`,
+konsol/`bot.log`/`trades.log` çok satırlı (üç ayrı bozma), `depth+1` yok (kayıt sarmalayıcıyı gösterir), biçimlendirme geri dönüşü yok, `extra` çevrilmiyor,
+`exc_info` çevrilmiyor, aktif istisna yokken `exc_info=True` istisna ekliyor, koruma takılmıyor, sink hatasında da yeniden yazma, yedek yazma `except` içinde,
+yedek yazmada `record`/`colors` açık, `record`/`colors` biçimlendirme sayılmıyor, `Logger.__init__` imzası denetlenmiyor: 16'sında en az bir test düştü. Yakalanmayan tek
+bozma konsol sink'indeki `diagnose` ayarıdır; konsol artık istisna yazmadığı için gözlenemez (savunma amaçlı).
+Tam paket (yerel `.env`, son ağaç): 4105 geçti / 85 atlandı, 153 sn (önceki 4065 + 40 yeni test). Temiz kopya + sunucunun secret olmayan ayarları (`scripts/preflight_server_env.sh awa`): 4104 geçti / 86 atlandı, 174 sn (66 ayar satırı). CI `test` işi bu kararı taşıyan PR'dadır.
+Kod bağımsız bir düşmanca incelemeden geçti (76 araç çağrısı, 3000'lik rastgele fark testi dahil): iki gerçek kusur bulundu ve düzeltildi (yukarıdaki `bot.log` tek satır sözleşmesi
+ve yedek yazmanın yanlış istisnayı kaydetmesi), ayrıca `record`/`colors` altında yedek yazma açığı ile `Logger.__init__` imza denetimi eklendi; çağıran satır, `catch`/`bind`/`patch`/`contextualize`,
+iş parçacığı/asyncio yarışları ve `enqueue` altında başka kusur bulunmadı.
+
+**Bilinmeyenler / sınırlar (açıkça).**
+- Koruma loguru'nun iç `Logger._log` fonksiyonuna takılıdır (genel API değil). Sürüm yükseltmesinde imza kayarsa koruma TAKILMAZ ve çalışma
+  sırasında yalnız bir `RuntimeWarning` görünür; asıl güvence CI'dır: `test_guard_is_installed_and_installing_again_changes_nothing` düşer. Bu yüzden
+  `loguru` pini yükseltilirken bu test (ve kanarya testi) geçirilmelidir.
+- Traceback hacmi canlıda ÖLÇÜLMEDİ. 27 çağrı yeri artık `errors.log`'a traceback yazar (50 MB/60 gün döner); kalıcı bir hatada döngü yakalayıcıları her turda
+  bir traceback üretir (ör. `_monitoring_loop` 10 sn'de bir). Bağımsız ölçüm: üç çerçeveli bir görevde tek kayıt ≈ 25 satır/2,2 KB; gerçek sink'lerle `exc_info=True` çağrısı ≈ 360 µs
+  (düz çağrı ≈ 140 µs) ve biçimlendirme çağıran iş parçacığında, yani olay döngüsünde yapılır. 27 çağrının 17'si döngü içindedir.
+- Tanınan `exc_info` türleri bool/`None`/istisna/3'lü demettir; başka türler (tamsayı, sınıf, metin) tanınmaz ve eskisi gibi sıradan kwarg kalır.
+  `extra`/`exc_info` kwarg'ı artık tüketildiği için `{extra}`, `{extra[k]}`, `{exc_info}` yer tutucuları biçimlenmez, aynen yazılır; kodda böyle bir şablon YOKTUR
+  (116 kwargs'lı çağrının hepsi f-string ya da sabit metin, AST taraması). `lazy=True` + `exc_info/extra` artık hata yerine ham yazılır (kodda `opt(lazy=...)` yok).
+  `opt(colors=True)` ile argümansız ve geçersiz etiketli çağrı hâlâ `ValueError` fırlatır (kapsam dışı; kodda `opt(colors=...)`/`opt(record=...)` yok).
+- Koruma `Logger.__init__` imzasından seçenek sayısını/sırasını doğrular; `_stdlib_kwargs_to_options` kendi hatasında sessizce dönüşümü atlar (satır yine yazılır).
+- Önceden var, bu kararda DEĞİŞMEDİ: `setup_logger()` ikinci kez çağrılırsa ya da `importlib.reload(src.core.logger)` yapılırsa `logger.remove()` konsol sink'inin
+  `TextIOWrapper(sys.stdout.buffer)`'ını çöpe bırakır ve o `sys.stdout`'u kapatır (`ValueError: I/O operation on closed file`).
+- Kural 4 yalnız yayından ÖNCE patlayan çağrıyı (biçimlendirme) biçimlendirmeden yeniden yazar. Bir sink'in kendi hatası (`catch=False`) aynen
+  yükselir ve satır ikinci kez yazılmaz; bu ayrımı traceback'teki `loguru._handler` çerçevesi belirler (loguru'nun iç yapısına ikinci bir bağ: CI testi var).
+  Uygulama sink'lerinin hepsi varsayılan `catch=True`'dur (loguru hatayı kendisi yutar).
+- Kapsam yalnız loguru'dur: `import logging` kullanan iki modül etkilenmez (stdlib anlamı zaten güvenlidir).
+- Mevcut testlerin çoğu `logger`'ı `MagicMock` yapar; onlar tuzağı hâlâ göremez. Güvence loguru düzeyindeki testlerdedir ve iki kritik yoldaki
+  (takipçi dolum hatası, orkestratör mandalı) gerçek-logger regresyonlarındadır.
+- Canlıda (TESTNET) henüz gözlenmedi: ancak süslü parantezli bir hata geldiğinde ve ilk `exc_info` traceback satırında görülebilir.
+
+**Geri alma.** `scripts/deploy.sh awa <önceki-commit>`; ayar ya da veri göçü yok. Kod geri alınınca log çağrıları eski davranışa döner:
+süslü parantezli hata metni yine log çağrısını patlatır, `exc_info` yine traceback yazmaz, `diagnose` ve `errors.log` biçimi eskiye döner.
+
 ### D44 — Orkestratörün açılış kurtarması kendini onarır: başarısız kurtarma izleme döngüsünde geri çekilmeli aralıklarla yeniden denenir · 2026-11-20 · TESTNET'TE CANLI (2026-11-20 deploy, `4f0c159`)
 
 **Sorun.** `TradingOrchestrator.start()` açılışta `_recovery_ready = await recover_open_positions()` atıyor ve bu bayrak başka hiçbir
@@ -103,7 +246,7 @@ kusur bulunmadı. Deploy kaydı deploy'dan sonra buraya eklenir.
 - Önceden beri var, doğrulandı: günlükleyici loguru'dur; `exc_info=True` ya da `extra={...}` ile yazılan bir mesajda `{...}`
   geçerse log çağrısı `KeyError` fırlatır. `_monitoring_loop`'un genel hata yakalayıcısı bu kalıbı kullanır; metninde süslü
   parantez olan bir hata oraya ulaşırsa döngü ölür. Yeni yol etkilenmez (kwargs'sız çağrı ya da `opt(exception=)`; süslü
-  parantezli hata metniyle test edildi). Yakalayıcının kendisi bu kararda değiştirilmedi.
+  parantezli hata metniyle test edildi). Yakalayıcının kendisi bu kararda değiştirilmedi; tuzak kod tabanı genelinde D45'te kapatıldı.
 - Canlıda (TESTNET) kendini onarma henüz gözlenmedi: ancak bir açılış kurtarması başarısız olduğunda görülebilir.
 
 **Geri alma.** `scripts/deploy.sh awa <önceki-commit>`; ayar ya da veri göçü yok. Kod geri alınınca davranış bu karardan öncesine
