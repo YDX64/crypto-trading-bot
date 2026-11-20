@@ -474,7 +474,7 @@ async def test_precondition_false_waits_then_true_attempts(clock, monkeypatch):
 async def test_start_skips_initial_recovery_while_precondition_false(
     clock, db_sessionmaker, monkeypatch
 ):
-    """Scalper kurtarması bitmediyse açılış çağrısı borsaya HİÇ sormaz.
+    """Scalper kurtarması bitmediyse açılış pozisyon kurtarma sorgusu atmaz, hiçbir şey sahiplenmez.
 
     Senaryo: scalper'ın ilk yoklaması başarısız oldu, kurtarması koşmadı ve
     sembolleri rezerve edilmedi. Borsada scalper'a ait, henüz OPEN `scalp_trades`
@@ -492,7 +492,7 @@ async def test_start_skips_initial_recovery_while_precondition_false(
         await _start_without_loop(orch)
         skipped = logs.messages("WARNING", "Açılış kurtarması ATLANDI")
 
-    assert fake.get_all_positions_calls == 0
+    assert fake.get_all_positions_calls == 0  # start() kurtarma sorgusu atmadı
     assert orch._recovery_ready is False
     assert orch.active_positions == {}
     assert symbol_reservations.snapshot() == {}
@@ -502,6 +502,19 @@ async def test_start_skips_initial_recovery_while_precondition_false(
     assert orch._recovery_retry_due_monotonic == T0 + orch.RECOVERY_RETRY_INITIAL_SECONDS
     assert orch.health_snapshot()["recovery_next_retry_in_seconds"] == 30.0
     assert len(skipped) == 1
+
+    # Gerçek izleme döngüsü ilk turda salt-okunur bir hazır-olma yoklaması atar
+    # (D44'ün başarısız-açılış yolunda da böyle). Borsayı OKUR ama listeyi
+    # kullanmaz: sahiplenme, emir ve kurtarma bayrağı değişmez.
+    await orch._refresh_exchange_readiness_if_due()
+
+    assert fake.get_all_positions_calls == 1
+    assert orch._exchange_ready is True
+    assert orch._recovery_ready is False
+    assert orch.active_positions == {}
+    assert symbol_reservations.snapshot() == {}
+    assert fake.orders == [] and fake.cancels == []
+    assert await _position_rows(db_sessionmaker) == []
 
 
 async def test_skipped_initial_recovery_heals_once_precondition_turns_true(

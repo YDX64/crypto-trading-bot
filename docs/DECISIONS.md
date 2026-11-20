@@ -21,9 +21,11 @@ başarılı olursa: scalper kurtarması hiç koşmamış, bekleyen maker semboll
 başarısız olan bir açılışta ortaya çıkar. Kodda doğrulandı ve kırmızı testle yeniden üretildi (eski açılış borsaya sordu).
 
 **Karar.** `start()` AYNI ön koşulu sorar; başlatma ve yeniden deneme tek yardımcıyı kullanır (`_recovery_precondition_pending()`).
-Ön koşul bağlı ve sağlanmıyorsa açılış kurtarması ATLANIR: borsaya sorgu yok, pozisyon sahiplenme yok, `_recovery_ready=False`, ilk
-yeniden deneme D44 aralığıyla (30 sn) planlanır ve `Açılış kurtarması ATLANDI` uyarısı yazılır. Scalper hazır olunca D44 döngüsü
-kurtarmayı kendisi koşar ve `/health` o zaman düzelir.
+Ön koşul bağlı ve sağlanmıyorsa açılış kurtarması ATLANIR: pozisyon kurtarma sorgusu (`get_all_positions` ve sahiplenme) yok,
+`_recovery_ready=False`, ilk yeniden deneme D44 aralığıyla (30 sn) planlanır ve `Açılış kurtarması ATLANDI` uyarısı yazılır. Başka
+borsa trafiği değişmez: `start()`'ın bağlantı ping'i (`test_connection`) ve izleme döngüsünün ilk turundaki salt-okunur hazır-olma
+yoklaması (`get_all_positions`; hiçbir pozisyonu sahiplenmez) yine atılır. Scalper hazır olunca D44 döngüsü kurtarmayı kendisi koşar
+ve `/health` o zaman düzelir.
 
 | Durum | Açılışta | Not |
 |---|---|---|
@@ -65,7 +67,7 @@ geçiyordu), kod sonrası `25 passed`. Orkestratöre dokunan dört dosya birlikt
 
 | Davranış | Test |
 |---|---|
-| Ön koşul `False` iken açılışta borsa sorgusu yok; STOP'suz scalper pozisyonu sahiplenilmez/kapatılmaz (emir yok, DB satırı yok, rezervasyon yok); bayrak `False`; ilk deneme 30 sn'ye planlı | `test_start_skips_initial_recovery_while_precondition_false` |
+| Ön koşul `False` iken `start()` pozisyon kurtarma sorgusu atmaz; STOP'suz scalper pozisyonu sahiplenilmez/kapatılmaz (emir yok, DB satırı yok, rezervasyon yok); bayrak `False`; ilk deneme 30 sn'ye planlı; döngünün salt-okunur hazır-olma yoklaması da hiçbir şey sahiplenmez | `test_start_skips_initial_recovery_while_precondition_false` |
 | Atlanan açılış: vade geldiğinde ön koşul `False` ise deneme yok ve hak harcanmaz; `True` olunca kurtarma koşar | `test_skipped_initial_recovery_heals_once_precondition_turns_true` |
 | GERÇEK `_monitoring_loop` + `main._scalper_recovery_settled`: scalper hazır olana dek kurtarma koşmaz, sonra koşar ve `health_snapshot()["healthy"]` `True` olur | `test_real_loop_recovers_and_health_heals_after_scalper_settles` |
 | Ön koşul yok ya da sağlanıyorsa açılış bugünkü gibi (tek sorgu, pozisyon izlemede, rezervasyon) | `test_start_recovers_immediately_when_precondition_missing_or_true` (2 parametre) |
@@ -73,6 +75,17 @@ geçiyordu), kod sonrası `25 passed`. Orkestratöre dokunan dört dosya birlikt
 
 Üç ortam (son ağaç): yerel `.env` ile 4071 geçti / 85 atlandı, 165 sn (önceki 4065 + 6 yeni test); temiz kopya + sunucunun secret olmayan ayarları (`scripts/preflight_server_env.sh awa`)
 4070 geçti / 86 atlandı, 165 sn (66 ayar satırı, "ÖN SINAV GEÇTİ"); CI `test` işi (`env.example`) bu kararı taşıyan PR'dadır. Deploy kaydı deploy'dan sonra buraya eklenir.
+
+**İnceleme (PR #13, birleştirmeden önce).** Bağımsız bir düşmanca inceleme (salt okunur, kod okuma; çalıştırma yok) bulgu getirmedi:
+ön koşul yok/sağlanıyor yolunun bire bir aynı kaldığını, kilitlenme olmadığını (scalper bayrağı yalnız `_attempt_recovery`'de atanır ve
+`_exchange_loop` 30 sn'de bir yeniden dener; kapıda bekleyen turlar deneme hakkı harcamaz), lifespan sırasında yarış olmadığını
+doğruladı; üç davranış testinin eski kodda düştüğünü ve gerçek-döngü testinin zamanlamaya bağlı olmadığını belirtti. cubic iki bulgu
+bıraktı:
+
+| Bulgu | Hüküm | Sonuç |
+|---|---|---|
+| Atlanan açılışta döngü ilk turda yine imzalı `get_all_positions()` hazır-olma yoklaması atıyor; yoklamaya da aynı kapı konmalı, yoksa gerçek-döngü testinin sıfır-çağrı iddiası düşer | Gözlem doğru, sonuç yanlış | Yoklama yalnız okur, sahiplenmez; kapı `/health`'te borsa sağlıklıyken `exchange_ready=false` gösterirdi. Testin sıfır-çağrı iddiası `recover_open_positions` çağrılarına aittir ve geçer. Kod değişmedi; davranış testle sabitlendi (yoklama borsayı okur, hiçbir şey sahiplenmez) |
+| Belge "borsaya sorgu yok" diyor ama `start()` önce bağlantı ping'i (`test_connection`) atıyor | Geçerli (belge kesinliği) | Düzeltildi: yalnız pozisyon kurtarma sorgusunun atlandığı yazıldı |
 
 **Bilinmeyenler / sınırlar (açıkça).**
 - Scalper kurtarması DENENDİ ama başarısız kaldıysa (ör. kalıcı entry-halt, `_recovery_ready=False`) açılış kurtarması da atlanır.
@@ -85,7 +98,8 @@ geçiyordu), kod sonrası `25 passed`. Orkestratöre dokunan dört dosya birlikt
   `True` görünebilir. Kod okumasından çıkarıldı, tetiklenmedi; scalper kodu kapsam dışı (bu karar yalnız bayrağı okur). D44 yeniden
   denemesi de aynı bayrağa bakar.
 - Atlanan açılışta izleme döngüsünün ilk turu bir hazır-olma yoklaması (`get_all_positions`, ağırlık 5) atar: yalnız okur,
-  `_exchange_ready` işaretler, pozisyon sahiplenmez.
+  `_exchange_ready` işaretler, pozisyon sahiplenmez (testle sabit). Yoklamaya aynı kapı BİLEREK konmadı: sahiplenme riski yok ve kapı
+  `/health`'te borsa sağlıklıyken `exchange_ready=false` gösterirdi. D44'ün başarısız-açılış yolunda da aynı yoklama zaten böyle atılıyordu.
 - D44'ün diğer sınırları (gömülü takipçi sırası, listeyi okuduktan sonraki yarış, `_entry_halted` kendiliğinden temizlenmez, loguru
   süslü parantez tuzağı) aynen geçerlidir.
 - Canlıda (TESTNET) gözlenmedi: ancak scalper'ın ilk yoklaması başarısız olan bir açılışta görülebilir.
