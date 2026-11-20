@@ -118,7 +118,7 @@
     "start": "2025-01-01",
     "end": "2025-12-31",
     "status": "burned",
-    "note": "E17'nin DEV kümesi ve E16'nın sekiz doğrulama penceresi V1..V8 bu yılın içindedir; bugünkü ayarlar burada ESKİ modelle ölçüldü (yıl boyunca PF 0.777, V1..V8'de PF 0.773). 'end' kapsayıcıdır.",
+    "note": "E17'nin DEV kümesi ve E16'nın sekiz doğrulama penceresi V1..V8 bu yılın içindedir; bugünkü ayarlar burada ESKİ modelle ölçüldü (yıl boyunca PF 0.777, V1..V8'de PF 0.773). E18'in (momentum ailesi M, 6 kol, gerçekçi model) DEV kümesi de budur: 2026-11-20'de altı kol da burada elendi (DEV-YOK, PF 0.64-0.88). 'end' kapsayıcıdır.",
     "opens": []
   },
   {
