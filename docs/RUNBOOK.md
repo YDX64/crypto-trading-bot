@@ -1301,6 +1301,12 @@ yukarıdaki üç kapıdan biri kapalıdır. Restart'tan ÖNCE 418/ban var mı ko
 "Binance 418" maddesi); sonra `RESTART_LABEL=<etiket> scripts/restart_safe.sh`. Skalper yolu bu bayraktan etkilenmez (kendi
 readiness'i var; `/scalper/status` ayrıca bak).
 
+Kurtarma sırasında görülebilen iki WARNING satırı kendi başına iş gerektirmez: "önceki kurtarma denemesinden kalan rezervasyon
+bırakıldı" (yarım kalan denemenin sembol kilidi temizlendi) ve "hesap listesinde açık görünüyor ama taze positionRisk miktarı 0"
+(kapanmış pozisyon için kayıt açılmadı). İkincisi aynı sembolde yineleniyorsa borsada o sembolü elle kontrol et: pozisyon
+gerçekten AÇIKSA `positionRisk` yanlış dönüyor demektir ve pozisyonu orkestratör yönetmiyordur (stop emrine bak, gerekirse
+elle kapat, sonra restart).
+
 **Pozisyon korumasız uyarısı / -4120:** koşullu emirler `/fapi/v1/algoOrder`'da; `openOrders`
 onları göstermez, `allOpenOrders` iptal etmez.
 

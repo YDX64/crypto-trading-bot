@@ -120,15 +120,38 @@ alındı"). `.env` değişmedi (yedek `backups/env.bak-20261120-105745-deploy`).
 kendini onarma yolu; açılış kurtarması başarılı olduğu için yeniden deneme hiç tetiklenmedi.
 
 **Birleştirmeden sonra gelen inceleme (cubic, PR #11).** Beş bulgu kodda tek tek doğrulandı. Hiçbiri emir ya da çift yönetim riski
-taşımıyor; kod düzeltmeleri bu deploy'a KATILMADI, takip işidir.
+taşımıyor; kod düzeltmeleri bu deploy'a KATILMADI, takip işidir. Dört geçerli bulgunun üçü takip değişikliğiyle (`e9c2dd8`), biri
+bu kayıtla düzeltildi; ayrıntı tablonun altındaki "İnceleme düzeltmeleri" paragrafında.
 
 | Bulgu | Hüküm | Etki |
 |---|---|---|
-| Yeniden denemede döngü ortasında beklenmeyen bir istisna olur ve pozisyon sonraki denemeden önce kapanırsa "telegram" rezervasyonu izlemesiz kalır | Geçerli (dar) | Fail-closed: o sembol yeniden başlatmaya kadar başka motora kapalı; emir riski yok. Düzeltme: her başarılı hesap okumasından sonra izlenmeyen "telegram" rezervasyonlarını bırak |
-| Bayat hesap listesi denemeler boyunca sürerse her deneme emirsiz bir CLOSED `positions` satırı ekler | Geçerli (düşük olasılık: liste her zaman taze okunur) | Kozmetik, emir yok. Düzeltme: yetim satırı eklemeden önce canlı miktarı doğrula |
+| Yeniden denemede döngü ortasında beklenmeyen bir istisna olur ve pozisyon sonraki denemeden önce kapanırsa "telegram" rezervasyonu izlemesiz kalır | Geçerli (dar) | Fail-closed: o sembol yeniden başlatmaya kadar başka motora kapalı; emir riski yok. Düzeltildi (`e9c2dd8`): her başarılı hesap okumasında, izlemede olmayan ve listede açık pozisyonu bulunmayan "telegram" rezervasyonu bırakılır |
+| Bayat hesap listesi denemeler boyunca sürerse her deneme emirsiz bir CLOSED `positions` satırı ekler | Geçerli (düşük olasılık: liste her zaman taze okunur) | Kozmetik, emir yok. Düzeltildi (`e9c2dd8`): yetim satırı açılmadan önce canlı miktar taze okunur |
 | RUNBOOK'ta scalper alan yolu yanlıştı | Geçerli | Bu kayıtla düzeltildi: `scalper_details.exchange.recovery_ready` |
-| Lifespan testi `_check_disabled_follower_open_trades`'i gerçek veritabanı yolunda bırakıyor | Geçerli (test izolasyonu) | Yalnız test |
+| Lifespan testi `_check_disabled_follower_open_trades`'i gerçek veritabanı yolunda bırakıyor | Geçerli (test izolasyonu) | Yalnız test. Düzeltildi (`e9c2dd8`) |
 | Ön koşul gömülü takipçinin kurtarmasını da beklemeli | Geçersiz | Takipçinin canlı pozisyonları `scalp_trades`'te OPEN satırdır (atlama sorgusu strateji süzmez) ve uçuştaki girişi emirden önce rezerve eder. Tasarım sırası orkestratör → takipçidir; tersine bağlamak takipçinin yetim denetimini bozar |
+
+**İnceleme düzeltmeleri (2026-11-20, `e9c2dd8`, PR #14; TESTNET'e henüz deploy EDİLMEDİ).** Yalnız `recover_open_positions` ve iki
+yeni özel yardımcı değişti; `start()`, yeniden deneme zamanlaması, sinyal yolu, scalper ve takipçi kodu, ayarlar aynı.
+
+- **Artakalan rezervasyon.** Kurtarma sembolü önce sahiplenir, sonra izlemeye alır; arada beklenmeyen bir istisna olursa
+  rezervasyon bilerek kalır (fail-closed). `_release_stale_reservations` her başarılı hesap okumasında şu koşulların hepsini
+  sağlayan rezervasyonu bırakır: sahip "telegram", sembol izlemede değil, taze hesap listesinde açık pozisyonu yok. İki durumda
+  hiçbir şey bırakılmaz: `entry_halted` (sinyal yolu korumasız pozisyon şüphesinde izlenmeyen rezervasyonu bilerek tutar) ve sinyal
+  kilidi tutulurken (uçuştaki giriş sembolü izlemeden önce sahiplenir). İzlenen ama listede olmayan pozisyona kurtarma dokunmaz:
+  onu izleme döngüsü aynı turda kapanış muhasebesiyle kapatır.
+- **Çift CLOSED satır.** Veritabanında açık kaydı olmayan (yetim) pozisyon için satır açılmadan önce canlı miktar
+  `get_position_risk(force_fresh=True)` ile okunur. Miktar 0 ise ya da kayıt dönmezse pozisyon kapanmış sayılır: satır açılmaz,
+  sembol izlemeden düşer, rezervasyon bırakılır (izleme döngüsünün `is_position_still_open` kuralının aynısı; tek-yön mod
+  varsayılır). Okuma başarısızsa ya da miktar eksik/bozuksa pozisyon eskisi gibi benimsenir. Ek REST yükü yetim adayı başına bir
+  weight-5 çağrıdır; veritabanı kaydı olan pozisyonlarda ek çağrı yoktur.
+- **Kabul edilen artık risk.** Hesap listesi pozisyonu açık gösterirken taze `positionRisk` 0 dönerse hüküm `positionRisk`'e göre
+  verilir. `positionRisk` yanlış olsaydı canlı bir yetim pozisyon orkestratörce yönetilmeden kalırdı; bundan emir ya da çift
+  yönetim doğmaz, izleme döngüsü ve acil kapatma da aynı kaynağa güvenir. Olay WARNING olarak loglanır (`docs/RUNBOOK.md`).
+- **Kanıt.** `tests/test_orchestrator_recovery_retry.py` 19 → 28 test (9 yeni, 1 sıkılaştırılmış: bayat listede ikinci deneme artık
+  tek satır şartını da ölçer). Her yeni test ya önce kırmızı görüldü ya da mutasyonla doğrulandı (izlemeden düşürme, "listede"
+  koşulu, taze okuma şartı). Tam paket yerel: 4074 geçti / 85 atlandı. İki bağımsız inceleme (üretim kodu, testler) gerçek hata
+  bulmadı; test incelemesinin üç boşluğu (miktarsız yanıt, "listede" koşulu, doğrulamanın gerçekten denendiği) kapatıldı.
 
 ### D43 — 2026-11-20 ölçüm hükmü: strateji C'nin örneklem-dışı kenarı gösterilemedi, başka kurulumda da yok, kayıp-örüntü korumaları geçmedi · 2026-11-20 · HİÇBİR AYAR DEĞİŞMEDİ — mainnet NO-GO teyit
 
