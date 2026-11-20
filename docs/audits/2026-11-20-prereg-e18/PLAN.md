@@ -134,6 +134,7 @@ kol konmaz ve m küçülür. CAL sayımı: §3.6.
 | `DIAG_Z0` | komisyon 0, kayma 0 (fonlama kalır) | teşhis: ücretten önce kenar var mı |
 | `DIAG_MAKER` | `SCALPER_ENTRY_MODE=maker` | teşhis: limit giriş |
 | `DIAG_T` | sunucu çıkış geometrisi (stop ROI 50, TP1 ROI 10, k = 3) | teşhis: sonuç geometriye bağlı mı |
+| `DIAG_NOLATCH` | `SCALPER_DAILY_LOSS_LIMIT_PCT=0` (günlük kesici düşürmez) | teşhis: sonuç günlük kesiciye bağlı mı |
 
 Teşhis koşuları yalnız `DEV_DECISION.json` yazıldıktan SONRA, altı kolun hepsi için DEV'de koşulur; karar vermez.
 
@@ -152,9 +153,24 @@ CAL koşuları (6 kol, 92 gün) yalnız SAYIM için okunur: işlem sayısı, LON
 sayaçları. Sayım betiği PnL alanlarını okumaz ve basmaz; ham CAL raporları açılmaz (dürüstlük sistemidir, makine
 zorlaması değildir).
 
-<!-- CAL-TABLO-BASLANGIC -->
-(kilitten önce doldurulacak)
-<!-- CAL-TABLO-BITIS -->
+Kod commit'i **H = `425e82a6092ba0614071b6858538331093ed3a83`** ile koşuldu (2026-11-20). Kaynak: `cal_counts.json`.
+
+| Kol | N (92 gün) | LONG | SHORT | Çeyrek izdüşümü | Test edilebilir | 20x payı | 3x payı | Kapasiteden düşen | Günlük kesiciden düşen |
+|---|---|---|---|---|---|---|---|---|---|
+| K15R | 294 | 164 | 130 | 291.6 | evet | %16.7 | %0 | 22 | 318 |
+| K30R | 233 | 128 | 105 | 231.1 | evet | %18.0 | %0 | 9 | 102 |
+| K15B | 408 | 219 | 189 | 404.7 | evet | %16.7 | %0 | 59 | 560 |
+| K30B | 286 | 145 | 141 | 283.7 | evet | %13.6 | %0 | 33 | 116 |
+| G15B | 510 | 236 | 274 | 505.8 | evet | %14.7 | %0 | 68 | 708 |
+| G30B | 326 | 158 | 168 | 323.3 | evet | %13.2 | %0 | 28 | 253 |
+
+- Altı kolun hepsi kuralı geçti; aile m = 6 olarak kilitlenir. Sessiz düşüş sayaçlarının hepsi 0.
+- Günlük kesici (R5) açılabilecek işlemlerin %27–55'ini düşürüyor (kol başına: düşen / (N + kapasite + kesici)). Bu,
+  canlı botun günlük zarar sınırının aynasıdır ve kolların parçasıdır; kilitten sonra değişmez. Sonuçlar bu kuralla
+  birlikte okunur: "kesicisiz M" bu deneyde sınanmıyor.
+- Duman testleri (H ile): S1 parite eşleşti (C, AYI: 92 işlem, net +2808.05); S2 belirlenimcilik eşleşti (K15R, CAL,
+  PYTHONHASHSEED 0 ve 1); S3 altı CAL koşusu check-run'dan geçti; altı kaplamanın her biri K30R ile CAL'de bir kez
+  denendi ve check-run'dan geçti (sonuçları okunmadı). Tam test paketi H'de yeşil (4171 geçti, 85 atlandı).
 
 ## 4. Veri doldurma
 
@@ -204,7 +220,7 @@ zorlaması değildir).
 | P3 | `dev-screen` (G0–G5) → hangi kollara stres gerekir | hiçbiri geçmezse P5'e |
 | P4 | Stres koşuları: G0–G5'i geçen HER kol için `ROB_FEE2`, `ROB_DLY1` | |
 | P5 | `dev-decide` → `DEV_DECISION.json` TEK KEZ yazılır | ilerleyen yoksa VAL yok |
-| P6 | Teşhis: `DIAG_Z0`, `DIAG_MAKER`, `DIAG_T` (6 kol, DEV); mühür kalkar | |
+| P6 | Teşhis: `DIAG_Z0`, `DIAG_MAKER`, `DIAG_T`, `DIAG_NOLATCH` (6 kol, DEV); mühür kalkar | |
 | P7 | (yalnız ilerleyen varsa) VAL doldur; mühür açılışı kayda yazılır; ilerleyen başına taban + FEE2 + DLY1; `val-decide` | doldurma hatası → VAL-YAPILAMADI; kazanan yoksa FINAL yok |
 | P8 | (yalnız VAL kazananı varsa) FINAL mührü açılır; kazanan bir kez koşar; `final` | tek atış |
 | P9 | `report` → `run/DECISION.md`, `results.csv`; EXPERIMENTS E18, DECISIONS, kayıt defteri | |
@@ -303,9 +319,24 @@ taramada yeniden değerlendirir, harness mum kapanışında bir kez; mum-yaşı 
 
 ## 11. Güç (yaklaşık; uçtan uca simülasyon YAPILMADI)
 
-<!-- GUC-BASLANGIC -->
-(kilitten önce, CAL sayımıyla doldurulacak)
-<!-- GUC-BITIS -->
+CAL sayımından izdüşüm (× 365 / 92 ve × 687 / 92; ±%10–20 belirsizlik, 2026 baharı ile 2025 ve 2023–2024 oynaklığı
+farklıdır):
+
+| Kol | DEV N (beklenen) | VAL N (beklenen) | %80 güçle görülebilen ortalama R / işlem (DEV) | Buna karşılık gelen kaba PF |
+|---|---|---|---|---|
+| K15R | ≈ 1170 | ≈ 2200 | ≈ 0.11 | ≈ 1.20 |
+| K30R | ≈ 925 | ≈ 1740 | ≈ 0.12 | ≈ 1.22 |
+| K15B | ≈ 1620 | ≈ 3050 | ≈ 0.09 | ≈ 1.17 |
+| K30B | ≈ 1135 | ≈ 2140 | ≈ 0.11 | ≈ 1.20 |
+| G15B | ≈ 2025 | ≈ 3810 | ≈ 0.08 | ≈ 1.15 |
+| G30B | ≈ 1295 | ≈ 2430 | ≈ 0.10 | ≈ 1.19 |
+
+Hesap: tek yönlü test, ailede tek gerçek etki varsayımıyla BH eşiği p ≤ 0.10 / 6 (z ≈ 2.13), %80 güç (+0.84), günlük
+kümelenme için tasarım etkisi 1.3, işlem başına R standart sapması 1.1, işlem başına brüt kayıp ≈ 0.55R. Son üç sayı
+VARSAYIMDIR, ölçülmedi. Okuma: bu tasarım net PF ≈ 1.2 ve üstü bir kenarı büyük olasılıkla görür; 1.05–1.10 düzeyinde
+ince bir kenarı göremez ve "kazanan yok" der (PF ≥ 1.15 kapısı zaten bunu ister). Bir "yok" sonucunda kol başına PF %90
+güven aralığı yazılır. Gerçek PF = 1.0 iken tüm kapı yığınını (DEV + VAL) geçme olasılığı hesaplanmadı; E17'nin aynı
+türden yığını için simülasyonla ≈ %0.1 bulunmuştu (E17 PLAN §7.4), burada yalnız kıyas olarak anılır.
 
 ## 12. Tasarımın gördüğü ön bilgi (körlük beyanı)
 
