@@ -172,6 +172,8 @@ class TradingOrchestrator:
         self._last_exchange_success_at = datetime.utcnow().isoformat() + "Z"
         self._last_exchange_error = None
 
+        self._release_stale_reservations(exchange_positions)
+
         if not exchange_positions:
             self.logger.info("📭 Borsada açık pozisyon yok")
             return True
@@ -229,7 +231,20 @@ class TradingOrchestrator:
                         f"  ↩️ {symbol}: veritabanı kaydı bulundu (#{position.id}), senkronlandı"
                     )
                 else:
-                    # Kayıt yok — muhtemelen eski bir çökmeden kalan yetim pozisyon
+                    # Kayıt yok — muhtemelen eski bir çökmeden kalan yetim pozisyon.
+                    # Hesap listesi bayat olabilir: canlıda miktar 0 ise hayalet bir
+                    # CLOSED satır eklemeyelim (her yeniden denemede bir tane daha).
+                    if await self._listed_position_is_gone(symbol):
+                        # Önceki başarısız bir denemeden izlemede kalmış olabilir
+                        # (aşağıdaki `protection is False` dalıyla aynı gerekçe).
+                        self.active_positions.pop(symbol, None)
+                        symbol_reservations.release(symbol, self.RESERVATION_OWNER)
+                        self.logger.warning(
+                            f"  ⏭️ {symbol}: hesap listesinde açık görünüyor ama taze "
+                            "positionRisk miktarı 0; kapanmış sayıldı, yetim satır "
+                            "açılmadı, rezervasyon bırakıldı"
+                        )
+                        continue
                     entry = float(raw.get("entryPrice") or 0)
                     position = PositionModel(
                         symbol=symbol,
@@ -289,6 +304,57 @@ class TradingOrchestrator:
 
         self.logger.info(f"✅ {len(self.active_positions)} pozisyon izlemeye alındı")
         return recovery_ok
+
+    def _release_stale_reservations(self, exchange_positions) -> None:
+        """Başarısız bir kurtarma denemesinden artakalan rezervasyonu bırak.
+
+        Kural: bu orchestrator'ın rezervasyonu, taze hesap listesinde YOK ve
+        izlemede (active_positions) de YOK ise bırakılır. Aksi halde pozisyon
+        arada kapanınca döngü o sembole bir daha uğramaz; sembol tüm motorlara
+        kilitli ve bir kapasite yuvası dolu kalırdı (süreç yeniden başlayana dek).
+
+        Dokunulmayan iki durum:
+        - `_entry_halted`: korumasız pozisyon şüphesi; sinyal yolu bu durumda
+          izlenmeyen rezervasyonu bilerek tutar, o kanıttır ve insan bakmalı.
+        - `_signal_lock` tutuluyorsa: uçuştaki giriş, pozisyonu izlemeye almadan
+          önce sembolü rezerve eder; şimdi bırakmak onu yarıştırırdı.
+        İzlemedeki pozisyonun listeden düşmesi izleme döngüsünün işidir (muhasebeyle
+        kapatır); bu yüzden kurtarma ona dokunmaz.
+        """
+        if self._entry_halted or self._signal_lock.locked():
+            return
+        live = {str(raw.get("symbol", "")).upper() for raw in exchange_positions}
+        tracked = {str(symbol).upper() for symbol in self.active_positions}
+        for symbol, owner in symbol_reservations.snapshot().items():
+            if owner != self.RESERVATION_OWNER or symbol in live or symbol in tracked:
+                continue
+            symbol_reservations.release(symbol, self.RESERVATION_OWNER)
+            self.logger.warning(
+                f"🧹 {symbol}: önceki kurtarma denemesinden kalan rezervasyon bırakıldı "
+                "(borsada açık pozisyon yok, izlemede de değil)."
+            )
+
+    async def _listed_position_is_gone(self, symbol: str) -> bool:
+        """Listelenen pozisyonun canlıda gerçekten kalmadığını (miktar 0) doğrula.
+
+        Hüküm taze `positionRisk` okumasına dayanır; izleme döngüsünün
+        (`is_position_still_open`) kullandığı kuralın aynısıdır (tek-yön mod
+        varsayılır).
+
+        Doğrulanamazsa (hata, eksik ya da bozuk miktar) False döner: yetim pozisyon
+        eskisi gibi benimsenir; belirsizlikte korumasız bırakmaktan iyidir.
+        """
+        try:
+            live = await self.binance.get_position_risk(symbol, force_fresh=True)
+            # Eksik/bozuk miktar istisna üretir ve "doğrulanamadı" sayılır: yanlış
+            # bir "yok" hükmü canlı pozisyonu yönetimsiz bırakırdı.
+            return not live or float(live["positionAmt"]) == 0.0
+        except Exception as e:
+            self.logger.warning(
+                f"⚠️ {symbol}: canlı miktar doğrulanamadı ({type(e).__name__}: {e}); "
+                "yetim pozisyon eskisi gibi benimseniyor."
+            )
+            return False
 
     async def _ensure_protected(self, position: PositionModel) -> Optional[bool]:
         """Pozisyonun borsada aktif bir stop emri var mı, kontrol et ve uyar.
