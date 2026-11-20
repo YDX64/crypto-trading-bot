@@ -467,7 +467,7 @@ async def test_precondition_false_waits_then_true_attempts(clock, monkeypatch):
 
 
 # ----------------------------------------------------------------------
-# 9b) Açılış çağrısı da ön koşula bağlı (D45)
+# 9b) Açılış çağrısı da ön koşula bağlı (D46)
 # ----------------------------------------------------------------------
 
 

@@ -7,7 +7,7 @@ Pencereler: AYI 2026-01-23→02-13 (BTC −30%) · YATAY 2026-07-01→07-21 · B
 
 ## Aktif kararlar
 
-### D45 — Orkestratörün AÇILIŞ kurtarması da scalper ön koşuluna bağlandı: scalper kurtarması bitmeden borsadaki pozisyonlar sahiplenilmez · 2026-11-20 · KOD HAZIR — TESTNET deploy'u kullanıcı onayını bekliyor
+### D46 — Orkestratörün AÇILIŞ kurtarması da scalper ön koşuluna bağlandı: scalper kurtarması bitmeden borsadaki pozisyonlar sahiplenilmez · 2026-11-20 · KOD HAZIR — TESTNET deploy'u kullanıcı onayını bekliyor
 
 **Sorun (D44 "Bilinmeyenler"deki boşluk; kodda doğrulandı).** D44 ön koşulu (`recovery_precondition = _scalper_recovery_settled`) yalnız
 izleme döngüsündeki YENİDEN denemede sorulur; `TradingOrchestrator.start()` `recover_open_positions()`'ı koşulsuz çağırıyordu.
@@ -199,7 +199,7 @@ kusur bulunmadı. Deploy kaydı deploy'dan sonra buraya eklenir.
   gecikir (tazelik sınırı 180 sn).
 - Açılış çağrısı (`start()`) ön koşula BAKMAZ; bugünkü davranış korunur. Scalper'ın ilk yoklaması başarısız olup orkestratörün
   sorgusu saniyeler sonra başarılı olursa "Sıra kuralı"ndaki risk açılış yolunda bu karardan önce de vardı ve duruyor. Kapsam
-  dışı bırakıldı (açılış davranışını değiştirir, kendi kararını ister). Sonradan: D45'te kapatıldı (açılış çağrısı da aynı ön
+  dışı bırakıldı (açılış davranışını değiştirir, kendi kararını ister). Sonradan: D46'te kapatıldı (açılış çağrısı da aynı ön
   koşula bağlandı).
 - Önceden beri var, doğrulandı: günlükleyici loguru'dur; `exc_info=True` ya da `extra={...}` ile yazılan bir mesajda `{...}`
   geçerse log çağrısı `KeyError` fırlatır. `_monitoring_loop`'un genel hata yakalayıcısı bu kalıbı kullanır; metninde süslü

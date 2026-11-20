@@ -82,7 +82,7 @@ class TradingOrchestrator:
 
         # D44: gecikmeli kurtarma yeniden denemesi durumu. `main.py` ön koşulu
         # bağlar (scalper kendi kurtarmasını bitirmiş olmalı); None = ön koşul yok.
-        # D45: `start()` açılış kurtarması da aynı ön koşula bağlıdır.
+        # D46: `start()` açılış kurtarması da aynı ön koşula bağlıdır.
         self.recovery_precondition: Optional[Callable[[], bool]] = None
         self._recovery_retry_delay = self.RECOVERY_RETRY_INITIAL_SECONDS
         self._recovery_retry_due_monotonic: Optional[float] = None
@@ -106,7 +106,7 @@ class TradingOrchestrator:
                 "❌ Binance bağlantısı kurulamadı! Orchestrator sinyal kabul etmeyecek."
             )
 
-        # D45: scalper kendi kurtarmasını bitirmeden borsadaki pozisyonlara DOKUNMA.
+        # D46: scalper kendi kurtarmasını bitirmeden borsadaki pozisyonlara DOKUNMA.
         # Scalper'ın ilk borsa yoklaması başarısızsa `_attempt_recovery()` hiç
         # koşmamıştır, sembolleri rezerve değildir; buradaki sorgu saniyeler sonra
         # başarılı olursa OPEN `scalp_trades` satırı olmayan bir scalper pozisyonu
@@ -430,7 +430,7 @@ class TradingOrchestrator:
         (c) `recovery_precondition`: scalper önce kendi kurtarmasını bitirmeli
             (main.py başlangıç sırasıyla aynı); aksi hâlde scalper'a ait ama
             OPEN `scalp_trades` satırı henüz olmayan pozisyon benimsenebilirdi.
-            `start()` açılış kurtarması da aynı kapıdan geçer (D45).
+            `start()` açılış kurtarması da aynı kapıdan geçer (D46).
         (d) Backoff: sonraki deneme çağrıdan ÖNCE planlanır; istisna da
             geri çekilir. Ban/ön koşul beklemesi deneme hakkı tüketmez.
 

@@ -1300,7 +1300,7 @@ fazla 30 dakikada bir yazılır, başarı tek satırdır. Restart yine son çare
 yukarıdaki üç kapıdan biri kapalıdır. Restart'tan ÖNCE 418/ban var mı kontrol et (ban aktifken restart YASAK, yukarıdaki
 "Binance 418" maddesi); sonra `RESTART_LABEL=<etiket> scripts/restart_safe.sh`. Skalper yolu bu bayraktan etkilenmez (kendi
 readiness'i var; `/scalper/status` ayrıca bak). Açılışta scalper hazır değilse (ilk borsa yoklaması başarısız) orkestratör ilk
-kurtarmayı da atlar ve `logs/bot.log`'a "Açılış kurtarması ATLANDI" yazar; bu hata değil beklemedir, scalper hazır olunca döngü kurtarır (D45).
+kurtarmayı da atlar ve `logs/bot.log`'a "Açılış kurtarması ATLANDI" yazar; bu hata değil beklemedir, scalper hazır olunca döngü kurtarır (D46).
 
 **Pozisyon korumasız uyarısı / -4120:** koşullu emirler `/fapi/v1/algoOrder`'da; `openOrders`
 onları göstermez, `allOpenOrders` iptal etmez.
