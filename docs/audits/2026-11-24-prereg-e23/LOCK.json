@@ -1,0 +1,31 @@
+{
+  "H": "3672f29f41f83d62ee8bdbb95c603b042c9031d5",
+  "H_tree": "45fdc0920aae5a2c79b53beb53c9352811b55f55",
+  "blobs_at_H": {
+    "scripts/e23/analyze_e23.py": "373c9dc3ffa3ad8e1d21a512cc66d81cbb09eac6",
+    "scripts/e23/e23_common.py": "a8a600464648d25d4343fd07cab681bca2d82951",
+    "scripts/e23/run_e23.py": "ada043e738e2964a110ff861643a6867c2f2d4ca",
+    "src/core/config.py": "edc724d6e64b1050aafbad76ebf485205c170e4d",
+    "src/strategies/scalper/backtest.py": "fddfdfd32ec5092d40fa07b01b503f63e7f7740e",
+    "src/strategies/scalper/engine.py": "7bd69d8f90de05a7454e1e3492764eb60fe14e89",
+    "src/strategies/scalper/market_gate.py": "41589c6526a57ac3b734a23a58ee9b6bf840c91d",
+    "src/strategies/scalper/setups.py": "93b336381bf1a452e1a800482043ce82e86052d8"
+  },
+  "files": {
+    "PLAN.md": "0117269d9fde8e5235f69e6f6ce9afb126a34f85e078320551952504fe7ee0ac",
+    "cal_counts.json": "5f06f13ae3da02bdd504e79f03ad48766ce422c4dd87bbb67a75ea97ae4b3565",
+    "variants.json": "01907f1f95f4e477e472300efe9edf172aac3c2f04f81cdb5f960e3198cff748"
+  },
+  "labels_e17": {
+    "path": "docs/audits/2026-10-10-prereg-tf/labels_frozen.json",
+    "sha256": "fe6f195cbca618fd1eb3dfaa27a41253cf9eb201ee19f802334946bd3c3ea20a"
+  },
+  "locked_utc": "2026-11-24T01:06:15Z",
+  "python": "3.12.11",
+  "schema": "e23-lock/1",
+  "shock_e18": {
+    "path": "docs/audits/2026-11-20-prereg-e18/shock_days.json",
+    "sha256": "05d10d6b205d4dfabcbad6530f9a3166947aa1ceff139898db57355fe9d54978"
+  },
+  "snapshot_sha256": "2a4748a3d0e822751c2da071a105e8a5b5391206b62d6e3f27515a7789e841a2"
+}
