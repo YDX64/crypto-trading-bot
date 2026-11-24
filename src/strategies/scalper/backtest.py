@@ -108,7 +108,10 @@ from src.strategies.scalper.entry_gates import (
 from src.strategies.scalper.market_gate import (
     MARKET_GATE_INTRADAY_TF,
     evaluate_market_gate,
+    evaluate_shock_trigger,
     resolve_day_open,
+    shock_trigger_direction,
+    shock_trigger_enabled,
 )
 from src.strategies.scalper.permutation import (
     DEFAULT_METRICS as PERMUTATION_DEFAULT_METRICS,
@@ -781,6 +784,58 @@ def _leader_window_snapshot(
         # bir durumdur (kapı fail-open olur), bu yüzden burada korunur.
         "first_close_utc": _ms_to_utc_iso(first) if first is not None else None,
         "last_close_utc": _ms_to_utc_iso(last) if last is not None else None,
+    }
+
+
+def shock_trigger_activity(
+    leader: LeaderSeries, start_ms: int, end_ms: int, pct: float
+) -> Dict[str, Any]:
+    """E23 rapor bloğu (PLAN §3.2 "Rapor"): YALNIZ ÖLÇÜM, karar vermez.
+
+    Karar noktaları = liderin giriş-TF kapanış zamanları `t`,
+    `start_ms <= t < end_ms` (test penceresi). Her `t` için tetikleyicinin
+    girdileri `LeaderSeries.inputs_at(t)` ile (simulate_symbol'dekiyle AYNI
+    yol) alınır; girdi yoksa `nodata_points` artar, varsa
+    `shock_trigger_direction` tetik yönünü verir ve açıksa `on_points`'e
+    `[close_ms, "LONG"|"SHORT"]` yazılır (artan sırada). `days` = pencereye
+    düşen lider 1d mumlarının açılış/kapanışı (şok günü etiketi için).
+    SAF — IO YOK.
+    """
+    decision_points = 0
+    nodata_points = 0
+    on_points: List[List[Any]] = []
+    for t in leader.entry_close_times:
+        if t < start_ms:
+            continue
+        if t >= end_ms:
+            break
+        decision_points += 1
+        inputs = leader.inputs_at(t)
+        if inputs is None:
+            nodata_points += 1
+            continue
+        direction = shock_trigger_direction(inputs[0], inputs[1], pct)
+        if direction is not None:
+            on_points.append([int(t), direction])
+    days: List[Dict[str, Any]] = []
+    for c in leader.daily_candles or []:
+        if start_ms <= c.open_time < end_ms:
+            days.append({
+                "date": datetime.fromtimestamp(
+                    c.open_time / 1000.0, tz=timezone.utc
+                ).strftime("%Y-%m-%d"),
+                "open": float(c.open),
+                "close": float(c.close),
+            })
+    return {
+        "pct": float(pct),
+        "leader": leader.symbol,
+        "window_start_ms": int(start_ms),
+        "window_end_ms": int(end_ms),
+        "decision_points": decision_points,
+        "nodata_points": nodata_points,
+        "on_points": on_points,
+        "days": days,
     }
 
 
@@ -2104,6 +2159,14 @@ def simulate_symbol(
     davranış birebir aynıdır. Sayaçlar kapasite kapısından ÖNCE, simüle
     edilen tüm adaylar üzerindedir.
 
+    E23: `cfg.scalper_shock_trigger_pct > 0` ise şok tetikleyicisi
+    (`market_gate.evaluate_shock_trigger`) piyasa kapısının HEMEN ardında
+    uygulanır; yalnız tetik yönündeki sinyaller geçer. Engellenenler
+    `missed_counter["shock_trigger_off"/"shock_trigger_dir"/
+    "shock_trigger_nodata"]` altında sayılır. Piyasa kapısının tersine
+    fail-CLOSED: `leader` None ya da girdi yoksa sinyal engellenir
+    (`shock_trigger_nodata`). Kapalıyken (varsayılan) bu blok HİÇ çalışmaz.
+
     `leader` verilir VE `cfg.scalper_market_gate` açıksa lider piyasa kapısı
     (D15) da uygulanır — canlı motorla AYNI saf fonksiyonla
     (`market_gate.evaluate_market_gate`). Engellenenler
@@ -2165,6 +2228,7 @@ def simulate_symbol(
             _role_series, structure_window_bars(cfg), cfg
         )
     market_gate_on = bool(getattr(cfg, "scalper_market_gate", False))
+    shock_trigger_on = shock_trigger_enabled(cfg)
     i = (
         bisect.bisect_left(close_times_5m, test_start_time_ms)
         if test_start_time_ms is not None
@@ -2228,6 +2292,27 @@ def simulate_symbol(
                         )
                     i += 1
                     continue
+        # E23 şok tetikleyicisi (PLAN §3.2): piyasa kapısının HEMEN ardında,
+        # canlı motordaki (engine._evaluate_symbol) sırayla birebir; AYNI
+        # saf fonksiyon, AYNI girdiler (lider, karar anı = bu mumun
+        # close_time'ı). Lider yoksa girdi de yok → fail-CLOSED (nodata).
+        if shock_trigger_on:
+            shock_inputs = (
+                leader.inputs_at(close_times_5m[i]) if leader is not None else None
+            )
+            shock_reason = evaluate_shock_trigger(
+                raw_signal.direction,
+                shock_inputs[0] if shock_inputs is not None else None,
+                shock_inputs[1] if shock_inputs is not None else None,
+                cfg,
+            )
+            if shock_reason is not None:
+                if missed_counter is not None:
+                    missed_counter[shock_reason] = (
+                        missed_counter.get(shock_reason, 0) + 1
+                    )
+                i += 1
+                continue
         # Canlı parite: yapı kapısı (engine._evaluate_symbol'de rejim kapısının
         # HEMEN ARDINDA, AYNI saf fonksiyonla — structure.structure_gate_blocks).
         # Kapı kapalıyken (varsayılan) hiçbir şey hesaplanmaz.
@@ -3037,6 +3122,10 @@ def write_json_report(
         "permutation": permutation,
         "trades": [t.to_dict() for t in all_trades],
     }
+    # E23: `shock_trigger` bloğu YALNIZ tetikleyici açıkken yazılır → kapalıyken
+    # rapor bit düzeyinde değişmez (golden).
+    if metadata.get("shock_trigger") is not None:
+        payload["shock_trigger"] = metadata["shock_trigger"]
     # E17/H2: `diagnostics` bloğu yalnız --diagnostics ile yazılır.
     if diagnostics is not None:
         payload["diagnostics"] = dict(diagnostics)
@@ -3479,8 +3568,13 @@ async def run_backtest(
         # çekilir ve her sembolün simülasyonuna aynen verilir. Kapı kapalıysa
         # (varsayılan) hiç çekilmez — mevcut koşuların istek sayısı ve çıktısı
         # bit düzeyinde değişmez.
+        # E23: şok tetikleyicisi de aynı lider girdilerini okur → kapı kapalı
+        # olsa da tetikleyici açıksa lider yüklenir (metadata["market_gate"]
+        # yine YALNIZ kapının kendisi açıkken yazılır).
         leader_series: Optional[LeaderSeries] = None
-        if bool(getattr(cfg, "scalper_market_gate", False)):
+        market_gate_cfg_on = bool(getattr(cfg, "scalper_market_gate", False))
+        shock_cfg_on = shock_trigger_enabled(cfg)
+        if market_gate_cfg_on or shock_cfg_on:
             leader_symbol = str(
                 getattr(cfg, "scalper_market_gate_symbol", "") or "BTCUSDT"
             ).strip().upper() or "BTCUSDT"
@@ -3495,40 +3589,52 @@ async def run_backtest(
                 f"(gün-içi %{getattr(cfg, 'scalper_market_gate_day_pct', 0)}, "
                 f"uzama %{getattr(cfg, 'scalper_market_gate_run_pct', 0)}/"
                 f"{leader_run_days}g)"
+                if market_gate_cfg_on else
+                f"⚡ E23 şok tetikleyicisi AÇIK — {leader_symbol} serisi çekiliyor "
+                f"(eşik %{getattr(cfg, 'scalper_shock_trigger_pct', 0)})"
             )
             leader_series = await gather_leader_series(
                 throttled, leader_symbol, days, test_end_time_ms, tf_entry,
                 leader_run_days, cache_dir=cache_dir_path, refresh=refresh,
             )
+            if shock_cfg_on:
+                metadata["shock_trigger"] = {
+                    **shock_trigger_activity(
+                        leader_series, test_start_time_ms, test_end_time_ms,
+                        float(getattr(cfg, "scalper_shock_trigger_pct", 0.0)),
+                    ),
+                    "tf": tf_entry,
+                }
             # Yeniden üretilebilirlik: kapının HANGİ veriyle karar verdiği
             # rapordan okunabilmeli — yalnız mum SAYISI değil, serilerin
             # zaman KAPSAMI da (bir seri beklenenden kısa/kaydıksa kapı
             # sessizce fail-open olur; sayı tek başına bunu göstermez).
-            metadata["market_gate"] = {
-                "leader": leader_symbol,
-                # `*_threshold`: `/scalper/status`'te `run_drift_pct` ÖLÇÜLEN
-                # koşudur; ikisine de `run_pct` demek, iki çıktıyı yan yana
-                # koyan operatörde yanlış-teşhis üretiyordu.
-                "day_pct_threshold": getattr(
-                    cfg, "scalper_market_gate_day_pct", None
-                ),
-                "run_pct_threshold": getattr(
-                    cfg, "scalper_market_gate_run_pct", None
-                ),
-                "run_days": leader_run_days,
-                "entry_tf": tf_entry,
-                "intraday_tf": MARKET_GATE_INTRADAY_TF,
-                "daily": _leader_window_snapshot(
-                    leader_series.daily_close_times, len(leader_series.daily_closes)
-                ),
-                "entry": _leader_window_snapshot(
-                    leader_series.entry_close_times, len(leader_series.entry_closes)
-                ),
-                "intraday": _leader_window_snapshot(
-                    leader_series.intraday_close_times,
-                    len(leader_series.intraday_opens),
-                ),
-            }
+            if market_gate_cfg_on:
+                metadata["market_gate"] = {
+                    "leader": leader_symbol,
+                    # `*_threshold`: `/scalper/status`'te `run_drift_pct` ÖLÇÜLEN
+                    # koşudur; ikisine de `run_pct` demek, iki çıktıyı yan yana
+                    # koyan operatörde yanlış-teşhis üretiyordu.
+                    "day_pct_threshold": getattr(
+                        cfg, "scalper_market_gate_day_pct", None
+                    ),
+                    "run_pct_threshold": getattr(
+                        cfg, "scalper_market_gate_run_pct", None
+                    ),
+                    "run_days": leader_run_days,
+                    "entry_tf": tf_entry,
+                    "intraday_tf": MARKET_GATE_INTRADAY_TF,
+                    "daily": _leader_window_snapshot(
+                        leader_series.daily_close_times, len(leader_series.daily_closes)
+                    ),
+                    "entry": _leader_window_snapshot(
+                        leader_series.entry_close_times, len(leader_series.entry_closes)
+                    ),
+                    "intraday": _leader_window_snapshot(
+                        leader_series.intraday_close_times,
+                        len(leader_series.intraday_opens),
+                    ),
+                }
 
         if leader_out is not None:
             leader_out.append(leader_series)

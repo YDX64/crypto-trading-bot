@@ -364,8 +364,8 @@ z ≈ 2.13), %80 güç (+0.84), günlük kümelenme tasarım etkisi 1.3, işlem 
 ## Ek A. Dosyalar ve komutlar
 
 - `scripts/e23/run_e23.py`: `init-clone`, `fill`, `fill-funding`, `manifest`, `run`, `smoke`.
-- `scripts/e23/analyze_e23.py`: `cal-counts`, `lock`, `verify-lock`, `check-run`, `dev-screen`, `dev-decide`, `val-decide`,
-  `final`, `report`, `package`.
+- `scripts/e23/analyze_e23.py`: `cal-counts`, `lock`, `verify-lock`, `check-run`, `s2-compare` (duman S2; yalnız
+  kanonik-JSON sha256 eşitliği), `dev-screen`, `dev-decide`, `val-decide`, `final`, `report`, `package`.
 - Etiketler: taban koşu `<SET>_<KOL>` (örnek `DEV_K30B-L`), kaplama `<SET>_<KOL>__<KAPLAMA>`, duman `S1_AYI_C`,
   `S2_K30B-L_h0`, `S2_K30B-L_h1`.
 - Bu klasör: `PLAN.md`, `variants.json`, `cal_counts.json`, `LOCK.json`; `run/` altında `LOCK_REF.json`, `ledger.jsonl`,

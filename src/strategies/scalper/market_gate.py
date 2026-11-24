@@ -42,6 +42,10 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 # missed_counter / log anahtarları — harness ve motor AYNI dizeleri kullanır.
 REASON_DAY = "market_gate_day"
 REASON_RUN = "market_gate_run"
+# E23 şok tetikleyicisi (PLAN §3.2) — intent.REASON_SHOCK_TRIGGER_* ile birebir.
+REASON_SHOCK_OFF = "shock_trigger_off"
+REASON_SHOCK_DIR = "shock_trigger_dir"
+REASON_SHOCK_NODATA = "shock_trigger_nodata"
 
 UTC_DAY_MS = 86_400_000
 
@@ -280,3 +284,73 @@ def market_gate_metrics(
         run = _run_pct_from_closes(leader_daily_closes, run_days)
 
     return {"day_drift_pct": day_drift, "run_pct": run}
+
+
+# ==========================================================================
+# E23 gerçek zamanlı şok tetikleyicisi T (PLAN §3.2) — varsayılan KAPALI
+# ==========================================================================
+
+
+def shock_trigger_enabled(cfg: Any) -> bool:
+    """`SCALPER_SHOCK_TRIGGER_PCT > 0` ise tetikleyici AÇIK (0 = KAPALI)."""
+    return _cfg_float(cfg, "scalper_shock_trigger_pct", 0.0) > 0.0
+
+
+def shock_trigger_direction(
+    day_open: Optional[float], last_close: Optional[float], pct: float
+) -> Optional[str]:
+    """Tetikleyici yönü: sapma d = (son_kapanış / gün_açılışı − 1) × 100;
+    d ≥ +pct → "LONG", d ≤ −pct → "SHORT", aksi hâlde None.
+
+    SAF fonksiyon. Eşik DAHİL (gün-içi alt-kapısıyla aynı karşılaştırma
+    üslubu). Girdi geçersizse (None / sonlu değil / gün açılışı ≤ 0) de None
+    döner; "veri yok" ile "tetik yok" ayrımını ÇAĞIRAN yapar
+    (`evaluate_shock_trigger` önce veri yokluğuna bakar).
+    """
+    thr = _as_float(pct)
+    open_ = _as_float(day_open)
+    close = _as_float(last_close)
+    if thr is None or thr <= 0.0 or open_ is None or open_ <= 0.0 or close is None or close <= 0.0:
+        return None
+    drift_pct = (close / open_ - 1.0) * 100.0
+    if drift_pct >= thr:
+        return "LONG"
+    if drift_pct <= -thr:
+        return "SHORT"
+    return None
+
+
+def evaluate_shock_trigger(
+    direction: Any,
+    leader_day_open: Optional[float],
+    leader_last_close: Optional[float],
+    cfg: Any,
+) -> Optional[str]:
+    """Şok tetikleyicisi: sinyal engelleniyorsa NEDEN dizesi, serbestse None.
+
+    Yön kuralı SABİT (config'siz): yön D'li sinyal yalnız tetikleyici yönü
+    == D ise geçer. Dönen değerler: `REASON_SHOCK_NODATA` (girdi yok/geçersiz
+    → giriş YOK, fail-CLOSED; piyasa kapısının tersi — bu bir "izin" kapısı,
+    veri yoksa izin de yok), `REASON_SHOCK_OFF` (|d| < X), `REASON_SHOCK_DIR`
+    (tetik açık ama ters yön). Tetikleyici kapalıysa (varsayılan) hiçbir
+    hesap yapılmaz ve None döner.
+
+    Harness (`backtest.simulate_symbol`) ve canlı motor
+    (`engine._shock_trigger_reason`) bunu AYNI girdilerle çağırır
+    (CLAUDE.md kural 2). SAF — IO YOK.
+    """
+    if not shock_trigger_enabled(cfg):
+        return None
+    pct = _cfg_float(cfg, "scalper_shock_trigger_pct", 0.0)
+
+    yon = _direction_value(direction)
+    open_ = _as_float(leader_day_open)
+    close = _as_float(leader_last_close)
+    if open_ is None or open_ <= 0.0 or close is None or close <= 0.0:
+        return REASON_SHOCK_NODATA
+    trig = shock_trigger_direction(open_, close, pct)
+    if trig is None:
+        return REASON_SHOCK_OFF
+    if trig != yon:
+        return REASON_SHOCK_DIR
+    return None
