@@ -173,6 +173,10 @@ da `docs/holdout_registry.json`'da YANIK; yeni pencereler `VAL-2026Q4a` ve müh�
 - E16/E17 (main, 2026-10-10/11, eski model) 2025 verisinde aynı hükme vardı: 8 taze pencerede PF 0.773, 2025'in tamamında PF 0.777;
   hiçbir çıkış varyantı ya da giriş zaman dilimi geçmedi, komisyonsuz PF yine < 1. E18 numarası, dokunulmamış 2023-01-01 → 2024-11-18
   verisinde yeni bir fikrin ön-kayıtlı sınaması için ayrıldı.
+- **E18 (2026-11-20, ön-kayıtlı, gerçekçi model): trend yönlü giriş ailesi DEV-YOK.** Kurulum M (kırılım ve geri çekilme, 15m ve
+  30m, iki trend tanımı; 6 kol) 2025 verisinde PF 0.64–0.88, altı kolda ΣR < 0, LONG ve SHORT ayrı ayrı da < 1; maliyetsiz PF en çok
+  1.15. VAL (2023-01-01 → 2024-11-18) açılmadı, mühürlü duruyor. Şok günlerinde PF > 1 gözlemi ileri bakışlıdır, kural değildir.
+  M kodda varsayılan KAPALI. Kayıt: `docs/EXPERIMENTS.md` E18.
 - Başka kurulumlar (A, B, D, E) PF 0.76-0.84, kenarı yok; sekiz D42 koruması P2-v2'yi geçmedi (en iyi p 0.14). Ayarlar KAPALI
   kalır, mainnet NO-GO; harness canlıdan kazanma oranında 9-19 puan iyimser (TP1'e ulaşma %66 vs %54).
 - Sürpriz bir şey görürsen önce `docs/DECISIONS.md`'de denenmiş mi bak; sonra

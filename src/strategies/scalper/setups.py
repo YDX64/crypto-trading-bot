@@ -1,6 +1,7 @@
 """
 Scalper strateji varyantları: A (trend kırılması), B (trend içi uç avcısı,
-ana strateji), C (saf uç avcısı, trend filtresiz).
+ana strateji), C (saf uç avcısı, trend filtresiz). M (varsayılan KAPALI,
+D44/E18 deneyi): trend yönünde momentum girişi — kırılım ya da EMA geri çekilmesi.
 
 Kullanıcı felsefesi: "en dipten long, en tepeden short" — uç yakalama.
 Her strateji SAF olmalı: yalnız StrategyContext okur, IO/saat/rastgelelik
@@ -27,6 +28,7 @@ from src.strategies.scalper.indicators import (
     crossover,
     crossunder,
     donchian,
+    ema,
     equal_level_clusters,
     equilibrium,
     find_fvg,
@@ -921,8 +923,148 @@ class StrategyE(StrategyProtocol):
         return None
 
 
+class StrategyM(StrategyProtocol):
+    """M — trend yönünde momentum girişi (D44/E18 ön-kayıtlı deney, varsayılan KAPALI).
+
+    Yön: SCALPER_M_TREND=regime → 4h rejim (UP=LONG, DOWN=SHORT, diğer yok);
+    context → bağlam serisinde kapanış > EMA20 > EMA50 (LONG) / tersi (SHORT).
+    Tetik: SCALPER_M_TRIGGER=breakout → Donchian(20) kırılımı + hacim > 1.5x;
+    pullback → hızlı EMA'ya son 5 mumda dokunuş + yön mumu + önceki mumun ucunu
+    geçen kapanış. Kurallar ön-kayıtlıdır; eşikler sabittir, ayar DEĞİLDİR.
+    """
+
+    name = "M"
+
+    _DONCHIAN_PERIOD = 20
+    _VOLUME_LOOKBACK = 20
+    _VOLUME_MULT = 1.5
+    _EMA_FAST = 20
+    _EMA_SLOW = 50
+    _PULLBACK_LOOKBACK = 5
+    _MAX_EXTENSION_ATR = 1.0
+    _STOP_ATR_MULT = 2.0
+
+    def _trend_direction(self, ctx: StrategyContext, mode: str) -> Direction | None:
+        if mode == "regime":
+            if ctx.regime == Regime.UP:
+                return Direction.LONG
+            if ctx.regime == Regime.DOWN:
+                return Direction.SHORT
+            return None
+        if mode == "context":
+            c = ctx.candles_15m
+            if len(c) < self._EMA_SLOW + 1:
+                return None
+            closes = [x.close for x in c]
+            e_fast = ema(closes, self._EMA_FAST)[-1]
+            e_slow = ema(closes, self._EMA_SLOW)[-1]
+            lc = closes[-1]
+            if lc > e_fast > e_slow:
+                return Direction.LONG
+            if lc < e_fast < e_slow:
+                return Direction.SHORT
+            return None
+        return None
+
+    def _breakout_score(
+        self, candles, atr: float, direction: Direction
+    ) -> float | None:
+        if len(candles) < self._DONCHIAN_PERIOD + 1:
+            return None
+        dc_high, dc_low = donchian(candles, self._DONCHIAN_PERIOD, exclude_last=True)
+        last = candles[-1]
+        volume_window = candles[-self._VOLUME_LOOKBACK - 1:-1]
+        avg_volume = sum(c.volume for c in volume_window) / len(volume_window)
+        if avg_volume <= 0.0:
+            return None
+        if last.volume / avg_volume <= self._VOLUME_MULT:
+            return None
+        if direction == Direction.LONG:
+            if last.close <= dc_high:
+                return None
+            return (last.close - dc_high) / atr
+        if last.close >= dc_low:
+            return None
+        return (dc_low - last.close) / atr
+
+    def _pullback_score(
+        self, candles, atr: float, direction: Direction
+    ) -> float | None:
+        n = len(candles)
+        if n < self._EMA_SLOW + self._PULLBACK_LOOKBACK + 1:
+            return None
+        closes = [x.close for x in candles]
+        e_fast = ema(closes, self._EMA_FAST)
+        e_slow = ema(closes, self._EMA_SLOW)
+        last, prev = candles[-1], candles[-2]
+        touch_range = range(n - 1 - self._PULLBACK_LOOKBACK, n - 1)
+        if direction == Direction.LONG:
+            if not e_fast[-1] > e_slow[-1]:
+                return None
+            if not any(candles[i].low <= e_fast[i] for i in touch_range):
+                return None
+            if not (last.close > last.open and last.close > prev.high
+                    and last.close > e_fast[-1]):
+                return None
+            if (last.close - e_fast[-1]) > self._MAX_EXTENSION_ATR * atr:
+                return None
+            return (last.close - prev.high) / atr
+        if not e_fast[-1] < e_slow[-1]:
+            return None
+        if not any(candles[i].high >= e_fast[i] for i in touch_range):
+            return None
+        if not (last.close < last.open and last.close < prev.low
+                and last.close < e_fast[-1]):
+            return None
+        if (e_fast[-1] - last.close) > self._MAX_EXTENSION_ATR * atr:
+            return None
+        return (prev.low - last.close) / atr
+
+    def evaluate(self, ctx: StrategyContext) -> ScalpSignal | None:
+        atr = ctx.atr_5m
+        if atr <= 0.0:
+            return None
+
+        trigger = str(getattr(settings, "scalper_m_trigger", "breakout")).lower()
+        trend_mode = str(getattr(settings, "scalper_m_trend", "regime")).lower()
+
+        direction = self._trend_direction(ctx, trend_mode)
+        if direction is None:
+            return None
+
+        candles = ctx.candles_5m
+        if trigger == "breakout":
+            score = self._breakout_score(candles, atr, direction)
+        elif trigger == "pullback":
+            score = self._pullback_score(candles, atr, direction)
+        else:
+            return None
+        if score is None:
+            return None
+
+        if direction == Direction.LONG:
+            stop_price = ctx.current_price - self._STOP_ATR_MULT * atr
+            if stop_price <= 0.0:
+                return None
+        else:
+            stop_price = ctx.current_price + self._STOP_ATR_MULT * atr
+
+        yon = "yukarı" if direction == Direction.LONG else "aşağı"
+        return ScalpSignal(
+            strategy=self.name,
+            symbol=ctx.symbol,
+            direction=direction,
+            entry_price=ctx.current_price,
+            stop_price=stop_price,
+            reason=f"M momentum {trigger} ({yon}, trend={trend_mode})",
+            regime=ctx.regime,
+            atr_5m=atr,
+            score=score,
+        )
+
+
 ALL_STRATEGIES: list[StrategyProtocol] = [
-    StrategyA(), StrategyB(), StrategyC(), StrategyD(), StrategyE(),
+    StrategyA(), StrategyB(), StrategyC(), StrategyD(), StrategyE(), StrategyM(),
 ]
 
 _STRATEGY_BY_NAME: dict[str, StrategyProtocol] = {s.name: s for s in ALL_STRATEGIES}

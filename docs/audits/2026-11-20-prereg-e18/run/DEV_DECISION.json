@@ -1,0 +1,47 @@
+{
+  "schema": "e18-devdecision/1",
+  "lock_sha256": "3607e392161efa0ca0584f73d44760fd2efd2936617d683d77f8a5cf84ce67e6",
+  "created_utc": "2026-11-20T11:42:46Z",
+  "label": "DEV-YOK",
+  "advancers": [],
+  "k": 0,
+  "ranking": [],
+  "arms": {
+    "K15R": {
+      "pass_g0_g5": false,
+      "t_obs": -4.16144198424157,
+      "pass_g0_g6": false,
+      "selected": false
+    },
+    "K30R": {
+      "pass_g0_g5": false,
+      "t_obs": -1.0897658396662981,
+      "pass_g0_g6": false,
+      "selected": false
+    },
+    "K15B": {
+      "pass_g0_g5": false,
+      "t_obs": -6.040016731830738,
+      "pass_g0_g6": false,
+      "selected": false
+    },
+    "K30B": {
+      "pass_g0_g5": false,
+      "t_obs": -1.307136820988265,
+      "pass_g0_g6": false,
+      "selected": false
+    },
+    "G15B": {
+      "pass_g0_g5": false,
+      "t_obs": -2.7771514350727786,
+      "pass_g0_g6": false,
+      "selected": false
+    },
+    "G30B": {
+      "pass_g0_g5": false,
+      "t_obs": -3.4087913736219844,
+      "pass_g0_g6": false,
+      "selected": false
+    }
+  }
+}

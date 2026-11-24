@@ -1,0 +1,122 @@
+{
+  "arms": {
+    "G15B": {
+      "lev20_share": 0.14705882352941177,
+      "lev3_share": 0.0,
+      "missed_signals": {
+        "capacity": 68,
+        "daily_latch": 708
+      },
+      "n": 510,
+      "n_long": 236,
+      "n_short": 274,
+      "per_month": {
+        "2026-03": 180,
+        "2026-04": 167,
+        "2026-05": 163
+      },
+      "projected_per_quarter": 505.8423913043478,
+      "testable": true
+    },
+    "G30B": {
+      "lev20_share": 0.13190184049079753,
+      "lev3_share": 0.0,
+      "missed_signals": {
+        "capacity": 28,
+        "daily_latch": 253
+      },
+      "n": 326,
+      "n_long": 158,
+      "n_short": 168,
+      "per_month": {
+        "2026-03": 121,
+        "2026-04": 102,
+        "2026-05": 103
+      },
+      "projected_per_quarter": 323.3423913043478,
+      "testable": true
+    },
+    "K15B": {
+      "lev20_share": 0.16666666666666666,
+      "lev3_share": 0.0,
+      "missed_signals": {
+        "capacity": 59,
+        "daily_latch": 560
+      },
+      "n": 408,
+      "n_long": 219,
+      "n_short": 189,
+      "per_month": {
+        "2026-03": 152,
+        "2026-04": 122,
+        "2026-05": 134
+      },
+      "projected_per_quarter": 404.67391304347825,
+      "testable": true
+    },
+    "K15R": {
+      "lev20_share": 0.16666666666666666,
+      "lev3_share": 0.0,
+      "missed_signals": {
+        "capacity": 22,
+        "daily_latch": 318
+      },
+      "n": 294,
+      "n_long": 164,
+      "n_short": 130,
+      "per_month": {
+        "2026-03": 80,
+        "2026-04": 87,
+        "2026-05": 127
+      },
+      "projected_per_quarter": 291.6032608695652,
+      "testable": true
+    },
+    "K30B": {
+      "lev20_share": 0.13636363636363635,
+      "lev3_share": 0.0,
+      "missed_signals": {
+        "capacity": 33,
+        "daily_latch": 116
+      },
+      "n": 286,
+      "n_long": 145,
+      "n_short": 141,
+      "per_month": {
+        "2026-03": 95,
+        "2026-04": 85,
+        "2026-05": 106
+      },
+      "projected_per_quarter": 283.66847826086956,
+      "testable": true
+    },
+    "K30R": {
+      "lev20_share": 0.18025751072961374,
+      "lev3_share": 0.0,
+      "missed_signals": {
+        "capacity": 9,
+        "daily_latch": 102
+      },
+      "n": 233,
+      "n_long": 128,
+      "n_short": 105,
+      "per_month": {
+        "2026-03": 67,
+        "2026-04": 78,
+        "2026-05": 88
+      },
+      "projected_per_quarter": 231.10054347826087,
+      "testable": true
+    }
+  },
+  "family_testable": [
+    "K15R",
+    "K30R",
+    "K15B",
+    "K30B",
+    "G15B",
+    "G30B"
+  ],
+  "rule": "testable = N * 91.25 / 92 >= 90; yalnız sayım, PnL okunmadı",
+  "schema": "e18-cal/1"
+}

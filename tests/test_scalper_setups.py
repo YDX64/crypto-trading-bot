@@ -473,7 +473,7 @@ class TestGetEnabled:
         # olarak eklendi (tests/test_sr_crossover.py kendi davranış testlerini
         # taşır). Canlıda hangi varyantın çalıştığını SCALPER_STRATEGIES
         # belirler; bu liste yalnız kayıt sırasını doğrular.
-        assert [s.name for s in ALL_STRATEGIES] == ["A", "B", "C", "D", "E"]
+        assert [s.name for s in ALL_STRATEGIES] == ["A", "B", "C", "D", "E", "M"]
 
 
 # --------------------------------------------------------------------------

@@ -1,0 +1,32 @@
+{
+  "H": "425e82a6092ba0614071b6858538331093ed3a83",
+  "H_tree": "e4999342a524b3618ff957b9e3ec4f201943fb78",
+  "blobs_at_H": {
+    "scripts/e18/analyze_e18.py": "c3faeb7ae67223cab48974a4ca9f182abf7595cd",
+    "scripts/e18/e18_common.py": "a0d259bbd21d95c150b56f07a44475aec29afd89",
+    "scripts/e18/run_e18.py": "cbcbf679285a8fe82a56e355281d067804cd3b7f",
+    "scripts/fill_funding_cache.py": "0ade1ec8b7973c00e50cfdfafc1fd5bd4a937303",
+    "scripts/fill_klines_cache_from_vision.py": "e9b42844725ee4eb16ce5b8909caae2fbd90cf65",
+    "src/core/config.py": "af7cc73fd6722b7b18d9ec3d3e73873817185474",
+    "src/strategies/scalper/backtest.py": "c9de0867501b0d08401d346981bce39fa18e79e6",
+    "src/strategies/scalper/entry_gates.py": "f496ea4af2c03054cac8dc9b29ea318556a87824",
+    "src/strategies/scalper/funding.py": "38fec9d7a31e1a42fcce1924044d8657979eebd1",
+    "src/strategies/scalper/indicators.py": "dbbb72dd1f76811a03c837faa650a9e1fa9f1948",
+    "src/strategies/scalper/regime.py": "01a7f2a31c2c5195f188824bd3e717bc0cbc8f2a",
+    "src/strategies/scalper/setups.py": "93b336381bf1a452e1a800482043ce82e86052d8"
+  },
+  "files": {
+    "PLAN.md": "91794a674850d714a80ec233a1073d864b0098bd5b552be5fc741ece18419637",
+    "cal_counts.json": "d5db102d74598c754f838aad196c3a615f9c61db674fb783ecb4b21eed07e251",
+    "shock_days.json": "05d10d6b205d4dfabcbad6530f9a3166947aa1ceff139898db57355fe9d54978",
+    "variants.json": "e97d72ab7b645e61acd3fb8513c31c65aad78377497f2f3111d43818b8977073"
+  },
+  "labels_e17": {
+    "path": "docs/audits/2026-10-10-prereg-tf/labels_frozen.json",
+    "sha256": "fe6f195cbca618fd1eb3dfaa27a41253cf9eb201ee19f802334946bd3c3ea20a"
+  },
+  "locked_utc": "2026-11-20T11:16:34Z",
+  "python": "3.12.11",
+  "schema": "e18-lock/1",
+  "snapshot_sha256": "2a4748a3d0e822751c2da071a105e8a5b5391206b62d6e3f27515a7789e841a2"
+}
