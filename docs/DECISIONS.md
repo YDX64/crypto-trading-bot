@@ -7,6 +7,271 @@ Pencereler: AYI 2026-01-23→02-13 (BTC −30%) · YATAY 2026-07-01→07-21 · B
 
 ## Aktif kararlar
 
+### D46 — Orkestratörün AÇILIŞ kurtarması da scalper ön koşuluna bağlandı: scalper kurtarması bitmeden borsadaki pozisyonlar sahiplenilmez · 2026-11-20 · TESTNET'TE CANLI (2026-11-20 deploy, `b8c18de`)
+
+**Sorun (D44 "Bilinmeyenler"deki boşluk; kodda doğrulandı).** D44 ön koşulu (`recovery_precondition = _scalper_recovery_settled`) yalnız
+izleme döngüsündeki YENİDEN denemede sorulur; `TradingOrchestrator.start()` `recover_open_positions()`'ı koşulsuz çağırıyordu.
+`ScalperEngine.start()` kendi kurtarmasını yalnız ilk borsa yoklaması başarılıysa koşar (`if await self._probe_exchange(): ...
+await self._attempt_recovery()`), sembol rezervasyonları `_attempt_recovery()`'nin sonunda yapılır ve `main.py` lifespan sırası
+`scalper_engine.start()` → `orchestrator.start()`'tır. Scalper'ın yoklaması başarısız olup orkestratörün sorgusu saniyeler sonra
+başarılı olursa: scalper kurtarması hiç koşmamış, bekleyen maker sembolleri rezerve değil, `scalp_trades`'te OPEN satırı olmayan
+(ör. çökme anında dolmuş maker niyeti) bir scalper pozisyonu orkestratöre "yetim" görünür. Orkestratör sahiplenir: stop yoksa
+`reduceOnly` MARKET ile acil kapatır; stop varsa `telegram` rezervasyonunu koyar ve scalper'ın sonraki kurtarması sahiplik
+çakışmasını görüp kalıcı entry-halt dosyası yazar (insan müdahalesi ister). Canlıda gözlenmedi: yalnız scalper'ın ilk yoklaması
+başarısız olan bir açılışta ortaya çıkar. Kodda doğrulandı ve kırmızı testle yeniden üretildi (eski açılış borsaya sordu).
+
+**Karar.** `start()` AYNI ön koşulu sorar; başlatma ve yeniden deneme tek yardımcıyı kullanır (`_recovery_precondition_pending()`).
+Ön koşul bağlı ve sağlanmıyorsa açılış kurtarması ATLANIR: pozisyon kurtarma sorgusu (`get_all_positions` ve sahiplenme) yok,
+`_recovery_ready=False`, ilk yeniden deneme D44 aralığıyla (30 sn) planlanır ve `Açılış kurtarması ATLANDI` uyarısı yazılır. Başka
+borsa trafiği değişmez: `start()`'ın bağlantı ping'i (`test_connection`) ve izleme döngüsünün ilk turundaki salt-okunur hazır-olma
+yoklaması (`get_all_positions`; hiçbir pozisyonu sahiplenmez) yine atılır. Scalper hazır olunca D44 döngüsü kurtarmayı kendisi koşar
+ve `/health` o zaman düzelir.
+
+| Durum | Açılışta | Not |
+|---|---|---|
+| Ön koşul yok (`scalper_engine is None`, yani `SCALPER_ENABLED=false`) | kurtarma bugünkü gibi | davranış birebir aynı |
+| Scalper hazır (`_recovery_ready=True`; normal açılış) | kurtarma bugünkü gibi | davranış birebir aynı |
+| Scalper'ın ilk yoklaması başarısız ya da kurtarması bitmedi | kurtarma ATLANIR | bu kararın konusu |
+| Scalper kurtarması denendi ama başarısız (ör. kalıcı entry-halt) | kurtarma ATLANIR | D44'ün yeniden deneme kuralıyla aynı; ilk "Bilinmeyenler" maddesi |
+
+**Sağlık kapısı etkisi (kodda hesaplandı; sunucuda ölçülmedi).** `scripts/server_deploy.sh` ve `scripts/restart_safe.sh` AYNI kapıyı
+kullanır: `HEALTH_TIMEOUT=240` sn, 5 sn aralıkla yoklar, `status=healthy` VE `core_healthy=true` ister; `core_healthy` = orkestratör
+sağlıklı VE scalper sağlıklı (`src/main.py` `health_check`), orkestratör sağlığı da `_recovery_ready`'ye bağlıdır. Etki yalnız
+scalper'ın ilk borsa yoklamasının (ya da kurtarmasının) açılışta başarısız olduğu durumda vardır; normal açılışta değişen bir şey yok.
+
+| Bileşen | En kötü süre | Kaynak |
+|---|---|---|
+| Scalper'ın sonraki borsa yoklaması/kurtarması | 30 sn | `ScalperEngine._EXCHANGE_PROBE_INTERVAL` |
+| Orkestratörün ilk yeniden deneme vadesi | 30 sn | `RECOVERY_RETRY_INITIAL_SECONDS` |
+| Vade ve ön koşuldan sonra izleme turu | 30 sn | `CHECK_INTERVAL_SECONDS` |
+| Kaba toplam (üst sınır) | 90 sn | bileşenler büyük ölçüde üst üste biner; ek gecikme genelde ≤ ~60 sn |
+
+Karşılaştırma: gözlenen açılış → sağlıklı süreleri 25-92 sn (deploy kayıtları; D44 deploy'unda 45 sn; RUNBOOK ≈ 90 sn). En kötü açılış
+(92 sn) + en kötü ek gecikme (90 sn) = 182 sn < 240 sn: pay 58 sn; D44 deploy'undaki 45 sn ile pay 105 sn. Pencere YETER. Yetmeyecek
+durum: aynı açılışta hem scalper'ın ilk yoklaması başarısız hem açılış süresi ≥ 150 sn olursa (betik yorumu açılışın 3 dk'ya
+çıkabildiğini söyler). Bu iki olay muhtemelen ilişkilidir (Binance bağlantısı yavaşken ikisi de uzar); ilişki ölçülmedi. Yetmezse
+deploy kendiliğinden geri alınır (ayar/veri göçü yok). `scripts/server_deploy.sh` ve `scripts/restart_safe.sh` DEĞİŞTİRİLMEDİ. Not:
+yerel `scripts/deploy.sh` `HEALTH_TIMEOUT`'u sunucuya İLETMEZ (yalnız `DEPLOY_SKIP_TESTS`, `DEPLOY_NO_RESTART` ve halka
+değişkenleri); pencereyi büyütmek betik değişikliği ister. Sunucuda doğrudan `restart_safe.sh` çalıştırırken `HEALTH_TIMEOUT=300`
+verilebilir.
+
+**Değişen dosyalar.** `src/services/orchestrator.py` (`start()`, yeni `_recovery_precondition_pending()`; `_retry_recovery_if_due`
+aynı yardımcıyı kullanır), `tests/test_orchestrator_recovery_retry.py` (+6 test), `docs/DECISIONS.md`, `docs/RUNBOOK.md`,
+`CHANGELOG.md`, `CLAUDE.md` (test sayısı). `src/main.py` DEĞİŞMEDİ (bağlama D44'te yapılmıştı). Ayar (`.env`) değişmez;
+scalper/takipçi kodu değişmez; giriş/çıkış/boyutlama kuralı değişmez.
+
+**Kanıt.** `tests/test_orchestrator_recovery_retry.py` (25 test: önceki 19 + yeni 6). Kırmızı → yeşil: yalnız testler eklenip kod
+eskiyken `3 failed, 22 passed` (üç davranış testi `assert 1 == 0` ile düştü: açılış borsaya sordu; üç davranış-koruma testi baştan
+geçiyordu), kod sonrası `25 passed`. Orkestratöre dokunan dört dosya birlikte (`test_orchestrator_recovery_retry`,
+`test_orchestrator_safety`, `test_runtime_liveness`, `test_container`): 126 geçti / 1 atlandı.
+
+| Davranış | Test |
+|---|---|
+| Ön koşul `False` iken `start()` pozisyon kurtarma sorgusu atmaz; STOP'suz scalper pozisyonu sahiplenilmez/kapatılmaz (emir yok, DB satırı yok, rezervasyon yok); bayrak `False`; ilk deneme 30 sn'ye planlı; döngünün salt-okunur hazır-olma yoklaması da hiçbir şey sahiplenmez | `test_start_skips_initial_recovery_while_precondition_false` |
+| Atlanan açılış: vade geldiğinde ön koşul `False` ise deneme yok ve hak harcanmaz; `True` olunca kurtarma koşar | `test_skipped_initial_recovery_heals_once_precondition_turns_true` |
+| GERÇEK `_monitoring_loop` + `main._scalper_recovery_settled`: scalper hazır olana dek kurtarma koşmaz, sonra koşar ve `health_snapshot()["healthy"]` `True` olur | `test_real_loop_recovers_and_health_heals_after_scalper_settles` |
+| Ön koşul yok ya da sağlanıyorsa açılış bugünkü gibi (tek sorgu, pozisyon izlemede, rezervasyon) | `test_start_recovers_immediately_when_precondition_missing_or_true` (2 parametre) |
+| Ön koşul sağlanıyor ve borsa erişilemiyorsa D44 başarısızlık yolu (ATLAMA değil) | `test_start_with_precondition_true_and_unreachable_exchange_keeps_failure_path` |
+
+Üç ortam (son ağaç): yerel `.env` ile 4071 geçti / 85 atlandı, 165 sn (önceki 4065 + 6 yeni test); temiz kopya + sunucunun secret olmayan ayarları (`scripts/preflight_server_env.sh awa`)
+4070 geçti / 86 atlandı, 165 sn (66 ayar satırı, "ÖN SINAV GEÇTİ"); CI `test` işi (`env.example`) bu kararı taşıyan PR'dadır. Deploy kaydı deploy'dan sonra buraya eklenir.
+
+**İnceleme (PR #13, birleştirmeden önce).** Bağımsız bir düşmanca inceleme (salt okunur, kod okuma; çalıştırma yok) bulgu getirmedi:
+ön koşul yok/sağlanıyor yolunun bire bir aynı kaldığını, kilitlenme olmadığını (scalper bayrağı yalnız `_attempt_recovery`'de atanır ve
+`_exchange_loop` 30 sn'de bir yeniden dener; kapıda bekleyen turlar deneme hakkı harcamaz), lifespan sırasında yarış olmadığını
+doğruladı; üç davranış testinin eski kodda düştüğünü ve gerçek-döngü testinin zamanlamaya bağlı olmadığını belirtti. cubic iki bulgu
+bıraktı:
+
+| Bulgu | Hüküm | Sonuç |
+|---|---|---|
+| Atlanan açılışta döngü ilk turda yine imzalı `get_all_positions()` hazır-olma yoklaması atıyor; yoklamaya da aynı kapı konmalı, yoksa gerçek-döngü testinin sıfır-çağrı iddiası düşer | Gözlem doğru, sonuç yanlış | Yoklama yalnız okur, sahiplenmez; kapı `/health`'te borsa sağlıklıyken `exchange_ready=false` gösterirdi. Testin sıfır-çağrı iddiası `recover_open_positions` çağrılarına aittir ve geçer. Kod değişmedi; davranış testle sabitlendi (yoklama borsayı okur, hiçbir şey sahiplenmez) |
+| Belge "borsaya sorgu yok" diyor ama `start()` önce bağlantı ping'i (`test_connection`) atıyor | Geçerli (belge kesinliği) | Düzeltildi: yalnız pozisyon kurtarma sorgusunun atlandığı yazıldı |
+
+**Bilinmeyenler / sınırlar (açıkça).**
+- Scalper kurtarması DENENDİ ama başarısız kaldıysa (ör. kalıcı entry-halt, `_recovery_ready=False`) açılış kurtarması da atlanır.
+  Eskiden orkestratör o durumda yine de bir kez denerdi ve Telegram'a ait bir pozisyonu sahiplenebilirdi; artık scalper hazır olana
+  dek sahiplenmez: o pozisyonların borsadaki stopları durur ama trailing/break-even çalışmaz. Bilinçli: çift yönetim (D20b'nin
+  kritik sınıfı) bu kararın kapattığı risktir ve D44'ün yeniden deneme kapısı zaten aynı kuralı koyuyordu. Kalıcı scalper halt'ı zaten
+  insan müdahalesi ister. Canlıda gözlenmedi, ölçülmedi.
+- Ön koşul scalper'ın `_recovery_ready` bayrağıdır. `_attempt_recovery()` bayrağı önce `True` atar, rezervasyonları sonra yapar;
+  rezervasyonlar arasında `await` yoktur, ama sahiplik çakışması bulursa `await _latch_entry_halt(...)` sırasında bayrak kısa süre
+  `True` görünebilir. Kod okumasından çıkarıldı, tetiklenmedi; scalper kodu kapsam dışı (bu karar yalnız bayrağı okur). D44 yeniden
+  denemesi de aynı bayrağa bakar.
+- Atlanan açılışta izleme döngüsünün ilk turu bir hazır-olma yoklaması (`get_all_positions`, ağırlık 5) atar: yalnız okur,
+  `_exchange_ready` işaretler, pozisyon sahiplenmez (testle sabit). Yoklamaya aynı kapı BİLEREK konmadı: sahiplenme riski yok ve kapı
+  `/health`'te borsa sağlıklıyken `exchange_ready=false` gösterirdi. D44'ün başarısız-açılış yolunda da aynı yoklama zaten böyle atılıyordu.
+- D44'ün diğer sınırları (gömülü takipçi sırası, listeyi okuduktan sonraki yarış, `_entry_halted` kendiliğinden temizlenmez, loguru
+  süslü parantez tuzağı) aynen geçerlidir.
+- Canlıda (TESTNET) gözlenmedi: ancak scalper'ın ilk yoklaması başarısız olan bir açılışta görülebilir.
+
+**Geri alma.** `scripts/deploy.sh awa <önceki-commit>`; ayar ya da veri göçü yok. Kod geri alınınca açılış yine ön koşula bakmaz
+(D44 sonrası durum).
+
+**Deploy (2026-11-20 16:23-16:25 UTC, TESTNET; D44 inceleme düzeltmeleri + D45 + D46 TEK deploy, kullanıcı onayıyla).** Üç PR yerelde
+tek dalda birleştirildi (#14 → #12 → #13; birleştirme commit'leri `fa5088b` ve `b8c18de`; çakışma yalnız `CHANGELOG.md` ve
+`docs/DECISIONS.md` başındaydı, kod ve test dosyaları otomatik birleşti) ve main ileri sarıldı: `75c7040` → `b8c18de`. Birleştirmeden
+önce PR #12 ve PR #13 birer bağımsız incelemeden geçti (engel yok; D45 ve bu kayıttaki sınırlar). Birleşik ağaçta tam paket 4121
+geçti / 85 atlandı; sunucu ayarlı ön sınav (66 ayar satırı) 4120 geçti / 86 atlandı. `scripts/deploy.sh awa`: sunucu `4f0c159` →
+`b8c18de`; sunucu testleri 4121 geçti / 85 atlandı (108 sn); `tradingbot_v2` yeniden başlatıldı (pid 769473, başlangıç 16:25:02 UTC);
+sağlık kapısı 25 sn sonra yeşil. Deploy sonrası 130 sn boyunca 13 yoklamanın 13'ü HTTP 200, `status=healthy`, `core_healthy=true`,
+`recovery_ready=true` (`recovery_retry_attempts=0`, `entry_halted=false`). Yeniden başlangıçtan beri `bot.log`'da ERROR/CRITICAL
+satırı 0 ve zaman damgasız (traceback) satır 0; supervisor çıktılarında `RuntimeWarning` ya da "koruması KAPALI" izi yok. Açılış
+normal yoldan geçti ("Açılış kurtarması ATLANDI" yok; "Borsada açık pozisyon yok"). Deploy anında üç motorda da açık pozisyon
+yoktu; `/scalper/status`: `entries_blocked_by=null`, `kill_switch_active=false`, tarama `ok`. `.env` değişmedi (yedek
+`backups/env.bak-20261120-162305-deploy`). Geri alma hedefi `4f0c159`. Bu deploy'un DOĞRULAMADIĞI: (1) bu kararın atlama yolu ve
+D44'ün yeniden deneme yolu (açılış kurtarması yine ilk denemede başarılı oldu); (2) D44 inceleme düzeltmelerinin iki yolu
+(artakalan rezervasyon, okuma çelişkisi) canlıda tetiklenmedi; (3) D45 korumasının canlı süreçte kurulu olduğu dolaylı kanıta
+dayanır (sunucu testleri kurulumu doğrular, uyarı izi yok): deploy'dan sonra `extra=` ya da `exc_info=` taşıyan bir satır henüz
+yazılmadı.
+
+### D45 — Loguru çağrıları kendi istisnasını fırlatmaz: stdlib tarzı `exc_info=`/`extra=` kwargs'ı `src/core/logger.py`'de merkezi bir korumayla çevrilir · 2026-11-20 · TESTNET'TE CANLI (2026-11-20 deploy, `b8c18de`)
+
+**Sorun.** Günlükleyici loguru'dur. loguru, çağrıya konumsal argüman ya da kwargs verilirse mesajı `str.format(*args, **kwargs)` ile
+biçimlendirir; `exc_info=` ise loguru'da tanınmaz (yok sayılır, traceback eklemez). Kod tabanında yaygın kalıp stdlib `logging`
+alışkanlığıdır: `logger.error(f"... {e}", exc_info=True)` ve `logger.critical(f"... {e}", extra={"trade": True})`. Mesajda `{`/`}` varsa
+(Binance JSON hata gövdesi `{"code":-1021,...}`, HTML hata sayfası, dict metni) log çağrısının KENDİSİ istisna fırlatır. Pinli
+sürümde (`loguru==0.7.2`) denendi: `logger.error('x {"a":1}', exc_info=True)` → `KeyError: '"a"'`; `'x {}'` + `extra=` →
+`IndexError`; `'x }'` → `ValueError`; çift parantez (`{{404}}`) hata vermez ama mesajı sessizce `{404}` yapar (mesaj bozulur).
+Aynı mesaj kwargs'sız yazılınca sorunsuzdur. Mevcut testlerin çoğu `logger`'ı `MagicMock` ile değiştirdiği için tuzak hiç görülmedi.
+
+Zarar yeri çağrının konumudur: `except` bloğunda log çağrısı bir güvenlik eyleminden ÖNCE gelirse eylem atlanır; bir döngü
+yakalayıcısında gelirse görev ölür; blok log ile biterse asıl istisna `KeyError` ile DEĞİŞİR (çağıranın tür kontrolü yanlış dala düşer).
+
+**Envanter** (AST taraması, `src/` 956 log çağrısı; betik ve satır satır döküm `docs/audits/2026-11-20-loguru-kwargs/`):
+
+| Ölçüt | Sayı |
+|---|---|
+| kwargs'lı çağrı | **116** (89 `extra=`, 27 `exc_info=`; başka kwarg yok; 111'i f-string, 2 birleştirme, 3 sabit metin) |
+| bunlardan serbest metin taşıyan (istisna, neden, webhook/olay metni gömülü) | **53** (kalan 63'ü sayı, sembol ya da kod içi etiket gömer; süslü parantez taşıması beklenmez. Sınıflandırma değişken adına göredir, sezgiseldir) |
+| `except` içinde | **39**; 38'i serbest metinli |
+| `except` içinde + serbest metin + ardından güvenlik eylemi (koruma emri, `_entry_halted` mandalı, tmp dosya temizliği, `set_status`) | **7** |
+| `except` içinde + serbest metin + ardından yalnız çıkış (`raise`/`return`/`continue`/`break`: log patlarsa asıl istisna ya da dönüş değeri değişir) | **9** (+1: çıkış ve başka ifade) |
+| `except` içinde + serbest metin + döngü içinde (log patlarsa görev ölür) | **18** |
+| `except` içinde + serbest metin + log işleyicinin son ifadesi (istisna çağırana kaçar, türü değişir) | 16 |
+| konumsal argümanlı çağrı (mesajdan sonra) | 1 (sabit metin: güvenli) |
+
+Öncelikli dosyalar (kwargs'lı / serbest metin / `except`+serbest): `scalper/executor.py` 4/0/0, `scalper/exits.py` 6/1/0,
+`scalper/engine.py` 32/23/14, `trading/position_manager.py` 8/1/0, `services/orchestrator.py` 8/5/5; diğerleri
+`follower/engine.py` 20/12/8, `follower/executor.py` 8/2/2, `main.py` 4/3/3, `signal_queue.py` 3/2/2, `waiting_mode/monitor.py` 2/2/2.
+En tehlikeli örnekler (satır numaraları 75c7040 ağacına göredir):
+- `follower/executor.py:271` `open_position`: dolum bilgisi okunamayınca CRITICAL log, SONRA `place_stop_loss_or_close`. Log patlarsa
+  koruma emri hiç konmaz: pozisyon korumasız kalır ve çağıran `KeyError` görür.
+- `orchestrator.py:681` `_process_signal_locked`: `UnprotectedPositionError` → log, SONRA `_entry_halted = True`. Log patlarsa giriş
+  mandalı kurulmaz ve `UnprotectedPositionError` yerine `KeyError` yükselir.
+- `orchestrator.py:361` `_monitoring_loop` genel yakalayıcısı: log patlarsa izleme döngüsü ölür, pozisyon izleme durur.
+- `orchestrator.py:269` `recover_open_positions` (döngü içinde `continue`): log patlarsa kalan pozisyonların kurtarması atlanır ve istisna çağırana kaçar.
+- `scalper/engine.py:670,818`, `follower/engine.py:309`, `follower/risk_halt.py:199` (mandal dosyası yazılamadı): tmp dosya temizliği
+  (ve varsa `return False`) atlanır.
+Taramada `scalper/executor.py`, `scalper/exits.py` ve `position_manager.py`'de `except` içinde serbest metinli kwargs'lı çağrı
+çıkmadı; `position_manager.py:699` (acil kapatmadan önce) yalnız `{symbol}` gömer, süslü parantez taşıyamaz.
+
+**Karar.** Merkezi çözüm (a): `src/core/logger.py` loguru'nun tek çıkış noktasına (`Logger._log`: `info/error/critical/log` hepsi
+buradan geçer) bir koruma takar. Çağrı yerleri DEĞİŞMEDİ (`git diff src/` yalnız `src/core/logger.py`); log metinleri ve seviyeleri aynıdır.
+Dört kural:
+1. `exc_info=` (bool, istisna, 3'lü demet, `None`) → loguru `exception` seçeneği: kayda GERÇEK traceback girer. İşlenen istisna
+   yokken `exc_info=True` hiçbir şey eklemez (`NoneType: None` satırı yok).
+2. `extra={...}` → kayda `bind(**extra)` gibi eklenir: `record["extra"]["trade"]`. `_is_trade_record` değişmedi ve `trades.log` yönlendirmesi aynı
+   çalışır (iç içe eski biçimi de kabul etmeye devam eder).
+3. Bu ikisi çıkarıldıktan sonra geriye konumsal argüman ya da gerçek yer tutucu kwarg'ı kalmazsa mesaj BİÇİMLENDİRİLMEZ (zaten
+   biçimlenmiş bir f-string'dir). `logger.info("a {} b {c}", 1, c=2)` gibi gerçek şablonlar eskisi gibi biçimlenir.
+4. Biçimlendirme yine de patlarsa (f-string + konumsal argüman gibi) satır aynen, biçimlendirmeden yazılır; bu yedek yazma `except`
+   bloğunun DIŞINDA koşar (içeride `exception=True` çağıranın istisnası yerine biçimlendirme hatasını kaydederdi) ve `record`/`colors`
+   seçeneklerini kapatır. Biçimlendirme olmayan hata (ör. olmayan seviye adı) ve bir sink'in kendi hatası (`catch=False`) yutulmaz.
+5. Traceback YALNIZ `errors.log`'a gider; konsol, `bot.log` ve `trades.log` kayıt başına TEK satırlı kalır (aşağıya bak).
+
+**Neden (b) değil.** (b) 116 çağrıyı `opt(exception=e)` / `bind(...)` biçimine çevirmekti. Reddedildi: (1) kalıp stdlib alışkanlığıdır
+ve yeni kod yazan her oturum onu yeniden yazar; (b) yalnız bugünkü çağrıları düzeltir, yarınkini CI'ya bırakır (lint/test gerekir),
+(a) ikisini birden kapatır. (2) (b) 17 dosyaya, güvenlik açısından en kritik motor dosyalarına (`scalper/engine.py` 32,
+`follower/engine.py` 20 çağrı) dokunur; `orchestrator.py`'de aynı anda iki başka dal çalışıyor ve "log metinleri aynı kalır"
+kanıtı büyük bir farkta zayıflar. (3) Bedeli (a) öder: koruma loguru'nun İÇ fonksiyonuna takılır. Önlem: `loguru==0.7.2` pini,
+takmadan önce imza kontrolü (kayarsa HİÇBİR ŞEYE dokunulmaz, `RuntimeWarning`), imza ve davranış için CI testleri (aşağıda).
+Ölçülen maliyet: argümansız çağrıda ≈ +0.1 µs, kwargs'lı çağrıda ≈ +0.3-0.6 µs (bastırılmış debug çağrısı 0.14 → 0.29 µs); boş sink'li
+tam bir çağrı ≈ 20 µs (girişimli medyan, 7×30 000 çağrı; ikinci bir bağımsız ölçüm aynı mertebeyi verdi).
+
+**Log çıktısındaki değişiklikler (bilinçli).**
+- `exc_info=True` kullanan 27 çağrı artık traceback yazar (önce hiçbiri yazmıyordu), YALNIZ `errors.log`'a. Konsol (`logs/supervisor.log`), `bot.log` ve
+  `trades.log` kayıt başına tek satırlı KALIR: loguru metin biçimlerinin sonuna `\n{exception}` ekler, bu üç sink fonksiyon biçimleyici
+  (`_one_line`) kullanır. Neden: `scripts/restart_safe.sh:115`, `scripts/server_deploy.sh:135` ve `scripts/docker_run.sh:242` 418 ban kapısı için
+  `tail -n 2000 logs/bot.log | awk '($1" "substr($2,1,5))>=since' | grep -E 'HTTP 418|banned'` çalıştırır, yani her satırın başında zaman damgası
+  varsayar. Damgasız traceback satırlarında `$1` "Traceback"/"File"/istisna adıdır ve dizge karşılaştırmasında her tarihten büyük çıkar: süzgeçten HER
+  ZAMAN geçer. Kaynak satırında ya da istisna metninde `banned`/`HTTP 418` geçen her traceback eski bir ban izini sonsuza kadar "taze" gösterir ve
+  restart/deploy kapısını kilitlerdi (fail-closed ama kalıcı yanlış alarm). Bu hata kodun ilk sürümünde VARDI; bağımsız düşmanca inceleme buldu,
+  `test_real_sinks_...` artık tek satır sözleşmesini (her `bot.log`/`trades.log`/konsol satırı zaman damgasıyla başlar, traceback yok) kilitliyor.
+- Dört sink'in hepsinde `diagnose=False`: loguru traceback'e DEĞİŞKEN DEĞERLERİNİ basar (`api_secret = '...'`; deneyle doğrulandı) ve `diagnose`
+  varsayılanı `True`'dur. Traceback artık üretildiği için değerler log dosyasına sızardı (CLAUDE.md yasak 5). Eskiden yalnız `errors.log` açıkça
+  `diagnose=True` idi ama kayıt hiç üretilmediği için işlemiyordu. Pratikte yalnız `errors.log` istisna yazar; diğer üçünde ayar savunma amaçlıdır.
+- `errors.log` biçiminden açık `\n{exception}` kaldırıldı: loguru metin biçiminin sonuna onu kendisi ekler, ikisi birlikte traceback'i İKİ kez
+  basıyordu (deneyle doğrulandı). Yan etki: `errors.log` kayıtları artık aralarında boş satır olmadan yazılır (önceden her kayıt iki satır
+  sonu taşıyordu). `errors.log`'u okuyan betik yok (`scripts/`, `src/`, `tests/` tarandı; yalnız log dizini yalıtımından söz eden yorumlar çıktı). Biçimi/`diagnose`'u anlatan tek belge
+  `docs/vault/50-veri/loglar.md`'dir ve bu kararla güncellendi. `bot.log`'u okuyan tek makine tüketicisi yukarıdaki üç betiktir.
+- `extra={"trade": True}` kaydı artık `record["extra"]["trade"]` (üst seviye); önceden `record["extra"]["extra"]["trade"]` idi. `record["extra"]`'ı
+  `_is_trade_record` dışında okuyan kod yok (tarandı).
+
+**Değişen dosyalar.** `src/core/logger.py` (koruma + sink ayarları), `tests/test_logger_kwargs_safety.py` (yeni), `tests/test_follower_executor.py`
+ve `tests/test_orchestrator_safety.py` (birer gerçek-logger regresyonu), `docs/vault/50-veri/loglar.md`, `docs/audits/2026-11-20-loguru-kwargs/` (envanter), bu kayıt, `CHANGELOG.md`.
+Ayar (`.env`) değişmez; giriş/çıkış/boyutlama kuralı değişmez; `src/services/orchestrator.py`, diğer çağrı yerleri ve deploy betikleri (`restart_safe.sh` vb.) değişmez.
+
+**Kanıt.** `tests/test_logger_kwargs_safety.py` (38 test, GERÇEK loguru çekirdeği, sink `catch=False`):
+
+| Davranış | Test |
+|---|---|
+| 9 düşmanca metin (JSON gövde, dict metni, `{}`, tek `{`/`}`, `{0}`/`{name}`, `{a.b}`, `{:d}`, çift parantez) `extra=` ile AYNEN yazılır | `test_extra_kwarg_with_braces_is_logged_verbatim` |
+| aynı 9 metin `exc_info=True` ile aynen yazılır ve kayıt gerçek traceback taşır | `test_exc_info_kwarg_with_braces_is_logged_verbatim_with_a_real_traceback` |
+| `exc_info=` istisna örneği / `sys.exc_info()` demeti; aktif istisna yokken `True`/`False`/`None` istisna eklemez | `test_exc_info_accepts_an_exception_instance_and_an_exc_info_tuple`, `test_exc_info_without_an_active_exception_adds_no_exception_record` |
+| `extra` kayda `bind` gibi birleşir; `trades.log` süzgeci `extra=`, `bind(trade=True)` ve düşmanca metinli çağrıyı yönlendirir | `test_extra_mapping_is_merged_into_record_extra_like_bind`, `test_trade_filter_routes_extra_form_bind_form_and_hostile_text` |
+| gerçek şablon (`"sym={s}", s=...`) hâlâ biçimlenir; kwargs'sız süslü metin aynen kalır | `test_template_message_with_genuine_kwargs_is_still_formatted`, `test_regular_loguru_formatting_is_untouched` |
+| f-string + konumsal argüman istisna fırlatmaz; olmayan seviye adı hâlâ fırlatır | `test_message_with_braces_and_positional_args_is_logged_verbatim_instead_of_raising`, `test_a_non_formatting_failure_still_raises` |
+| bir sink'in kendi hatası (`catch=False`) yutulmaz ve satır önceki sink'lere ikinci kez yazılmaz | `test_a_failing_sink_is_not_retried_so_the_record_is_not_written_twice` |
+| yedek yazma çağıranın istisnasını kaydeder (`logger.exception`/`exc_info=True`, `ZeroDivisionError`), biçimlendirme hatasını (`KeyError`) değil; `opt(record=True)`/`opt(colors=True)` altında da çalışır | `test_fallback_write_records_the_callers_exception_not_the_formatting_error`, `test_fallback_write_also_turns_off_the_record_and_colors_options` |
+| kayıt çağıran satırı gösterir (`function`/`line`/`name`), sarmalayıcıyı değil | `test_record_points_at_the_call_site_not_the_guard` |
+| koruma tek sefer takılır; `_log` ya da `Logger.__init__` imzası (seçenek dizilimi) kayarsa takılmaz; pinli loguru kwargs'ı hâlâ biçimlendiriyor (kanarya) | `test_guard_is_installed_and_installing_again_changes_nothing`, `test_guard_refuses_to_patch_when_the_loguru_internal_signature_changed`, `test_guard_refuses_to_patch_when_the_options_layout_may_have_changed`, `test_canary_pinned_loguru_still_formats_kwargs_so_the_guard_is_still_needed` |
+| GERÇEK sink'ler (ayrı süreç, gerçek dosyadan): trade satırı `trades.log`'a gider; traceback YALNIZ `errors.log`'ta (istisna başına bir); `bot.log`/`trades.log`/konsolun her satırı zaman damgasıyla başlar (418 ban kapısı sözleşmesi); hiçbir çıktıda değişken değeri yok | `test_real_sinks_route_trade_line_and_write_one_traceback_without_variable_values` |
+| izleme döngüsü süslü parantezli hatada ÖLMEZ, yakalayıcı dalı çalışır ve kayıt traceback taşır | `test_monitoring_loop_survives_an_exception_whose_text_has_braces` |
+| takipçide dolum okunamayınca (süslü parantezli hata) koruma emri YİNE konur | `test_follower_executor.py::TestUnreadableFillWithBraceLadenError` |
+| `UnprotectedPositionError` süslü parantezli metinle de türünü korur ve giriş mandalı kurulur | `test_orchestrator_safety.py::test_unprotected_error_with_brace_text_still_latches_and_keeps_its_type` |
+
+Düzeltme KAPALIYKEN testler düşer: `origin/main`'in `logger.py`'siyle 40 yeni testten **37**'si düşer (kalan üçü davranışın DEĞİŞMEDİĞİNİ kilitler:
+`test_regular_loguru_formatting_is_untouched`, `test_a_non_formatting_failure_still_raises`, `test_a_failing_sink_is_not_retried_so_the_record_is_not_written_twice`);
+koruma hiç takılmazsa 35'i düşer. Her koruma parçası ayrı ayrı bozularak da denendi (17 bozma): `errors.log` `diagnose` açık, `errors.log` çift `{exception}`,
+konsol/`bot.log`/`trades.log` çok satırlı (üç ayrı bozma), `depth+1` yok (kayıt sarmalayıcıyı gösterir), biçimlendirme geri dönüşü yok, `extra` çevrilmiyor,
+`exc_info` çevrilmiyor, aktif istisna yokken `exc_info=True` istisna ekliyor, koruma takılmıyor, sink hatasında da yeniden yazma, yedek yazma `except` içinde,
+yedek yazmada `record`/`colors` açık, `record`/`colors` biçimlendirme sayılmıyor, `Logger.__init__` imzası denetlenmiyor: 16'sında en az bir test düştü. Yakalanmayan tek
+bozma konsol sink'indeki `diagnose` ayarıdır; konsol artık istisna yazmadığı için gözlenemez (savunma amaçlı).
+Tam paket (yerel `.env`, son ağaç): 4105 geçti / 85 atlandı, 153 sn (önceki 4065 + 40 yeni test). Temiz kopya + sunucunun secret olmayan ayarları (`scripts/preflight_server_env.sh awa`): 4104 geçti / 86 atlandı, 174 sn (66 ayar satırı). CI `test` işi bu kararı taşıyan PR'dadır.
+Kod bağımsız bir düşmanca incelemeden geçti (76 araç çağrısı, 3000'lik rastgele fark testi dahil): iki gerçek kusur bulundu ve düzeltildi (yukarıdaki `bot.log` tek satır sözleşmesi
+ve yedek yazmanın yanlış istisnayı kaydetmesi), ayrıca `record`/`colors` altında yedek yazma açığı ile `Logger.__init__` imza denetimi eklendi; çağıran satır, `catch`/`bind`/`patch`/`contextualize`,
+iş parçacığı/asyncio yarışları ve `enqueue` altında başka kusur bulunmadı.
+
+**Bilinmeyenler / sınırlar (açıkça).**
+- Koruma loguru'nun iç `Logger._log` fonksiyonuna takılıdır (genel API değil). Sürüm yükseltmesinde imza kayarsa koruma TAKILMAZ ve çalışma
+  sırasında yalnız bir `RuntimeWarning` görünür; asıl güvence CI'dır: `test_guard_is_installed_and_installing_again_changes_nothing` düşer. Bu yüzden
+  `loguru` pini yükseltilirken bu test (ve kanarya testi) geçirilmelidir.
+- Traceback hacmi canlıda ÖLÇÜLMEDİ. 27 çağrı yeri artık `errors.log`'a traceback yazar (50 MB/60 gün döner); kalıcı bir hatada döngü yakalayıcıları her turda
+  bir traceback üretir (ör. `_monitoring_loop` 10 sn'de bir). Bağımsız ölçüm: üç çerçeveli bir görevde tek kayıt ≈ 25 satır/2,2 KB; gerçek sink'lerle `exc_info=True` çağrısı ≈ 360 µs
+  (düz çağrı ≈ 140 µs) ve biçimlendirme çağıran iş parçacığında, yani olay döngüsünde yapılır. 27 çağrının 17'si döngü içindedir.
+- Tanınan `exc_info` türleri bool/`None`/istisna/3'lü demettir; başka türler (tamsayı, sınıf, metin) tanınmaz ve eskisi gibi sıradan kwarg kalır.
+  `extra`/`exc_info` kwarg'ı artık tüketildiği için `{extra}`, `{extra[k]}`, `{exc_info}` yer tutucuları biçimlenmez, aynen yazılır; kodda böyle bir şablon YOKTUR
+  (116 kwargs'lı çağrının hepsi f-string ya da sabit metin, AST taraması). `lazy=True` + `exc_info/extra` artık hata yerine ham yazılır (kodda `opt(lazy=...)` yok).
+  `opt(colors=True)` ile argümansız ve geçersiz etiketli çağrı hâlâ `ValueError` fırlatır (kapsam dışı; kodda `opt(colors=...)`/`opt(record=...)` yok).
+- Koruma `Logger.__init__` imzasından seçenek sayısını/sırasını doğrular; `_stdlib_kwargs_to_options` kendi hatasında sessizce dönüşümü atlar (satır yine yazılır).
+- Önceden var, bu kararda DEĞİŞMEDİ: `setup_logger()` ikinci kez çağrılırsa ya da `importlib.reload(src.core.logger)` yapılırsa `logger.remove()` konsol sink'inin
+  `TextIOWrapper(sys.stdout.buffer)`'ını çöpe bırakır ve o `sys.stdout`'u kapatır (`ValueError: I/O operation on closed file`).
+- Kural 4 yalnız yayından ÖNCE patlayan çağrıyı (biçimlendirme) biçimlendirmeden yeniden yazar. Bir sink'in kendi hatası (`catch=False`) aynen
+  yükselir ve satır ikinci kez yazılmaz; bu ayrımı traceback'teki `loguru._handler` çerçevesi belirler (loguru'nun iç yapısına ikinci bir bağ: CI testi var).
+  Uygulama sink'lerinin hepsi varsayılan `catch=True`'dur (loguru hatayı kendisi yutar).
+- Kapsam yalnız loguru'dur: `import logging` kullanan iki modül etkilenmez (stdlib anlamı zaten güvenlidir).
+- Mevcut testlerin çoğu `logger`'ı `MagicMock` yapar; onlar tuzağı hâlâ göremez. Güvence loguru düzeyindeki testlerdedir ve iki kritik yoldaki
+  (takipçi dolum hatası, orkestratör mandalı) gerçek-logger regresyonlarındadır.
+- Canlıda (TESTNET) henüz gözlenmedi: ancak süslü parantezli bir hata geldiğinde ve ilk `exc_info` traceback satırında görülebilir.
+
+**Geri alma.** `scripts/deploy.sh awa <önceki-commit>`; ayar ya da veri göçü yok. Kod geri alınınca log çağrıları eski davranışa döner:
+süslü parantezli hata metni yine log çağrısını patlatır, `exc_info` yine traceback yazmaz, `diagnose` ve `errors.log` biçimi eskiye döner.
+
+**Deploy.** 2026-11-20 16:23-16:25 UTC, TESTNET, `b8c18de`: D46 kaydındaki ortak deploy paragrafı. Birleştirme öncesi bağımsız
+incelemenin not ettiği sınır: `opt(exception=...)` ile WARNING düzeyinde yazılan tek çağrının (D44 yeniden deneme uyarısı,
+`src/services/orchestrator.py`) traceback'i artık hiçbir dosyaya yazılmaz (`bot.log` ve konsol tek satır, `errors.log` ERROR ve
+üstü); mesaj istisna türünü ve metnini taşımaya devam eder.
+
 ### D44 — Orkestratörün açılış kurtarması kendini onarır: başarısız kurtarma izleme döngüsünde geri çekilmeli aralıklarla yeniden denenir · 2026-11-20 · TESTNET'TE CANLI (2026-11-20 deploy, `4f0c159`)
 
 **Sorun.** `TradingOrchestrator.start()` açılışta `_recovery_ready = await recover_open_positions()` atıyor ve bu bayrak başka hiçbir
@@ -99,11 +364,12 @@ kusur bulunmadı. Deploy kaydı deploy'dan sonra buraya eklenir.
   gecikir (tazelik sınırı 180 sn).
 - Açılış çağrısı (`start()`) ön koşula BAKMAZ; bugünkü davranış korunur. Scalper'ın ilk yoklaması başarısız olup orkestratörün
   sorgusu saniyeler sonra başarılı olursa "Sıra kuralı"ndaki risk açılış yolunda bu karardan önce de vardı ve duruyor. Kapsam
-  dışı bırakıldı (açılış davranışını değiştirir, kendi kararını ister).
+  dışı bırakıldı (açılış davranışını değiştirir, kendi kararını ister). Sonradan: D46'te kapatıldı (açılış çağrısı da aynı ön
+  koşula bağlandı).
 - Önceden beri var, doğrulandı: günlükleyici loguru'dur; `exc_info=True` ya da `extra={...}` ile yazılan bir mesajda `{...}`
   geçerse log çağrısı `KeyError` fırlatır. `_monitoring_loop`'un genel hata yakalayıcısı bu kalıbı kullanır; metninde süslü
   parantez olan bir hata oraya ulaşırsa döngü ölür. Yeni yol etkilenmez (kwargs'sız çağrı ya da `opt(exception=)`; süslü
-  parantezli hata metniyle test edildi). Yakalayıcının kendisi bu kararda değiştirilmedi.
+  parantezli hata metniyle test edildi). Yakalayıcının kendisi bu kararda değiştirilmedi; tuzak kod tabanı genelinde D45'te kapatıldı.
 - Canlıda (TESTNET) kendini onarma henüz gözlenmedi: ancak bir açılış kurtarması başarısız olduğunda görülebilir.
 
 **Geri alma.** `scripts/deploy.sh awa <önceki-commit>`; ayar ya da veri göçü yok. Kod geri alınınca davranış bu karardan öncesine
@@ -120,15 +386,46 @@ alındı"). `.env` değişmedi (yedek `backups/env.bak-20261120-105745-deploy`).
 kendini onarma yolu; açılış kurtarması başarılı olduğu için yeniden deneme hiç tetiklenmedi.
 
 **Birleştirmeden sonra gelen inceleme (cubic, PR #11).** Beş bulgu kodda tek tek doğrulandı. Hiçbiri emir ya da çift yönetim riski
-taşımıyor; kod düzeltmeleri bu deploy'a KATILMADI, takip işidir.
+taşımıyor; kod düzeltmeleri bu deploy'a KATILMADI, takip işidir. Dört geçerli bulgunun üçü takip değişikliğiyle (`e9c2dd8`), biri
+bu kayıtla düzeltildi; ayrıntı tablonun altındaki "İnceleme düzeltmeleri" paragrafında.
 
 | Bulgu | Hüküm | Etki |
 |---|---|---|
-| Yeniden denemede döngü ortasında beklenmeyen bir istisna olur ve pozisyon sonraki denemeden önce kapanırsa "telegram" rezervasyonu izlemesiz kalır | Geçerli (dar) | Fail-closed: o sembol yeniden başlatmaya kadar başka motora kapalı; emir riski yok. Düzeltme: her başarılı hesap okumasından sonra izlenmeyen "telegram" rezervasyonlarını bırak |
-| Bayat hesap listesi denemeler boyunca sürerse her deneme emirsiz bir CLOSED `positions` satırı ekler | Geçerli (düşük olasılık: liste her zaman taze okunur) | Kozmetik, emir yok. Düzeltme: yetim satırı eklemeden önce canlı miktarı doğrula |
+| Yeniden denemede döngü ortasında beklenmeyen bir istisna olur ve pozisyon sonraki denemeden önce kapanırsa "telegram" rezervasyonu izlemesiz kalır | Geçerli (dar) | Fail-closed: o sembol yeniden başlatmaya kadar başka motora kapalı; emir riski yok. Düzeltildi (`e9c2dd8`): her başarılı hesap okumasında, izlemede olmayan ve listede açık pozisyonu bulunmayan "telegram" rezervasyonu bırakılır |
+| Bayat hesap listesi denemeler boyunca sürerse her deneme emirsiz bir CLOSED `positions` satırı ekler | Geçerli (düşük olasılık: liste her zaman taze okunur) | Kozmetik, emir yok. Düzeltildi (`e9c2dd8`): yetim satırı açılmadan önce canlı miktar taze okunur |
 | RUNBOOK'ta scalper alan yolu yanlıştı | Geçerli | Bu kayıtla düzeltildi: `scalper_details.exchange.recovery_ready` |
-| Lifespan testi `_check_disabled_follower_open_trades`'i gerçek veritabanı yolunda bırakıyor | Geçerli (test izolasyonu) | Yalnız test |
+| Lifespan testi `_check_disabled_follower_open_trades`'i gerçek veritabanı yolunda bırakıyor | Geçerli (test izolasyonu) | Yalnız test. Düzeltildi (`e9c2dd8`) |
 | Ön koşul gömülü takipçinin kurtarmasını da beklemeli | Geçersiz | Takipçinin canlı pozisyonları `scalp_trades`'te OPEN satırdır (atlama sorgusu strateji süzmez) ve uçuştaki girişi emirden önce rezerve eder. Tasarım sırası orkestratör → takipçidir; tersine bağlamak takipçinin yetim denetimini bozar |
+
+**İnceleme düzeltmeleri (2026-11-20, `e9c2dd8` + `5d2a8ad`, PR #14; TESTNET'TE CANLI: 2026-11-20 16:25 UTC, `b8c18de`, D46 kaydındaki ortak deploy paragrafı).** Yalnız `recover_open_positions` ve iki
+yeni özel yardımcı değişti; `start()`, yeniden deneme zamanlaması, sinyal yolu, scalper ve takipçi kodu, ayarlar aynı.
+
+- **Artakalan rezervasyon.** Kurtarma sembolü önce sahiplenir, sonra izlemeye alır; arada beklenmeyen bir istisna olursa
+  rezervasyon bilerek kalır (fail-closed). `_release_stale_reservations` her başarılı hesap okumasında şu koşulların hepsini
+  sağlayan rezervasyonu bırakır: sahip "telegram", sembol izlemede değil, taze hesap listesinde açık pozisyonu yok. İki durumda
+  hiçbir şey bırakılmaz: `entry_halted` (sinyal yolu korumasız pozisyon şüphesinde izlenmeyen rezervasyonu bilerek tutar) ve sinyal
+  kilidi tutulurken (uçuştaki giriş sembolü izlemeden önce sahiplenir). İzlenen ama listede olmayan pozisyona kurtarma dokunmaz:
+  onu izleme döngüsü aynı turda kapanış muhasebesiyle kapatır.
+- **Çift CLOSED satır.** Veritabanında açık kaydı olmayan (yetim) pozisyon için satır açılmadan önce canlı miktar
+  `get_position_risk(force_fresh=True)` ile okunur. Miktar 0 ise ya da kayıt dönmezse iki taze okuma çelişiyor demektir (hesap
+  listesi: açık, `positionRisk`: kapalı) ve hangisinin bayat olduğu o anda bilinemez. Bu durumda KARAR VERİLMEZ: satır açılmaz,
+  sembol izlemeden düşürülmez, rezervasyon bırakılmaz, deneme tamamlanmamış sayılır (`recovery_ready=false`) ve sonraki deneme
+  yeniden bakar. Hesap listesi yetişirse süpürme rezervasyonu bırakır; `positionRisk` yetişirse pozisyon benimsenir. Okuma
+  başarısızsa ya da miktar eksik/bozuksa pozisyon eskisi gibi benimsenir. Tek-yön mod varsayılır. Ek REST yükü yetim adayı başına
+  bir weight-5 çağrıdır; veritabanı kaydı olan pozisyonlarda ek çağrı yoktur. Olay WARNING olarak loglanır (`docs/RUNBOOK.md`).
+- **İlk sürümün hatası ve PR #14 incelemesi.** İlk sürüm (`e9c2dd8`) çelişkide pozisyonu kapanmış sayıyor, izlemeden düşürüp
+  rezervasyonu bırakıyor ve kurtarmayı başarılı bitiriyordu; `positionRisk` yanlış olsaydı canlı bir pozisyon başka hiçbir işaret
+  olmadan yönetimsiz kalırdı (kurtarma bitince yeniden deneme yapılmaz). Bunu hem bağımsız kod incelemesi (artık risk olarak) hem
+  cubic (P1) işaret etti; `5d2a8ad` kuralı yukarıdaki "karar verilmez" hâline getirdi. cubic'in PR #14'teki diğer iki bulgusu:
+  miktarsız yanıt testi taze okumanın yapıldığını ölçmüyordu (geçerli, `5d2a8ad` ile düzeltildi); benimsenen yetimin miktar ve
+  giriş değerleri taze kayıttan alınsın (reddedildi: iki okuma art arda yapılır ve ikisi de tazedir, aradaki pencere
+  milisaniyedir; veritabanı kaydı olan dalda da değerler hesap listesinden alınır, tutarlı bir çözüm bu değişikliğin kapsamını
+  aşar).
+- **Kanıt.** `tests/test_orchestrator_recovery_retry.py` 19 → 29 test (10 yeni, 1 sıkılaştırılmış: bayat listede ikinci deneme artık
+  tek satır şartını da ölçer). Her yeni test ya önce kırmızı görüldü ya da mutasyonla doğrulandı ("listede" koşulu, taze okuma
+  şartı). Tam paket yerel: 4075 geçti / 85 atlandı (`5d2a8ad`). İlk sürümü iki bağımsız inceleme (üretim kodu, testler) okudu:
+  test incelemesinin üç boşluğu (miktarsız yanıt, "listede" koşulu, doğrulamanın gerçekten denendiği) kapatıldı; kod incelemesinin
+  işaret ettiği artık risk `5d2a8ad` ile giderildi.
 
 ### D43 — 2026-11-20 ölçüm hükmü: strateji C'nin örneklem-dışı kenarı gösterilemedi, başka kurulumda da yok, kayıp-örüntü korumaları geçmedi · 2026-11-20 · HİÇBİR AYAR DEĞİŞMEDİ — mainnet NO-GO teyit
 

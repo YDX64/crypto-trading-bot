@@ -62,7 +62,9 @@ class FakeExchange:
         self.positions: List[Dict[str, Any]] = []
         self.algo_orders: List[Dict[str, Any]] = []
         self.algo_fail = False
+        self.risk_fail = False
         self.risk_amounts: Dict[str, float] = {}
+        self.risk_calls: List[tuple] = []
         self.orders: List[Dict[str, Any]] = []
         self.cancels: List[str] = []
 
@@ -83,7 +85,10 @@ class FakeExchange:
             raise TimeoutError("algo okunamadi")
         return [dict(o) for o in self.algo_orders]
 
-    async def get_position_risk(self, symbol: str) -> Optional[Dict[str, Any]]:
+    async def get_position_risk(self, symbol: str, **kwargs: Any) -> Optional[Dict[str, Any]]:
+        self.risk_calls.append((symbol, dict(kwargs)))
+        if self.risk_fail:
+            raise TimeoutError("risk okunamadi")
         if symbol not in self.risk_amounts:
             return None
         return {"symbol": symbol, "positionAmt": str(self.risk_amounts[symbol])}
@@ -104,6 +109,15 @@ def _btc_position(amt: str = "0.01") -> Dict[str, Any]:
         "symbol": "BTCUSDT",
         "positionAmt": amt,
         "entryPrice": "50000",
+        "leverage": "10",
+    }
+
+
+def _eth_position(amt: str = "0.5") -> Dict[str, Any]:
+    return {
+        "symbol": "ETHUSDT",
+        "positionAmt": amt,
+        "entryPrice": "3000",
         "leverage": "10",
     }
 
@@ -467,6 +481,173 @@ async def test_precondition_false_waits_then_true_attempts(clock, monkeypatch):
 
 
 # ----------------------------------------------------------------------
+# 9b) Açılış çağrısı da ön koşula bağlı (D46)
+# ----------------------------------------------------------------------
+
+
+async def test_start_skips_initial_recovery_while_precondition_false(
+    clock, db_sessionmaker, monkeypatch
+):
+    """Scalper kurtarması bitmediyse açılış pozisyon kurtarma sorgusu atmaz, hiçbir şey sahiplenmez.
+
+    Senaryo: scalper'ın ilk yoklaması başarısız oldu, kurtarması koşmadı ve
+    sembolleri rezerve edilmedi. Borsada scalper'a ait, henüz OPEN `scalp_trades`
+    satırı olmayan (maker dolumu) STOP'suz bir pozisyon var. Eski açılış onu
+    "yetim" sanıp acil kapatırdı.
+    """
+    fake = FakeExchange()
+    fake.positions = [_btc_position()]
+    fake.algo_orders = []  # stop yok: sahiplenilseydi acil kapatılırdı
+    fake.risk_amounts["BTCUSDT"] = 0.01
+    orch = _make_orchestrator(fake, monkeypatch)
+    orch.recovery_precondition = lambda: False
+
+    with LogCapture() as logs:
+        await _start_without_loop(orch)
+        skipped = logs.messages("WARNING", "Açılış kurtarması ATLANDI")
+
+    assert fake.get_all_positions_calls == 0  # start() kurtarma sorgusu atmadı
+    assert orch._recovery_ready is False
+    assert orch.active_positions == {}
+    assert symbol_reservations.snapshot() == {}
+    assert fake.orders == [] and fake.cancels == []
+    assert await _position_rows(db_sessionmaker) == []
+    assert orch._recovery_retry_attempts == 0
+    assert orch._recovery_retry_due_monotonic == T0 + orch.RECOVERY_RETRY_INITIAL_SECONDS
+    assert orch.health_snapshot()["recovery_next_retry_in_seconds"] == 30.0
+    assert len(skipped) == 1
+
+    # Gerçek izleme döngüsü ilk turda salt-okunur bir hazır-olma yoklaması atar
+    # (D44'ün başarısız-açılış yolunda da böyle). Borsayı OKUR ama listeyi
+    # kullanmaz: sahiplenme, emir ve kurtarma bayrağı değişmez.
+    await orch._refresh_exchange_readiness_if_due()
+
+    assert fake.get_all_positions_calls == 1
+    assert orch._exchange_ready is True
+    assert orch._recovery_ready is False
+    assert orch.active_positions == {}
+    assert symbol_reservations.snapshot() == {}
+    assert fake.orders == [] and fake.cancels == []
+    assert await _position_rows(db_sessionmaker) == []
+
+
+async def test_skipped_initial_recovery_heals_once_precondition_turns_true(
+    clock, db_sessionmaker, monkeypatch
+):
+    fake = FakeExchange()
+    fake.positions = [_btc_position()]
+    fake.algo_orders = [dict(STOP_ORDER)]
+    fake.risk_amounts["BTCUSDT"] = 0.01
+    orch = _make_orchestrator(fake, monkeypatch)
+    settled = {"value": False}
+    orch.recovery_precondition = lambda: settled["value"]
+    await _start_without_loop(orch)
+    assert fake.get_all_positions_calls == 0
+
+    # Vade geldi ama scalper hâlâ hazır değil: deneme yok, deneme hakkı harcanmaz.
+    clock.now = orch._recovery_retry_due_monotonic + 1
+    await orch._retry_recovery_if_due()
+    assert fake.get_all_positions_calls == 0
+    assert orch._recovery_retry_attempts == 0
+    assert orch._recovery_ready is False
+
+    # Scalper kurtarmasını bitirdi: sıradaki turda kurtarma koşar.
+    settled["value"] = True
+    await orch._retry_recovery_if_due()
+
+    assert fake.get_all_positions_calls == 1
+    assert orch._recovery_retry_attempts == 1
+    assert orch._recovery_ready is True
+    assert orch._recovery_retry_due_monotonic is None
+    assert set(orch.active_positions) == {"BTCUSDT"}
+    assert symbol_reservations.snapshot() == {"BTCUSDT": "telegram"}
+    assert fake.orders == []
+
+
+async def test_real_loop_recovers_and_health_heals_after_scalper_settles(monkeypatch):
+    """GERÇEK _monitoring_loop + main._scalper_recovery_settled: scalper hazır olunca sağlık düzelir."""
+    engine = SimpleNamespace(_recovery_ready=False)
+    monkeypatch.setattr(main_module, "scalper_engine", engine)
+    fake = FakeExchange()
+    orch = _make_orchestrator(fake, monkeypatch)
+    orch.recovery_precondition = main_module._scalper_recovery_settled
+    monkeypatch.setattr(orch.config, "check_interval_seconds", 0.005)
+    monkeypatch.setattr(TradingOrchestrator, "RECOVERY_RETRY_INITIAL_SECONDS", 0.01)
+    monkeypatch.setattr(TradingOrchestrator, "RECOVERY_RETRY_MAX_SECONDS", 0.02)
+    original = orch.recover_open_positions
+    calls = {"n": 0}
+
+    async def spy(*args: Any, **kwargs: Any) -> bool:
+        calls["n"] += 1
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(orch, "recover_open_positions", spy)
+    try:
+        await orch.start()
+        # Vade (10 ms) çoktan doldu; scalper hazır değilken kurtarma HİÇ koşmaz.
+        await asyncio.sleep(0.1)
+        assert calls["n"] == 0
+        assert orch._recovery_ready is False
+        assert orch.health_snapshot()["healthy"] is False
+
+        engine._recovery_ready = True
+        for _ in range(200):
+            if orch._recovery_ready:
+                break
+            await asyncio.sleep(0.005)
+        await asyncio.sleep(0.03)  # döngü bir tur daha damga bassın
+
+        assert calls["n"] == 1
+        assert orch._recovery_ready is True
+        assert orch.health_snapshot()["healthy"] is True
+    finally:
+        await orch.stop()
+
+
+@pytest.mark.parametrize("precondition", [None, lambda: True], ids=["yok", "saglaniyor"])
+async def test_start_recovers_immediately_when_precondition_missing_or_true(
+    clock, db_sessionmaker, monkeypatch, precondition
+):
+    """Ön koşul yoksa ya da sağlanıyorsa açılış bugünküyle BİREBİR aynı çalışır."""
+    fake = FakeExchange()
+    fake.positions = [_btc_position()]
+    fake.algo_orders = [dict(STOP_ORDER)]
+    fake.risk_amounts["BTCUSDT"] = 0.01
+    orch = _make_orchestrator(fake, monkeypatch)
+    orch.recovery_precondition = precondition
+
+    await _start_without_loop(orch)
+
+    assert fake.get_all_positions_calls == 1
+    assert orch._recovery_ready is True
+    assert orch._exchange_ready is True
+    assert orch._recovery_retry_due_monotonic is None
+    assert set(orch.active_positions) == {"BTCUSDT"}
+    assert symbol_reservations.snapshot() == {"BTCUSDT": "telegram"}
+
+
+async def test_start_with_precondition_true_and_unreachable_exchange_keeps_failure_path(
+    clock, monkeypatch
+):
+    """Ön koşul sağlanıyorsa borsa hatası ATLAMA değil, D44'ün başarısızlık yoludur."""
+    fake = FakeExchange()
+    fake.fail = True
+    orch = _make_orchestrator(fake, monkeypatch)
+    orch.recovery_precondition = lambda: True
+
+    with LogCapture() as logs:
+        await _start_without_loop(orch)
+        failed = logs.messages("WARNING", "Açılış kurtarması tamamlanamadı")
+        skipped = logs.messages("WARNING", "Açılış kurtarması ATLANDI")
+
+    assert fake.get_all_positions_calls == 1
+    assert orch._recovery_ready is False
+    assert orch._recovery_retry_due_monotonic == T0 + orch.RECOVERY_RETRY_INITIAL_SECONDS
+    assert len(failed) == 1
+    assert skipped == []
+
+
+# ----------------------------------------------------------------------
 # 10) recover_open_positions beklenmedik istisna
 # ----------------------------------------------------------------------
 
@@ -620,13 +801,156 @@ async def test_recovery_without_stop_closes_once_and_stale_snapshot_adds_no_orde
     assert symbol_reservations.snapshot() == {}
 
     # Hesap anlık görüntüsü BAYAT: hâlâ listeliyor; ama get_position_risk 0.
+    # İki taze okuma çelişiyor: karar verilmez, kurtarma tamamlanmış sayılmaz.
     assert fake.risk_amounts["BTCUSDT"] == 0.0
-    assert await orch.recover_open_positions() is True
+    assert await orch.recover_open_positions() is False
 
     assert len(fake.orders) == 1  # ikinci denemede EK emir yok
     assert orch.active_positions == {}
+    assert symbol_reservations.snapshot() == {"BTCUSDT": "telegram"}
+    rows = await _position_rows(db_sessionmaker)
+    assert len(rows) == 1 and rows[0].status == PositionStatus.CLOSED
+
+    # Hesap listesi yetişti: süpürme rezervasyonu bırakır, kurtarma tamamlanır.
+    fake.positions = []
+    assert await orch.recover_open_positions() is True
+
     assert symbol_reservations.snapshot() == {}
-    assert all(r.status == PositionStatus.CLOSED for r in await _position_rows(db_sessionmaker))
+    assert len(fake.orders) == 1
+    rows = await _position_rows(db_sessionmaker)
+    assert len(rows) == 1 and rows[0].status == PositionStatus.CLOSED
+
+
+async def test_listed_orphan_reported_flat_is_not_adopted_and_recovery_stays_unsettled(
+    db_sessionmaker, monkeypatch
+):
+    """Liste "açık", taze positionRisk "kapalı": yetim satır açılmaz ama pozisyon
+    kapanmış da sayılmaz; rezervasyon tutulur, kurtarma tamamlanmaz."""
+    fake = FakeExchange()
+    fake.positions = [_btc_position()]
+    fake.algo_orders = []
+    orch = _make_orchestrator(fake, monkeypatch)
+
+    assert await orch.recover_open_positions() is False
+
+    assert await _position_rows(db_sessionmaker) == []
+    assert orch.active_positions == {}
+    assert symbol_reservations.snapshot() == {"BTCUSDT": "telegram"}
+    assert fake.orders == []
+    # Kurtarma kararı önbellekten verilmez: 5 sn'lik anlık görüntü sıfır olmayan
+    # bayat bir miktarı doğrulamadan döndürür ve bu kontrolü boşa çıkarırdı.
+    assert fake.risk_calls == [("BTCUSDT", {"force_fresh": True})]
+
+    fake.positions = []  # hesap listesi yetişti
+    assert await orch.recover_open_positions() is True
+    assert symbol_reservations.snapshot() == {}
+
+
+async def test_orphan_is_adopted_once_position_risk_agrees_with_the_list(
+    db_sessionmaker, monkeypatch
+):
+    fake = FakeExchange()
+    fake.positions = [_btc_position()]
+    fake.algo_orders = [dict(STOP_ORDER)]
+    orch = _make_orchestrator(fake, monkeypatch)
+
+    assert await orch.recover_open_positions() is False
+    assert await _position_rows(db_sessionmaker) == []
+    assert symbol_reservations.snapshot() == {"BTCUSDT": "telegram"}
+
+    fake.risk_amounts["BTCUSDT"] = 0.01  # positionRisk yetişti
+    assert await orch.recover_open_positions() is True
+
+    rows = await _position_rows(db_sessionmaker)
+    assert len(rows) == 1 and rows[0].status == PositionStatus.OPEN
+    assert set(orch.active_positions) == {"BTCUSDT"}
+    assert symbol_reservations.snapshot() == {"BTCUSDT": "telegram"}
+    assert fake.orders == []
+
+
+async def test_orphan_is_adopted_when_live_amount_cannot_be_verified(
+    db_sessionmaker, monkeypatch
+):
+    """Canlı miktar okunamazsa yetim pozisyon eskisi gibi benimsenir (fail-closed)."""
+    fake = FakeExchange()
+    fake.positions = [_btc_position()]
+    fake.algo_orders = [dict(STOP_ORDER)]
+    fake.risk_fail = True
+    orch = _make_orchestrator(fake, monkeypatch)
+
+    assert await orch.recover_open_positions() is True
+
+    rows = await _position_rows(db_sessionmaker)
+    assert len(rows) == 1 and rows[0].status == PositionStatus.OPEN
+    assert set(orch.active_positions) == {"BTCUSDT"}
+    assert symbol_reservations.snapshot() == {"BTCUSDT": "telegram"}
+    # Doğrulama gerçekten denendi (benimseme eski davranış olduğu için test,
+    # kontrol tümden silinse de geçerdi).
+    assert fake.risk_calls == [("BTCUSDT", {"force_fresh": True})]
+
+
+async def test_orphan_is_adopted_when_live_record_has_no_amount(db_sessionmaker, monkeypatch):
+    """Miktar alanı olmayan (bozuk) yanıt "kapanmış" sayılmaz: yanlış bir "yok"
+    hükmü canlı pozisyonu yönetimsiz bırakırdı."""
+    fake = FakeExchange()
+    fake.positions = [_btc_position()]
+    fake.algo_orders = [dict(STOP_ORDER)]
+    orch = _make_orchestrator(fake, monkeypatch)
+
+    calls: List[tuple] = []
+
+    async def no_amount(symbol: str, **kwargs: Any) -> Dict[str, Any]:
+        calls.append((symbol, dict(kwargs)))
+        return {"symbol": symbol}
+
+    monkeypatch.setattr(fake, "get_position_risk", no_amount)
+
+    assert await orch.recover_open_positions() is True
+
+    rows = await _position_rows(db_sessionmaker)
+    assert len(rows) == 1 and rows[0].status == PositionStatus.OPEN
+    assert set(orch.active_positions) == {"BTCUSDT"}
+    assert symbol_reservations.snapshot() == {"BTCUSDT": "telegram"}
+    assert calls == [("BTCUSDT", {"force_fresh": True})]  # taze kontrol gerçekten yapıldı
+
+
+async def test_disagreeing_reads_leave_tracked_position_to_the_monitor(
+    db_sessionmaker, monkeypatch
+):
+    """BTC izlemeye alındı, ETH'te istisna -> oturum geri alındı (satır yok).
+    Sonraki denemede liste "açık", positionRisk "kapalı": izlemedeki pozisyon
+    izleme döngüsünün işidir; kurtarma ne düşürür ne rezervasyonunu bırakır."""
+    fake = FakeExchange()
+    fake.positions = [_btc_position(), _eth_position()]
+    fake.algo_orders = [dict(STOP_ORDER)]
+    fake.risk_amounts["BTCUSDT"] = 0.01
+    fake.risk_amounts["ETHUSDT"] = 0.5
+    orch = _make_orchestrator(fake, monkeypatch)
+    original = orch._ensure_protected
+
+    async def flaky(position: Any) -> Optional[bool]:
+        if position.symbol == "ETHUSDT":
+            raise RuntimeError("beklenmedik")
+        return None
+
+    monkeypatch.setattr(orch, "_ensure_protected", flaky)
+    with pytest.raises(RuntimeError):
+        await orch.recover_open_positions()
+
+    assert set(orch.active_positions) == {"BTCUSDT"}
+    assert symbol_reservations.snapshot() == {"BTCUSDT": "telegram", "ETHUSDT": "telegram"}
+
+    monkeypatch.setattr(orch, "_ensure_protected", original)
+    fake.positions = [_btc_position()]
+    fake.risk_amounts["BTCUSDT"] = 0.0
+
+    assert await orch.recover_open_positions() is False
+
+    assert set(orch.active_positions) == {"BTCUSDT"}
+    assert symbol_reservations.snapshot() == {"BTCUSDT": "telegram"}  # ETH süpürüldü
+    assert await _position_rows(db_sessionmaker, "BTCUSDT") == []
+    assert await _position_rows(db_sessionmaker, "ETHUSDT") == []
+    assert fake.orders == []
 
 
 async def test_retry_that_emergency_closes_drops_previously_tracked_position(
@@ -658,6 +982,95 @@ async def test_retry_that_emergency_closes_drops_previously_tracked_position(
     assert fake.orders[0]["params"]["reduceOnly"] == "true"
     rows = await _position_rows(db_sessionmaker)
     assert len(rows) == 1 and rows[0].status == PositionStatus.CLOSED
+
+
+async def test_retry_releases_reservation_leaked_by_failed_attempt_once_position_is_gone(
+    clock, db_sessionmaker, monkeypatch
+):
+    """Başarısız deneme rezervasyonu açık bırakır (fail-closed); pozisyon sonra
+    kapanırsa döngü o sembole bir daha uğramaz -> artık rezervasyon bırakılmalı."""
+    symbol_reservations.reserve("SOLUSDT", "scalper")
+    fake = FakeExchange()
+    fake.fail = True
+    orch = _make_orchestrator(fake, monkeypatch)
+    await _start_without_loop(orch)
+
+    fake.fail = False
+    fake.positions = [_btc_position()]
+    fake.risk_amounts["BTCUSDT"] = 0.01
+
+    async def boom(_position: Any) -> Optional[bool]:
+        raise RuntimeError("beklenmedik")
+
+    monkeypatch.setattr(orch, "_ensure_protected", boom)
+    clock.now = orch._recovery_retry_due_monotonic
+    await orch._retry_recovery_if_due()
+
+    assert orch._recovery_ready is False
+    assert orch.active_positions == {}
+    assert symbol_reservations.snapshot() == {"SOLUSDT": "scalper", "BTCUSDT": "telegram"}
+
+    fake.positions = []  # pozisyon arada kapandı
+    clock.now = orch._recovery_retry_due_monotonic
+    await orch._retry_recovery_if_due()
+
+    assert orch._recovery_ready is True
+    assert symbol_reservations.snapshot() == {"SOLUSDT": "scalper"}
+
+
+async def test_tracked_position_missing_from_list_keeps_reservation_for_the_monitor(
+    db_sessionmaker, monkeypatch
+):
+    """İzlemedeki pozisyon listeden düştüyse onu izleme döngüsü muhasebeyle
+    kapatır; kurtarma rezervasyonuna dokunmamalı."""
+    fake = FakeExchange()
+    fake.positions = [_btc_position()]
+    fake.algo_fail = True
+    fake.risk_amounts["BTCUSDT"] = 0.01
+    orch = _make_orchestrator(fake, monkeypatch)
+
+    assert await orch.recover_open_positions() is False  # izlemede, koruma bilinmiyor
+
+    fake.positions = []
+    assert await orch.recover_open_positions() is True
+
+    assert set(orch.active_positions) == {"BTCUSDT"}
+    assert symbol_reservations.snapshot() == {"BTCUSDT": "telegram"}
+
+
+async def test_entry_halt_keeps_untracked_reservation(monkeypatch):
+    """Giriş durdurulduysa izlenmeyen rezervasyon kanıttır; insan bakmalı."""
+    fake = FakeExchange()
+    orch = _make_orchestrator(fake, monkeypatch)
+    symbol_reservations.reserve("ETHUSDT", "telegram")
+    orch._entry_halted = True
+
+    assert await orch.recover_open_positions() is True
+
+    assert symbol_reservations.snapshot() == {"ETHUSDT": "telegram"}
+
+
+async def test_reservation_of_in_flight_signal_is_not_released(monkeypatch):
+    """Uçuştaki giriş, pozisyonu izlemeye almadan önce sembolü rezerve eder."""
+    fake = FakeExchange()
+    orch = _make_orchestrator(fake, monkeypatch)
+    symbol_reservations.reserve("ETHUSDT", "telegram")
+
+    async with orch._signal_lock:
+        assert await orch.recover_open_positions() is True
+
+    assert symbol_reservations.snapshot() == {"ETHUSDT": "telegram"}
+
+
+async def test_sweep_keeps_reservation_of_symbol_still_listed(monkeypatch):
+    """Listede hâlâ açık görünen sembol süpürülmez: döngü ona gelene kadar araya
+    DB/REST beklemeleri girer ve o arada başka motor sembolü sahiplenebilirdi."""
+    orch = _make_orchestrator(FakeExchange(), monkeypatch)
+    symbol_reservations.reserve("BTCUSDT", "telegram")
+
+    orch._release_stale_reservations([_btc_position()])
+
+    assert symbol_reservations.snapshot() == {"BTCUSDT": "telegram"}
 
 
 # ----------------------------------------------------------------------
@@ -695,6 +1108,9 @@ async def test_lifespan_wires_scalper_precondition_before_orchestrator_start(mon
     for name in ("orchestrator", "telegram_bot", "scalper_engine", "follower_engine"):
         monkeypatch.setattr(main_module, name, getattr(main_module, name))
     monkeypatch.setattr(main_module, "init_db", AsyncMock())
+    monkeypatch.setattr(
+        main_module, "_check_disabled_follower_open_trades", AsyncMock(return_value=[])
+    )
     monkeypatch.setattr(main_module, "close_db", AsyncMock())
     monkeypatch.setattr(main_module, "TradingOrchestrator", FakeOrchestrator)
     monkeypatch.setattr(main_module, "TelegramBotService", FakeTelegram)

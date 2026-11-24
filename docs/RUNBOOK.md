@@ -1299,7 +1299,16 @@ anları bu ızgaraya oturur. `logs/bot.log`'da "Açılış kurtarması" satırla
 fazla 30 dakikada bir yazılır, başarı tek satırdır. Restart yine son çaredir: bayrak uzun süre `false` ve sayaç artmıyorsa
 yukarıdaki üç kapıdan biri kapalıdır. Restart'tan ÖNCE 418/ban var mı kontrol et (ban aktifken restart YASAK, yukarıdaki
 "Binance 418" maddesi); sonra `RESTART_LABEL=<etiket> scripts/restart_safe.sh`. Skalper yolu bu bayraktan etkilenmez (kendi
-readiness'i var; `/scalper/status` ayrıca bak).
+readiness'i var; `/scalper/status` ayrıca bak). Açılışta scalper hazır değilse (ilk borsa yoklaması başarısız) orkestratör ilk
+kurtarmayı da atlar ve `logs/bot.log`'a "Açılış kurtarması ATLANDI" yazar; bu hata değil beklemedir, scalper hazır olunca döngü kurtarır (D46).
+
+Kurtarma sırasında iki WARNING satırı görülebilir. (1) "önceki kurtarma denemesinden kalan rezervasyon bırakıldı": yarım kalan
+bir denemenin sembol kilidi temizlendi; iş gerektirmez. (2) "hesap listesinde açık görünüyor ama taze positionRisk miktarı 0":
+iki borsa okuması çelişti. Kayıt açılmadı, sembol "telegram" adına kilitli kaldı ve kurtarma tamamlanmış SAYILMADI
+(`recovery_ready=false`); döngü kendiliğinden yeniden dener, okumalar uzlaşınca ya kilidi bırakır ya pozisyonu benimser. Bu
+satırı HER gördüğünde borsada o sembolün pozisyonuna ve stop emrine bak: o sırada pozisyonu orkestratör YÖNETMİYOR. Pozisyon
+açık ve stop'suzsa elle koru ya da kapat. Aynı satır birkaç denemedir yineleniyorsa borsa uçlarından biri bayat dönüyordur;
+pozisyonu elle yönet, düzelmezse restart.
 
 **Pozisyon korumasız uyarısı / -4120:** koşullu emirler `/fapi/v1/algoOrder`'da; `openOrders`
 onları göstermez, `allOpenOrders` iptal etmez.

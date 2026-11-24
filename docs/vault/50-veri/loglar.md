@@ -1,6 +1,6 @@
 ---
 tags: [veri, log, secret, guvenlik]
-guncelleme: 2026-08-24
+guncelleme: 2026-11-20
 kaynak: src/core/logger.py, src/strategies/scalper/forensics_log.py, docs/RUNBOOK.md
 ---
 # Loglar — hangisi nerede, hangisi SECRET icerir
@@ -9,17 +9,25 @@ kaynak: src/core/logger.py, src/strategies/scalper/forensics_log.py, docs/RUNBOO
 
 | Dosya | Ne | Rotasyon / saklama | Secret? |
 |---|---|---|---|
-| `logs/bot.log` | uygulama (DEBUG+) | 100 MB / 30 gun | hayir |
+| `logs/bot.log` | uygulama (DEBUG+, kayit basina TEK satir) | 100 MB / 30 gun | hayir |
 | `logs/trades.log` | insan-okur **denetim izi** (trade kayitlari) | 50 MB / 90 gun | hayir |
-| `logs/errors.log` | ERROR+ (backtrace + diagnose) | 50 MB / 60 gun | hayir |
+| `logs/errors.log` | ERROR+ (**traceback YALNIZ burada**; `diagnose` KAPALI, bkz. asagisi) | 50 MB / 60 gun | hayir |
 | **`logs/supervisor.log`** | supervisord'un yakaladigi **erisim logu** | conf'ta 10 MB × 5 | ⚠️ **EVET** |
 | `logs/trades.jsonl` | D21 **makine sozlesmesi** olay akisi | gunluk rotasyon / 30 gun | hayir |
 | `logs/deploy.log` | deploy izleri | — | hayir |
 | `logs/autoresearch/<tarih>/` | autoresearch ham loglari | — | hayir |
 
-Loguru kurulumu `src/core/logger.py:30` blogundadir.
+Loguru kurulumu `src/core/logger.py:175` blogundadir.
 Dizin `TRADINGBOT_LOG_DIR` ile degistirilebilir
-(`src/core/logger.py:54`) — testler prod izini kirletmesin diye.
+(`src/core/logger.py:207`) — testler prod izini kirletmesin diye.
+
+**Traceback ve `diagnose` (D45).** `exc_info=True` / `logger.exception` kayitlari artik GERCEK traceback uretir ve traceback YALNIZ
+`errors.log`'a yazilir; konsol (`supervisor.log`), `bot.log` ve `trades.log` kayit basina TEK satirli kalir. Neden: `scripts/restart_safe.sh`,
+`server_deploy.sh` ve `docker_run.sh` 418 ban kapisi icin `bot.log`'u satir basindaki zaman damgasina bakarak suzer; damgasiz traceback satirlari
+o suzgecten HEP gecer (kaynak satirinda `banned`/`HTTP 418` gecen her traceback eski bir ban izini "taze" gosterirdi). Tum sink'lerde
+`diagnose=False`: loguru `diagnose` acikken traceback'e degisken DEGERLERINI basar (ornegin `api_secret = '...'`) ve secret sizardi.
+`errors.log` traceback'i bir kez basar ve kayitlari arasinda bos satir birakmaz. `Logger._log` korumasi (stdlib `exc_info=`/`extra=`
+kwargs'i, suslu parantezli mesaj): `src/core/logger.py:34`.
 
 ## ⛔ `logs/supervisor.log` SECRET ICERIR
 

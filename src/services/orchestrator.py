@@ -82,6 +82,7 @@ class TradingOrchestrator:
 
         # D44: gecikmeli kurtarma yeniden denemesi durumu. `main.py` ön koşulu
         # bağlar (scalper kendi kurtarmasını bitirmiş olmalı); None = ön koşul yok.
+        # D46: `start()` açılış kurtarması da aynı ön koşula bağlıdır.
         self.recovery_precondition: Optional[Callable[[], bool]] = None
         self._recovery_retry_delay = self.RECOVERY_RETRY_INITIAL_SECONDS
         self._recovery_retry_due_monotonic: Optional[float] = None
@@ -105,7 +106,17 @@ class TradingOrchestrator:
                 "❌ Binance bağlantısı kurulamadı! Orchestrator sinyal kabul etmeyecek."
             )
 
-        self._recovery_ready = await self.recover_open_positions()
+        # D46: scalper kendi kurtarmasını bitirmeden borsadaki pozisyonlara DOKUNMA.
+        # Scalper'ın ilk borsa yoklaması başarısızsa `_attempt_recovery()` hiç
+        # koşmamıştır, sembolleri rezerve değildir; buradaki sorgu saniyeler sonra
+        # başarılı olursa OPEN `scalp_trades` satırı olmayan bir scalper pozisyonu
+        # "yetim" diye sahiplenilirdi (stop yoksa acil kapatma). Atlanan kurtarma
+        # D44 döngüsünün işidir; döngü aynı ön koşulu orada da sorar.
+        scalper_pending = self._recovery_precondition_pending()
+        if scalper_pending:
+            self._recovery_ready = False
+        else:
+            self._recovery_ready = await self.recover_open_positions()
         self._exchange_ready = self._recovery_ready and self._exchange_ready
 
         # D44: açılış kurtarması başarısızsa (ör. Binance açılışta erişilemezdi)
@@ -117,11 +128,20 @@ class TradingOrchestrator:
         if not self._recovery_ready:
             first_delay = self._recovery_retry_delay
             self._schedule_recovery_retry()
-            self.logger.warning(
-                "⚠️ Açılış kurtarması tamamlanamadı; izleme döngüsü "
-                f"{first_delay:.0f} sn sonra geri çekilmeyle (backoff) yeniden "
-                "deneyecek. Telegram girişleri ve /health o zamana dek kapalı."
-            )
+            if scalper_pending:
+                self.logger.warning(
+                    "Açılış kurtarması ATLANDI: scalper kendi kurtarmasını henüz "
+                    "bitirmedi (ilk borsa yoklaması başarısız olmuş olabilir); "
+                    "borsadaki pozisyonlar sahiplenilmedi. İzleme döngüsü scalper "
+                    f"hazır olunca, en erken {first_delay:.0f} sn sonra kurtaracak. "
+                    "Telegram girişleri ve /health o zamana dek kapalı."
+                )
+            else:
+                self.logger.warning(
+                    "⚠️ Açılış kurtarması tamamlanamadı; izleme döngüsü "
+                    f"{first_delay:.0f} sn sonra geri çekilmeyle (backoff) yeniden "
+                    "deneyecek. Telegram girişleri ve /health o zamana dek kapalı."
+                )
 
         self._running = True
         if not self.monitoring_task or self.monitoring_task.done():
@@ -171,6 +191,8 @@ class TradingOrchestrator:
         self._last_exchange_probe_monotonic = time.monotonic()
         self._last_exchange_success_at = datetime.utcnow().isoformat() + "Z"
         self._last_exchange_error = None
+
+        self._release_stale_reservations(exchange_positions)
 
         if not exchange_positions:
             self.logger.info("📭 Borsada açık pozisyon yok")
@@ -229,7 +251,23 @@ class TradingOrchestrator:
                         f"  ↩️ {symbol}: veritabanı kaydı bulundu (#{position.id}), senkronlandı"
                     )
                 else:
-                    # Kayıt yok — muhtemelen eski bir çökmeden kalan yetim pozisyon
+                    # Kayıt yok — muhtemelen eski bir çökmeden kalan yetim pozisyon.
+                    if await self._position_risk_reports_flat(symbol):
+                        # İki taze okuma çelişiyor (liste "açık", positionRisk "kapalı")
+                        # ve hangisinin bayat olduğu burada bilinemez. Satır açılmaz
+                        # (her deneme emirsiz bir CLOSED satır daha eklerdi) ama pozisyon
+                        # kapanmış da sayılmaz: rezervasyon kalır (fail-closed), kurtarma
+                        # tamamlanmış sayılmaz; sonraki deneme karar verir (liste
+                        # yetişirse süpürme rezervasyonu bırakır, positionRisk yetişirse
+                        # pozisyon benimsenir). Önceki denemeden izlemede kalmış bir
+                        # pozisyon izleme döngüsüne bırakılır.
+                        recovery_ok = False
+                        self.logger.warning(
+                            f"  ⏸️ {symbol}: hesap listesinde açık görünüyor ama taze "
+                            "positionRisk miktarı 0; yetim satır açılmadı, rezervasyon "
+                            "tutuluyor, kurtarma sonraki denemede yeniden bakacak"
+                        )
+                        continue
                     entry = float(raw.get("entryPrice") or 0)
                     position = PositionModel(
                         symbol=symbol,
@@ -289,6 +327,56 @@ class TradingOrchestrator:
 
         self.logger.info(f"✅ {len(self.active_positions)} pozisyon izlemeye alındı")
         return recovery_ok
+
+    def _release_stale_reservations(self, exchange_positions) -> None:
+        """Başarısız bir kurtarma denemesinden artakalan rezervasyonu bırak.
+
+        Kural: bu orchestrator'ın rezervasyonu, taze hesap listesinde YOK ve
+        izlemede (active_positions) de YOK ise bırakılır. Aksi halde pozisyon
+        arada kapanınca döngü o sembole bir daha uğramaz; sembol tüm motorlara
+        kilitli ve bir kapasite yuvası dolu kalırdı (süreç yeniden başlayana dek).
+
+        Dokunulmayan iki durum:
+        - `_entry_halted`: korumasız pozisyon şüphesi; sinyal yolu bu durumda
+          izlenmeyen rezervasyonu bilerek tutar, o kanıttır ve insan bakmalı.
+        - `_signal_lock` tutuluyorsa: uçuştaki giriş, pozisyonu izlemeye almadan
+          önce sembolü rezerve eder; şimdi bırakmak onu yarıştırırdı.
+        İzlemedeki pozisyonun listeden düşmesi izleme döngüsünün işidir (muhasebeyle
+        kapatır); bu yüzden kurtarma ona dokunmaz.
+        """
+        if self._entry_halted or self._signal_lock.locked():
+            return
+        live = {str(raw.get("symbol", "")).upper() for raw in exchange_positions}
+        tracked = {str(symbol).upper() for symbol in self.active_positions}
+        for symbol, owner in symbol_reservations.snapshot().items():
+            if owner != self.RESERVATION_OWNER or symbol in live or symbol in tracked:
+                continue
+            symbol_reservations.release(symbol, self.RESERVATION_OWNER)
+            self.logger.warning(
+                f"🧹 {symbol}: önceki kurtarma denemesinden kalan rezervasyon bırakıldı "
+                "(borsada açık pozisyon yok, izlemede de değil)."
+            )
+
+    async def _position_risk_reports_flat(self, symbol: str) -> bool:
+        """Taze `positionRisk` okuması sembolü kapalı mı gösteriyor (miktar 0 / kayıt yok)?
+
+        Bu bir hüküm değildir: hesap listesiyle çelişebilir; çağıran karar vermez,
+        yalnızca yetim satır açmaktan kaçınır. Tek-yön mod varsayılır.
+
+        Doğrulanamazsa (hata, eksik ya da bozuk miktar) False döner: yetim pozisyon
+        eskisi gibi benimsenir; belirsizlikte korumasız bırakmaktan iyidir.
+        """
+        try:
+            live = await self.binance.get_position_risk(symbol, force_fresh=True)
+            # Eksik/bozuk miktar istisna üretir ve "doğrulanamadı" sayılır: yanlış
+            # bir "yok" hükmü canlı pozisyonu yönetimsiz bırakırdı.
+            return not live or float(live["positionAmt"]) == 0.0
+        except Exception as e:
+            self.logger.warning(
+                f"⚠️ {symbol}: canlı miktar doğrulanamadı ({type(e).__name__}: {e}); "
+                "yetim pozisyon eskisi gibi benimseniyor."
+            )
+            return False
 
     async def _ensure_protected(self, position: PositionModel) -> Optional[bool]:
         """Pozisyonun borsada aktif bir stop emri var mı, kontrol et ve uyar.
@@ -367,6 +455,10 @@ class TradingOrchestrator:
         self._recovery_retry_due_monotonic = time.monotonic() + delay
         self._recovery_retry_delay = min(delay * 2.0, self.RECOVERY_RETRY_MAX_SECONDS)
 
+    def _recovery_precondition_pending(self) -> bool:
+        """Ön koşul bağlı ve SAĞLANMIYOR mu? `start()` ve yeniden deneme AYNI kapıyı kullanır."""
+        return self.recovery_precondition is not None and not self.recovery_precondition()
+
     @staticmethod
     def _rest_ban_active() -> bool:
         """Binance REST 418/-1003 ban devre kesicisi şu an açık mı?"""
@@ -406,6 +498,7 @@ class TradingOrchestrator:
         (c) `recovery_precondition`: scalper önce kendi kurtarmasını bitirmeli
             (main.py başlangıç sırasıyla aynı); aksi hâlde scalper'a ait ama
             OPEN `scalp_trades` satırı henüz olmayan pozisyon benimsenebilirdi.
+            `start()` açılış kurtarması da aynı kapıdan geçer (D46).
         (d) Backoff: sonraki deneme çağrıdan ÖNCE planlanır; istisna da
             geri çekilir. Ban/ön koşul beklemesi deneme hakkı tüketmez.
 
@@ -419,7 +512,7 @@ class TradingOrchestrator:
             return
         if self._rest_ban_active():
             return
-        if self.recovery_precondition is not None and not self.recovery_precondition():
+        if self._recovery_precondition_pending():
             return
 
         self._schedule_recovery_retry()

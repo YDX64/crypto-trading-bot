@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import src.models.waiting_signal  # noqa: F401  (SQLAlchemy mapper zinciri)
+from src.core.logger import app_logger
 from src.strategies.follower.executor import FollowerExecutor, FollowerPosition
 from src.strategies.follower.levels import resolve_levels
 from src.strategies.follower.parser import parse_follower_event
@@ -752,3 +753,32 @@ class TestFeeGateDefault:
             equity_usdt=1000.0,
         )
         assert position is not None
+
+
+class TestUnreadableFillWithBraceLadenError:
+    """D45: `except` içindeki log çağrısı koruma emrinden ÖNCE patlarsa pozisyon korumasız kalırdı.
+
+    `_make_executor` logger'ı MagicMock yapar; sahte logger bu tuzağı gizler. Burada GERÇEK
+    loguru kullanılır ve hata metni Binance JSON gövdesi gibi süslü parantez taşır.
+    """
+
+    async def test_brace_laden_fill_error_still_places_protection(self):
+        executor, client, pm, tracker = _make_executor()
+        executor.logger = app_logger
+
+        async def _unreadable(symbol, entry_order):
+            pm.calls.append("resolve_fill")
+            raise RuntimeError(
+                'Binance [400] kod=-1021: {"code":-1021,"msg":"Timestamp outside recvWindow"}'
+            )
+
+        pm.resolve_fill = _unreadable
+        position = await executor.open_position(
+            event=parse_follower_event(SELL_ENTRY),
+            levels=_levels(),
+            equity_usdt=1000.0,
+        )
+
+        assert position is None
+        assert pm.calls == ["resolve_fill", "place_stop_loss_or_close"]
+        tracker.record_open.assert_not_called()

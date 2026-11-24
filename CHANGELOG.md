@@ -1,5 +1,32 @@
 # Değişiklik Günlüğü
 
+## v2.1.3 - Orkestratör açılış kurtarması da scalper ön koşuluna bağlandı (D46, 2026-11-20)
+
+### 🐛 Düzeltilen Hatalar
+
+- Orkestratörün AÇILIŞ kurtarması (`start()`) scalper ön koşuluna bakmıyordu (D44 yalnız izleme döngüsündeki yeniden denemeyi
+  bağlamıştı): scalper'ın ilk borsa yoklaması başarısız olup orkestratörün sorgusu saniyeler sonra başarılı olursa, OPEN `scalp_trades`
+  satırı olmayan bir scalper pozisyonu "yetim" diye sahiplenilebilirdi (stop yoksa acil kapatma; stop varsa scalper'ın sonraki
+  kurtarması sahiplik çakışması görüp kalıcı entry-halt yazar). Artık scalper kendi kurtarmasını bitirmediyse açılış kurtarması ATLANIR
+  ve D44 döngüsü scalper hazır olunca kurtarır. Ön koşul yoksa ya da sağlanıyorsa açılış davranışı değişmez. Scalper ve takipçi kodu,
+  ayarlar ve giriş/çıkış kuralları değişmedi (`docs/DECISIONS.md` D46, `docs/RUNBOOK.md` "Sorun giderme")
+
+## v2.1.2 - Log çağrıları kendi istisnasını fırlatmaz (D45, 2026-11-20)
+
+### 🐛 Düzeltilen Hatalar
+
+- `exc_info=True` ya da `extra={...}` ile yazılan log çağrılarında mesajda süslü parantez (Binance JSON hata gövdesi, dict metni)
+  varsa loguru çağrının KENDİSİNDE `KeyError`/`IndexError`/`ValueError` fırlatıyordu: `except` içinde güvenlik eyleminden önce patlarsa
+  eylem atlanıyor (ör. takipçide dolum okunamayınca koruma emri, orkestratörde giriş mandalı), döngü yakalayıcısında patlarsa görev ölüyordu
+  (`_monitoring_loop`). `exc_info=True` ayrıca traceback üretmiyordu. `src/core/logger.py` loguru'nun tek çıkış noktasına bir koruma takar:
+  `exc_info` gerçek traceback olur, `extra` kayda `bind` gibi eklenir (`trades.log` yönlendirmesi aynı), biçimlendirme gerektirmeyen mesaj
+  biçimlendirilmez, biçimlendirme yine de patlarsa satır aynen yazılır. Çağrı yerleri (116 kwargs'lı çağrı), log metinleri ve seviyeleri değişmedi;
+  ayar, giriş/çıkış kuralı ve deploy betikleri değişmedi.
+- Traceback YALNIZ `errors.log`'a yazılır (27 `exc_info=True` çağrısı artık traceback üretir); konsol, `bot.log` ve `trades.log` kayıt başına tek satırlı
+  kalır, çünkü `restart_safe.sh`/`server_deploy.sh`/`docker_run.sh` 418 ban kapısı `bot.log`'u satır başındaki zaman damgasına bakarak süzer. Tüm
+  sink'lerde `diagnose=False` (traceback değişken değeri basmaz); `errors.log` traceback'i artık iki kez basmaz ve kayıtlar arasında boş satır bırakmaz
+  (`docs/DECISIONS.md` D45, `docs/audits/2026-11-20-loguru-kwargs/`)
+
 ## v2.1.1 - Orkestratör açılış kurtarması kendini onarır (D44, 2026-11-20)
 
 ### 🐛 Düzeltilen Hatalar
@@ -10,6 +37,12 @@
   varken ve scalper kendi kurtarmasını bitirmeden deneme yapılmaz; deneme başına tek imzalı sorgu, uyarı en fazla 30 dakikada bir.
   `/health` → `orchestrator_details` iki yeni alan: `recovery_retry_attempts`, `recovery_next_retry_in_seconds`. Scalper ve takipçi
   kodu, ayarlar ve giriş/çıkış kuralları değişmedi (`docs/DECISIONS.md` D44, `docs/RUNBOOK.md` "Sorun giderme")
+- D44 inceleme düzeltmeleri (takip değişikliği, PR #14): (1) yarım kalan bir kurtarma denemesinin aldığı "telegram" sembol
+  rezervasyonu, pozisyon sonradan kapanırsa yeniden başlatmaya kadar kilitli kalıyordu; artık her başarılı hesap okumasında,
+  izlemede olmayan ve borsada açık pozisyonu bulunmayan rezervasyon bırakılır (`entry_halted` iken ve sinyal işlenirken
+  dokunulmaz). (2) Hesap listesi bayatken her yeniden deneme emirsiz bir CLOSED `positions` satırı ekliyordu; yetim satırı
+  açılmadan önce canlı miktar taze okunur; hesap listesiyle çelişirse satır açılmaz, sembol kilitli kalır ve kurtarma bir sonraki
+  denemede yeniden bakar. Emir, boyut, giriş/çıkış kuralı ve ayar değişmedi (`docs/DECISIONS.md` D44 "İnceleme düzeltmeleri")
 
 ## v2.1.0 - Değerlendirme harness'i gerçekçilik paketi (D41, 2026-11-20)
 
