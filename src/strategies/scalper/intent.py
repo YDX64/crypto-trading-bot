@@ -73,6 +73,10 @@ KNOWN_DECISIONS: frozenset = frozenset(
 REASON_REGIME_GATE = "regime_gate"
 REASON_MARKET_GATE_DAY = "market_gate_day"
 REASON_MARKET_GATE_RUN = "market_gate_run"
+# E23 BTC şok tetikleyicisi (market_gate.REASON_SHOCK_* ile birebir aynı dize)
+REASON_SHOCK_TRIGGER_OFF = "shock_trigger_off"
+REASON_SHOCK_TRIGGER_DIR = "shock_trigger_dir"
+REASON_SHOCK_TRIGGER_NODATA = "shock_trigger_nodata"
 REASON_STRUCTURE_GATE = "structure_gate"
 REASON_TV_STRUCTURE_GATE = "tv_structure_gate"
 # 2026-09-03 genel deterministik giriş kapıları (entry_gates.py, varsayılan
@@ -116,6 +120,9 @@ REASON_LABELS: Dict[str, str] = {
     REASON_REGIME_GATE: "rejim kapısı: 4h rejime ters yön",
     REASON_MARKET_GATE_DAY: "piyasa kapısı: liderin gün-içi sapması",
     REASON_MARKET_GATE_RUN: "piyasa kapısı: liderin çok-günlük uzaması",
+    REASON_SHOCK_TRIGGER_OFF: "şok tetikleyici: lider sapması eşiğin altında (giriş yok)",
+    REASON_SHOCK_TRIGGER_DIR: "şok tetikleyici: sinyal lider hareketine ters yönde",
+    REASON_SHOCK_TRIGGER_NODATA: "şok tetikleyici: lider verisi yok (fail-closed)",
     REASON_STRUCTURE_GATE: "yapı kapısı: son swing kırılımına ters yön",
     REASON_TV_STRUCTURE_GATE: "TV yapı kapısı: CHoCH/trend olayına ters yön",
     REASON_CELL_GATE: "hücre kapısı: rejim×yön çifti yasak listesinde",
@@ -149,6 +156,9 @@ KNOWN_REASONS: frozenset = frozenset(
         REASON_REGIME_GATE,
         REASON_MARKET_GATE_DAY,
         REASON_MARKET_GATE_RUN,
+        REASON_SHOCK_TRIGGER_OFF,
+        REASON_SHOCK_TRIGGER_DIR,
+        REASON_SHOCK_TRIGGER_NODATA,
         REASON_STRUCTURE_GATE,
         REASON_TV_STRUCTURE_GATE,
         REASON_CELL_GATE,

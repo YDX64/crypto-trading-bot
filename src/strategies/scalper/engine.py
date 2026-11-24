@@ -67,8 +67,10 @@ from src.strategies.scalper.market_gate import (
     MARKET_GATE_INTRADAY_LIMIT,
     MARKET_GATE_INTRADAY_TF,
     evaluate_market_gate,
+    evaluate_shock_trigger,
     market_gate_metrics,
     resolve_day_open,
+    shock_trigger_enabled,
     utc_day_start_ms,
 )
 from src.strategies.scalper.regime import detect_regime
@@ -503,6 +505,7 @@ class ScalperEngine:
         await self._assert_universe_survives_follower_reservation()
         self._maybe_log_shadow_mode_banner()
         self._maybe_log_market_gate_banner()
+        self._maybe_log_shock_trigger_banner()
         self._log_kline_source()
         self.logger.info(
             f"🎯 Evren={self.cfg.scalper_top_n} sembol, tarama={self.cfg.scalper_scan_interval_seconds}sn, "
@@ -2338,6 +2341,31 @@ class ScalperEngine:
                     extra={"leader": gate_status.get("leader")},
                 )
                 continue
+            # E23 şok tetikleyicisi (PLAN §3.2, varsayılan KAPALI): piyasa
+            # kapısının HEMEN ardında; harness'ta simulate_symbol AYNI saf
+            # fonksiyonu AYNI sırayla çağırır. C ve TV sinyalleri aynı yerden
+            # geçer (ayrı muafiyet yok). Fail-CLOSED: veri yoksa giriş yok.
+            shock_reason = await self._shock_trigger_reason(sig.direction)
+            if shock_reason is not None:
+                kaynak = "TV sinyali" if is_external else "girişi"
+                yon = getattr(sig.direction, "value", str(sig.direction))
+                self.logger.info(
+                    f"⛔ {symbol}: şok tetikleyicisi — {intent.REASON_LABELS.get(shock_reason, shock_reason)} "
+                    f"nedeniyle {yon} {kaynak} engellendi (SCALPER_SHOCK_TRIGGER_PCT="
+                    f"{getattr(self.cfg, 'scalper_shock_trigger_pct', 0.0)})"
+                )
+                self._record_intent(
+                    symbol=symbol,
+                    direction=sig.direction,
+                    signal=sig,
+                    stage=intent.STAGE_DECIDED,
+                    decision=intent.DECISION_DENY,
+                    reason=shock_reason,
+                    strategy=getattr(sig, "strategy", None),
+                    source=intent_source,
+                    extra={"leader": self._market_gate_leader()},
+                )
+                continue
             # 2026-08-23 yapı kapısı (E9/D18 adayı, varsayılan KAPALI): rejim
             # kapısı 15m EMA50/200 ile dönüşleri saatler geç görüyor; yapı
             # (son swing kırılımı) aynı soruyu daha erken yanıtlar. TEK kapı:
@@ -3622,6 +3650,17 @@ class ScalperEngine:
                 "E8: canlı defterde net negatif). Kapatmak için "
                 "SCALPER_MARKET_GATE_RUN_PCT=0 (bkz. docs/DECISIONS.md D15)"
             )
+
+    def _maybe_log_shock_trigger_banner(self) -> None:
+        """E23 BTC şok tetikleyicisi açıksa başlangıçta bildir (kapalıysa sessiz)."""
+        if not shock_trigger_enabled(self.cfg):
+            return
+        self.logger.warning(
+            f"⚡ ŞOK TETİKLEYİCİSİ AÇIK (E23) — lider {self._market_gate_leader()}, "
+            f"eşik %{getattr(self.cfg, 'scalper_shock_trigger_pct', 0.0)}: yalnız "
+            f"lider hareketi yönündeki girişler geçer; veri yoksa giriş YOK "
+            f"(fail-closed)"
+        )
 
     def _kline_source_snapshot(self) -> Dict[str, Any]:
         """Kline verisinin GERÇEKTEN geldiği host + kaynak etiketi (D17).
@@ -5047,7 +5086,7 @@ class ScalperEngine:
         `BinanceAPIError` yükseltir. Başarısızlık kapıyı KAPATMAZ (fail-open
         semantiği korunur) ama `gate_effective=false` ile GÖRÜNÜR olur.
         """
-        if not bool(getattr(self.cfg, "scalper_market_gate", False)):
+        if not self._leader_data_needed():
             return False
         leader = self._market_gate_leader()
         try:
@@ -5091,6 +5130,36 @@ class ScalperEngine:
         self._market_gate_retry_after = 0.0
         self.logger.info(f"🧭 Piyasa kapısı lideri doğrulandı: {leader}")
         return True
+
+    def _leader_data_needed(self) -> bool:
+        """Lider verisi (tur başı tazeleme + açılış doğrulaması) gerekli mi?
+
+        Piyasa kapısı VEYA E23 şok tetikleyicisi açıksa. Kapının KENDİ kararı
+        (`_market_gate_reason`) hâlâ yalnız `scalper_market_gate` ile belirlenir.
+        """
+        return bool(getattr(self.cfg, "scalper_market_gate", False)) or (
+            shock_trigger_enabled(self.cfg)
+        )
+
+    async def _shock_trigger_reason(self, direction: Any) -> Optional[str]:
+        """E23 şok tetikleyicisi bu yönü engelliyorsa neden dizesi, yoksa None.
+
+        Kapalıysa (varsayılan) HİÇ veri çekilmez, REST ağırlığı değişmez.
+        Piyasa kapısının tersine fail-CLOSED: lider anlık görüntüsü yoksa
+        girdiler None gider ve `evaluate_shock_trigger` `shock_trigger_nodata`
+        üretir. Harness (`backtest.simulate_symbol`) AYNI saf fonksiyonu
+        çağırır (CLAUDE.md kural 2). Tazelik kuralı piyasa kapısıyla aynıdır.
+        """
+        if not shock_trigger_enabled(self.cfg):
+            return None
+        snapshot = await self._leader_market_snapshot(
+            max_age=self._market_gate_max_age()
+        )
+        if snapshot is None:
+            return evaluate_shock_trigger(direction, None, None, self.cfg)
+        return evaluate_shock_trigger(
+            direction, snapshot.get("day_open"), snapshot.get("last_close"), self.cfg
+        )
 
     async def _market_gate_reason(self, direction: Any) -> Optional[str]:
         """Kapı bu yönü engelliyorsa neden dizesi, aksi hâlde None.
@@ -5157,7 +5226,7 @@ class ScalperEngine:
         sinyalsiz turda hiç istek gitmiyordu; artık kapı AÇIKSA her tur
         tazelenir. "Maliyet değişmez" ifadesi bu yüzden yanlıştı.
         """
-        if not bool(getattr(self.cfg, "scalper_market_gate", False)):
+        if not self._leader_data_needed():
             return
         try:
             await asyncio.wait_for(

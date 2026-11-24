@@ -105,7 +105,7 @@ Yeni sinyal kaynağı (haber botu vb.) eklemek: `docs/INTEGRATIONS.md`. Otomatik
 
 ## Nasıl çalıştırılır / test edilir / deploy edilir
 ```bash
-python3 -m pytest tests -q                      # 4121 test (+85 atlanan), ~170 sn — her değişiklikten önce
+python3 -m pytest tests -q                      # 4427 test (+85 atlanan), ~200 sn — her değişiklikten önce
 scripts/preflight_server_env.sh awa             # deploy ÖNCESİ: temiz kopya + sunucu ayarlarıyla test (D43)
 scripts/deploy.sh awa                           # push edilmiş main'i sunucuya uygula (test + restart + sağlık + otomatik geri alma)
 DEPLOY_NO_RESTART=1 scripts/deploy.sh awa       # yalnız kod/test; süreci yeniden başlatma
@@ -177,6 +177,10 @@ da `docs/holdout_registry.json`'da YANIK; yeni pencereler `VAL-2026Q4a` ve müh�
   30m, iki trend tanımı; 6 kol) 2025 verisinde PF 0.64–0.88, altı kolda ΣR < 0, LONG ve SHORT ayrı ayrı da < 1; maliyetsiz PF en çok
   1.15. VAL (2023-01-01 → 2024-11-18) açılmadı, mühürlü duruyor. Şok günlerinde PF > 1 gözlemi ileri bakışlıdır, kural değildir.
   M kodda varsayılan KAPALI. Kayıt: `docs/EXPERIMENTS.md` E18.
+- **E23 (2026-11-24, ön-kayıtlı): BTC gün-içi şok tetikleyicisiyle momentum girişi DEV-YOK.** Tetikleyici (BTC son 30m
+  kapanışı gün açılışından ≥ %1.5 / %3.0 uzaktayken yalnız o yönde giriş) 2025'te PF 0.59–0.89; tetikleyici günlerinin
+  çoğu şoka dönüşmüyor ve o günlerin işlemleri kaybediyor. VAL mühürlü. `SCALPER_SHOCK_TRIGGER_PCT` varsayılan 0 (KAPALI).
+  Kayıt: `docs/EXPERIMENTS.md` E23.
 - Başka kurulumlar (A, B, D, E) PF 0.76-0.84, kenarı yok; sekiz D42 koruması P2-v2'yi geçmedi (en iyi p 0.14). Ayarlar KAPALI
   kalır, mainnet NO-GO; harness canlıdan kazanma oranında 9-19 puan iyimser (TP1'e ulaşma %66 vs %54).
 - Sürpriz bir şey görürsen önce `docs/DECISIONS.md`'de denenmiş mi bak; sonra

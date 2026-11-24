@@ -1,0 +1,152 @@
+{
+  "arms": {
+    "G30B-H": {
+      "decision_points": 4416,
+      "lev20_share": 0.05,
+      "lev3_share": 0.0,
+      "missed_signals": {
+        "capacity": 1,
+        "daily_latch": 1,
+        "shock_trigger_dir": 1,
+        "shock_trigger_off": 1219
+      },
+      "n": 20,
+      "n_long": 7,
+      "n_short": 13,
+      "nodata_points": 0,
+      "per_month": {
+        "2026-03": 15,
+        "2026-04": 5
+      },
+      "projected_per_year": 79.34782608695652,
+      "testable": false,
+      "trigger_days": 20,
+      "trigger_on_points": 259
+    },
+    "G30B-L": {
+      "decision_points": 4416,
+      "lev20_share": 0.046153846153846156,
+      "lev3_share": 0.0,
+      "missed_signals": {
+        "capacity": 3,
+        "daily_latch": 16,
+        "shock_trigger_dir": 22,
+        "shock_trigger_off": 1065
+      },
+      "n": 65,
+      "n_long": 36,
+      "n_short": 29,
+      "nodata_points": 0,
+      "per_month": {
+        "2026-03": 32,
+        "2026-04": 16,
+        "2026-05": 17
+      },
+      "projected_per_year": 257.8804347826087,
+      "testable": true,
+      "trigger_days": 61,
+      "trigger_on_points": 966
+    },
+    "K30B-H": {
+      "decision_points": 4416,
+      "lev20_share": 0.0,
+      "lev3_share": 0.0,
+      "missed_signals": {
+        "capacity": 5,
+        "daily_latch": 3,
+        "shock_trigger_off": 767
+      },
+      "n": 48,
+      "n_long": 33,
+      "n_short": 15,
+      "nodata_points": 0,
+      "per_month": {
+        "2026-03": 29,
+        "2026-04": 14,
+        "2026-05": 5
+      },
+      "projected_per_year": 190.43478260869566,
+      "testable": true,
+      "trigger_days": 20,
+      "trigger_on_points": 259
+    },
+    "K30B-L": {
+      "decision_points": 4416,
+      "lev20_share": 0.05223880597014925,
+      "lev3_share": 0.0,
+      "missed_signals": {
+        "capacity": 15,
+        "daily_latch": 24,
+        "shock_trigger_dir": 1,
+        "shock_trigger_off": 550
+      },
+      "n": 134,
+      "n_long": 73,
+      "n_short": 61,
+      "nodata_points": 0,
+      "per_month": {
+        "2026-03": 58,
+        "2026-04": 37,
+        "2026-05": 39
+      },
+      "projected_per_year": 531.6304347826087,
+      "testable": true,
+      "trigger_days": 61,
+      "trigger_on_points": 966
+    },
+    "K30R-H": {
+      "decision_points": 4416,
+      "lev20_share": 0.0,
+      "lev3_share": 0.0,
+      "missed_signals": {
+        "daily_latch": 1,
+        "shock_trigger_off": 629
+      },
+      "n": 32,
+      "n_long": 16,
+      "n_short": 16,
+      "nodata_points": 0,
+      "per_month": {
+        "2026-03": 13,
+        "2026-04": 13,
+        "2026-05": 6
+      },
+      "projected_per_year": 126.95652173913044,
+      "testable": false,
+      "trigger_days": 20,
+      "trigger_on_points": 259
+    },
+    "K30R-L": {
+      "decision_points": 4416,
+      "lev20_share": 0.057692307692307696,
+      "lev3_share": 0.0,
+      "missed_signals": {
+        "capacity": 3,
+        "daily_latch": 21,
+        "shock_trigger_dir": 1,
+        "shock_trigger_off": 448
+      },
+      "n": 104,
+      "n_long": 53,
+      "n_short": 51,
+      "nodata_points": 0,
+      "per_month": {
+        "2026-03": 37,
+        "2026-04": 34,
+        "2026-05": 33
+      },
+      "projected_per_year": 412.60869565217394,
+      "testable": true,
+      "trigger_days": 61,
+      "trigger_on_points": 966
+    }
+  },
+  "family_testable": [
+    "K30R-L",
+    "K30B-L",
+    "K30B-H",
+    "G30B-L"
+  ],
+  "rule": "testable = N * 365 / 92 >= 150; yalnız sayım, PnL okunmadı",
+  "schema": "e23-cal/1"
+}

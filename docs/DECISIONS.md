@@ -480,6 +480,12 @@ canlı defterdeki işaretler örneklem-içidir ve ~25 kesitin taranmasından gel
    maliyetsiz PF en çok 1.15. VAL (2023-01-01 → 2024-11-18) AÇILMADI ve mühürlü duruyor. Şok günlerinde PF > 1 gözlemi
    ileri bakışlıdır (günün kapanışını kullanır), kural değildir. Ayar değişmedi; M kurulumu kodda varsayılan KAPALI.
    Kayıt: `docs/EXPERIMENTS.md` E18, `docs/audits/2026-11-20-prereg-e18/`.
+   **Ek (E23, 2026-11-24): DEV-YOK.** Şok gözlemi gerçek zamanlı bir tetikleyiciye çevrildi (BTC gün açılışına göre son
+   kapanmış 30m sapması ≥ %1.5 ya da ≥ %3.0 iken yalnız BTC yönünde giriş; nedensel, fail-closed; 4 kol) ve ön-kayıtlı
+   sınandı: 2025'te PF 0.59–0.89, dört kolda ΣR < 0, BH q ≈ 1.0. %1.5 tetikleyici günlerinin yalnız %21.5'i şoka dönüşüyor
+   ve dönüşmeyen günlerin işlemleri (PF 0.37–0.50) şok günü kazancını siliyor; %3.0 geç açılıyor (medyan 15:30 UTC).
+   Maliyetsiz PF en çok 1.18. VAL yine AÇILMADI. Ayar değişmedi; `SCALPER_SHOCK_TRIGGER_PCT` varsayılan 0 (KAPALI).
+   Kayıt: `docs/EXPERIMENTS.md` E23, `docs/audits/2026-11-24-prereg-e23/`.
 2. **Maker (limit) kâr-al emirleri:** ücretler brüt kârın %31.5'ini yiyor (387 vs 1229 USDT, 464 işlem); 20x'te gidiş-dönüş
    1.4-2.0 ROI = tipik +8 kazancın %17-25'i. Harness çıkış tarafında maker modeli yok; önce modellenmeli.
    E17, komisyon ve kayma sıfırken bile hiçbir kolun PF 1'e ulaşmadığını gösterdi (0.53-0.93): düşük maliyet kaybı küçültebilir, tek başına

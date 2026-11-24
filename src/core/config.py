@@ -4,6 +4,7 @@ Tüm environment variables ve uygulama ayarları burada yönetilir.
 """
 
 import ipaddress
+import math
 import os
 import sys
 import warnings
@@ -276,6 +277,13 @@ class Settings(BaseSettings):
     # her sinyalin 3 seri × 3 deneme boşa REST isteği açmasını (ve KlineFetcher
     # kilidini saniyelerce tutmasını) engeller. 0 = negatif önbellek kapalı.
     scalper_market_gate_retry_sec: float = 60.0
+    # E23 gerçek zamanlı BTC şok tetikleyicisi T (docs/audits/2026-11-24-prereg-e23/
+    # PLAN.md §3.2). 0 = KAPALI (varsayılan; sıfır davranış değişikliği, ek REST
+    # yok). > 0 ise X (%): lider (scalper_market_gate_symbol) gün açılışına göre
+    # ≥ +X ise yalnız LONG, ≤ −X ise yalnız SHORT geçer; |sapma| < X iken giriş
+    # YOK. Veri yoksa giriş YOK (fail-CLOSED; piyasa kapısının tersi). Piyasa
+    # kapısından BAĞIMSIZDIR ama aynı lider girdilerini kullanır.
+    scalper_shock_trigger_pct: float = 0.0
     scalper_leverage: int = 20
     scalper_risk_percentage: float = 2.0       # işlem başına bakiye riski (C yarısını kullanır)
     scalper_max_positions: int = 3
@@ -925,6 +933,22 @@ class Settings(BaseSettings):
                 f"(verilen: {value!r})"
             )
         return v
+
+    @field_validator("scalper_shock_trigger_pct")
+    @classmethod
+    def _validate_shock_trigger_pct(cls, value: float) -> float:
+        """E23 tetikleyici eşiği (%): sonlu ve >= 0 olmalı (0 = KAPALI).
+
+        NaN/inf sessizce "hiç tetiklenmez" ya da "hep tetiklenir" üretirdi;
+        negatif eşik ise anlamsızdır — ikisi de açılışta patlamalı.
+        """
+        pct = float(value)
+        if not math.isfinite(pct) or pct < 0.0:
+            raise ValueError(
+                f"SCALPER_SHOCK_TRIGGER_PCT sonlu ve >= 0 olmalı "
+                f"(0 = kapalı; verilen: {value!r})"
+            )
+        return pct
 
     @field_validator("scalper_slippage_rate")
     @classmethod

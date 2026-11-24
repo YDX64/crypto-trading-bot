@@ -79,6 +79,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from src.core.config import settings  # noqa: E402
 from src.strategies.scalper import backtest, kline_cache  # noqa: E402
+from src.strategies.scalper.market_gate import shock_trigger_enabled  # noqa: E402
 from src.strategies.scalper.setups import get_enabled  # noqa: E402
 from src.strategies.scalper.types import Candle  # noqa: E402
 
@@ -523,14 +524,19 @@ def _utc(ms: int) -> str:
 # --------------------------------------------------------------------------
 
 def leader_params(cfg: Any, force: bool = False) -> Optional[Tuple[str, int]]:
-    """Lider piyasa kapısı AÇIKSA (lider sembol, run_days); kapalıysa None.
+    """Lider piyasa kapısı VEYA E23 şok tetikleyicisi AÇIKSA (lider sembol,
+    run_days); ikisi de kapalıysa None.
     `force=True` kapı bayrağını yok sayıp sembol/run_days'i cfg'den türetir.
 
     `backtest.run_backtest`'in aynı bloğunun birebir aynası (aynı varsayılanlar);
     tests/test_fill_klines_cache_from_vision.py bunu run_backtest'in gerçek istek
     kümesiyle karşılaştırır.
     """
-    if not force and not bool(getattr(cfg, "scalper_market_gate", False)):
+    if (
+        not force
+        and not bool(getattr(cfg, "scalper_market_gate", False))
+        and not shock_trigger_enabled(cfg)
+    ):
         return None
     leader_symbol = str(
         getattr(cfg, "scalper_market_gate_symbol", "") or "BTCUSDT"
@@ -745,8 +751,10 @@ def main(argv: Optional[Sequence[str]] = None, transport: Optional[Transport] = 
         args.tf_context or base_tfs[1],
         args.tf_regime or base_tfs[2],
     )
-    gate = args.market_gate if args.market_gate is not None else bool(
-        getattr(settings, "scalper_market_gate", False)
+    # E23: şok tetikleyicisi de lider serisini okur → o da "lider AÇIK" sayılır.
+    gate = args.market_gate if args.market_gate is not None else (
+        bool(getattr(settings, "scalper_market_gate", False))
+        or shock_trigger_enabled(settings)
     )
     log(
         f"Pencere [{args.start}, {args.end}) UTC | semboller={symbols} | TF(entry,ctx,regime)={tfs} "
