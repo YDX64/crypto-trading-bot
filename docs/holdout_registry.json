@@ -118,7 +118,7 @@
     "start": "2025-01-01",
     "end": "2025-12-31",
     "status": "burned",
-    "note": "E17'nin DEV kümesi ve E16'nın sekiz doğrulama penceresi V1..V8 bu yılın içindedir; bugünkü ayarlar burada ESKİ modelle ölçüldü (yıl boyunca PF 0.777, V1..V8'de PF 0.773). E18'in (momentum ailesi M, 6 kol, gerçekçi model) DEV kümesi de budur: 2026-11-20'de altı kol da burada elendi (DEV-YOK, PF 0.64-0.88). 'end' kapsayıcıdır.",
+    "note": "E17'nin DEV kümesi ve E16'nın sekiz doğrulama penceresi V1..V8 bu yılın içindedir; bugünkü ayarlar burada ESKİ modelle ölçüldü (yıl boyunca PF 0.777, V1..V8'de PF 0.773). E18'in (momentum ailesi M, 6 kol, gerçekçi model) DEV kümesi de budur: 2026-11-20'de altı kol da burada elendi (DEV-YOK, PF 0.64-0.88). E23 (BTC şok tetikleyicisi + M, 4 kol) DEV kümesi de budur; bu soru için KİRLİ olduğu plana yazıldı (E18 tablosu bu yıldan); 2026-11-24'te dört kol da elendi (DEV-YOK, PF 0.59-0.89). 'end' kapsayıcıdır.",
     "opens": []
   },
   {
@@ -148,7 +148,7 @@
     "start": "2023-01-01",
     "end": "2024-11-17",
     "status": "sealed",
-    "note": "E17'nin VAL kümesi (2023-01-01 → 2024-11-18, bitiş hariç); hiç indirilmedi ve koşulmadı. E17'nin kilitli planı E18'i ('yeni fikir, yeni veri') bunun için ayırır. Yalnız --open-sealed ile açılır. 'end' kapsayıcıdır.",
+    "note": "E17'nin VAL kümesi (2023-01-01 → 2024-11-18, bitiş hariç); hiç indirilmedi ve koşulmadı. E17'nin kilitli planı E18'i ('yeni fikir, yeni veri') bunun için ayırır. Yalnız --open-sealed ile açılır. E18 (2026-11-20) ve E23 (2026-11-24) bu pencereyi VAL olarak ayırdı; ikisi de DEV-YOK çıktığı için pencere indirilmedi ve AÇILMADI. 'end' kapsayıcıdır.",
     "opens": []
   }
 ]

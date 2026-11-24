@@ -2176,3 +2176,82 @@ farkıyla oynadı (q 0.354 K1-K5 ve K8, 0.576 K6, 0.742 K7; 191 kapsanan günle 
    kapasite/kesici kaymasıyla gelen yeni girişler ve her adayda net negatif (−994…−4742). (c) Hipotezler canlı defterden (08-23'ten sonra)
    türetildi, test geçmişi 08-21'de bitiyor: hipotez için bağımsız; ama pencerelerin çoğu başka deneylerde yanık (E19), yani strateji
    seçimi için taze değil. (d) Mühürlü `SEAL-2026Q4b` açılmadı.
+
+## E23 — Ön-kayıtlı şok tetikleyicisi: momentum girişi yalnız BTC gün-içi şok anında, 4 kol, DEV 2025 (2026-11-24) — DEV-YOK
+
+**Soru.** Momentum girişi (E18'in kurulum M'si) yalnız GERÇEK ZAMANLI bir şok tetikleyicisi açıkken yapılırsa komisyon ve
+kayma sonrası kenar üretir mi? E18'in betimleyici tablosu şok günlerinde (BTC günü ≥ %3 kapattı) PF > 1 gösteriyordu, ama o
+ayrım günün kapanışını kullanır. E23 bunu nedensel bir kurala çevirip sınadı. Plan sonuç görülmeden kilitlendi:
+`docs/audits/2026-11-24-prereg-e23/PLAN.md` (kod H `3672f29`, kilit L `9a38da3`, `LOCK.json` sha256 `d9b3838b…833f`).
+Ölçüm D41 gerçekçi model, taker giriş, sunucu `SCALPER_*` özeti + yalnız `variants.json` override'ları. DEV (2025) bu soru
+için KİRLİYDİ (E18 tablosu o yıldan); DEV'i geçmek kanıt sayılmayacaktı.
+
+**Tetikleyici.** d = (BTC son kapanmış 30m kapanışı / BTC gün açılışı − 1) × 100; LONG yalnız d ≥ +X, SHORT yalnız d ≤ −X;
+arada ya da veri yokken giriş yok (fail-closed). X ∈ {1.5 (şok eşiğinin yarısı), 3.0 (şok eşiğinin kendisi)}, tanımdan
+seçildi. Harness ve canlı motor aynı saf fonksiyonu (`market_gate.evaluate_shock_trigger`) aynı noktada çağırır;
+nedensellik testi: karar anından sonraki mumlar değişince karar değişmiyor. Ayar `SCALPER_SHOCK_TRIGGER_PCT`, varsayılan 0
+(KAPALI). CAL sayımı (yalnız işlem sayısı) K30R-H ve G30B-H'yi aileden çıkardı (yıllık izdüşüm < 150); aile m = 4.
+
+**Sonuç: DEV-YOK.** Dört kolun hiçbiri DEV (2025-01-01 → 2026-01-01, 365 gün) kapılarını geçmedi; hepsinde ΣR < 0.
+Kural gereği VAL indirilmedi ve koşulmadı; `SEAL-2023-2024` ve `SEAL-2026Q4b` mühürlü kaldı.
+
+| Kol | N | WR % | PF | ΣR | t_obs | PF %90 GA | ΣR > 0 çeyrek |
+|---|---|---|---|---|---|---|---|
+| K30R-L (kırılım, yavaş trend, %1.5) | 496 | 48.2 | 0.887 | −26.5 | −0.70 | [0.65, 1.17] | 1 / 4 |
+| K30B-L (kırılım, hızlı trend, %1.5) | 556 | 47.1 | 0.871 | −35.9 | −0.80 | [0.64, 1.13] | 1 / 4 |
+| K30B-H (kırılım, hızlı trend, %3.0) | 223 | 47.1 | 0.893 | −12.1 | −0.46 | [0.58, 1.29] | 3 / 4 |
+| G30B-L (geri çekilme, hızlı trend, %1.5) | 335 | 41.2 | 0.588 | −70.7 | −2.95 | [0.44, 0.78] | 1 / 4 |
+
+Kapılar: G0 (bütünlük: tetikleyici ihlali 0, veri-yok karar noktası 0) ve G1 (havuz N, 4 / 4 aktif çeyrek) dört kolda geçti;
+G2 (PF ≥ 1.15), G3 (BH q ≤ 0.10; hepsinde q ≈ 1.0) ve G5 dört kolda kaldı; G4 yalnız K30B-H'de geçti (3 / 4, sınırda).
+Stres koşusu gerekmedi (aday yok).
+
+**Tetikleyici etkinliği (2025, lider verisinden).**
+
+| Eşik | Tetikleyici günü | Şok günü | İsabet (şoka dönüşen) | İlk açılış saati (UTC, medyan) | İki yönde açılan gün |
+|---|---|---|---|---|---|
+| %1.5 | 242 | 52 | %21.5 | 12:00 | 27 |
+| %3.0 | 92 | 52 | %56.5 | 15:30 | 2 |
+
+Kapsama her iki eşikte 52 / 52'dir ama bu mekaniktir: günü ≥ %3 kapatan gün, en geç günün son 30m kapanışında tetikleyiciyi açar.
+
+**İşlem kırılımı (DEV, R birimi; şok günü = sinyal gününün BTC 1d mumu, ileri bakışlı etiket, yalnız betimleyici).**
+
+| Kol | LONG N / PF | SHORT N / PF | Şok günü N / PF | Şoka dönüşmeyen tetikleyici günü N / PF | İşlem / tetikleyici günü |
+|---|---|---|---|---|---|
+| K30R-L | 154 / 0.72 | 342 / 0.98 | 148 / 2.86 | 348 / 0.41 | 2.05 |
+| K30B-L | 204 / 0.68 | 352 / 1.00 | 158 / 2.28 | 398 / 0.50 | 2.30 |
+| K30B-H | 57 / 1.24 | 166 / 0.80 | 135 / 1.41 | 88 / 0.35 | 2.42 |
+| G30B-L | 130 / 0.74 | 205 / 0.51 | 95 / 1.67 | 240 / 0.37 | 1.38 |
+
+**Teşhis (karar vermez; DEV, karar yazıldıktan sonra koşuldu).**
+
+| Kol | Komisyonsuz + kaymasız PF | Günlük kesicisiz PF |
+|---|---|---|
+| K30R-L | 1.182 | 0.960 |
+| K30B-L | 1.132 | 0.853 |
+| K30B-H | 1.042 | 0.816 |
+| G30B-L | 0.723 | 0.591 |
+
+**Yorum.**
+1. Gerçek zamanlı tetikleyici şok gününü ayırt edemiyor. %1.5 eşiğinde tetikleyici günlerinin yalnız %21.5'i şoka dönüşüyor;
+   kalan günlerdeki işlemler PF 0.37–0.50 ile şok günü kazancını (PF 1.67–2.86) fazlasıyla siliyor. E18'deki "şok gününde
+   kazanır" gözlemi işlem anında kullanılabilir bir kurala dönüşmedi.
+2. %3.0 eşiği isabeti %56.5'e çıkarıyor ama tetikleyici geç açılıyor (medyan 15:30 UTC); şok günü işlemlerinin PF'si 1.41'e
+   iniyor (hareketin çoğu geçmiş), şoka dönüşmeyen 88 işlem PF 0.35.
+3. Maliyet sıfırlanınca en iyi kol PF 1.18 (K30R-L): ham kenar ince ve komisyon + kayma onu yiyor. Günlük kesici kaldırılınca
+   dört kolda da sonuç kötüleşiyor (kesici burada koruyor).
+4. LONG ve SHORT ayrı: yalnız K30B-H LONG PF 1.24 (57 işlem, ΣR > 0) ve K30B-L SHORT PF 1.005 (ΣR +0.8); diğer altı hücre < 1. Tek hücre, kapı
+   değil, yeni bir sınama için yeni veri ister.
+5. Bayrak NORMAL-ZAYIF dört kolda açık (şoka dönüşmeyen tetikleyici günlerinde n ≥ 30 ve ΣR < 0).
+
+**Bütünlük.** Ledger 18 satır (6 CAL, 4 DEV taban, 8 DEV teşhis; hepsi check-run'dan geçti, hepsi H'de); ayrıca S1 parite
+(C, AYI: 92 işlem, +2808.05 eşleşti) ve S2 belirlenimcilik (PYTHONHASHSEED 0 / 1 aynı) duman testleri. Manşet sayıları
+(N, PF, ΣR, LONG/SHORT, şok ve normal gün, teşhisler) analizörden bağımsız bir betikle ham rapor JSON'larından yeniden
+hesaplandı: birebir aynı. Tam test paketi H'de yeşil (4426 geçti, 85 atlandı). Canlı ayar, `.env`, deploy, restart: yok.
+Tetikleyici kodda varsayılan KAPALI kalır.
+
+**Dosyalar.** `docs/audits/2026-11-24-prereg-e23/`: `PLAN.md`, `variants.json`, `cal_counts.json`, `LOCK.json`;
+`run/DECISION.md`, `run/results.csv`, `run/DEV_SCREEN.json`, `run/DEV_DECISION.json`, `run/LOCK_REF.json`,
+`run/artifacts.tgz` (21 rapor + ledger + manifest; `provenance.scalper_config` çıkarıldı, sunucu ayar satırlarına karşı
+tarandı: 0 eşleşme).
