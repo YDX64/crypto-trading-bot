@@ -37,7 +37,7 @@ yalnız BTC hareketinin yönünde girilirse, kenar maliyetten sonra kalır mı? 
 5. Tetikleyici seyrek açılır; işlem sayısı E18 kollarının küçük bir kesridir. Tasarım yalnız büyük bir kenarı görebilir
    (§11); ince bir kenarı göremez.
 
-**Karar akışı.** 2025'te en çok 6 kol elenir; en çok 2'si ilerler. İlerleyen olursa 2023–2024 mührü bir kez açılır ve onay
+**Karar akışı.** 2025'te 4 kol (CAL test edilebilirlik kuralından sonra) elenir; en çok 2'si ilerler. İlerleyen olursa 2023–2024 mührü bir kez açılır ve onay
 koşulur; onaylanan en çok 1 kol 2026 Ekim–Kasım'da yalnız veto için bir kez koşulur. İlerleyen olmazsa 2023–2024 verisi
 indirilmez ve mühür kapalı kalır.
 
@@ -153,6 +153,8 @@ Her kol = sunucu `SCALPER_*` özeti (E18 ile AYNI dosya: 55 satır, sha256 `2a47
 150 (DEV havuz tabanı 100'ün 1.5 katı; E18'deki 1.5 oranı). Kuralı geçemeyen kol kilitten ÖNCE aileden çıkarılır, yerine
 kol konmaz ve m küçülür. CAL sayımı: §3.8.
 
+**Uygulandı (CAL sayımı, §3.8):** K30R-H (127.0/yıl) ve G30B-H (79.3/yıl) kuralı geçemedi ve aileden çıkarıldı. **Kilitli aile: K30R-L, K30B-L, K30B-H, G30B-L; m = 4.** Çıkarılan kolların sayımı `cal_counts.json`'da kayıtlı kalır.
+
 ### 3.5 Kaplamalar (aile üyesi değil)
 
 | Kaplama | Ne | Rol |
@@ -180,9 +182,18 @@ Teşhis koşuları yalnız `DEV_DECISION.json` yazıldıktan SONRA, ailedeki her
 CAL koşuları (aile, 92 gün) yalnız SAYIM için okunur: işlem sayısı, LONG/SHORT sayısı, kaldıraç payları, düşen sinyal
 sayaçları (tetikleyici nedenleri dahil), tetikleyici gün sayısı. Sayım betiği PnL alanlarını okumaz ve basmaz.
 
-Kod commit'i **H = `<KİLİTTEN ÖNCE DOLDURULUR>`**. Kaynak: `cal_counts.json`.
+Kod commit'i **H = `3672f29f41f83d62ee8bdbb95c603b042c9031d5`**. Kaynak: `cal_counts.json`.
 
-<!-- CAL_TABLE -->
+| Kol | N | LONG | SHORT | N/yıl | Test edilebilir | 20x payı | 3x payı | Tetik. günü | Açık karar noktası | Karar noktası | Veri-yok |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| K30R-L | 104 | 53 | 51 | 412.6 | EVET | 0.06 | 0.00 | 61 | 966 | 4416 | 0 |
+| K30R-H | 32 | 16 | 16 | 127.0 | HAYIR (çıkarıldı) | 0.00 | 0.00 | 20 | 259 | 4416 | 0 |
+| K30B-L | 134 | 73 | 61 | 531.6 | EVET | 0.05 | 0.00 | 61 | 966 | 4416 | 0 |
+| K30B-H | 48 | 33 | 15 | 190.4 | EVET | 0.00 | 0.00 | 20 | 259 | 4416 | 0 |
+| G30B-L | 65 | 36 | 29 | 257.9 | EVET | 0.05 | 0.00 | 61 | 966 | 4416 | 0 |
+| G30B-H | 20 | 7 | 13 | 79.3 | HAYIR (çıkarıldı) | 0.05 | 0.00 | 20 | 259 | 4416 | 0 |
+
+CAL = 2026-03-01 → 2026-06-01 (92 gün). Duman testleri: S1 parite eşleşti (92 işlem, net +2808.05); S2 belirlenimcilik (PYTHONHASHSEED 0 ve 1) eşleşti; S3 altı CAL koşusu check-run'dan geçti. Bu tabloda PnL, PF ya da kazanma oranı YOKTUR; sayım betiği bu alanları okumaz.
 
 ## 4. Veri doldurma
 
@@ -214,6 +225,10 @@ Kod commit'i **H = `<KİLİTTEN ÖNCE DOLDURULUR>`**. Kaynak: `cal_counts.json`.
   `signal_close_time`'ı tetikleyicinin aynı yönde AÇIK olduğu bir karar noktasıdır (ihlal 0); `missed` sayaçlarında
   `market_gate_*` yok.
 - Koşular ardışıktır. Başarı `ledger.jsonl`'a yazılır; tamamlanmış koşu tekrarlanmaz.
+- Kilitten sonra koşucu `--variants` ile kilit commit'indeki (L) `variants.json`'ı okur ve kolları açıkça adlandırır
+  (`--arms K30R-L,K30B-L,K30B-H,G30B-L`); H klonundaki 6 kollu taslak kullanılmaz. check-run H klonundaki kopyayı okur; dört
+  kolun tanımı ve diğer bütün alanlar iki dosyada aynıdır (kilitten önce doğrulandı). Karar alt komutları (`dev-screen` ve
+  sonrası) kilitli dosyaların bulunduğu çalışma ağacından koşar.
 - **Duman testleri (kilitten önce; DEV değil):** **S1 parite**: H klonunda C, AYI penceresi (2026-01-23 → 02-13, snapshot
   aynen, ana depo önbelleği) = 92 işlem ve net +2808.05 (E19); yalnız "eşleşti / eşleşmedi". **S2 belirlenimcilik**: K30B-L,
   CAL, PYTHONHASHSEED 0 ve 1; `trades` ve `shock_trigger` bloklarının kanonik-JSON sha256'sı aynı. **S3**: ailenin CAL
@@ -338,10 +353,18 @@ etkisi ayrıca ölçülür; (3) `docs/DECISIONS.md` kaydı ve `.env` yedeği; (4
 
 ## 11. Güç (yaklaşık; uçtan uca simülasyon YAPILMADI)
 
-<!-- POWER_TABLE -->
+| DEV havuz N | Görülebilen ortalama R | Kaba PF |
+|---|---|---|
+| 100 | 0.400 | 1.73 |
+| 150 | 0.327 | 1.59 |
+| 200 | 0.283 | 1.51 |
+| 300 | 0.231 | 1.42 |
+| 500 | 0.179 | 1.33 |
+
+m = 4 (kilitli aile) için z = 1.960. CAL'dan yıllık izdüşüm: K30R-L ≈ 413, K30B-L ≈ 532, K30B-H ≈ 190, G30B-L ≈ 258 işlem (2025 bu izdüşüme uymayabilir; ölçülmedi). Yorum: tasarım ancak büyük bir kenarı (ortalama ≈ 0.2–0.3 R, PF ≈ 1.4–1.55) güvenilir biçimde görür; küçük bir kenar bu ailede 'kanıt yok' olarak kalabilir.
 
 Hesap (E18 §11 ile aynı varsayımlar): tek yönlü test, ailede tek gerçek etki varsayımıyla BH eşiği p ≤ 0.10 / m (m = 6 için
-z ≈ 2.13), %80 güç (+0.84), günlük kümelenme tasarım etkisi 1.3, işlem başına R standart sapması 1.1, işlem başına brüt kayıp
+z ≈ 2.13; kilitli aile m = 4 için z ≈ 1.96), %80 güç (+0.84), günlük kümelenme tasarım etkisi 1.3, işlem başına R standart sapması 1.1, işlem başına brüt kayıp
 ≈ 0.55R. Son üç sayı VARSAYIMDIR, ölçülmedi. Görülebilen ortalama R ≈ (z + 0.84) × 1.1 × 1.3 / √N; kaba PF ≈ 1 + R / 0.55.
 
 ## 12. Tasarımın gördüğü ön bilgi (körlük beyanı)

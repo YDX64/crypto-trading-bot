@@ -35,8 +35,34 @@ from src.strategies.scalper.multitest import benjamini_hochberg  # noqa: E402
 INF = float("inf")
 DAY = 86_400_000
 FAST = {"BOOT_N": 199, "BOOT_N_HI": 399}
-VARIANTS = C.load_variants(REPO_REAL / C.PLAN_REL / "variants.json")
+_ARM_ORDER = ("K30R-L", "K30R-H", "K30B-L", "K30B-H", "G30B-L", "G30B-H")
+
+
+def _six_arm_variants(v: Dict) -> Dict:
+    """Mantik testleri tasarlanan 6 kolluk aile uzerinde calisir. Gercek variants.json CAL test
+    edilebilirlik kuralindan sonra kol cikarabilir (PLAN §3.4); cikan -H kollari -L kardeslerinden
+    (yalniz esik 3.0) geri kurulur. Gercek dosyanin kendisi DEGISMEZ."""
+    v = json.loads(json.dumps(v))
+    have = {a["id"] for a in v["family"]}
+    for arm_id in _ARM_ORDER:
+        if arm_id in have:
+            continue
+        sib = next(a for a in v["family"] if a["id"] == arm_id[:-1] + "L")
+        arm = json.loads(json.dumps(sib))
+        arm["id"] = arm_id
+        arm["shock_pct"] = 3.0
+        arm["env"]["SCALPER_SHOCK_TRIGGER_PCT"] = "3.0"
+        v["family"].append(arm)
+    v["family"].sort(key=lambda a: _ARM_ORDER.index(a["id"]))
+    return v
+
+
+VARIANTS = _six_arm_variants(C.load_variants(REPO_REAL / C.PLAN_REL / "variants.json"))
 ARMS = C.arm_ids(VARIANTS)
+
+
+def _write_test_variants(pdir: Path) -> None:
+    (pdir / "variants.json").write_text(json.dumps(VARIANTS, indent=2) + "\n", encoding="utf-8")
 
 
 def ms_of(day: str, hour: int = 12) -> int:
@@ -573,7 +599,7 @@ def env(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     pdir = repo / C.PLAN_REL
     pdir.mkdir(parents=True)
-    shutil.copy(REPO_REAL / C.PLAN_REL / "variants.json", pdir / "variants.json")
+    _write_test_variants(pdir)
     (repo / Path(C.E17_LABELS_REL).parent).mkdir(parents=True)
     shutil.copy(REPO_REAL / C.E17_LABELS_REL, repo / C.E17_LABELS_REL)
     (repo / Path(C.SHOCK_E18_REL).parent).mkdir(parents=True)
@@ -774,7 +800,7 @@ def lockrepo(tmp_path, monkeypatch):
     _git(repo, "init", "-q")
     pdir = repo / C.PLAN_REL
     pdir.mkdir(parents=True)
-    shutil.copy(REPO_REAL / C.PLAN_REL / "variants.json", pdir / "variants.json")
+    _write_test_variants(pdir)
     (pdir / "PLAN.md").write_text("plan\n")
     (repo / Path(C.SHOCK_E18_REL).parent).mkdir(parents=True)
     (repo / C.SHOCK_E18_REL).write_text('{"days":{}}\n')

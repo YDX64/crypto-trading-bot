@@ -37,16 +37,12 @@
   "family": [
     {"id": "K30R-L", "base": "K30R", "trigger": "breakout", "trend": "regime", "entry_tf": "30m", "shock_pct": 1.5,
      "env": {"SCALPER_M_TRIGGER": "breakout", "SCALPER_M_TREND": "regime", "SCALPER_SHOCK_TRIGGER_PCT": "1.5"}},
-    {"id": "K30R-H", "base": "K30R", "trigger": "breakout", "trend": "regime", "entry_tf": "30m", "shock_pct": 3.0,
-     "env": {"SCALPER_M_TRIGGER": "breakout", "SCALPER_M_TREND": "regime", "SCALPER_SHOCK_TRIGGER_PCT": "3.0"}},
     {"id": "K30B-L", "base": "K30B", "trigger": "breakout", "trend": "context", "entry_tf": "30m", "shock_pct": 1.5,
      "env": {"SCALPER_M_TRIGGER": "breakout", "SCALPER_M_TREND": "context", "SCALPER_SHOCK_TRIGGER_PCT": "1.5"}},
     {"id": "K30B-H", "base": "K30B", "trigger": "breakout", "trend": "context", "entry_tf": "30m", "shock_pct": 3.0,
      "env": {"SCALPER_M_TRIGGER": "breakout", "SCALPER_M_TREND": "context", "SCALPER_SHOCK_TRIGGER_PCT": "3.0"}},
     {"id": "G30B-L", "base": "G30B", "trigger": "pullback", "trend": "context", "entry_tf": "30m", "shock_pct": 1.5,
-     "env": {"SCALPER_M_TRIGGER": "pullback", "SCALPER_M_TREND": "context", "SCALPER_SHOCK_TRIGGER_PCT": "1.5"}},
-    {"id": "G30B-H", "base": "G30B", "trigger": "pullback", "trend": "context", "entry_tf": "30m", "shock_pct": 3.0,
-     "env": {"SCALPER_M_TRIGGER": "pullback", "SCALPER_M_TREND": "context", "SCALPER_SHOCK_TRIGGER_PCT": "3.0"}}
+     "env": {"SCALPER_M_TRIGGER": "pullback", "SCALPER_M_TREND": "context", "SCALPER_SHOCK_TRIGGER_PCT": "1.5"}}
   ],
   "overlays": [
     {"id": "ROB_FEE2", "role": "gate", "cli": ["--fee-stress"], "env": {},
